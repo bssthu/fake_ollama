@@ -283,6 +283,81 @@ def test_thinking_cache_reinjects_via_tool_use_id():
     assert any(b.get("type") == "text" for b in blocks[1:])
     assert any(b.get("type") == "tool_use" and b.get("id") == "call_abc" for b in blocks)
 
+
+def test_thinking_cache_recall_tolerates_reformatted_text():
+    """Even when the client trims/lowercases/whitespace-collapses the
+    echoed assistant text, the cached thinking block must still come back.
+    """
+    from fake_ollama.converters import (
+        _clear_thinking_cache,
+        anthropic_to_openai_chat,
+        openai_chat_to_anthropic,
+    )
+
+    _clear_thinking_cache()
+    upstream_resp = {
+        "id": "msg_2",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 4},
+        "content": [
+            {"type": "thinking", "thinking": "Quietly thinking.", "signature": "sigQ"},
+            {"type": "text", "text": "Hello, world!  This is a multi-line\n  reply."},
+        ],
+    }
+    anthropic_to_openai_chat(upstream_resp, openai_model="m", show_thinking=False)
+
+    payload = {
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            # Client reformatted: collapsed whitespace + lowercased.
+            {"role": "assistant", "content": "hello, world! this is a multi-line reply."},
+            {"role": "user", "content": "thanks"},
+        ],
+    }
+    body = openai_chat_to_anthropic(payload, upstream_model="m", default_max_tokens=100)
+    asst = body["messages"][1]
+    assert isinstance(asst["content"], list)
+    assert asst["content"][0]["type"] == "thinking"
+    assert asst["content"][0]["signature"] == "sigQ"
+
+
+def test_thinking_cache_last_fallback_when_text_completely_changed():
+    from fake_ollama.converters import (
+        _clear_thinking_cache,
+        anthropic_to_openai_chat,
+        openai_chat_to_anthropic,
+    )
+
+    _clear_thinking_cache()
+    upstream_resp = {
+        "id": "msg_3",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+        "content": [
+            {"type": "thinking", "thinking": "deep thought", "signature": "sigZ"},
+            {"type": "text", "text": "original answer"},
+        ],
+    }
+    anthropic_to_openai_chat(upstream_resp, openai_model="m", show_thinking=False)
+
+    # The client sent something completely unrelated as the assistant text
+    # (e.g. a heavily edited summary). Last-write fallback must still inject
+    # the cached thinking so DeepSeek does not 400.
+    payload = {
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "totally different summary text"},
+            {"role": "user", "content": "go on"},
+        ],
+    }
+    body = openai_chat_to_anthropic(payload, upstream_model="m", default_max_tokens=100)
+    asst = body["messages"][1]
+    assert isinstance(asst["content"], list)
+    assert asst["content"][0]["type"] == "thinking"
+    assert asst["content"][0]["signature"] == "sigZ"
+
 def test_openai_consecutive_tool_messages_merged_into_one_user_message():
     payload = {
         "model": "x",

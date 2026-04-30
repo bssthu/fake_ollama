@@ -25,11 +25,13 @@ def _make_client(settings, transport: httpx.MockTransport) -> TestClient:
 
     app = create_app(settings)
     # Inject the mocked client BEFORE lifespan startup so it is preserved.
-    app.state.client = AnthropicClient(
+    # All upstreams in the test settings share the same mock transport.
+    mock = AnthropicClient(
         settings.upstream_url,
         settings.anthropic_auth_token,
         client=httpx.AsyncClient(transport=transport),
     )
+    app.state.clients = {up.name: mock for up in settings.upstreams}
     return TestClient(app)
 
 
@@ -649,6 +651,40 @@ def test_thinking_mode_enabled_injects_request_field(monkeypatch):
 
 def test_thinking_mode_disabled_injects_disabled(monkeypatch):
     settings = _thinking_settings(monkeypatch, mode="disabled")
+    captured: Dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    client = _make_client(settings, httpx.MockTransport(handler))
+    with client:
+        resp = client.post(
+            "/api/chat",
+            json={
+                "model": "deepseek-v4-pro",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            },
+        )
+    assert resp.status_code == 200
+    assert captured["body"]["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_auto_with_show_thinking_false_disables_upstream(monkeypatch):
+    """When the profile is `auto` but show_thinking=False, the upstream must
+    receive ``thinking: {type:"disabled"}`` so reasoning models that auto-
+    enter thinking mode (DeepSeek-V3.2+) do not later 400 with "thinking ...
+    must be passed back" on multi-turn requests we cannot reconstruct.
+    """
+    settings = _thinking_settings(monkeypatch, mode="auto", show=False)
     captured: Dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:

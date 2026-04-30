@@ -40,6 +40,10 @@ htmlcov/
 .env.*
 !.env.example
 
+# Local config (user-specific; ship config.json.example instead)
+config.json
+!config.json.example
+
 # Logs
 *.log
 logs/

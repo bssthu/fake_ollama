@@ -99,8 +99,33 @@ def _normalise_thinking_blocks(
     return out
 
 
+_WS_RE = re.compile(r"\s+")
+
+
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8", errors="replace")).hexdigest()[:32]
+
+
+def _hash_text_normalised(text: str) -> str:
+    """Hash whitespace-collapsed lowercase text. Tolerant of reformatting."""
+    norm = _WS_RE.sub(" ", text).strip().lower()
+    return hashlib.sha256(norm.encode("utf-8", errors="replace")).hexdigest()[:32]
+
+
+def _hash_text_tail(text: str, n: int = 256) -> str:
+    """Hash the last ``n`` chars of normalised text. Tolerant of truncation."""
+    norm = _WS_RE.sub(" ", text).strip().lower()
+    return hashlib.sha256(norm[-n:].encode("utf-8", errors="replace")).hexdigest()[:32]
+
+
+def _text_keys(text: str) -> List[str]:
+    if not text or not text.strip():
+        return []
+    return [
+        f"tx:{_hash_text(text)}",
+        f"txn:{_hash_text_normalised(text)}",
+        f"txt:{_hash_text_tail(text)}",
+    ]
 
 
 def remember_thinking(
@@ -117,8 +142,12 @@ def remember_thinking(
     for tid in tool_use_ids or []:
         if tid:
             keys.append(f"tu:{tid}")
-    if text and text.strip():
-        keys.append(f"tx:{_hash_text(text)}")
+    if text:
+        keys.extend(_text_keys(text))
+    # Always remember the most recent entry under a wildcard sentinel so we
+    # can fall back to it when the client reformats the assistant text in a
+    # way that defeats every text-hash variant.
+    keys.append("__last__")
     for key in keys:
         _THINKING_CACHE[key] = list(norm)
         _THINKING_CACHE.move_to_end(key)
@@ -130,8 +159,15 @@ def recall_thinking(
     *,
     tool_use_ids: Optional[Iterable[str]] = None,
     text: Optional[str] = None,
+    allow_last_fallback: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Look up cached thinking blocks; tool ids take precedence over text."""
+    """Look up cached thinking blocks; tool ids take precedence over text.
+
+    When neither tool ids nor any text-hash variant matches, falls back to
+    the most recently cached entry (``__last__``) so DeepSeek's
+    "thinking ... must be passed back" requirement is satisfied even when
+    the client has reformatted the echoed assistant text.
+    """
     for tid in tool_use_ids or []:
         if not tid:
             continue
@@ -140,10 +176,14 @@ def recall_thinking(
             _THINKING_CACHE.move_to_end(f"tu:{tid}")
             return [dict(b) for b in cached]
     if text and text.strip():
-        key = f"tx:{_hash_text(text)}"
-        cached = _THINKING_CACHE.get(key)
+        for key in _text_keys(text):
+            cached = _THINKING_CACHE.get(key)
+            if cached:
+                _THINKING_CACHE.move_to_end(key)
+                return [dict(b) for b in cached]
+    if allow_last_fallback:
+        cached = _THINKING_CACHE.get("__last__")
         if cached:
-            _THINKING_CACHE.move_to_end(key)
             return [dict(b) for b in cached]
     return []
 

@@ -34,20 +34,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        owns_client = False
-        if not getattr(app.state, "client", None):
-            app.state.client = AnthropicClient(
-                settings.upstream_url,
-                settings.anthropic_auth_token,
+        owned_names: list[str] = []
+        if not getattr(app.state, "clients", None):
+            app.state.clients = {}
+        for up in settings.upstreams:
+            if up.name in app.state.clients:
+                continue
+            app.state.clients[up.name] = AnthropicClient(
+                up.base_url,
+                up.auth_token,
                 timeout=settings.timeout_seconds,
                 trust_env=settings.use_system_proxy,
             )
-            owns_client = True
+            owned_names.append(up.name)
         try:
             yield
         finally:
-            if owns_client:
-                client: AnthropicClient | None = getattr(app.state, "client", None)
+            for name in owned_names:
+                client = app.state.clients.pop(name, None)
                 if client is not None:
                     await client.aclose()
 
@@ -55,6 +59,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     _register_routes(app)
     return app
+
+
+def _client_for(app: FastAPI, settings: Settings, model_name: str) -> AnthropicClient:
+    """Pick the AnthropicClient that should serve the given model."""
+    name = settings.upstream_name_for(model_name)
+    clients: Dict[str, AnthropicClient] = app.state.clients
+    if name not in clients:
+        # Fall back to the first available client. Should not happen in
+        # normal operation but keeps tests that inject a single client
+        # under any key working.
+        return next(iter(clients.values()))
+    return clients[name]
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +304,13 @@ def _apply_thinking_config(
     """Inject the per-model `thinking` directive into the upstream payload.
 
     Honours the client's explicit ``thinking`` field if already present so
-    the user can override per-request. Only acts when the profile mode is
-    `enabled` or `disabled`; `auto` leaves the payload unchanged.
+    the user can override per-request. Acts when the profile mode is
+    ``enabled`` or ``disabled``. For ``auto`` we also force ``disabled`` if
+    the profile sets ``show_thinking=False`` -- the user clearly does not
+    want reasoning, and otherwise upstreams that auto-enter thinking mode
+    (DeepSeek-V3.2+) will demand the prior-turn thinking blocks be echoed
+    back, which we cannot reconstruct after a restart for messages we
+    never saw.
     """
     if "thinking" in upstream_payload:
         return
@@ -302,12 +323,13 @@ def _apply_thinking_config(
         }
     elif mode == "disabled":
         upstream_payload["thinking"] = {"type": "disabled"}
+    elif mode == "auto" and not profile.show_thinking:
+        upstream_payload["thinking"] = {"type": "disabled"}
 
 
 async def _handle(request: Request, *, mode: str) -> Any:
     app = request.app
     settings: Settings = app.state.settings
-    client: AnthropicClient = app.state.client
 
     try:
         payload = await request.json()
@@ -318,6 +340,7 @@ async def _handle(request: Request, *, mode: str) -> Any:
     if not ollama_model:
         raise HTTPException(status_code=400, detail="missing 'model'")
     upstream_model = settings.resolve_model(ollama_model)
+    client = _client_for(app, settings, ollama_model)
 
     if mode == "chat":
         upstream_payload = ollama_chat_to_anthropic(
@@ -383,7 +406,6 @@ async def _handle(request: Request, *, mode: str) -> Any:
 async def _handle_openai_chat(request: Request) -> Any:
     app = request.app
     settings: Settings = app.state.settings
-    client: AnthropicClient = app.state.client
 
     try:
         payload = await request.json()
@@ -394,6 +416,7 @@ async def _handle_openai_chat(request: Request) -> Any:
     if not openai_model:
         raise HTTPException(status_code=400, detail="missing 'model'")
     upstream_model = settings.resolve_model(openai_model)
+    client = _client_for(app, settings, openai_model)
 
     upstream_payload = openai_chat_to_anthropic(
         payload,
