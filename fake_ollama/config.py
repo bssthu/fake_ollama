@@ -1,51 +1,57 @@
-"""Application configuration loaded from environment / .env file."""
+"""Application configuration.
+
+Configuration is layered, in order of increasing priority:
+
+  1. Defaults (hard-coded in this module)
+  2. ``config.json`` (path overridable via ``--config`` CLI flag or
+     ``FAKE_OLLAMA_CONFIG`` env var; default ``./config.json``)
+  3. Environment variables (``FAKE_OLLAMA_*`` and the legacy single-upstream
+     ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN`` pair)
+
+The structured ``upstreams`` and ``model_profiles`` sections are best edited
+in ``config.json``. Secrets can be kept out of the JSON file by leaving the
+``auth_token`` placeholder there and overriding via env var.
+"""
 
 from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from typing import Annotated
-
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-# Default capabilities advertised when a model has no explicit profile.
-# Anthropic models support all three.
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+
 DEFAULT_CAPABILITIES: List[str] = ["completion", "tools", "vision"]
-# Default context window when no profile is supplied. Conservative – clients
-# (including GitHub Copilot) display this value, so make it match Anthropic
-# Claude 3.5 / 4 family which is 200k tokens.
 DEFAULT_CONTEXT_LENGTH: int = 200_000
-
-
-# Thinking modes for reasoning models (DeepSeek-V3.2, Claude 3.7+):
-#   "auto"     - do not touch the upstream `thinking` field; let the client
-#                or upstream default decide.
-#   "enabled"  - inject `thinking: {type:"enabled", budget_tokens:N}` if
-#                the client did not already specify one.
-#   "disabled" - inject `thinking: {type:"disabled"}` (force off).
-VALID_THINKING_MODES = ("auto", "enabled", "disabled")
 DEFAULT_THINKING_BUDGET_TOKENS: int = 1024
+VALID_THINKING_MODES = ("auto", "enabled", "disabled")
+
+CONFIG_ENV_VAR = "FAKE_OLLAMA_CONFIG"
+DEFAULT_CONFIG_PATH = Path("config.json")
+LEGACY_UPSTREAM_NAME = "default"
+
+
+# ---------------------------------------------------------------------------
+# Per-model profile
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class ModelProfile:
-    """Per-model metadata: advertised capabilities and limits."""
-
     capabilities: List[str]
     context_length: int
     max_output_tokens: Optional[int] = None
-    # Reasoning / thinking controls. See VALID_THINKING_MODES.
     thinking_mode: str = "auto"
     thinking_budget_tokens: int = DEFAULT_THINKING_BUDGET_TOKENS
-    # Whether to surface upstream `thinking` blocks back to the client. When
-    # True we wrap them in <think>...</think> in the output text (and also
-    # emit OpenAI-style `reasoning_content` deltas on /v1/chat/completions).
     show_thinking: bool = True
 
     @classmethod
@@ -70,102 +76,125 @@ class ModelProfile:
         )
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+# ---------------------------------------------------------------------------
+# Upstream
+# ---------------------------------------------------------------------------
 
-    anthropic_base_url: str = Field(..., alias="ANTHROPIC_BASE_URL")
-    anthropic_auth_token: str = Field(..., alias="ANTHROPIC_AUTH_TOKEN")
 
-    host: str = Field("127.0.0.1", alias="FAKE_OLLAMA_HOST")
-    port: int = Field(21434, alias="FAKE_OLLAMA_PORT")
+class Upstream(BaseModel):
+    """A single Anthropic-compatible upstream endpoint."""
 
-    # Version string returned by /api/version. Some clients refuse to talk to
-    # servers older than a minimum Ollama version, so we advertise a recent
-    # one by default. Override via FAKE_OLLAMA_ADVERTISED_VERSION if needed.
-    advertised_version: str = Field("0.6.4", alias="FAKE_OLLAMA_ADVERTISED_VERSION")
+    name: str
+    base_url: str
+    auth_token: str = ""
+    # Display names this upstream serves. The union across upstreams (with
+    # order preserved and duplicates dropped, first occurrence wins) is what
+    # /api/tags reports.
+    models: List[str] = Field(default_factory=list)
+    # Display name -> upstream-side model id. Falls through to the display
+    # name itself when not present.
+    model_map: Dict[str, str] = Field(default_factory=dict)
 
-    default_max_tokens: int = Field(4096, alias="FAKE_OLLAMA_DEFAULT_MAX_TOKENS")
-    timeout_seconds: float = Field(300.0, alias="FAKE_OLLAMA_TIMEOUT")
-    # If False (default), httpx ignores HTTP_PROXY/HTTPS_PROXY/system proxy
-    # when calling the upstream. Useful on machines where Clash/V2Ray etc.
-    # would otherwise hijack the request to a local proxy.
-    use_system_proxy: bool = Field(False, alias="FAKE_OLLAMA_USE_SYSTEM_PROXY")
-
-    # If True (default), reject requests whose estimated input + max_tokens
-    # exceed the configured context_length for the target model. This is a
-    # cheap guardrail to avoid huge upstream bills from runaway prompts.
-    enforce_context_limit: bool = Field(True, alias="FAKE_OLLAMA_ENFORCE_CONTEXT_LIMIT")
-
-    models: Annotated[List[str], NoDecode] = Field(
-        default_factory=lambda: ["claude-3-5-sonnet-20241022"],
-        alias="FAKE_OLLAMA_MODELS",
-    )
-    model_map: Annotated[Dict[str, str], NoDecode] = Field(
-        default_factory=dict,
-        alias="FAKE_OLLAMA_MODEL_MAP",
-    )
-
-    # JSON object: { "<ollama-name>": { "capabilities": [...],
-    #                                   "context_length": 200000,
-    #                                   "max_output_tokens": 8192 }, ... }
-    # Unspecified models fall back to defaults.
-    model_profiles: Annotated[Dict[str, Dict[str, Any]], NoDecode] = Field(
-        default_factory=dict,
-        alias="FAKE_OLLAMA_MODEL_PROFILES",
-    )
-
-    @field_validator("models", mode="before")
+    @field_validator("base_url")
     @classmethod
-    def _split_models(cls, value):
-        if value is None or value == "":
-            return ["claude-3-5-sonnet-20241022"]
-        if isinstance(value, str):
-            return [m.strip() for m in value.split(",") if m.strip()]
-        return value
+    def _strip_trailing_slash(cls, v: str) -> str:
+        return v.rstrip("/")
 
-    @field_validator("model_map", mode="before")
-    @classmethod
-    def _parse_model_map(cls, value):
-        if value is None or value == "":
-            return {}
-        if isinstance(value, str):
-            return json.loads(value)
-        return value
-
-    @field_validator("model_profiles", mode="before")
-    @classmethod
-    def _parse_model_profiles(cls, value):
-        if value is None or value == "":
-            return {}
-        if isinstance(value, str):
-            return json.loads(value)
-        return value
-
-    @property
-    def upstream_url(self) -> str:
-        return self.anthropic_base_url.rstrip("/")
-
-    def resolve_model(self, ollama_name: str) -> str:
-        """Map an Ollama-style model name to the upstream model id."""
-        if ollama_name in self.model_map:
-            return self.model_map[ollama_name]
-        # Strip optional ":tag" suffix that Ollama clients sometimes append.
-        if ":" in ollama_name:
-            base = ollama_name.split(":", 1)[0]
+    def resolve_model(self, display_name: str) -> str:
+        if display_name in self.model_map:
+            return self.model_map[display_name]
+        if ":" in display_name:
+            base = display_name.split(":", 1)[0]
             if base in self.model_map:
                 return self.model_map[base]
             return base
-        return ollama_name
+        return display_name
 
-    def profile_for(self, ollama_name: str) -> ModelProfile:
-        """Return the ModelProfile for a given Ollama-style model name."""
-        raw = self.model_profiles.get(ollama_name)
-        if raw is None and ":" in ollama_name:
-            raw = self.model_profiles.get(ollama_name.split(":", 1)[0])
+    def serves(self, display_name: str) -> bool:
+        if display_name in self.models:
+            return True
+        if ":" in display_name and display_name.split(":", 1)[0] in self.models:
+            return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+class Settings(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 21434
+    advertised_version: str = "0.6.4"
+    default_max_tokens: int = 4096
+    timeout_seconds: float = 300.0
+    use_system_proxy: bool = False
+    enforce_context_limit: bool = True
+    upstreams: List[Upstream] = Field(default_factory=list)
+    model_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    # Where the JSON config came from (empty string if no file was used).
+    config_path: str = ""
+
+    @model_validator(mode="after")
+    def _validate(self) -> "Settings":
+        if not self.upstreams:
+            raise ValueError(
+                "At least one upstream is required. Either set ANTHROPIC_BASE_URL "
+                "and ANTHROPIC_AUTH_TOKEN, or define an `upstreams` array in "
+                "config.json."
+            )
+        names = [u.name for u in self.upstreams]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Duplicate upstream names: {names}")
+        return self
+
+    # -- Backwards-compatible aggregated views ---------------------------
+
+    @property
+    def models(self) -> List[str]:
+        """Union of all upstream models, dedup, order preserved."""
+        seen: Dict[str, None] = {}
+        for up in self.upstreams:
+            for name in up.models:
+                if name not in seen:
+                    seen[name] = None
+        return list(seen.keys())
+
+    @property
+    def upstream_url(self) -> str:
+        """First upstream's base_url. Kept for backwards compatibility."""
+        return self.upstreams[0].base_url if self.upstreams else ""
+
+    @property
+    def anthropic_auth_token(self) -> str:
+        """First upstream's token. Kept for backwards compatibility."""
+        return self.upstreams[0].auth_token if self.upstreams else ""
+
+    # -- Routing helpers -------------------------------------------------
+
+    def upstream_for_model(self, display_name: str) -> Upstream:
+        """Return the upstream that should serve the given display name.
+
+        Falls back to the first upstream when no explicit match exists, so
+        unknown model names still get a sensible default route.
+        """
+        for up in self.upstreams:
+            if up.serves(display_name):
+                return up
+        return self.upstreams[0]
+
+    def upstream_name_for(self, display_name: str) -> str:
+        return self.upstream_for_model(display_name).name
+
+    def resolve_model(self, display_name: str) -> str:
+        return self.upstream_for_model(display_name).resolve_model(display_name)
+
+    def profile_for(self, display_name: str) -> ModelProfile:
+        raw = self.model_profiles.get(display_name)
+        if raw is None and ":" in display_name:
+            raw = self.model_profiles.get(display_name.split(":", 1)[0])
         if raw is None:
             return ModelProfile(
                 capabilities=list(DEFAULT_CAPABILITIES),
@@ -175,9 +204,119 @@ class Settings(BaseSettings):
         return ModelProfile.from_dict(raw)
 
 
+# ---------------------------------------------------------------------------
+# Loader
+# ---------------------------------------------------------------------------
+
+
+def _parse_bool(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+_ENV_SCALARS: Dict[str, tuple] = {
+    "FAKE_OLLAMA_HOST": ("host", str),
+    "FAKE_OLLAMA_PORT": ("port", int),
+    "FAKE_OLLAMA_ADVERTISED_VERSION": ("advertised_version", str),
+    "FAKE_OLLAMA_DEFAULT_MAX_TOKENS": ("default_max_tokens", int),
+    "FAKE_OLLAMA_TIMEOUT": ("timeout_seconds", float),
+    "FAKE_OLLAMA_USE_SYSTEM_PROXY": ("use_system_proxy", _parse_bool),
+    "FAKE_OLLAMA_ENFORCE_CONTEXT_LIMIT": ("enforce_context_limit", _parse_bool),
+}
+
+
+def _resolve_config_path(explicit: Optional[str | Path]) -> Optional[Path]:
+    if explicit:
+        return Path(explicit)
+    env_path = os.getenv(CONFIG_ENV_VAR)
+    if env_path:
+        return Path(env_path)
+    if DEFAULT_CONFIG_PATH.exists():
+        return DEFAULT_CONFIG_PATH
+    return None
+
+
+def _read_json(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None or not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        return {}
+    return json.loads(raw)
+
+
+def _apply_env_overrides(data: Dict[str, Any]) -> Dict[str, Any]:
+    # Scalar overrides
+    for env_key, (field, caster) in _ENV_SCALARS.items():
+        if env_key in os.environ:
+            try:
+                data[field] = caster(os.environ[env_key])
+            except (TypeError, ValueError):
+                continue
+
+    # model_profiles via FAKE_OLLAMA_MODEL_PROFILES (JSON)
+    raw_profiles = os.getenv("FAKE_OLLAMA_MODEL_PROFILES")
+    if raw_profiles:
+        try:
+            data["model_profiles"] = json.loads(raw_profiles)
+        except json.JSONDecodeError:
+            pass
+
+    # Legacy single-upstream env vars. When set, they create or override the
+    # upstream named "default".
+    base_url = os.getenv("ANTHROPIC_BASE_URL")
+    auth = os.getenv("ANTHROPIC_AUTH_TOKEN")
+    if base_url and auth:
+        legacy_models_str = os.getenv("FAKE_OLLAMA_MODELS")
+        legacy_map_str = os.getenv("FAKE_OLLAMA_MODEL_MAP")
+        legacy_models = (
+            [m.strip() for m in legacy_models_str.split(",") if m.strip()]
+            if legacy_models_str
+            else []
+        )
+        legacy_map: Dict[str, str] = {}
+        if legacy_map_str:
+            try:
+                legacy_map = json.loads(legacy_map_str)
+            except json.JSONDecodeError:
+                legacy_map = {}
+        env_up = {
+            "name": LEGACY_UPSTREAM_NAME,
+            "base_url": base_url,
+            "auth_token": auth,
+            "models": legacy_models,
+            "model_map": legacy_map,
+        }
+        upstreams = list(data.get("upstreams") or [])
+        for i, up in enumerate(upstreams):
+            if up.get("name") == LEGACY_UPSTREAM_NAME:
+                merged = {**up, **env_up}
+                if not legacy_models and up.get("models"):
+                    merged["models"] = up["models"]
+                if not legacy_map and up.get("model_map"):
+                    merged["model_map"] = up["model_map"]
+                upstreams[i] = merged
+                break
+        else:
+            upstreams.insert(0, env_up)
+        data["upstreams"] = upstreams
+
+    return data
+
+
+def load_settings(config_path: Optional[str | Path] = None) -> Settings:
+    """Build a Settings object from JSON config + env vars."""
+    resolved = _resolve_config_path(config_path)
+    data = _read_json(resolved)
+    data = _apply_env_overrides(data)
+    settings = Settings(**data)
+    if resolved is not None:
+        settings = settings.model_copy(update={"config_path": str(resolved)})
+    return settings
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    return load_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -186,12 +325,7 @@ def get_settings() -> Settings:
 
 
 def estimate_tokens_from_anthropic_payload(body: Dict[str, Any]) -> int:
-    """Rough token estimate of an Anthropic /v1/messages request body.
-
-    Uses ~3 chars per token as a conservative (over-estimating) heuristic so
-    that the guardrail trips slightly early rather than slightly late. Images
-    and tool_result blocks add a fixed overhead.
-    """
+    """Rough token estimate of an Anthropic /v1/messages request body."""
     chars = 0
     images = 0
     sys = body.get("system")
@@ -226,8 +360,5 @@ def estimate_tokens_from_anthropic_payload(body: Dict[str, Any]) -> int:
                             chars += len(sub.get("text", ""))
             elif btype == "tool_use":
                 chars += len(json.dumps(block.get("input") or {}))
-    # rough overhead per message turn
     overhead = 4 * len(body.get("messages") or [])
-    # ~1500 tokens per image is a safe upper bound for Claude vision
     return math.ceil(chars / 3) + overhead + images * 1500
-

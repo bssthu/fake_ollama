@@ -1,0 +1,51 @@
+{
+  "host": "127.0.0.1",
+  "port": 21434,
+  "advertised_version": "0.6.4",
+  "default_max_tokens": 4096,
+  "timeout_seconds": 300.0,
+  "use_system_proxy": false,
+  "enforce_context_limit": true,
+
+  "upstreams": [
+    {
+      "name": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "auth_token": "sk-ant-...",
+      "models": [
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022"
+      ],
+      "model_map": {}
+    },
+    {
+      "name": "deepseek",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "auth_token": "sk-deepseek-...",
+      "models": ["deepseek-chat", "deepseek-reasoner"],
+      "model_map": {
+        "deepseek-chat": "deepseek-chat",
+        "deepseek-reasoner": "deepseek-reasoner"
+      }
+    }
+  ],
+
+  "model_profiles": {
+    "claude-3-5-sonnet-20241022": {
+      "capabilities": ["completion", "tools", "vision"],
+      "context_length": 200000,
+      "max_output_tokens": 8192,
+      "thinking_mode": "auto",
+      "thinking_budget_tokens": 2048,
+      "show_thinking": true
+    },
+    "deepseek-reasoner": {
+      "capabilities": ["completion", "tools"],
+      "context_length": 65536,
+      "max_output_tokens": 8192,
+      "thinking_mode": "enabled",
+      "thinking_budget_tokens": 4096,
+      "show_thinking": true
+    }
+  }
+}

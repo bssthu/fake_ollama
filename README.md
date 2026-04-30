@@ -16,7 +16,8 @@
   - Ollama `options.{temperature, top_p, top_k, num_predict, stop}` → Anthropic 对应字段
   - 多模态：Ollama `images`（base64）→ Anthropic `image` block
   - SSE → NDJSON 流式回包
-- 配置全部通过环境变量 / `.env`，**密钥不写入代码**
+- 配置走 `config.json`，密钥可单独放 `.env`，**不写入代码**
+- 支持**多个上游 URL**：把不同厂商（Claude / DeepSeek / 自建网关）合并成一个 Ollama 端口对外提供
 - `pytest` + `httpx.MockTransport` 单元测试 + 可选的 live integration 测试
 
 ## 快速开始
@@ -27,34 +28,77 @@ python -m venv .venv
 . .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-# 2. 配置 .env
+# 2. 准备配置文件
+Copy-Item config.json.example config.json
 Copy-Item .env.example .env
-# 然后用编辑器把 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 填好
+# 在 config.json 里填上游 URL / 模型；密钥推荐放 .env 的 ANTHROPIC_AUTH_TOKEN
 
 # 3. 启动
 python -m fake_ollama
-# 或自定义端口
-python -m fake_ollama --host 0.0.0.0 --port 21434
+# 或指定配置文件路径
+python -m fake_ollama --config ./config.json --host 0.0.0.0 --port 21434
 ```
 
 启动后即可用任何 Ollama 客户端连接 `http://127.0.0.1:21434`。
 
-## 配置项（环境变量）
+## 配置（config.json）
 
-| 变量 | 必填 | 说明 |
+推荐方式：在项目根目录维护一个 `config.json`（见 `config.json.example`）。运行时会按以下顺序逐层覆盖：
+
+1. 代码默认值
+2. `config.json`（路径优先级：`--config` > `$FAKE_OLLAMA_CONFIG` > `./config.json`）
+3. 环境变量 / `.env`
+
+顶层字段：
+
+| 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `ANTHROPIC_BASE_URL` | 是 | 上游 base url，例如 `http://8.166.137.143:48085` |
-| `ANTHROPIC_AUTH_TOKEN` | 是 | 上游鉴权 token；同时以 `x-api-key` 和 `Authorization: Bearer` 两种形式发送，兼容 Anthropic 原生与 OpenAI 风格代理 |
-| `FAKE_OLLAMA_HOST` | 否 | 监听地址，默认 `127.0.0.1` |
-| `FAKE_OLLAMA_PORT` | 否 | 监听端口，默认 `21434`（避开真正 Ollama 的 `11434`） |
-| `FAKE_OLLAMA_ADVERTISED_VERSION` | 否 | `/api/version` 返回的版本号，默认 `0.6.4`。部分 Ollama 客户端会拒绝低版本服务（例如报 `Please upgrade to version 0.6.4 or higher`），按需调高 |
-| `FAKE_OLLAMA_MODELS` | 否 | 暴露给 `/api/tags` 的模型名列表（逗号分隔） |
-| `FAKE_OLLAMA_MODEL_MAP` | 否 | JSON 字典：`{"短名": "上游真实模型ID"}`，未命中则原样透传 |
-| `FAKE_OLLAMA_MODEL_PROFILES` | 否 | JSON 对象：为每个模型声明 `capabilities`（`completion` / `tools` / `vision`，Copilot 等客户端会读它来判断该模型能否用作 chat / tool calling / vision）、`context_length`（最大上下文 token，同时用于在 UI 显示并拦截超长请求）、可选 `max_output_tokens`（覆盖 `num_predict` 默认值并设上限）。未配置的模型回退到 `["completion","tools","vision"]` + `200000` ctx |
-| `FAKE_OLLAMA_ENFORCE_CONTEXT_LIMIT` | 否 | 默认 `true`：估算 `输入 token + max_tokens` 超过该模型 `context_length` 时直接 400 拦截，避免误传超长 prompt 产生高额费用。设 `false` 关闭 |
-| `FAKE_OLLAMA_DEFAULT_MAX_TOKENS` | 否 | 客户端没传 `num_predict` 时使用 |
-| `FAKE_OLLAMA_TIMEOUT` | 否 | 上游请求超时秒数，默认 300 |
-| `FAKE_OLLAMA_USE_SYSTEM_PROXY` | 否 | 默认 `false`：上游 httpx 客户端**忽略** `HTTP_PROXY`/`HTTPS_PROXY`/Windows 系统代理；设为 `true` 才走（Clash/V2Ray 用户通常保持 `false`） |
+| `host` | string | 监听地址，默认 `127.0.0.1` |
+| `port` | int | 监听端口，默认 `21434` |
+| `advertised_version` | string | `/api/version` 返回的版本号，默认 `0.6.4` |
+| `default_max_tokens` | int | 客户端没传 `num_predict` 时使用，默认 `4096` |
+| `timeout_seconds` | float | 上游请求超时，默认 `300` |
+| `use_system_proxy` | bool | 是否走 Windows / 系统代理（Clash/V2Ray 用户通常 `false`） |
+| `enforce_context_limit` | bool | 默认 `true`：估算输入 + max_tokens 超过 `context_length` 时直接 400 |
+| `upstreams` | array | **必填**，至少一个上游，结构见下 |
+| `model_profiles` | object | 每个模型的 capabilities / 上下文 / 思维链等设置 |
+
+### 多上游（upstreams）
+
+每个 upstream 是一段独立的 Anthropic 兼容端点，结构：
+
+```jsonc
+{
+  "name": "anthropic",                       // 唯一名字
+  "base_url": "https://api.anthropic.com",    // 上游 base url
+  "auth_token": "sk-ant-...",                 // 鉴权 token
+  "models": ["claude-3-5-sonnet-20241022"],   // 该上游对外暴露的模型列表
+  "model_map": {                              // 可选：本地名 -> 上游真实 ID
+    "claude-sonnet": "claude-3-5-sonnet-20241022"
+  }
+}
+```
+
+路由规则：
+
+- `/api/tags` 返回所有 upstream `models` 的**并集**，去重时保留首个出现位置；
+- 一次请求按 `model` 字段查找：第一个 `models` 中包含该名字的 upstream 胜出；
+- 找不到匹配时回退到列表中第一个 upstream（方便客户端透传未配置的模型名）。
+
+配合 `model_map` 可以把短别名映射到上游真实模型 ID，再由对应 upstream 用自己的 token 调用。
+
+### 环境变量（.env）
+
+所有 `config.json` 顶层标量都能通过 `FAKE_OLLAMA_*` 环境变量覆盖，**密钥优先用环境变量**保管：
+
+| 变量 | 说明 |
+| --- | --- |
+| `FAKE_OLLAMA_CONFIG` | `config.json` 路径，等价于 `--config` |
+| `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` | 兼容旧版：自动建一个名为 `default` 的 upstream（如果 JSON 已有同名 upstream，env 提供的字段覆盖之） |
+| `FAKE_OLLAMA_MODELS` | 旧版：`default` upstream 的 `models`（逗号分隔） |
+| `FAKE_OLLAMA_MODEL_MAP` | 旧版：`default` upstream 的 `model_map`（JSON） |
+| `FAKE_OLLAMA_MODEL_PROFILES` | JSON，覆盖 `model_profiles` 字段 |
+| `FAKE_OLLAMA_HOST` / `_PORT` / `_ADVERTISED_VERSION` / `_DEFAULT_MAX_TOKENS` / `_TIMEOUT` / `_USE_SYSTEM_PROXY` / `_ENFORCE_CONTEXT_LIMIT` | 同名标量覆盖 |
 
 ## 每模型 capabilities / 上下文长度
 
@@ -143,3 +187,26 @@ curl -X POST http://127.0.0.1:21434/api/chat `
 
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。如果你装了 Clash / V2Ray，且上游是直连 IP，请保持 `FAKE_OLLAMA_USE_SYSTEM_PROXY=false`（默认）。
 - **503 `No available accounts: this group only allows Claude Code clients`**：这是上游（claude-relay-service 等）侧的账号池限制，要求请求必须来自 Claude Code 客户端，且当前池里有可用账号。这种限制无法通过修改请求体绕过——需要在上游后台调整该 API Key 的客户端限制 / 账户池。
+
+## 参考文档
+
+- [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)
+- [Anthropic Messages API（流式）](https://docs.anthropic.com/en/docs/build-with-claude/streaming)
+- [Ollama API 文档](https://github.com/ollama/ollama/blob/main/docs/api.md)
+- [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat)
+- [DeepSeek Anthropic API 兼容性](https://api-docs.deepseek.com/zh-cn/guides/anthropic_api)
+- [GitHub Copilot 自定义 Ollama provider](https://docs.github.com/en/copilot/customizing-copilot/extending-the-capabilities-of-github-copilot-in-your-ide)
+
+## 免责声明（Disclaimer）
+
+- 本项目只是一个**协议适配层**，不附带、不分发任何模型权重，也不与 Anthropic、Ollama、DeepSeek、OpenAI、GitHub 或任何商标持有人有关联或背书。
+- 使用者**有义务**遵守所连接的上游 API 提供商的服务条款（ToS）、Acceptable Use Policy 与所在司法辖区的法律法规。**不得**将本项目用于：
+  - 绕过上游计费、配额、客户端识别等限制；
+  - 转售/未经授权地代理上游服务；
+  - 生成违反提供商内容政策的内容。
+- 任何因使用本项目产生的费用、账号封禁、数据泄露或其他法律责任，**由使用者自行承担**，作者不承担任何明示或默示的担保责任。
+- 在生产环境使用前，请自行评估并加固访问控制、密钥管理与日志脱敏。
+
+## License
+
+MIT — 详见 [LICENSE](./LICENSE)。
