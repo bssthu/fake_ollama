@@ -1,0 +1,1191 @@
+"""Web admin UI for editing config.json.
+
+Architecture
+------------
+Three small endpoints back the UI:
+
+  GET  /admin/             -> HTML shell + bundled vanilla-JS form renderer
+  GET  /admin/schema       -> machine-readable form schema (see ``CONFIG_SCHEMA``)
+  GET  /admin/config       -> current effective config (with ``_path`` metadata)
+  PUT  /admin/config       -> validate (Pydantic) + persist + hot-reload
+
+The HTML page reads ``schema`` and ``config`` and renders one labelled
+input per field (with description and a "use this field" checkbox so the
+user can drop a field back to its default). Object lists
+(``upstreams`` / ``ollama_targets``) and the ``model_profiles`` map are
+rendered as repeatable groups with add/remove buttons. A "raw JSON"
+toggle is kept as an escape hatch.
+
+Security: there is **no** authentication. Disable via
+``"admin_enabled": false`` if the service is reachable from anything
+other than localhost.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, List
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+from .anthropic_client import AnthropicClient
+from .config import Settings
+from .ollama_client import OllamaClient
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+#
+# Field types understood by the front-end:
+#   string, int, float, bool, string_list, string_map,
+#   object_list, object_map
+#
+# - ``required`` fields cannot be omitted (no delete checkbox).
+# - ``secret`` fields render as <input type=password>.
+# - ``object_list`` / ``object_map`` carry an ``item_schema`` for inner fields.
+
+UPSTREAM_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "name", "type": "string", "default": "", "required": True,
+     "description": "唯一名字（routing key）"},
+    {"key": "base_url", "type": "string", "default": "", "required": True,
+     "description": "Anthropic 兼容上游 base URL，例如 https://api.anthropic.com"},
+    {"key": "auth_token", "type": "string", "default": "", "secret": True,
+     "description": "上游 API token；建议放 .env 而非提交到仓库"},
+    {"key": "models", "type": "string_list", "default": [],
+     "description": "该上游对外暴露的模型显示名（一行一个）"},
+    {"key": "expose_external", "type": "string_list_subset_of",
+     "default": None, "subset_of": "models",
+     "description": "该上游里哪些模型对外暴露在 /v1/models 与 /v1/messages；不勾该字段 = 默认全部暴露（保持旧行为）。需隐藏某些模型时勾上该字段并选中允许外部调用的模型即可"},
+    {"key": "model_map", "type": "string_map", "default": {},
+     "description": "可选：显示名 → 上游真实模型 ID"},
+]
+
+OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "name", "type": "string", "default": "", "required": True,
+     "description": "唯一名字"},
+    {"key": "base_url", "type": "string", "default": "http://127.0.0.1:11434",
+     "description": "本机 Ollama 服务 URL"},
+    {"key": "models", "type": "string_list", "default": [],
+     "description": "Anthropic 端可用的模型显示名"},
+    {"key": "model_map", "type": "string_map", "default": {},
+     "description": "可选：显示名 → Ollama 模型 ID（如 llama3.1 → llama3.1:8b）"},
+]
+
+MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "capabilities", "type": "string_list",
+     "default": ["completion", "tools", "vision"],
+     "description": "子集自 completion / tools / vision；至少包含 completion"},
+    {"key": "context_length", "type": "int", "default": 200000,
+     "description": "总上下文 token 上限（输入 + 输出）"},
+    {"key": "max_output_tokens", "type": "int", "default": None,
+     "description": "可选：覆盖默认 num_predict；同时是 max_tokens 的上限"},
+    {"key": "thinking_mode", "type": "string", "default": "auto",
+     "description": "auto / enabled / disabled；控制是否注入 thinking 字段"},
+    {"key": "thinking_budget_tokens", "type": "int", "default": 1024,
+     "description": "thinking=enabled 时的预算（DeepSeek 会忽略）"},
+    {"key": "show_thinking", "type": "bool", "default": True,
+     "description": "是否把上游 thinking 透传给客户端（<think> 块）"},
+]
+
+CONFIG_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "host", "type": "string", "default": "127.0.0.1", "group": "server",
+     "description": "内部监听地址（/admin + Ollama 兼容 /api/*）。生产环境请保持 127.0.0.1"},
+    {"key": "port", "type": "int", "default": 21434, "group": "server",
+     "description": "内部监听端口"},
+    {"key": "advertised_version", "type": "string", "default": "0.6.4", "group": "server",
+     "description": "GET /api/version 返回的版本号"},
+    {"key": "admin_enabled", "type": "bool", "default": True, "group": "server",
+     "description": "是否启用本 /admin 编辑器（关闭后需手动改 config.json）"},
+
+    {"key": "external_host", "type": "string", "default": None, "group": "external",
+     "description": "对外服务监听地址。填 127.0.0.1 仅本机（推荐 + Nginx）；填 0.0.0.0 直接对外。不填则不启用独立对外端口"},
+    {"key": "external_port", "type": "int", "default": None, "group": "external",
+     "description": "对外服务监听端口。填了才会启用独立端口（/v1/messages + /v1/models 仅在该端口提供，其他路由仅在内部端口）"},
+    {"key": "external_access_tokens", "type": "string_list", "default": [], "group": "external",
+     "secret_each": True, "generate_each": True,
+     "description": "外部访问 token 湠；客户端调用 /v1/messages 或 /v1/models 需携带其中任一（x-api-key 或 Authorization: Bearer）。启用独立对外端口时必填至少一个"},
+
+    {"key": "default_max_tokens", "type": "int", "default": 4096, "group": "behavior",
+     "description": "客户端没传 num_predict 时使用"},
+    {"key": "timeout_seconds", "type": "float", "default": 300.0, "group": "behavior",
+     "description": "上游请求超时（秒）"},
+    {"key": "use_system_proxy", "type": "bool", "default": False, "group": "behavior",
+     "description": "是否走系统代理（Clash/V2Ray 用户通常关）"},
+    {"key": "enforce_context_limit", "type": "bool", "default": True, "group": "behavior",
+     "description": "估算输入+max_tokens 超过 context_length 时直接 400"},
+
+    {"key": "upstreams", "type": "object_list", "default": [], "group": "upstreams",
+     "required": True, "item_schema": UPSTREAM_ITEM_SCHEMA,
+     "detect_models": "anthropic",
+     "description": "至少一个 Anthropic 兼容上游"},
+    {"key": "ollama_targets", "type": "object_list", "default": [], "group": "ollama",
+     "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
+     "detect_models": "ollama",
+     "description": "本机 Ollama 服务，用于反向代理 POST /v1/messages。访问鉴权使用上方 external_access_tokens"},
+    {"key": "model_profiles", "type": "object_map", "default": {}, "group": "profiles",
+     "item_schema": MODEL_PROFILE_ITEM_SCHEMA,
+     "key_autocomplete": "model_names",
+     "description": "每个模型的 capabilities / 上下文 / 思维链等设置；key 是模型显示名（输入时会提示已知模型名）"},
+]
+
+GROUP_LABELS: List[Dict[str, str]] = [
+    {"key": "server", "label": "Server (internal)", "hint": "/admin + Ollama 兼容 /api/* 的监听地址 / 端口"},
+    {"key": "external", "label": "External (reverse proxy)", "hint": "对外暴露的 Anthropic 兼容 /v1/* 端口 + 访问 token"},
+    {"key": "behavior", "label": "Behavior", "hint": "超时、max_tokens、代理、context 限制"},
+    {"key": "upstreams", "label": "Upstreams (forward)", "hint": "Anthropic 兼容上游"},
+    {"key": "ollama", "label": "Ollama Targets (reverse)", "hint": "本机 Ollama 反向代理"},
+    {"key": "profiles", "label": "Model Profiles", "hint": "每个模型的能力与上下文"},
+]
+
+
+# ---------------------------------------------------------------------------
+# HTML / JS bundle
+# ---------------------------------------------------------------------------
+
+_INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>fake-ollama config editor</title>
+<style>
+ :root { color-scheme: light dark; --gap: 0.55rem; --border: rgba(127,127,127,0.3); --accent: #3a7bd5; }
+ body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 1280px; margin: 0 auto; padding: 0 1rem 2rem; }
+ .topbar { position: sticky; top: 0; z-index: 50; background: Canvas; padding: 0.8rem 0 0.6rem; border-bottom: 1px solid var(--border); margin-bottom: 0.8rem; }
+ .topbar h1 { margin: 0 0 0.4rem 0; font-size: 1.4rem; }
+ .sub { color: #888; margin-bottom: 0.5rem; font-size: 0.9rem; }
+ .warn { background: rgba(255, 200, 0, 0.15); padding: 0.5rem 0.8rem; border-left: 3px solid orange; border-radius: 3px; margin-bottom: 1rem; font-size: 0.88rem; }
+ .layout { display: grid; grid-template-columns: 220px 1fr; gap: 1.2rem; align-items: start; }
+ @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } .sidenav { position: static !important; max-height: none !important; } }
+ .sidenav { position: sticky; top: 5.5rem; max-height: calc(100vh - 6rem); overflow-y: auto;
+   border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0; background: rgba(127,127,127,0.04); }
+ .sidenav h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888;
+   margin: 0.2rem 0.8rem 0.3rem; font-weight: 600; }
+ .sidenav a { display: block; padding: 0.4rem 0.8rem; text-decoration: none; color: inherit;
+   border-left: 3px solid transparent; font-size: 0.92rem; line-height: 1.25; }
+ .sidenav a:hover { background: rgba(127,127,127,0.1); }
+ .sidenav a.active { border-left-color: var(--accent); background: rgba(58,123,213,0.1); font-weight: 600; }
+ .sidenav a small { display: block; font-size: 0.75rem; color: #888; font-weight: 400; margin-top: 0.1rem; }
+ section.group-section { margin-bottom: 1.6rem; scroll-margin-top: 5.5rem; }
+ section.group-section > h2 { margin: 0 0 0.2rem 0; font-size: 1.1rem; padding-bottom: 0.3rem; border-bottom: 2px solid var(--accent); }
+ section.group-section > .group-hint { color: #888; font-size: 0.85rem; margin-bottom: 0.6rem; }
+ .field { border: 1px solid var(--border); border-radius: 5px; padding: 0.5rem 0.7rem; margin-bottom: var(--gap); background: Canvas; }
+ .field > label { display: flex; align-items: baseline; gap: 0.4rem; font-weight: 600; }
+ .field .desc { color: #888; font-size: 0.82rem; margin: 0.15rem 0 0.4rem 0; }
+ .field input[type=text], .field input[type=password], .field input[type=number],
+ .field textarea, .field select {
+   width: 100%; box-sizing: border-box; padding: 0.3rem 0.4rem;
+   font-family: inherit; font-size: 0.92rem;
+ }
+ .field textarea { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; min-height: 4.5rem; }
+ .field.disabled > .body { opacity: 0.45; pointer-events: none; }
+ .bool-row { display: flex; align-items: center; gap: 0.5rem; }
+ .bool-row .bool-label { font-family: ui-monospace, Consolas, monospace; font-weight: 600; }
+ .bool-row .bool-label.t { color: #2a8a2a; }
+ .bool-row .bool-label.f { color: #c0392b; }
+ .entries { display: flex; flex-direction: column; gap: 0.3rem; }
+ .entries .entry { display: flex; gap: 0.4rem; align-items: center; }
+ .entries .entry input { flex: 1; }
+ .entries .empty { color: #888; font-size: 0.85rem; font-style: italic; }
+ .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 100;
+   display: flex; align-items: center; justify-content: center; }
+ .modal { background: Canvas; color: CanvasText; border: 1px solid var(--border);
+   border-radius: 6px; padding: 1rem 1.2rem; max-width: 560px; width: 90%;
+   max-height: 80vh; display: flex; flex-direction: column; gap: 0.6rem; }
+ .modal h2 { margin: 0; font-size: 1.1rem; }
+ .modal .modal-body { overflow-y: auto; max-height: 55vh; border: 1px solid var(--border);
+   padding: 0.5rem 0.7rem; border-radius: 4px; }
+ .modal .modal-body label { display: flex; align-items: center; gap: 0.5rem;
+   padding: 0.15rem 0; font-family: ui-monospace, Consolas, monospace; font-size: 0.9rem; }
+ .modal .modal-body label.exists { color: #888; }
+ .modal .modal-body .tag { font-size: 0.7rem; padding: 0 0.3rem; border-radius: 2px;
+   background: rgba(127,127,127,0.2); }
+ .modal .modal-foot { display: flex; justify-content: flex-end; gap: 0.5rem; }
+ .modal .modal-tools { display: flex; gap: 0.5rem; align-items: center; font-size: 0.85rem; }
+ .group { border: 1px dashed var(--border); border-radius: 5px; padding: 0.5rem 0.7rem; margin-bottom: var(--gap); background: rgba(127,127,127,0.04); }
+ .group .item { border-left: 3px solid var(--border); padding: 0.4rem 0.6rem; margin-bottom: 0.5rem; background: rgba(127,127,127,0.04); border-radius: 3px; }
+ .map-key { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.4rem; }
+ .map-key input { flex: 1; }
+ button { padding: 0.35rem 0.8rem; font-size: 0.9rem; cursor: pointer; }
+ button.primary { font-weight: 600; }
+ button.danger { color: #c0392b; }
+ button.detect { font-size: 0.8rem; padding: 0.2rem 0.5rem; }
+ .row { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+ #status { margin-left: 0.5rem; font-size: 0.9rem; min-height: 1.2em; }
+ #status.ok { color: #2a8a2a; }
+ #status.err { color: #c0392b; white-space: pre-wrap; }
+ details > summary { cursor: pointer; }
+ details pre { overflow: auto; max-height: 50vh; background: rgba(127,127,127,0.08); padding: 0.5rem; border-radius: 4px; }
+ .field-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>fake-ollama config editor</h1>
+  <div class="row">
+    <button class="primary" id="save">Save & Reload</button>
+    <button id="reload">Discard & Reload from disk</button>
+    <button id="rawmode">Toggle raw JSON</button>
+    <span id="status"></span>
+  </div>
+</div>
+
+<div class="sub">file: <code id="path">(loading...)</code></div>
+<div class="warn">
+  <b>Warning:</b> 本编辑器没有鉴权。请仅在 <code>127.0.0.1</code> 使用，或在 <code>config.json</code> 里设置
+  <code>"admin_enabled": false</code>。保存会原子重建上游连接池。
+</div>
+
+<div class="layout">
+  <aside class="sidenav" id="sidenav">
+    <h3>Sections</h3>
+  </aside>
+  <main class="content">
+    <div id="form"></div>
+<datalist id="dl-model-names"></datalist>
+<textarea id="raw" hidden></textarea>
+    <details style="margin-top: 1rem;">
+      <summary>当前 schema（只读）</summary>
+      <pre id="schemaDump"></pre>
+    </details>
+  </main>
+</div>
+
+<script>
+// Resolve admin base whether the user landed on /admin or /admin/.
+const ADMIN_BASE = (() => {
+  const m = location.pathname.match(/^(.*?\/admin)(\/.*)?$/);
+  return m ? m[1] : '/admin';
+})();
+
+const $form = document.getElementById('form');
+const $raw = document.getElementById('raw');
+const $status = document.getElementById('status');
+const $path = document.getElementById('path');
+const $schemaDump = document.getElementById('schemaDump');
+const $sidenav = document.getElementById('sidenav');
+
+let SCHEMA = [];
+let GROUPS = [];
+let RAW_MODE = false;
+
+function setStatus(text, kind) {
+  $status.textContent = text;
+  $status.className = kind || '';
+}
+
+function el(tag, props, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === 'class') e.className = v;
+    else if (k === 'style') e.setAttribute('style', v);
+    else if (k.startsWith('on')) e[k] = v;
+    else if (v === true) e.setAttribute(k, '');
+    else if (v === false || v == null) { /* skip */ }
+    else e.setAttribute(k, v);
+  }
+  for (const c of children) {
+    if (c == null) continue;
+    e.append(c.nodeType ? c : document.createTextNode(c));
+  }
+  return e;
+}
+
+// ---- Renderers (each returns {node, read}) -------------------------
+
+function makeScalar(field, value) {
+  let input;
+  if (field.type === 'bool') {
+    input = el('input', {type: 'checkbox'});
+    input.checked = !!value;
+    const label = el('span', {class: 'bool-label ' + (input.checked ? 't' : 'f')},
+                     input.checked ? 'true' : 'false');
+    input.addEventListener('change', () => {
+      label.textContent = input.checked ? 'true' : 'false';
+      label.className = 'bool-label ' + (input.checked ? 't' : 'f');
+    });
+    const wrap = el('div', {class: 'bool-row'}, input, label);
+    return {
+      node: wrap,
+      read: () => input.checked,
+    };
+  }
+  if (field.type === 'int' || field.type === 'float') {
+    input = el('input', {type: 'number', step: field.type === 'float' ? 'any' : '1'});
+    if (value != null) input.value = value;
+  } else if (field.secret) {
+    input = el('input', {type: 'password'});
+    input.value = value == null ? '' : String(value);
+  } else {
+    input = el('input', {type: 'text'});
+    input.value = value == null ? '' : String(value);
+  }
+  // Wrap secret/generate fields with toggle + generate buttons.
+  if (field.secret || field.generate) {
+    const row = el('div', {class: 'row', style: 'gap:0.4rem;'});
+    input.style.flex = '1';
+    row.append(input);
+    if (field.secret) {
+      const eye = el('button', {type: 'button', class: 'detect',
+        title: 'Show / hide', onclick: () => {
+          input.type = input.type === 'password' ? 'text' : 'password';
+          eye.textContent = input.type === 'password' ? 'Show' : 'Hide';
+        }}, 'Show');
+      row.append(eye);
+    }
+    if (field.generate) {
+      const gen = el('button', {type: 'button', class: 'detect',
+        title: 'Generate a random token', onclick: () => {
+          input.value = randomToken();
+          if (input.type === 'password') {
+            // Briefly show so user can copy it.
+            input.type = 'text';
+          }
+        }}, 'Generate');
+      row.append(gen);
+    }
+    return {
+      node: row,
+      read() { return input.value; },
+    };
+  }
+  return {
+    node: input,
+    read() {
+      if (field.type === 'int') return input.value === '' ? null : parseInt(input.value, 10);
+      if (field.type === 'float') return input.value === '' ? null : parseFloat(input.value);
+      return input.value;
+    },
+  };
+}
+
+function randomToken(bytes) {
+  const arr = new Uint8Array(bytes || 24);
+  crypto.getRandomValues(arr);
+  return 'tk-' + Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function makeStringList(field, value) {
+  const wrap = el('div', {class: 'entries'});
+  const rows = [];
+  const empty = el('div', {class: 'empty'}, '(empty — click “+ add” to insert)');
+  function refreshEmpty() {
+    if (rows.length === 0) {
+      if (!wrap.contains(empty)) wrap.insertBefore(empty, addBtn);
+    } else if (wrap.contains(empty)) {
+      wrap.removeChild(empty);
+    }
+  }
+  function addRow(text) {
+    const isSecret = !!field.secret_each;
+    const input = el('input', {
+      type: isSecret ? 'password' : 'text',
+      placeholder: field.key,
+    });
+    input.value = text == null ? '' : String(text);
+    const entry = {input};
+    const extras = [];
+    if (isSecret) {
+      const eye = el('button', {type: 'button', class: 'detect',
+        title: 'Show / hide', onclick: () => {
+          input.type = input.type === 'password' ? 'text' : 'password';
+          eye.textContent = input.type === 'password' ? 'Show' : 'Hide';
+        }}, 'Show');
+      extras.push(eye);
+    }
+    if (field.generate_each) {
+      const gen = el('button', {type: 'button', class: 'detect',
+        title: 'Generate a random token', onclick: () => {
+          input.value = randomToken();
+          if (input.type === 'password') input.type = 'text';
+        }}, 'Generate');
+      extras.push(gen);
+    }
+    const rm = el('button', {class: 'danger', type: 'button', onclick: () => {
+      wrap.removeChild(row);
+      rows.splice(rows.indexOf(entry), 1);
+      refreshEmpty();
+    }}, '×');
+    const row = el('div', {class: 'entry'}, input, ...extras, rm);
+    rows.push(entry);
+    wrap.insertBefore(row, addBtn);
+    return input;
+  }
+  const addLabel = field.generate_each ? '+ add (blank)' : '+ add';
+  const addBtn = el('button', {type: 'button', onclick: () => {
+    const i = addRow('');
+    refreshEmpty();
+    i.focus();
+  }}, addLabel);
+  wrap.append(addBtn);
+  if (field.generate_each) {
+    const genBtn = el('button', {type: 'button',
+      style: 'margin-left:0.4rem;', onclick: () => {
+        const i = addRow(randomToken());
+        if (i.type === 'password') i.type = 'text';
+        refreshEmpty();
+      }}, '+ generate token');
+    wrap.append(genBtn);
+  }
+  if (Array.isArray(value)) for (const v of value) addRow(v);
+  refreshEmpty();
+  return {
+    node: wrap,
+    read: () => rows.map(r => r.input.value.trim()).filter(Boolean),
+    get: () => rows.map(r => r.input.value.trim()).filter(Boolean),
+    set: (arr) => {
+      // Replace all rows with the given list.
+      for (const r of rows.slice()) {
+        const node = r.input.parentNode;
+        if (node && node.parentNode === wrap) wrap.removeChild(node);
+      }
+      rows.length = 0;
+      if (Array.isArray(arr)) for (const v of arr) addRow(v);
+      refreshEmpty();
+    },
+    add: (arr) => {
+      if (!Array.isArray(arr)) return;
+      for (const v of arr) addRow(v);
+      refreshEmpty();
+    },
+  };
+}
+
+// Modal dialog: show a list of candidate models with checkboxes; pre-checks
+// items already present in `existing`. Resolves to {selected: string[]}
+// (only the items the user wants to keep) or null on cancel. The caller
+// decides whether to merge or replace.
+function pickModelsDialog({title, candidates, existing}) {
+  return new Promise((resolve) => {
+    const existingSet = new Set(existing || []);
+    const back = el('div', {class: 'modal-back'});
+    const body = el('div', {class: 'modal-body'});
+    const checkboxes = [];
+    const fresh = [];
+    for (const name of candidates) {
+      const cb = el('input', {type: 'checkbox'});
+      const isExisting = existingSet.has(name);
+      cb.checked = !isExisting;  // pre-check only NEW models
+      const tag = isExisting
+        ? el('span', {class: 'tag'}, 'already added')
+        : el('span', {class: 'tag', style: 'background:rgba(42,138,42,0.25);'}, 'new');
+      const lab = el('label', {class: isExisting ? 'exists' : ''}, cb, name, tag);
+      body.append(lab);
+      checkboxes.push({cb, name});
+      if (!isExisting) fresh.push(cb);
+    }
+    if (candidates.length === 0) {
+      body.append(el('div', {class: 'empty'}, '(上游未返回任何模型)'));
+    }
+
+    const checkAll = el('button', {type: 'button', onclick: () => {
+      for (const {cb} of checkboxes) cb.checked = true;
+    }}, 'Check all');
+    const checkNone = el('button', {type: 'button', onclick: () => {
+      for (const {cb} of checkboxes) cb.checked = false;
+    }}, 'Check none');
+    const checkNew = el('button', {type: 'button', onclick: () => {
+      for (const {cb, name} of checkboxes) cb.checked = !existingSet.has(name);
+    }}, 'Only new');
+
+    const cancel = el('button', {type: 'button', onclick: () => close(null)}, 'Cancel');
+    const merge = el('button', {class: 'primary', type: 'button', onclick: () => {
+      const picked = checkboxes.filter(x => x.cb.checked).map(x => x.name);
+      // Merge: keep existing + add picked (de-dup, preserve order: existing first, then new picks).
+      const seen = new Set(existing || []);
+      const out = [...(existing || [])];
+      for (const n of picked) if (!seen.has(n)) { out.push(n); seen.add(n); }
+      close(out);
+    }}, 'Merge into list');
+    const replace = el('button', {type: 'button', onclick: () => {
+      const picked = checkboxes.filter(x => x.cb.checked).map(x => x.name);
+      close(picked);
+    }}, 'Replace list');
+
+    const dialog = el('div', {class: 'modal'},
+      el('h2', {}, title || 'Detected models'),
+      el('div', {class: 'modal-tools'}, checkAll, checkNone, checkNew,
+        el('span', {style: 'margin-left:auto;color:#888;'},
+          candidates.length + ' total, ' + fresh.length + ' new')),
+      body,
+      el('div', {class: 'modal-foot'}, cancel, replace, merge),
+    );
+    back.append(dialog);
+    function onKey(e) { if (e.key === 'Escape') close(null); }
+    function close(result) {
+      document.removeEventListener('keydown', onKey);
+      if (back.parentNode) back.parentNode.removeChild(back);
+      resolve(result);
+    }
+    back.addEventListener('click', (e) => { if (e.target === back) close(null); });
+    document.addEventListener('keydown', onKey);
+    document.body.append(back);
+  });
+}
+
+function makeStringMap(field, value) {
+  const wrap = el('div');
+  const rows = [];
+  function addRow(k, v) {
+    const ki = el('input', {type: 'text', placeholder: 'key'});
+    ki.value = k || '';
+    const vi = el('input', {type: 'text', placeholder: 'value'});
+    vi.value = v == null ? '' : String(v);
+    const entry = {ki, vi};
+    const rm = el('button', {class: 'danger', type: 'button', onclick: () => {
+      wrap.removeChild(row);
+      rows.splice(rows.indexOf(entry), 1);
+    }}, '×');
+    const row = el('div', {class: 'map-key'}, ki, vi, rm);
+    rows.push(entry);
+    wrap.insertBefore(row, addBtn);
+  }
+  const addBtn = el('button', {type: 'button', onclick: () => addRow()}, '+ add entry');
+  wrap.append(addBtn);
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) addRow(k, v);
+  }
+  return {
+    node: wrap,
+    read() {
+      const out = {};
+      for (const {ki, vi} of rows) {
+        const k = ki.value.trim();
+        if (k) out[k] = vi.value;
+      }
+      return out;
+    },
+  };
+}
+
+function makeObjectGroup(itemSchema, value) {
+  const wrap = el('div');
+  const renderers = [];
+  const byKey = {};
+  const ctx = { getSibling: (k) => byKey[k] };
+  for (const sub of itemSchema) {
+    const f = renderField(sub, value ? value[sub.key] : undefined, ctx);
+    renderers.push({sub, f});
+    byKey[sub.key] = f;
+    wrap.append(f.node);
+  }
+  return {
+    node: wrap,
+    read() {
+      const out = {};
+      for (const {sub, f} of renderers) {
+        if (!f.isPresent()) continue;
+        out[sub.key] = f.read();
+      }
+      return out;
+    },
+    getRenderer: (key) => byKey[key],
+  };
+}
+
+function makeObjectList(field, value) {
+  const wrap = el('div', {class: 'group'});
+  const items = [];
+  function addItem(initial) {
+    const renderer = makeObjectGroup(field.item_schema, initial || {});
+    const entry = {renderer};
+    const remove = el('button', {class: 'danger', type: 'button', onclick: () => {
+      wrap.removeChild(itemBox);
+      items.splice(items.indexOf(entry), 1);
+    }}, 'Remove');
+    const headerChildren = [];
+    if (field.detect_models) {
+      const detectBtn = el('button', {class: 'detect', type: 'button', onclick: async () => {
+        const baseUrl = renderer.getRenderer('base_url')?.read();
+        const tokenR = renderer.getRenderer('auth_token');
+        const token = tokenR ? tokenR.read() : '';
+        if (!baseUrl) { setStatus('detect: base_url is empty', 'err'); return; }
+        detectBtn.disabled = true;
+        const prev = detectBtn.textContent;
+        detectBtn.textContent = 'detecting...';
+        try {
+          const r = await fetch(ADMIN_BASE + '/probe-models', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({kind: field.detect_models, base_url: baseUrl, auth_token: token}),
+          });
+          if (!r.ok) throw new Error(await r.text());
+          const j = await r.json();
+          const candidates = j.models || [];
+          setStatus('detected ' + candidates.length + ' models, choose...', 'ok');
+          const modelsR = renderer.getRenderer('models');
+          const existing = modelsR && modelsR.get ? modelsR.get() : [];
+          const result = await pickModelsDialog({
+            title: 'Detected models from ' + baseUrl,
+            candidates,
+            existing,
+          });
+          if (result == null) { setStatus('detect: cancelled'); return; }
+          if (modelsR && modelsR.set) modelsR.set(result);
+          setStatus('models updated (' + result.length + ' total)', 'ok');
+        } catch (e) {
+          setStatus('detect failed: ' + e.message, 'err');
+        } finally {
+          detectBtn.disabled = false;
+          detectBtn.textContent = prev;
+        }
+      }}, 'Detect models');
+      headerChildren.push(detectBtn);
+    }
+    headerChildren.push(remove);
+    const itemBox = el('div', {class: 'item'},
+      el('div', {class: 'row', style: 'justify-content: flex-end;'}, ...headerChildren),
+      renderer.node,
+    );
+    items.push(entry);
+    wrap.insertBefore(itemBox, addBtn);
+  }
+  const addBtn = el('button', {type: 'button', onclick: () => addItem({})},
+                       '+ add ' + field.key.replace(/s$/, ''));
+  wrap.append(addBtn);
+  if (Array.isArray(value)) for (const v of value) addItem(v);
+  return {
+    node: wrap,
+    read: () => items.map(i => i.renderer.read()),
+  };
+}
+
+function makeObjectMap(field, value) {
+  const wrap = el('div', {class: 'group'});
+  const items = [];
+  function addItem(key, initial) {
+    const ki = el('input', {type: 'text', placeholder: 'model name'});
+    if (field.key_autocomplete === 'model_names') {
+      ki.setAttribute('list', 'dl-model-names');
+      ki.addEventListener('focus', refreshModelDatalist);
+    }
+    ki.value = key || '';
+    const renderer = makeObjectGroup(field.item_schema, initial || {});
+    const entry = {ki, renderer};
+    const remove = el('button', {class: 'danger', type: 'button', onclick: () => {
+      wrap.removeChild(itemBox);
+      items.splice(items.indexOf(entry), 1);
+    }}, 'Remove');
+    const head = el('div', {class: 'map-key'}, el('strong', {}, 'key:'), ki, remove);
+    const itemBox = el('div', {class: 'item'}, head, renderer.node);
+    items.push(entry);
+    wrap.insertBefore(itemBox, addBtn);
+  }
+  const addBtn = el('button', {type: 'button', onclick: () => {
+    addItem('', {});
+    if (field.key_autocomplete === 'model_names') refreshModelDatalist();
+  }}, '+ add entry');
+  wrap.append(addBtn);
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) addItem(k, v);
+  }
+  return {
+    node: wrap,
+    read() {
+      const out = {};
+      for (const {ki, renderer} of items) {
+        const k = ki.value.trim();
+        if (k) out[k] = renderer.read();
+      }
+      return out;
+    },
+  };
+}
+
+// ---- Subset-of-sibling list (checkbox UI driven by sibling field) ----
+function makeStringListSubsetOf(field, value, ctx) {
+  const wrap = el('div');
+  const list = el('div', {style: 'display:flex;flex-direction:column;gap:0.1rem;margin-top:0.3rem;'});
+  const status = el('div', {class: 'desc', style: 'margin:0.2rem 0 0;'});
+  const checked = new Set(Array.isArray(value) ? value : []);
+  // Names known to the renderer at any point: union of sibling values + saved.
+  let knownNames = Array.from(checked);
+
+  function rerender() {
+    list.innerHTML = '';
+    if (!knownNames.length) {
+      list.append(el('div', {class: 'empty'},
+        '(上方 ' + field.subset_of + ' 为空。填好后点“Refresh”生成复选框)'));
+      return;
+    }
+    for (const name of knownNames) {
+      const cb = el('input', {type: 'checkbox'});
+      cb.checked = checked.has(name);
+      cb.onchange = () => { if (cb.checked) checked.add(name); else checked.delete(name); };
+      const lab = el('label',
+        {style: 'display:flex;align-items:center;gap:0.4rem;padding:0.1rem 0;font-family:ui-monospace,Consolas,monospace;font-size:0.9rem;'},
+        cb, name);
+      list.append(lab);
+    }
+  }
+
+  function doRefresh() {
+    const sib = ctx && ctx.getSibling ? ctx.getSibling(field.subset_of) : null;
+    const siblingValues = sib && sib.read ? sib.read() : [];
+    const seen = new Set();
+    const merged = [];
+    for (const n of siblingValues) if (!seen.has(n)) { seen.add(n); merged.push(n); }
+    // Keep stale checks visible so the user can decide to drop them.
+    const stale = [];
+    for (const n of checked) if (!seen.has(n)) stale.push(n);
+    for (const n of stale) merged.push(n);
+    knownNames = merged;
+    rerender();
+    status.textContent = 'refreshed: ' + siblingValues.length + ' from ' + field.subset_of
+      + ', ' + checked.size + ' checked'
+      + (stale.length ? ', ' + stale.length + ' stale (no longer in ' + field.subset_of + ')' : '');
+  }
+
+  const refreshBtn = el('button', {type: 'button', class: 'detect',
+    onclick: doRefresh}, 'Refresh from ' + field.subset_of);
+  const allBtn = el('button', {type: 'button', class: 'detect', style: 'margin-left:0.3rem;',
+    onclick: () => { for (const n of knownNames) checked.add(n); rerender(); }}, 'Check all');
+  const noneBtn = el('button', {type: 'button', class: 'detect', style: 'margin-left:0.3rem;',
+    onclick: () => { checked.clear(); rerender(); }}, 'Uncheck all');
+  wrap.append(
+    el('div', {class: 'row'}, refreshBtn, allBtn, noneBtn),
+    status,
+    list,
+  );
+  rerender();
+
+  return {
+    node: wrap,
+    read: () => Array.from(checked),
+    get: () => Array.from(checked),
+    set: (arr) => {
+      checked.clear();
+      if (Array.isArray(arr)) for (const v of arr) checked.add(v);
+      knownNames = Array.from(checked);
+      rerender();
+    },
+  };
+}
+
+// ---- Global model-name autocomplete (datalist for model_profiles keys) ----
+function collectKnownModelNames() {
+  const out = new Set();
+  function walkList(renderer) {
+    if (!renderer || typeof renderer.read !== 'function') return;
+    const arr = renderer.read();
+    if (!Array.isArray(arr)) return;
+    for (const item of arr) {
+      if (item && Array.isArray(item.models)) for (const n of item.models) if (n) out.add(n);
+    }
+  }
+  for (const {field, r} of topRenderers) {
+    if (field.key === 'upstreams' || field.key === 'ollama_targets') walkList(r);
+    if (field.key === 'model_profiles' && r && typeof r.read === 'function') {
+      const m = r.read();
+      if (m && typeof m === 'object') for (const k of Object.keys(m)) if (k) out.add(k);
+    }
+  }
+  return Array.from(out);
+}
+function refreshModelDatalist() {
+  const dl = document.getElementById('dl-model-names');
+  if (!dl) return;
+  const names = collectKnownModelNames();
+  dl.innerHTML = '';
+  for (const n of names) {
+    const o = document.createElement('option');
+    o.value = n;
+    dl.append(o);
+  }
+}
+
+// renderField returns {node, read, isPresent}
+function renderField(field, value, ctx) {
+  const present = value !== undefined;
+  let inner;
+  switch (field.type) {
+    case 'string':
+    case 'int':
+    case 'float':
+    case 'bool':
+      inner = makeScalar(field, present ? value : field.default); break;
+    case 'string_list':
+      inner = makeStringList(field, present ? value : field.default); break;
+    case 'string_list_subset_of':
+      inner = makeStringListSubsetOf(field, present ? value : field.default, ctx); break;
+    case 'string_map':
+      inner = makeStringMap(field, present ? value : field.default); break;
+    case 'object_list':
+      inner = makeObjectList(field, present ? value : field.default); break;
+    case 'object_map':
+      inner = makeObjectMap(field, present ? value : field.default); break;
+    default:
+      inner = makeScalar({type: 'string'}, JSON.stringify(value));
+  }
+
+  const fieldBox = el('div', {class: 'field'});
+  const labelChildren = [];
+  let presentBox = null;
+  if (!field.required) {
+    presentBox = el('input', {type: 'checkbox'});
+    presentBox.checked = present;
+    presentBox.title = '勾选以包含此字段；取消则使用默认值';
+    presentBox.onchange = () => fieldBox.classList.toggle('disabled', !presentBox.checked);
+    labelChildren.push(presentBox);
+  }
+  labelChildren.push(field.key);
+  if (field.required) labelChildren.push(el('span', {style: 'color:#c0392b;font-weight:400;'}, ' *required'));
+
+  const defaultStr = (field.default === undefined || field.default === null)
+    ? 'null'
+    : (typeof field.default === 'object' ? JSON.stringify(field.default) : String(field.default));
+  const showDefault = field.type !== 'object_list' && field.type !== 'object_map';
+  const desc = el('div', {class: 'desc'},
+    field.description || '',
+    showDefault ? ` (default: ${defaultStr})` : '',
+  );
+  fieldBox.append(
+    el('label', {}, ...labelChildren),
+    desc,
+    el('div', {class: 'body'}, inner.node),
+  );
+  if (presentBox && !presentBox.checked) fieldBox.classList.add('disabled');
+
+  function setPresent(on) {
+    if (!presentBox) return;
+    presentBox.checked = !!on;
+    fieldBox.classList.toggle('disabled', !presentBox.checked);
+  }
+
+  return {
+    node: fieldBox,
+    isPresent: () => field.required || (presentBox && presentBox.checked),
+    read: () => inner.read(),
+    get: inner.get ? (...a) => inner.get(...a) : undefined,
+    set: inner.set ? (...a) => { setPresent(true); return inner.set(...a); } : undefined,
+    add: inner.add ? (...a) => { setPresent(true); return inner.add(...a); } : undefined,
+  };
+}
+
+// ---- Top-level form -----------------------------------------------
+
+let topRenderers = [];
+
+function slug(s) { return String(s).replace(/[^a-z0-9]+/gi, '-').toLowerCase(); }
+
+function renderForm(config) {
+  $form.innerHTML = '';
+  $sidenav.innerHTML = '<h3>Sections</h3>';
+  topRenderers = [];
+
+  // Group fields by their declared group (preserving GROUPS order; unknown groups go last).
+  const groupOrder = GROUPS.length
+    ? GROUPS.map(g => g.key)
+    : [...new Set(SCHEMA.map(f => f.group || 'misc'))];
+  const groupMeta = {};
+  for (const g of GROUPS) groupMeta[g.key] = g;
+  const buckets = {};
+  for (const k of groupOrder) buckets[k] = [];
+  for (const field of SCHEMA) {
+    const k = field.group || 'misc';
+    if (!buckets[k]) { buckets[k] = []; groupOrder.push(k); }
+    buckets[k].push(field);
+  }
+
+  const sectionEls = [];
+  for (const k of groupOrder) {
+    const fields = buckets[k];
+    if (!fields || !fields.length) continue;
+    const meta = groupMeta[k] || {label: k, hint: ''};
+    const sectionId = 'grp-' + slug(k);
+    const section = el('section', {class: 'group-section', id: sectionId},
+      el('h2', {}, meta.label || k),
+    );
+    if (meta.hint) section.append(el('div', {class: 'group-hint'}, meta.hint));
+    for (const field of fields) {
+      const r = renderField(field, config[field.key]);
+      topRenderers.push({field, r});
+      section.append(r.node);
+    }
+    $form.append(section);
+    sectionEls.push({id: sectionId, section, label: meta.label || k, hint: meta.hint || ''});
+
+    const link = el('a', {href: '#' + sectionId,
+      onclick: (e) => { e.preventDefault();
+        document.getElementById(sectionId).scrollIntoView({behavior: 'smooth', block: 'start'});
+        history.replaceState(null, '', '#' + sectionId);
+      }},
+      meta.label || k,
+    );
+    if (meta.hint) link.append(el('small', {}, meta.hint));
+    link.dataset.target = sectionId;
+    $sidenav.append(link);
+  }
+
+  // Active-section highlighting via IntersectionObserver.
+  if (window._navObserver) window._navObserver.disconnect();
+  const links = $sidenav.querySelectorAll('a[data-target]');
+  const byId = {};
+  links.forEach(a => { byId[a.dataset.target] = a; });
+  const visible = new Set();
+  window._navObserver = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (e.isIntersecting) visible.add(e.target.id);
+      else visible.delete(e.target.id);
+    }
+    // Pick the first section in DOM order that is currently visible.
+    let active = null;
+    for (const {id} of sectionEls) if (visible.has(id)) { active = id; break; }
+    if (!active && sectionEls.length) active = sectionEls[0].id;
+    links.forEach(a => a.classList.toggle('active', a.dataset.target === active));
+  }, {rootMargin: '-30% 0px -55% 0px', threshold: 0});
+  for (const {section} of sectionEls) window._navObserver.observe(section);
+
+  // Populate the model-name autocomplete datalist now that all fields exist.
+  refreshModelDatalist();
+}
+
+function readForm() {
+  const out = {};
+  for (const {field, r} of topRenderers) {
+    if (!r.isPresent()) continue;
+    out[field.key] = r.read();
+  }
+  return out;
+}
+
+// ---- Network -------------------------------------------------------
+
+async function load() {
+  setStatus('loading...');
+  try {
+    const [schemaResp, cfgResp] = await Promise.all([
+      fetch(ADMIN_BASE + '/schema'),
+      fetch(ADMIN_BASE + '/config'),
+    ]);
+    if (!schemaResp.ok) throw new Error('schema: ' + await schemaResp.text());
+    if (!cfgResp.ok) throw new Error('config: ' + await cfgResp.text());
+    const sch = await schemaResp.json();
+    // Tolerate the legacy bare-array shape just in case.
+    if (Array.isArray(sch)) { SCHEMA = sch; GROUPS = []; }
+    else { SCHEMA = sch.fields || []; GROUPS = sch.groups || []; }
+    const cfg = await cfgResp.json();
+    $path.textContent = cfg._path || '(none)';
+    delete cfg._path;
+    delete cfg._inactive_ollama_targets;  // legacy field, ignore
+    $schemaDump.textContent = JSON.stringify({fields: SCHEMA, groups: GROUPS}, null, 2);
+    if (RAW_MODE) {
+      $raw.value = JSON.stringify(cfg, null, 2);
+    } else {
+      renderForm(cfg);
+    }
+    setStatus('loaded', 'ok');
+  } catch (e) {
+    setStatus('load failed: ' + e.message, 'err');
+  }
+}
+
+async function save() {
+  setStatus('saving...');
+  let payload;
+  if (RAW_MODE) {
+    try { payload = JSON.parse($raw.value); }
+    catch (e) { return setStatus('invalid JSON: ' + e.message, 'err'); }
+  } else {
+    payload = readForm();
+  }
+  try {
+    const r = await fetch(ADMIN_BASE + '/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    setStatus('saved & reloaded', 'ok');
+    load();
+  } catch (e) {
+    setStatus('save failed: ' + e.message, 'err');
+  }
+}
+
+document.getElementById('save').onclick = save;
+document.getElementById('reload').onclick = load;
+document.getElementById('rawmode').onclick = () => {
+  RAW_MODE = !RAW_MODE;
+  $form.hidden = RAW_MODE;
+  $raw.hidden = !RAW_MODE;
+  if (RAW_MODE) {
+    $raw.style.minHeight = '60vh';
+    $raw.style.fontFamily = 'ui-monospace, Consolas, monospace';
+    $raw.style.fontSize = '13px';
+  }
+  load();
+};
+
+load();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _settings_to_dict(s: Settings) -> Dict[str, Any]:
+    data = s.model_dump()
+    data.pop("config_path", None)
+    data["_path"] = s.config_path or ""
+    return data
+
+
+def _resolve_save_path(s: Settings) -> Path:
+    if s.config_path:
+        return Path(s.config_path)
+    return Path("config.json")
+
+
+async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
+    """Atomically replace app.state.settings and rebuild client pools."""
+    old_clients: Dict[str, AnthropicClient] = dict(getattr(app.state, "clients", {}))
+    old_ollama: Dict[str, OllamaClient] = dict(getattr(app.state, "ollama_clients", {}))
+
+    new_clients: Dict[str, AnthropicClient] = {}
+    for up in new_settings.upstreams:
+        new_clients[up.name] = AnthropicClient(
+            up.base_url,
+            up.auth_token,
+            timeout=new_settings.timeout_seconds,
+            trust_env=new_settings.use_system_proxy,
+        )
+    new_ollama: Dict[str, OllamaClient] = {}
+    for tgt in new_settings.ollama_targets:
+        new_ollama[tgt.name] = OllamaClient(
+            tgt.base_url,
+            timeout=new_settings.timeout_seconds,
+            trust_env=new_settings.use_system_proxy,
+        )
+
+    app.state.settings = new_settings
+    app.state.clients = new_clients
+    app.state.ollama_clients = new_ollama
+
+    for c in old_clients.values():
+        try:
+            await c.aclose()
+        except Exception:  # pragma: no cover
+            pass
+    for c in old_ollama.values():
+        try:
+            await c.aclose()
+        except Exception:  # pragma: no cover
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Route registration
+# ---------------------------------------------------------------------------
+
+
+def register_admin_routes(app: FastAPI) -> None:
+    """Mount the admin UI. No-op when admin is disabled in settings."""
+    settings: Settings = app.state.settings
+    if not settings.admin_enabled:
+        return
+
+    @app.get("/admin", include_in_schema=False)
+    @app.get("/admin/", include_in_schema=False)
+    async def admin_index() -> HTMLResponse:
+        return HTMLResponse(_INDEX_HTML)
+
+    @app.get("/admin/schema", include_in_schema=False)
+    async def admin_schema() -> JSONResponse:
+        return JSONResponse({"fields": CONFIG_SCHEMA, "groups": GROUP_LABELS})
+
+    @app.get("/admin/config", include_in_schema=False)
+    async def admin_get_config(request: Request) -> JSONResponse:
+        return JSONResponse(_settings_to_dict(request.app.state.settings))
+
+    @app.put("/admin/config", include_in_schema=False)
+    async def admin_put_config(request: Request) -> PlainTextResponse:
+        try:
+            data = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="config must be an object")
+        data.pop("_path", None)
+        data.pop("_inactive_ollama_targets", None)  # legacy front-end key
+        data.pop("config_path", None)
+        try:
+            new_settings = Settings(**data)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"invalid config: {exc}") from exc
+
+        save_path = _resolve_save_path(request.app.state.settings)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        on_disk = new_settings.model_dump()
+        on_disk.pop("config_path", None)
+        save_path.write_text(
+            json.dumps(on_disk, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        new_settings = new_settings.model_copy(update={"config_path": str(save_path)})
+
+        await _swap_settings(request.app, new_settings)
+        return PlainTextResponse(f"saved to {save_path}")
+
+    @app.post("/admin/probe-models", include_in_schema=False)
+    async def admin_probe_models(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+        kind = (body.get("kind") or "").lower()
+        base_url = (body.get("base_url") or "").rstrip("/")
+        token = body.get("auth_token") or ""
+        if not base_url:
+            raise HTTPException(status_code=400, detail="base_url is required")
+
+        cur: Settings = request.app.state.settings
+        timeout = float(body.get("timeout") or min(30.0, cur.timeout_seconds))
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout, trust_env=cur.use_system_proxy
+            ) as cli:
+                if kind == "ollama":
+                    resp = await cli.get(base_url + "/api/tags")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    names = [
+                        m.get("name")
+                        for m in (data.get("models") or [])
+                        if isinstance(m, dict) and m.get("name")
+                    ]
+                elif kind == "anthropic":
+                    headers = {"anthropic-version": "2023-06-01"}
+                    if token:
+                        headers["x-api-key"] = token
+                        headers["authorization"] = f"Bearer {token}"
+                    resp = await cli.get(base_url + "/v1/models", headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    # Anthropic-style: {"data": [{"id": ...}, ...]}.
+                    # OpenAI-style is identical for this field.
+                    names = [
+                        m.get("id")
+                        for m in (data.get("data") or [])
+                        if isinstance(m, dict) and m.get("id")
+                    ]
+                else:
+                    raise HTTPException(
+                        status_code=400, detail=f"unknown kind: {kind!r}"
+                    )
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"upstream {exc.response.status_code}: {exc.response.text[:300]}",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"probe failed: {exc}") from exc
+        return JSONResponse({"models": names})

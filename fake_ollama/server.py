@@ -6,7 +6,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, List
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -25,6 +25,12 @@ from .converters import (
     ollama_generate_to_anthropic,
     openai_chat_to_anthropic,
 )
+from .ollama_client import OllamaClient
+from .reverse_converters import (
+    anthropic_to_ollama_chat as anthropic_to_ollama_chat_payload,
+    ollama_chat_to_anthropic as ollama_chat_to_anthropic_response,
+    ollama_stream_to_anthropic_sse,
+)
 
 logger = logging.getLogger("fake_ollama")
 
@@ -35,18 +41,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owned_names: list[str] = []
+        owned_target_names: list[str] = []
         if not getattr(app.state, "clients", None):
             app.state.clients = {}
-        for up in settings.upstreams:
+        if not getattr(app.state, "ollama_clients", None):
+            app.state.ollama_clients = {}
+        for up in app.state.settings.upstreams:
             if up.name in app.state.clients:
                 continue
             app.state.clients[up.name] = AnthropicClient(
                 up.base_url,
                 up.auth_token,
-                timeout=settings.timeout_seconds,
-                trust_env=settings.use_system_proxy,
+                timeout=app.state.settings.timeout_seconds,
+                trust_env=app.state.settings.use_system_proxy,
             )
             owned_names.append(up.name)
+        for tgt in app.state.settings.ollama_targets:
+            if tgt.name in app.state.ollama_clients:
+                continue
+            app.state.ollama_clients[tgt.name] = OllamaClient(
+                tgt.base_url,
+                timeout=app.state.settings.timeout_seconds,
+                trust_env=app.state.settings.use_system_proxy,
+            )
+            owned_target_names.append(tgt.name)
         try:
             yield
         finally:
@@ -54,9 +72,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 client = app.state.clients.pop(name, None)
                 if client is not None:
                     await client.aclose()
+            for name in owned_target_names:
+                oc = app.state.ollama_clients.pop(name, None)
+                if oc is not None:
+                    await oc.aclose()
 
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
     app.state.settings = settings
+    _install_port_router(app)
     _register_routes(app)
     return app
 
@@ -71,6 +94,54 @@ def _client_for(app: FastAPI, settings: Settings, model_name: str) -> AnthropicC
         # under any key working.
         return next(iter(clients.values()))
     return clients[name]
+
+
+def _bearer_or_api_key(request: Request) -> str:
+    """Extract a token from ``x-api-key`` or ``Authorization: Bearer ...``."""
+    tok = request.headers.get("x-api-key") or ""
+    if tok:
+        return tok.strip()
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+# Path prefixes considered "external" (Anthropic-compatible reverse proxy).
+_EXTERNAL_PATH_PREFIXES = ("/v1/messages", "/v1/models")
+
+
+def _is_external_path(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in _EXTERNAL_PATH_PREFIXES)
+
+
+def _install_port_router(app: FastAPI) -> None:
+    """When an external listener is configured, split routes by listen port.
+
+    - External port (settings.external_port) serves ONLY ``/v1/messages`` and
+      ``/v1/models``; everything else returns 404.
+    - Internal port serves everything EXCEPT those two prefixes; requests to
+      them on the internal port return 404 so admin / Ollama clients cannot
+      reach the externally-exposed surface accidentally.
+
+    No-op when no external listener is configured (single-port mode).
+    """
+
+    @app.middleware("http")
+    async def _split(request: Request, call_next):
+        settings: Settings = request.app.state.settings
+        if not settings.external_listener_enabled:
+            return await call_next(request)
+        # ASGI scope["server"] is (host, port) of the local socket.
+        server = request.scope.get("server") or (None, None)
+        local_port = server[1] if isinstance(server, (tuple, list)) and len(server) > 1 else None
+        external = local_port == settings.external_port
+        path = request.url.path
+        if external and not _is_external_path(path):
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        if (not external) and _is_external_path(path):
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -183,9 +254,34 @@ def _register_routes(app: FastAPI) -> None:
     # ---- OpenAI-compatible endpoints (Ollama also implements these) -----
 
     @app.get("/v1/models")
-    async def openai_models() -> Dict[str, Any]:
+    async def openai_models(request: Request) -> Dict[str, Any]:
         settings: Settings = app.state.settings
         now = int(datetime.now(timezone.utc).timestamp())
+        # Auth gate: required whenever external_access_tokens is non-empty
+        # OR an external listener is configured (in which case an empty
+        # token list means nothing can pass — the operator must add one).
+        if settings.auth_required_for_v1:
+            token = _bearer_or_api_key(request)
+            if not settings.is_valid_external_token(token):
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "missing or invalid api token (send via x-api-key "
+                        "or Authorization: Bearer header)"
+                    ),
+                )
+
+        seen: Dict[str, None] = {}
+        names: List[str] = []
+        # Only upstream models opted in via expose_external are listed here.
+        for n in settings.externally_exposed_upstream_models:
+            if n not in seen:
+                seen[n] = None
+                names.append(n)
+        for n in settings.reverse_proxy_models:
+            if n not in seen:
+                seen[n] = None
+                names.append(n)
         return {
             "object": "list",
             "data": [
@@ -197,7 +293,7 @@ def _register_routes(app: FastAPI) -> None:
                     "context_length": settings.profile_for(name).context_length,
                     "capabilities": list(settings.profile_for(name).capabilities),
                 }
-                for name in settings.models
+                for name in names
             ],
         }
 
@@ -211,6 +307,17 @@ def _register_routes(app: FastAPI) -> None:
             status_code=501,
             detail="Embeddings are not supported by the upstream Anthropic API.",
         )
+
+    # ---- Reverse proxy: Anthropic Messages API -> local Ollama ----------
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request) -> Any:
+        return await _handle_anthropic_messages(request)
+
+    # ---- Web admin UI ---------------------------------------------------
+
+    from . import admin as _admin
+    _admin.register_admin_routes(app)
 
 
 def _read_error_text(exc: httpx.HTTPStatusError) -> str:
@@ -475,4 +582,143 @@ async def _handle_openai_chat(request: Request) -> Any:
     return StreamingResponse(body(), media_type="text/event-stream")
 
 
+# ---------------------------------------------------------------------------
+# Reverse proxy: Anthropic Messages API in -> local Ollama out (or pass-through)
+# ---------------------------------------------------------------------------
 
+
+async def _handle_anthropic_messages(request: Request) -> Any:
+    """Handle ``POST /v1/messages``.
+
+    If the requested model is served by an ``ollama_targets`` entry, convert
+    the Anthropic request to Ollama format and call the local daemon.
+    Otherwise, pass it through to the matching upstream Anthropic-compatible
+    server (so this same endpoint also doubles as a transparent proxy /
+    auth shim).
+    """
+    app = request.app
+    settings: Settings = app.state.settings
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+
+    anth_model = payload.get("model")
+    if not anth_model:
+        raise HTTPException(status_code=400, detail="missing 'model'")
+    stream = bool(payload.get("stream", False))
+
+    target = settings.ollama_target_for(anth_model)
+    if target is not None:
+        # Authenticate against the centralised external_access_tokens list.
+        presented = _bearer_or_api_key(request)
+        if not settings.is_valid_external_token(presented):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+        oc: OllamaClient = app.state.ollama_clients.get(target.name)
+        if oc is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"ollama_target '{target.name}' is not initialised",
+            )
+        ollama_payload = anthropic_to_ollama_chat_payload(
+            payload,
+            target_model=target.resolve_model(anth_model),
+            default_max_tokens=settings.default_max_tokens,
+        )
+        if not stream:
+            try:
+                resp = await oc.chat(ollama_payload)
+            except httpx.HTTPStatusError as exc:
+                _log_upstream_error(exc, ollama_payload)
+                return _upstream_error(exc)
+            return JSONResponse(
+                ollama_chat_to_anthropic_response(resp, anthropic_model=anth_model)
+            )
+
+        async def body() -> AsyncIterator[bytes]:
+            try:
+                lines = oc.stream_chat(ollama_payload)
+                async for chunk in ollama_stream_to_anthropic_sse(
+                    lines, anthropic_model=anth_model
+                ):
+                    yield chunk
+            except httpx.HTTPStatusError as exc:
+                _log_upstream_error(exc, ollama_payload)
+                err = {
+                    "type": "error",
+                    "error": {
+                        "type": "upstream_error",
+                        "message": _read_error_text(exc),
+                    },
+                }
+                yield (
+                    "event: error\ndata: "
+                    + json.dumps(err, ensure_ascii=False)
+                    + "\n\n"
+                ).encode("utf-8")
+
+        return StreamingResponse(body(), media_type="text/event-stream")
+
+    # Pass-through to the matching upstream Anthropic server.
+    # Reverse-proxy surface: refuse models that are not opted in via
+    # ``Upstream.expose_external``. Also gate with the access-token list
+    # whenever auth is required (same rule as /v1/models).
+    if not settings.is_externally_exposed(anth_model):
+        raise HTTPException(
+            status_code=404,
+            detail=f"model '{anth_model}' is not exposed externally",
+        )
+    if settings.auth_required_for_v1:
+        presented = _bearer_or_api_key(request)
+        if not settings.is_valid_external_token(presented):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+    upstream_payload = dict(payload)
+    upstream_model = settings.resolve_model(anth_model)
+    upstream_payload["model"] = upstream_model
+    upstream_payload["stream"] = stream
+    client = _client_for(app, settings, anth_model)
+    if not stream:
+        try:
+            data = await client.messages(upstream_payload)
+        except httpx.HTTPStatusError as exc:
+            _log_upstream_error(exc, upstream_payload)
+            return _upstream_error(exc)
+        return JSONResponse(data)
+
+    async def body_passthrough() -> AsyncIterator[bytes]:
+        try:
+            async for event_type, data in client.stream_messages(upstream_payload):
+                yield (
+                    f"event: {event_type}\ndata: "
+                    + json.dumps(data, ensure_ascii=False)
+                    + "\n\n"
+                ).encode("utf-8")
+        except httpx.HTTPStatusError as exc:
+            _log_upstream_error(exc, upstream_payload)
+            err = {
+                "type": "error",
+                "error": {
+                    "type": "upstream_error",
+                    "message": _read_error_text(exc),
+                },
+            }
+            yield (
+                "event: error\ndata: "
+                + json.dumps(err, ensure_ascii=False)
+                + "\n\n"
+            ).encode("utf-8")
+
+    return StreamingResponse(body_passthrough(), media_type="text/event-stream")

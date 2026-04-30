@@ -23,7 +23,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+import logging
+
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+_LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +98,14 @@ class Upstream(BaseModel):
     # Display name -> upstream-side model id. Falls through to the display
     # name itself when not present.
     model_map: Dict[str, str] = Field(default_factory=dict)
+    # Subset of ``models`` that should be visible on the EXTERNAL
+    # reverse-proxy surface (/v1/models, /v1/messages passthrough).
+    # Semantics:
+    #   None  -> expose all entries in ``models`` (legacy / default).
+    #   []    -> expose nothing from this upstream externally.
+    #   [...] -> expose only the listed display names.
+    # ollama_targets are unaffected (they exist solely for external use).
+    expose_external: Optional[List[str]] = None
 
     @field_validator("base_url")
     @classmethod
@@ -118,21 +130,72 @@ class Upstream(BaseModel):
         return False
 
 
+class OllamaTarget(BaseModel):
+    """A local-side Ollama-compatible server we expose as Anthropic API.
+
+    Used by the reverse proxy ``POST /v1/messages`` endpoint: when an
+    incoming request's ``model`` is served by an OllamaTarget, fake-ollama
+    converts the request to Ollama's ``/api/chat`` format, calls the target,
+    and converts the response back to the Anthropic Messages format.
+
+    Access control for the reverse-proxy surface lives at the Settings level
+    (``external_access_tokens``); targets themselves no longer carry tokens.
+    """
+
+    name: str
+    base_url: str = "http://127.0.0.1:11434"
+    # Anthropic-side display names this target serves.
+    models: List[str] = Field(default_factory=list)
+    # Anthropic-side display name -> Ollama-side model id.
+    model_map: Dict[str, str] = Field(default_factory=dict)
+
+    model_config = {"extra": "ignore"}  # tolerate legacy ``api_token`` field
+
+    @field_validator("base_url")
+    @classmethod
+    def _strip_trailing_slash(cls, v: str) -> str:
+        return v.rstrip("/")
+
+    def resolve_model(self, display_name: str) -> str:
+        if display_name in self.model_map:
+            return self.model_map[display_name]
+        return display_name
+
+    def serves(self, display_name: str) -> bool:
+        return display_name in self.models
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
 
 class Settings(BaseModel):
+    # ---- Internal listener (admin UI + Ollama-compatible /api/*) --------
     host: str = "127.0.0.1"
     port: int = 21434
+    # ---- External listener (reverse-proxy /v1/*; optional) --------------
+    # When ``external_port`` is set, /v1/* moves off the internal listener
+    # and is served on this separate (host, port). When unset, /v1/* stays
+    # on the internal listener (single-port mode).
+    external_host: Optional[str] = None
+    external_port: Optional[int] = None
+    # Tokens accepted on /v1/messages and /v1/models (x-api-key or Bearer).
+    # Required when an external listener is configured. Optional otherwise:
+    # if non-empty, /v1/* on the internal listener also requires auth.
+    external_access_tokens: List[str] = Field(default_factory=list)
+
     advertised_version: str = "0.6.4"
     default_max_tokens: int = 4096
     timeout_seconds: float = 300.0
     use_system_proxy: bool = False
     enforce_context_limit: bool = True
     upstreams: List[Upstream] = Field(default_factory=list)
+    ollama_targets: List[OllamaTarget] = Field(default_factory=list)
     model_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    # Web admin UI (mounted at /admin). Set to false to disable entirely.
+    admin_enabled: bool = True
 
     # Where the JSON config came from (empty string if no file was used).
     config_path: str = ""
@@ -148,7 +211,89 @@ class Settings(BaseModel):
         names = [u.name for u in self.upstreams]
         if len(set(names)) != len(names):
             raise ValueError(f"Duplicate upstream names: {names}")
+        target_names = [t.name for t in self.ollama_targets]
+        if len(set(target_names)) != len(target_names):
+            raise ValueError(f"Duplicate ollama_target names: {target_names}")
+        # Normalize tokens: drop blanks and dedupe.
+        seen: Dict[str, None] = {}
+        for tk in self.external_access_tokens:
+            if tk and tk not in seen:
+                seen[tk] = None
+        object.__setattr__(self, "external_access_tokens", list(seen.keys()))
+        # External listener requires at least one access token.
+        if self.external_port is not None and not self.external_access_tokens:
+            _LOG.warning(
+                "external_port=%s is set but external_access_tokens is empty; "
+                "/v1/* will refuse all requests until you add at least one "
+                "token (Web UI: External → Generate).",
+                self.external_port,
+            )
+        # Tokens configured but no ollama_target is unusual but allowed (the
+        # tokens then only gate the upstream-passthrough side of /v1/*).
         return self
+
+    # -- External-listener helpers ---------------------------------------
+
+    @property
+    def external_listener_enabled(self) -> bool:
+        return self.external_port is not None
+
+    @property
+    def reverse_proxy_models(self) -> List[str]:
+        """Union of model display names served by ``ollama_targets``."""
+        seen: Dict[str, None] = {}
+        for t in self.ollama_targets:
+            for m in t.models:
+                if m not in seen:
+                    seen[m] = None
+        return list(seen.keys())
+
+    def is_valid_external_token(self, token: str) -> bool:
+        """True iff ``token`` is in ``external_access_tokens``."""
+        if not token:
+            return False
+        return token in self.external_access_tokens
+
+    @property
+    def externally_exposed_upstream_models(self) -> List[str]:
+        """Upstream model names visible on /v1/* (subject to expose_external)."""
+        seen: Dict[str, None] = {}
+        for up in self.upstreams:
+            allowed = up.models if up.expose_external is None else [
+                m for m in up.models if m in set(up.expose_external)
+            ]
+            for m in allowed:
+                if m not in seen:
+                    seen[m] = None
+        return list(seen.keys())
+
+    def is_externally_exposed(self, display_name: str) -> bool:
+        """True iff a model is reachable on the /v1/* reverse-proxy surface.
+
+        ollama_targets are always exposed; upstream models follow each
+        upstream's ``expose_external`` whitelist.
+        """
+        for t in self.ollama_targets:
+            if t.serves(display_name):
+                return True
+        for up in self.upstreams:
+            if up.expose_external is None:
+                if display_name in up.models:
+                    return True
+            else:
+                if display_name in up.expose_external and display_name in up.models:
+                    return True
+        return False
+
+    @property
+    def auth_required_for_v1(self) -> bool:
+        """Whether /v1/messages and /v1/models require a token.
+
+        True when any access token is configured OR an external listener is
+        enabled (in which case auth is mandatory regardless of token list,
+        though an empty list means no token can pass — effectively closed).
+        """
+        return bool(self.external_access_tokens) or self.external_listener_enabled
 
     # -- Backwards-compatible aggregated views ---------------------------
 
@@ -191,6 +336,16 @@ class Settings(BaseModel):
     def resolve_model(self, display_name: str) -> str:
         return self.upstream_for_model(display_name).resolve_model(display_name)
 
+    # -- Reverse-proxy routing -------------------------------------------
+
+    def ollama_target_for(self, display_name: str):
+        """Return the OllamaTarget that should serve the given display name,
+        or ``None`` if no target serves it."""
+        for t in self.ollama_targets:
+            if t.serves(display_name):
+                return t
+        return None
+
     def profile_for(self, display_name: str) -> ModelProfile:
         raw = self.model_profiles.get(display_name)
         if raw is None and ":" in display_name:
@@ -216,6 +371,8 @@ def _parse_bool(value: str) -> bool:
 _ENV_SCALARS: Dict[str, tuple] = {
     "FAKE_OLLAMA_HOST": ("host", str),
     "FAKE_OLLAMA_PORT": ("port", int),
+    "FAKE_OLLAMA_EXTERNAL_HOST": ("external_host", str),
+    "FAKE_OLLAMA_EXTERNAL_PORT": ("external_port", int),
     "FAKE_OLLAMA_ADVERTISED_VERSION": ("advertised_version", str),
     "FAKE_OLLAMA_DEFAULT_MAX_TOKENS": ("default_max_tokens", int),
     "FAKE_OLLAMA_TIMEOUT": ("timeout_seconds", float),
@@ -252,6 +409,13 @@ def _apply_env_overrides(data: Dict[str, Any]) -> Dict[str, Any]:
                 data[field] = caster(os.environ[env_key])
             except (TypeError, ValueError):
                 continue
+
+    # CSV-list override for external_access_tokens.
+    raw_tokens = os.getenv("FAKE_OLLAMA_EXTERNAL_ACCESS_TOKENS")
+    if raw_tokens is not None:
+        data["external_access_tokens"] = [
+            t.strip() for t in raw_tokens.split(",") if t.strip()
+        ]
 
     # model_profiles via FAKE_OLLAMA_MODEL_PROFILES (JSON)
     raw_profiles = os.getenv("FAKE_OLLAMA_MODEL_PROFILES")
@@ -308,10 +472,43 @@ def load_settings(config_path: Optional[str | Path] = None) -> Settings:
     resolved = _resolve_config_path(config_path)
     data = _read_json(resolved)
     data = _apply_env_overrides(data)
+    data = _migrate_legacy_target_tokens(data)
     settings = Settings(**data)
     if resolved is not None:
         settings = settings.model_copy(update={"config_path": str(resolved)})
     return settings
+
+
+def _migrate_legacy_target_tokens(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Hoist legacy per-target ``api_token`` into ``external_access_tokens``.
+
+    Older config.json files carried an ``api_token`` on each ollama_target.
+    The new model centralises the access-token list on the Settings; we keep
+    backward compat by lifting any non-empty per-target tokens into the
+    central list (deduped) and then dropping the legacy field so the
+    OllamaTarget validator does not warn about it.
+    """
+    targets = data.get("ollama_targets")
+    if not isinstance(targets, list):
+        return data
+    existing = list(data.get("external_access_tokens") or [])
+    seen = {t for t in existing if isinstance(t, str)}
+    migrated = False
+    for tgt in targets:
+        if not isinstance(tgt, dict):
+            continue
+        tok = tgt.pop("api_token", None)
+        if isinstance(tok, str) and tok and tok not in seen:
+            existing.append(tok)
+            seen.add(tok)
+            migrated = True
+    if migrated:
+        _LOG.warning(
+            "migrated legacy ollama_target.api_token into external_access_tokens; "
+            "please re-save config from the Web UI to make this permanent."
+        )
+        data["external_access_tokens"] = existing
+    return data
 
 
 @lru_cache(maxsize=1)

@@ -1,0 +1,544 @@
+"""Tests for the reverse proxy endpoint POST /v1/messages."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, AsyncIterator, Dict, List, Optional
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from fake_ollama.config import OllamaTarget, Settings, load_settings
+from fake_ollama.server import create_app
+
+
+# ---------------------------------------------------------------------------
+# Fake OllamaClient used for the in-memory reverse-proxy tests.
+# ---------------------------------------------------------------------------
+
+
+class _FakeOllamaClient:
+    def __init__(
+        self,
+        chat_response: Optional[Dict[str, Any]] = None,
+        stream_lines: Optional[List[Dict[str, Any]]] = None,
+    ):
+        self.chat_response = chat_response or {}
+        self.stream_lines = stream_lines or []
+        self.last_chat_payload: Optional[Dict[str, Any]] = None
+        self.last_stream_payload: Optional[Dict[str, Any]] = None
+
+    async def chat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self.last_chat_payload = payload
+        return self.chat_response
+
+    def stream_chat(self, payload: Dict[str, Any]) -> AsyncIterator[bytes]:
+        self.last_stream_payload = payload
+        lines = self.stream_lines
+
+        async def gen() -> AsyncIterator[bytes]:
+            for ln in lines:
+                yield (json.dumps(ln) + "\n").encode("utf-8")
+
+        return gen()
+
+    async def aclose(self) -> None:  # pragma: no cover - nothing to do
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Settings helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def reverse_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """Settings with one upstream + one ollama_target serving 'llama3.1'."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://upstream.test")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tk")
+    monkeypatch.setenv("FAKE_OLLAMA_MODELS", "claude-3-5-sonnet-20241022")
+    s = load_settings()
+    # Inject an ollama target by constructing a new Settings instance.
+    data = s.model_dump()
+    data["external_access_tokens"] = ["rev-tk-1"]
+    data["ollama_targets"] = [
+        {
+            "name": "local",
+            "base_url": "http://127.0.0.1:11434",
+            "models": ["llama3.1"],
+            "model_map": {"llama3.1": "llama3.1:8b"},
+        }
+    ]
+    return Settings(**data)
+
+
+# Header sent by all reverse-proxy tests below.
+_AUTH = {"x-api-key": "rev-tk-1"}
+
+
+def _build_client(
+    settings: Settings,
+    *,
+    fake_ollama: Optional[_FakeOllamaClient] = None,
+    upstream_transport: Optional[httpx.MockTransport] = None,
+) -> TestClient:
+    from fake_ollama.anthropic_client import AnthropicClient
+
+    app = create_app(settings)
+    app.state.ollama_clients = (
+        {tgt.name: fake_ollama for tgt in settings.ollama_targets}
+        if fake_ollama is not None
+        else {}
+    )
+    if upstream_transport is not None:
+        mock = AnthropicClient(
+            settings.upstream_url,
+            settings.anthropic_auth_token,
+            client=httpx.AsyncClient(transport=upstream_transport),
+        )
+        app.state.clients = {up.name: mock for up in settings.upstreams}
+    return TestClient(app)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+def test_reverse_non_stream_text(reverse_settings):
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "hi there"},
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 7,
+            "eval_count": 3,
+        }
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["role"] == "assistant"
+    assert body["model"] == "llama3.1"
+    assert body["stop_reason"] == "end_turn"
+    assert body["content"] == [{"type": "text", "text": "hi there"}]
+    assert body["usage"] == {"input_tokens": 7, "output_tokens": 3}
+    # Verify request was converted: model_map applied, num_predict set.
+    sent = fake.last_chat_payload
+    assert sent["model"] == "llama3.1:8b"
+    assert sent["messages"] == [{"role": "user", "content": "hello"}]
+    assert sent["options"]["num_predict"] == 100
+
+
+def test_reverse_non_stream_tool_use(reverse_settings):
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"city": "Tokyo"},
+                        },
+                        "id": "call_abc",
+                    }
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+            "prompt_eval_count": 12,
+            "eval_count": 5,
+        }
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 64,
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    }
+                ],
+                "messages": [{"role": "user", "content": "weather?"}],
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["stop_reason"] == "tool_use"
+    tool_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
+    assert len(tool_blocks) == 1
+    assert tool_blocks[0]["name"] == "get_weather"
+    assert tool_blocks[0]["input"] == {"city": "Tokyo"}
+    # Request converted tools.
+    sent_tools = fake.last_chat_payload["tools"]
+    assert sent_tools[0]["type"] == "function"
+    assert sent_tools[0]["function"]["name"] == "get_weather"
+
+
+def test_reverse_streaming(reverse_settings):
+    fake = _FakeOllamaClient(
+        stream_lines=[
+            {"message": {"role": "assistant", "content": "hel"}, "done": False},
+            {"message": {"role": "assistant", "content": "lo"}, "done": False},
+            {
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 5,
+                "eval_count": 2,
+            },
+        ]
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    with client:
+        with client.stream(
+            "POST",
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "stream": True,
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            raw = b"".join(resp.iter_bytes())
+
+    text = raw.decode("utf-8")
+    # Sequence sanity: message_start, content_block_start, deltas, stop, message_delta, message_stop
+    assert "event: message_start" in text
+    assert "event: content_block_start" in text
+    assert "\"text\": \"hel\"" in text
+    assert "\"text\": \"lo\"" in text
+    assert "event: content_block_stop" in text
+    assert "event: message_delta" in text
+    assert "\"stop_reason\": \"end_turn\"" in text
+    assert "event: message_stop" in text
+
+
+def test_reverse_streaming_tool_use(reverse_settings):
+    fake = _FakeOllamaClient(
+        stream_lines=[
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "f",
+                                "arguments": {"x": 1},
+                            },
+                            "id": "call_z",
+                        }
+                    ],
+                },
+                "done": True,
+                "done_reason": "tool_calls",
+                "prompt_eval_count": 4,
+                "eval_count": 2,
+            }
+        ]
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    with client:
+        with client.stream(
+            "POST",
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "stream": True,
+                "max_tokens": 20,
+                "messages": [{"role": "user", "content": "go"}],
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            text = b"".join(resp.iter_bytes()).decode("utf-8")
+    assert "\"type\": \"tool_use\"" in text
+    assert "\"name\": \"f\"" in text
+    assert "input_json_delta" in text
+    assert "\"stop_reason\": \"tool_use\"" in text
+
+
+def test_reverse_passthrough_when_no_target(reverse_settings):
+    """Model not in any ollama_target -> falls through to upstream."""
+
+    captured: Dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "from upstream"}],
+                "model": "claude-3-5-sonnet-20241022",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            },
+        )
+
+    client = _build_client(
+        reverse_settings,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["content"] == [{"type": "text", "text": "from upstream"}]
+    assert captured["body"]["model"] == "claude-3-5-sonnet-20241022"
+
+
+def test_reverse_missing_model_returns_400(reverse_settings):
+    client = _build_client(reverse_settings, fake_ollama=_FakeOllamaClient())
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 400
+
+
+def test_reverse_tool_result_to_tool_role(reverse_settings):
+    """Anthropic tool_result inside user message -> Ollama 'tool' role."""
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 10,
+                "messages": [
+                    {"role": "user", "content": "weather?"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_1",
+                                "name": "f",
+                                "input": {"a": 1},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_1",
+                                "content": "sunny",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+    assert resp.status_code == 200
+    msgs = fake.last_chat_payload["messages"]
+    # last message should be a tool-role with content "sunny"
+    assert msgs[-1]["role"] == "tool"
+    assert msgs[-1]["content"] == "sunny"
+    assert msgs[-1]["tool_call_id"] == "call_1"
+
+
+def test_reverse_missing_token_returns_401(reverse_settings):
+    fake = _FakeOllamaClient(
+        chat_response={"message": {"role": "assistant", "content": "x"}, "done": True}
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    payload = {
+        "model": "llama3.1",
+        "max_tokens": 5,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    with client:
+        # No auth header at all.
+        resp = client.post("/v1/messages", json=payload)
+        assert resp.status_code == 401
+        # Wrong token.
+        resp = client.post("/v1/messages", headers={"x-api-key": "nope"}, json=payload)
+        assert resp.status_code == 401
+        # Bearer also accepted.
+        resp = client.post(
+            "/v1/messages",
+            headers={"Authorization": "Bearer rev-tk-1"},
+            json=payload,
+        )
+        assert resp.status_code == 200
+
+
+def test_reverse_token_required_in_settings():
+    """Legacy per-target ``api_token`` is silently dropped (extra='ignore').
+
+    The Settings instance still loads and the target is still routable;
+    auth is now centralised on ``external_access_tokens``.
+    """
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u",
+                "base_url": "http://x.test",
+                "auth_token": "t",
+                "models": ["m"],
+            }
+        ],
+        ollama_targets=[
+            {"name": "local", "models": ["llama3.1"], "api_token": "ignored"}
+        ],
+    )
+    # Target is routable regardless of legacy api_token.
+    assert s.ollama_target_for("llama3.1") is not None
+    # No central tokens -> no auth required for /v1/* (legacy permissive mode).
+    assert s.auth_required_for_v1 is False
+    assert s.is_valid_external_token("ignored") is False
+
+
+def test_legacy_target_api_token_is_migrated(tmp_path, monkeypatch):
+    """Loading config.json with legacy per-target ``api_token`` hoists it."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps({
+            "upstreams": [{"name": "u", "base_url": "http://x.test",
+                           "auth_token": "t", "models": ["m"]}],
+            "ollama_targets": [
+                {"name": "local", "models": ["llama3.1"], "api_token": "legacy-tk"}
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
+    s = load_settings()
+    assert "legacy-tk" in s.external_access_tokens
+    assert s.is_valid_external_token("legacy-tk")
+
+
+def test_v1_models_includes_reverse_targets_when_authed(reverse_settings):
+    client = _build_client(reverse_settings, fake_ollama=_FakeOllamaClient())
+    with client:
+        # Without token: 401 because external_access_tokens is non-empty.
+        r = client.get("/v1/models")
+        assert r.status_code == 401
+        # With token: lists upstream + ollama target models.
+        r = client.get("/v1/models", headers=_AUTH)
+        assert r.status_code == 200
+        ids = [m["id"] for m in r.json()["data"]]
+        assert "llama3.1" in ids
+        assert "claude-3-5-sonnet-20241022" in ids
+
+
+def test_v1_models_open_when_no_tokens(monkeypatch):
+    """No external_access_tokens -> /v1/models requires no auth (legacy mode)."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://upstream.test")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tk")
+    monkeypatch.setenv("FAKE_OLLAMA_MODELS", "m1")
+    s = load_settings()
+    client = _build_client(s, fake_ollama=_FakeOllamaClient())
+    with client:
+        r = client.get("/v1/models")
+        assert r.status_code == 200
+        ids = [m["id"] for m in r.json()["data"]]
+        assert "m1" in ids
+
+
+def test_expose_external_hides_upstream_models(reverse_settings):
+    """Setting expose_external=[] on an upstream hides its models from /v1/*."""
+    data = reverse_settings.model_dump()
+    # Hide all upstream models from the external surface.
+    for up in data["upstreams"]:
+        up["expose_external"] = []
+    s = Settings(**data)
+    client = _build_client(s, fake_ollama=_FakeOllamaClient())
+    with client:
+        r = client.get("/v1/models", headers=_AUTH)
+        assert r.status_code == 200
+        ids = [m["id"] for m in r.json()["data"]]
+        # Reverse-proxy target still listed (always exposed).
+        assert "llama3.1" in ids
+        # Upstream model is hidden.
+        assert "claude-3-5-sonnet-20241022" not in ids
+
+
+def test_expose_external_blocks_passthrough(reverse_settings):
+    """A non-exposed upstream model gets 404 on /v1/messages passthrough."""
+    data = reverse_settings.model_dump()
+    for up in data["upstreams"]:
+        up["expose_external"] = []
+    s = Settings(**data)
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("upstream must not be reached for hidden model")
+
+    client = _build_client(s, upstream_transport=httpx.MockTransport(handler))
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert resp.status_code == 404
+
+
+def test_expose_external_explicit_subset(reverse_settings):
+    """Only display names in expose_external are visible."""
+    data = reverse_settings.model_dump()
+    data["upstreams"][0]["models"] = ["public-m", "private-m"]
+    data["upstreams"][0]["expose_external"] = ["public-m"]
+    s = Settings(**data)
+    client = _build_client(s, fake_ollama=_FakeOllamaClient())
+    with client:
+        r = client.get("/v1/models", headers=_AUTH)
+        ids = [m["id"] for m in r.json()["data"]]
+        assert "public-m" in ids
+        assert "private-m" not in ids
