@@ -64,7 +64,10 @@ def main() -> None:
         s2 = uvicorn.Server(external_cfg)
         await asyncio.gather(s1.serve(), s2.serve())
 
-    asyncio.run(_run_both())
+    try:
+        asyncio.run(_run_both())
+    except KeyboardInterrupt:
+        logger.info("interrupted; exiting")
 
 
 if __name__ == "__main__":  # pragma: no cover

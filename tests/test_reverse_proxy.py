@@ -82,6 +82,7 @@ def _build_client(
     *,
     fake_ollama: Optional[_FakeOllamaClient] = None,
     upstream_transport: Optional[httpx.MockTransport] = None,
+    base_url: str = "http://testserver",
 ) -> TestClient:
     from fake_ollama.anthropic_client import AnthropicClient
 
@@ -98,7 +99,7 @@ def _build_client(
             client=httpx.AsyncClient(transport=upstream_transport),
         )
         app.state.clients = {up.name: mock for up in settings.upstreams}
-    return TestClient(app)
+    return TestClient(app, base_url=base_url)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +141,232 @@ def test_reverse_non_stream_text(reverse_settings):
     assert sent["model"] == "llama3.1:8b"
     assert sent["messages"] == [{"role": "user", "content": "hello"}]
     assert sent["options"]["num_predict"] == 100
+
+
+def test_openai_chat_non_stream_routes_to_ollama_target(reverse_settings):
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "hi from local"},
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 6,
+            "eval_count": 3,
+        }
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "llama3.1",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "stream": False,
+                "max_tokens": 50,
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "chat.completion"
+    assert body["model"] == "llama3.1"
+    assert body["choices"][0]["message"]["content"] == "hi from local"
+    assert body["usage"] == {
+        "prompt_tokens": 6,
+        "completion_tokens": 3,
+        "total_tokens": 9,
+    }
+    sent = fake.last_chat_payload
+    assert sent["model"] == "llama3.1:8b"
+    assert sent["messages"] == [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "hello"},
+    ]
+    assert sent["options"]["num_predict"] == 50
+
+
+def test_openai_chat_stream_routes_to_ollama_target(reverse_settings):
+    fake = _FakeOllamaClient(
+        stream_lines=[
+            {"message": {"role": "assistant", "content": "hel"}, "done": False},
+            {"message": {"role": "assistant", "content": "lo"}, "done": False},
+            {
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 4,
+                "eval_count": 2,
+            },
+        ]
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    with client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "llama3.1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            raw = b"".join(resp.iter_bytes()).decode("utf-8")
+
+    assert fake.last_stream_payload["model"] == "llama3.1:8b"
+    assert raw.endswith("data: [DONE]\n\n")
+    frames = [
+        json.loads(line[len("data: "):])
+        for line in raw.splitlines()
+        if line.startswith("data: ") and not line.endswith("[DONE]")
+    ]
+    assert "".join(
+        f["choices"][0]["delta"].get("content", "") or "" for f in frames
+    ) == "hello"
+    assert frames[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["external_host"] = "127.0.0.1"
+    data["external_port"] = 21435
+    settings = Settings(**data)
+    fake = _FakeOllamaClient()
+    captured: Dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_upstream",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "from upstream"}],
+                "model": "llama3.1",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 2},
+            },
+        )
+
+    client = _build_client(
+        settings,
+        fake_ollama=fake,
+        upstream_transport=httpx.MockTransport(handler),
+        base_url="http://testserver:21434",
+    )
+    with client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "llama3.1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "from upstream"
+    assert captured["body"]["model"] == "llama3.1"
+    assert fake.last_chat_payload is None
+
+
+def test_openai_chat_external_port_routes_to_ollama_target(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["external_host"] = "127.0.0.1"
+    data["external_port"] = 21435
+    settings = Settings(**data)
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "from local"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("external OpenAI route should use ollama target")
+
+    client = _build_client(
+        settings,
+        fake_ollama=fake,
+        upstream_transport=httpx.MockTransport(handler),
+        base_url="http://testserver:21435",
+    )
+    with client:
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "from local"
+    assert fake.last_chat_payload["model"] == "llama3.1:8b"
+
+
+def test_reverse_tagless_alias_routes_to_tagged_ollama_target(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["upstreams"][0]["expose_external"] = []
+    data["ollama_targets"][0]["models"] = ["qwen3.5-2b:latest"]
+    data["ollama_targets"][0]["model_map"] = {}
+    data["ollama_targets"][0]["expose_external"] = ["qwen3.5-2b:latest"]
+    settings = Settings(**data)
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "qwen3.5-2b:latest",
+            "message": {"role": "assistant", "content": "local"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    client = _build_client(settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.5-2b",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["model"] == "qwen3.5-2b:latest"
+    assert resp.json()["model"] == "qwen3.5-2b"
+
+
+def test_reverse_tagless_alias_does_not_route_to_non_latest_tag(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["upstreams"][0]["expose_external"] = []
+    data["ollama_targets"][0]["models"] = ["qwen3.6-27b:q2_k_p"]
+    data["ollama_targets"][0]["model_map"] = {}
+    data["ollama_targets"][0]["expose_external"] = ["qwen3.6-27b:q2_k_p"]
+    settings = Settings(**data)
+    fake = _FakeOllamaClient()
+    client = _build_client(settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.6-27b",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 404
+    assert fake.last_chat_payload is None
 
 
 def test_reverse_non_stream_tool_use(reverse_settings):

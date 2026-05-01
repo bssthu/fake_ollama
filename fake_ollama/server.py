@@ -29,6 +29,7 @@ from .ollama_client import OllamaClient
 from .reverse_converters import (
     anthropic_to_ollama_chat as anthropic_to_ollama_chat_payload,
     ollama_chat_to_anthropic as ollama_chat_to_anthropic_response,
+    ollama_stream_to_anthropic_events,
     ollama_stream_to_anthropic_sse,
 )
 
@@ -107,22 +108,33 @@ def _bearer_or_api_key(request: Request) -> str:
     return ""
 
 
-# Path prefixes considered "external" (Anthropic-compatible reverse proxy).
-_EXTERNAL_PATH_PREFIXES = ("/v1/messages", "/v1/models")
+# Path prefixes that are only served by the external reverse-proxy listener.
+_EXTERNAL_ONLY_PATH_PREFIXES = ("/v1/messages", "/v1/models")
+# Paths available on both listeners. The handler may still choose different
+# backends based on the local server port.
+_SHARED_V1_PATH_PREFIXES = ("/v1/chat/completions",)
 
 
-def _is_external_path(path: str) -> bool:
-    return any(path == p or path.startswith(p + "/") for p in _EXTERNAL_PATH_PREFIXES)
+def _has_path_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in prefixes)
+
+
+def _is_external_request(request: Request) -> bool:
+    settings: Settings = request.app.state.settings
+    if not settings.external_listener_enabled:
+        return False
+    server = request.scope.get("server") or (None, None)
+    local_port = server[1] if isinstance(server, (tuple, list)) and len(server) > 1 else None
+    return local_port == settings.external_port
 
 
 def _install_port_router(app: FastAPI) -> None:
     """When an external listener is configured, split routes by listen port.
 
-    - External port (settings.external_port) serves ONLY ``/v1/messages`` and
-      ``/v1/models``; everything else returns 404.
-    - Internal port serves everything EXCEPT those two prefixes; requests to
-      them on the internal port return 404 so admin / Ollama clients cannot
-      reach the externally-exposed surface accidentally.
+    - External port (settings.external_port) serves the external-only routes
+      plus selected shared /v1 routes.
+    - Internal port serves everything EXCEPT the external-only routes; shared
+      /v1 routes can use the local port to choose their backend.
 
     No-op when no external listener is configured (single-port mode).
     """
@@ -137,9 +149,11 @@ def _install_port_router(app: FastAPI) -> None:
         local_port = server[1] if isinstance(server, (tuple, list)) and len(server) > 1 else None
         external = local_port == settings.external_port
         path = request.url.path
-        if external and not _is_external_path(path):
+        external_only = _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES)
+        shared = _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES)
+        if external and not (external_only or shared):
             return JSONResponse({"detail": "not found"}, status_code=404)
-        if (not external) and _is_external_path(path):
+        if (not external) and external_only:
             return JSONResponse({"detail": "not found"}, status_code=404)
         return await call_next(request)
 
@@ -320,15 +334,23 @@ def _register_routes(app: FastAPI) -> None:
     _admin.register_admin_routes(app)
 
 
-def _read_error_text(exc: httpx.HTTPStatusError) -> str:
-    try:
-        return exc.response.text
-    except Exception:  # pragma: no cover
-        return str(exc)
+def _read_error_text(exc: httpx.HTTPError) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            return exc.response.text
+        except Exception:  # pragma: no cover
+            pass
+    return str(exc) or exc.__class__.__name__
+
+
+def _upstream_error_status(exc: httpx.HTTPError) -> int:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    return 502
 
 
 def _log_upstream_error(
-    exc: httpx.HTTPStatusError, upstream_payload: Dict[str, Any]
+    exc: httpx.HTTPError, upstream_payload: Dict[str, Any]
 ) -> None:
     """Log enough context to debug 4xx/5xx responses from the upstream."""
     body = _read_error_text(exc)
@@ -348,15 +370,15 @@ def _log_upstream_error(
     }
     logger.warning(
         "upstream %s: %s | request=%s",
-        exc.response.status_code,
+        _upstream_error_status(exc),
         body,
         json.dumps(summary, ensure_ascii=False),
     )
 
 
-def _upstream_error(exc: httpx.HTTPStatusError) -> JSONResponse:
+def _upstream_error(exc: httpx.HTTPError) -> JSONResponse:
     return JSONResponse(
-        status_code=exc.response.status_code,
+        status_code=_upstream_error_status(exc),
         content={"error": _read_error_text(exc)},
     )
 
@@ -472,7 +494,7 @@ async def _handle(request: Request, *, mode: str) -> Any:
     if not stream:
         try:
             data = await client.messages(upstream_payload)
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             _log_upstream_error(exc, upstream_payload)
             return _upstream_error(exc)
         if mode == "chat":
@@ -495,7 +517,7 @@ async def _handle(request: Request, *, mode: str) -> Any:
             async for event_type, data in client.stream_messages(upstream_payload):
                 for chunk in translator.feed_event(event_type, data):
                     yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             _log_upstream_error(exc, upstream_payload)
             err_chunk = {
                 "model": ollama_model,
@@ -522,6 +544,104 @@ async def _handle_openai_chat(request: Request) -> Any:
     openai_model = payload.get("model") or (settings.models[0] if settings.models else "")
     if not openai_model:
         raise HTTPException(status_code=400, detail="missing 'model'")
+    profile = settings.profile_for(openai_model)
+
+    external_request = _is_external_request(request)
+    if external_request and settings.auth_required_for_v1:
+        presented = _bearer_or_api_key(request)
+        if not settings.is_valid_external_token(presented):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+
+    reverse_openai = external_request or not settings.external_listener_enabled
+    target = settings.ollama_target_for(openai_model) if reverse_openai else None
+    if external_request and target is not None and not target.exposes(openai_model):
+        target = None
+
+    if external_request and target is None and not settings.is_externally_exposed(openai_model):
+        raise HTTPException(
+            status_code=404,
+            detail=f"model '{openai_model}' is not exposed externally",
+        )
+
+    if target is not None:
+        oc: OllamaClient = app.state.ollama_clients.get(target.name)
+        if oc is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"ollama_target '{target.name}' is not initialised",
+            )
+        anthropic_payload = openai_chat_to_anthropic(
+            payload,
+            upstream_model=openai_model,
+            default_max_tokens=settings.default_max_tokens,
+        )
+        stream = bool(payload.get("stream", False))
+        anthropic_payload["stream"] = stream
+        ollama_payload = anthropic_to_ollama_chat_payload(
+            anthropic_payload,
+            target_model=target.resolve_model(openai_model),
+            default_max_tokens=settings.default_max_tokens,
+        )
+        if not stream:
+            try:
+                resp = await oc.chat(ollama_payload)
+            except httpx.HTTPError as exc:
+                _log_upstream_error(exc, ollama_payload)
+                return _upstream_error(exc)
+            anthropic_resp = ollama_chat_to_anthropic_response(
+                resp, anthropic_model=openai_model
+            )
+            return JSONResponse(
+                anthropic_to_openai_chat(
+                    anthropic_resp,
+                    openai_model=openai_model,
+                    show_thinking=profile.show_thinking,
+                )
+            )
+
+        async def body_local() -> AsyncIterator[bytes]:
+            translator = OpenAIChatStreamTranslator(
+                openai_model, show_thinking=profile.show_thinking
+            )
+            try:
+                lines = oc.stream_chat(ollama_payload)
+                async for event_type, data in ollama_stream_to_anthropic_events(
+                    lines, anthropic_model=openai_model
+                ):
+                    for frame in translator.feed_event(event_type, data):
+                        yield (
+                            "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
+                        ).encode("utf-8")
+            except httpx.HTTPError as exc:
+                _log_upstream_error(exc, ollama_payload)
+                err_frame = {
+                    "id": "chatcmpl-fake",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now(timezone.utc).timestamp()),
+                    "model": openai_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": f"[upstream error: {_read_error_text(exc)}]"
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                yield (
+                    "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
+                ).encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(body_local(), media_type="text/event-stream")
+
     upstream_model = settings.resolve_model(openai_model)
     client = _client_for(app, settings, openai_model)
 
@@ -535,12 +655,10 @@ async def _handle_openai_chat(request: Request) -> Any:
     _apply_thinking_config(settings, openai_model, upstream_payload)
     _enforce_limits(settings, openai_model, upstream_payload)
 
-    profile = settings.profile_for(openai_model)
-
     if not stream:
         try:
             data = await client.messages(upstream_payload)
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             _log_upstream_error(exc, upstream_payload)
             return _upstream_error(exc)
         return JSONResponse(
@@ -559,7 +677,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                     yield (
                         "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
                     ).encode("utf-8")
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             _log_upstream_error(exc, upstream_payload)
             err_frame = {
                 "id": "chatcmpl-fake",
@@ -635,7 +753,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
         if not stream:
             try:
                 resp = await oc.chat(ollama_payload)
-            except httpx.HTTPStatusError as exc:
+            except httpx.HTTPError as exc:
                 _log_upstream_error(exc, ollama_payload)
                 return _upstream_error(exc)
             return JSONResponse(
@@ -649,7 +767,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                     lines, anthropic_model=anth_model
                 ):
                     yield chunk
-            except httpx.HTTPStatusError as exc:
+            except httpx.HTTPError as exc:
                 _log_upstream_error(exc, ollama_payload)
                 err = {
                     "type": "error",
@@ -693,7 +811,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
     if not stream:
         try:
             data = await client.messages(upstream_payload)
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             _log_upstream_error(exc, upstream_payload)
             return _upstream_error(exc)
         return JSONResponse(data)
@@ -706,7 +824,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                     + json.dumps(data, ensure_ascii=False)
                     + "\n\n"
                 ).encode("utf-8")
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             _log_upstream_error(exc, upstream_payload)
             err = {
                 "type": "error",

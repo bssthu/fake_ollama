@@ -145,6 +145,61 @@ def test_resolve_model_respects_per_upstream_map(monkeypatch, tmp_path):
     assert s.resolve_model("dpsk") == "deepseek-v4-pro"
 
 
+def test_tagless_request_matches_configured_tagged_model():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "tagged",
+                "base_url": "https://upstream.example.com",
+                "auth_token": "tok",
+                "models": ["qwen3.5-2b:latest"],
+            }
+        ],
+        model_profiles={
+            "qwen3.5-2b:latest": {
+                "capabilities": ["completion", "tools"],
+                "context_length": 8192,
+            }
+        },
+    )
+
+    assert s.upstream_name_for("qwen3.5-2b") == "tagged"
+    assert s.resolve_model("qwen3.5-2b") == "qwen3.5-2b:latest"
+    assert s.resolve_model("qwen3.5-2b:latest") == "qwen3.5-2b:latest"
+    assert s.profile_for("qwen3.5-2b").context_length == 8192
+
+
+def test_tagless_request_only_matches_latest_tag():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u1",
+                "base_url": "https://first.example.com",
+                "auth_token": "tok",
+                "models": ["fallback"],
+            },
+            {
+                "name": "quantized",
+                "base_url": "https://quantized.example.com",
+                "auth_token": "tok",
+                "models": ["qwen3.6-27b:q2_k_p"],
+            },
+        ],
+        ollama_targets=[
+            {
+                "name": "local",
+                "base_url": "http://127.0.0.1:11434",
+                "models": ["qwen3.6-27b:q2_k_p"],
+            }
+        ],
+    )
+
+    assert s.upstream_name_for("qwen3.6-27b:q2_k_p") == "quantized"
+    assert s.upstream_name_for("qwen3.6-27b") == "u1"
+    assert s.ollama_target_for("qwen3.6-27b:q2_k_p") is not None
+    assert s.ollama_target_for("qwen3.6-27b") is None
+
+
 def test_routes_request_to_correct_upstream(monkeypatch, tmp_path):
     cfg = tmp_path / "config.json"
     _write_config(

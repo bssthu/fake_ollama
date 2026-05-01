@@ -44,6 +44,35 @@ DEFAULT_CONFIG_PATH = Path("config.json")
 LEGACY_UPSTREAM_NAME = "default"
 
 
+def _model_base(name: str) -> str:
+    """Return the Ollama-style tagless model name."""
+    return name.split(":", 1)[0] if ":" in name else name
+
+
+def _find_configured_model(display_name: str, models: Iterable[str]) -> Optional[str]:
+    """Find the configured display name matching a client-supplied model.
+
+    Ollama model names are ``model:tag`` where an omitted tag defaults to
+    ``latest``. Therefore ``foo`` and ``foo:latest`` are equivalent, but
+    ``foo`` must not match a different explicit tag such as ``foo:q4_K_M``.
+    """
+    model_list = list(models)
+    if display_name in model_list:
+        return display_name
+
+    base = _model_base(display_name)
+    if ":" in display_name:
+        tag = display_name.split(":", 1)[1]
+        if tag == "latest" and base in model_list:
+            return base
+        return None
+
+    latest = f"{base}:latest"
+    if latest in model_list:
+        return latest
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Per-model profile
 # ---------------------------------------------------------------------------
@@ -112,22 +141,36 @@ class Upstream(BaseModel):
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
 
+    def matching_model(self, display_name: str) -> Optional[str]:
+        return _find_configured_model(display_name, self.models)
+
     def resolve_model(self, display_name: str) -> str:
-        if display_name in self.model_map:
-            return self.model_map[display_name]
+        configured = self.matching_model(display_name)
+        for key in (display_name, configured, _model_base(display_name)):
+            if key and key in self.model_map:
+                return self.model_map[key]
+        if configured:
+            base = _model_base(configured)
+            if base in self.model_map:
+                return self.model_map[base]
+            return configured
         if ":" in display_name:
-            base = display_name.split(":", 1)[0]
+            base = _model_base(display_name)
             if base in self.model_map:
                 return self.model_map[base]
             return base
         return display_name
 
     def serves(self, display_name: str) -> bool:
-        if display_name in self.models:
+        return self.matching_model(display_name) is not None
+
+    def exposes(self, display_name: str) -> bool:
+        configured = self.matching_model(display_name)
+        if not configured:
+            return False
+        if self.expose_external is None:
             return True
-        if ":" in display_name and display_name.split(":", 1)[0] in self.models:
-            return True
-        return False
+        return _find_configured_model(configured, self.expose_external) is not None
 
 
 class OllamaTarget(BaseModel):
@@ -162,13 +205,31 @@ class OllamaTarget(BaseModel):
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
 
+    def matching_model(self, display_name: str) -> Optional[str]:
+        return _find_configured_model(display_name, self.models)
+
     def resolve_model(self, display_name: str) -> str:
-        if display_name in self.model_map:
-            return self.model_map[display_name]
+        configured = self.matching_model(display_name)
+        for key in (display_name, configured, _model_base(display_name)):
+            if key and key in self.model_map:
+                return self.model_map[key]
+        if configured:
+            base = _model_base(configured)
+            if base in self.model_map:
+                return self.model_map[base]
+            return configured
         return display_name
 
     def serves(self, display_name: str) -> bool:
-        return display_name in self.models
+        return self.matching_model(display_name) is not None
+
+    def exposes(self, display_name: str) -> bool:
+        configured = self.matching_model(display_name)
+        if not configured:
+            return False
+        if self.expose_external is None:
+            return True
+        return _find_configured_model(configured, self.expose_external) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -284,19 +345,11 @@ class Settings(BaseModel):
         [...] = subset).
         """
         for t in self.ollama_targets:
-            if not t.serves(display_name):
-                continue
-            if t.expose_external is None:
-                return True
-            if display_name in t.expose_external:
+            if t.exposes(display_name):
                 return True
         for up in self.upstreams:
-            if up.expose_external is None:
-                if display_name in up.models:
-                    return True
-            else:
-                if display_name in up.expose_external and display_name in up.models:
-                    return True
+            if up.exposes(display_name):
+                return True
         return False
 
     @property
@@ -362,8 +415,24 @@ class Settings(BaseModel):
 
     def profile_for(self, display_name: str) -> ModelProfile:
         raw = self.model_profiles.get(display_name)
+        if raw is None:
+            key = _find_configured_model(display_name, self.model_profiles.keys())
+            if key is not None:
+                raw = self.model_profiles.get(key)
         if raw is None and ":" in display_name:
-            raw = self.model_profiles.get(display_name.split(":", 1)[0])
+            raw = self.model_profiles.get(_model_base(display_name))
+        if raw is None:
+            for up in self.upstreams:
+                configured = up.matching_model(display_name)
+                if configured and configured in self.model_profiles:
+                    raw = self.model_profiles[configured]
+                    break
+        if raw is None:
+            for target in self.ollama_targets:
+                configured = target.matching_model(display_name)
+                if configured and configured in self.model_profiles:
+                    raw = self.model_profiles[configured]
+                    break
         if raw is None:
             return ModelProfile(
                 capabilities=list(DEFAULT_CAPABILITIES),

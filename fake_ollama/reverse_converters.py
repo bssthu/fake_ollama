@@ -267,10 +267,22 @@ async def ollama_stream_to_anthropic_sse(
     anthropic_model: str,
 ) -> AsyncIterator[bytes]:
     """Translate a stream of Ollama NDJSON lines into Anthropic SSE events."""
+    async for event, data in ollama_stream_to_anthropic_events(
+        lines, anthropic_model=anthropic_model
+    ):
+        yield _sse(event, data)
+
+
+async def ollama_stream_to_anthropic_events(
+    lines: AsyncIterator[bytes],
+    *,
+    anthropic_model: str,
+) -> AsyncIterator[Tuple[str, Dict[str, Any]]]:
+    """Translate a stream of Ollama NDJSON lines into Anthropic event tuples."""
     msg_id = _new_msg_id()
 
     # message_start
-    yield _sse(
+    yield (
         "message_start",
         {
             "type": "message_start",
@@ -305,7 +317,7 @@ async def ollama_stream_to_anthropic_sse(
 
         if delta_text:
             if not text_block_open:
-                yield _sse(
+                yield (
                     "content_block_start",
                     {
                         "type": "content_block_start",
@@ -314,7 +326,7 @@ async def ollama_stream_to_anthropic_sse(
                     },
                 )
                 text_block_open = True
-            yield _sse(
+            yield (
                 "content_block_delta",
                 {
                     "type": "content_block_delta",
@@ -328,7 +340,7 @@ async def ollama_stream_to_anthropic_sse(
 
         if chunk.get("done"):
             if text_block_open:
-                yield _sse(
+                yield (
                     "content_block_stop",
                     {"type": "content_block_stop", "index": 0},
                 )
@@ -349,7 +361,7 @@ async def ollama_stream_to_anthropic_sse(
                     args = {}
                 idx = base_idx + i
                 tu_id = tc.get("id") or f"call_{i}"
-                yield _sse(
+                yield (
                     "content_block_start",
                     {
                         "type": "content_block_start",
@@ -362,7 +374,7 @@ async def ollama_stream_to_anthropic_sse(
                         },
                     },
                 )
-                yield _sse(
+                yield (
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
@@ -373,7 +385,7 @@ async def ollama_stream_to_anthropic_sse(
                         },
                     },
                 )
-                yield _sse(
+                yield (
                     "content_block_stop",
                     {"type": "content_block_stop", "index": idx},
                 )
@@ -385,7 +397,7 @@ async def ollama_stream_to_anthropic_sse(
             output_tokens = int(chunk.get("eval_count") or output_tokens)
             input_tokens = int(chunk.get("prompt_eval_count") or input_tokens)
 
-            yield _sse(
+            yield (
                 "message_delta",
                 {
                     "type": "message_delta",
@@ -396,16 +408,16 @@ async def ollama_stream_to_anthropic_sse(
                     },
                 },
             )
-            yield _sse("message_stop", {"type": "message_stop"})
+            yield ("message_stop", {"type": "message_stop"})
             return
 
     # Stream ended without a `done` flag (defensive).
     if text_block_open:
-        yield _sse(
+        yield (
             "content_block_stop",
             {"type": "content_block_stop", "index": 0},
         )
-    yield _sse(
+    yield (
         "message_delta",
         {
             "type": "message_delta",
@@ -413,11 +425,12 @@ async def ollama_stream_to_anthropic_sse(
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         },
     )
-    yield _sse("message_stop", {"type": "message_stop"})
+    yield ("message_stop", {"type": "message_stop"})
 
 
 __all__ = [
     "anthropic_to_ollama_chat",
     "ollama_chat_to_anthropic",
+    "ollama_stream_to_anthropic_events",
     "ollama_stream_to_anthropic_sse",
 ]

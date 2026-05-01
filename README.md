@@ -24,13 +24,14 @@
 │  external listener  (可选；推荐 127.0.0.1:21435)        │
 │    /v1/messages Anthropic 兼容（反向；可对外）          │
 │    /v1/models                                           │
+│    /v1/chat/completions  OpenAI 兼容（反向；可对外）    │
 │    必须带 external_access_tokens 之一                   │
 └─────────────────────────────────────────────────────────┘
 ```
 
 - **internal listener**（必开）：服务正向调用方（本机 IDE / Copilot），以及 Web 编辑器。生产环境**保持 `127.0.0.1`**。
-- **external listener**（可选）：单独承载反向代理 `/v1/messages`、`/v1/models`。`external_port` 设为 `null` 即退化成单端口模式，所有路由都跑在 internal 上（适合纯本机使用）。
-- 设置 `external_port` 后，`/v1/messages` 与 `/v1/models` **只在 external 端口**可达；它们在 internal 端口返回 404。`/admin` 只在 internal 端口暴露——这是这个拆分最重要的安全收益。
+- **external listener**（可选）：单独承载反向代理 `/v1/messages`、`/v1/models`，以及反向模式的 `/v1/chat/completions`。`external_port` 设为 `null` 即退化成单端口模式，所有路由都跑在 internal 上（适合纯本机使用）。
+- 设置 `external_port` 后，`/v1/messages` 与 `/v1/models` **只在 external 端口**可达；它们在 internal 端口返回 404。`/v1/chat/completions` 两个端口都可达，但按端口分流：internal 端口走 upstream API，external 端口命中 `ollama_targets` 时走本机 Ollama。`/admin` 只在 internal 端口暴露——这是这个拆分最重要的安全收益。
 - 想让别的机器访问反向代理：把 `external_host` 改 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
 
 ## 特性一览
@@ -38,10 +39,11 @@
 - **多上游路由**：把 Anthropic / DeepSeek / 自建网关合并到同一个 Ollama 端口
 - **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限
 - **每个模型可控外露**（`expose_external`，upstream 与 ollama_target 都支持）：某些模型只想本机用、不想出现在反向代理 `/v1/models` 里？勾上即可
-- **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权 `/v1/messages` 与 `/v1/models`
+- **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权 external 端口上的 `/v1/messages`、`/v1/models` 与 `/v1/chat/completions`
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP），不再硬编码 `image/png`
 - **零依赖 Web 编辑器**：字段说明 / 默认值回退 / 上游 detect-models / model_profiles key 自动补全
-- `pytest` + `httpx.MockTransport`，离线 76 单测
+- `pytest` + `httpx.MockTransport` 离线单测
+- **网络错误安全降级**：上游连接断开 / 超时等非 HTTP 错误统一返回 502 / 流式错误帧，不会抛出未处理异常
 
 ## 快速开始
 
@@ -81,9 +83,9 @@ python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `host` | string | `127.0.0.1` | **internal** listener 地址（`/api/*`、`/admin/*`、`/v1/chat/completions`） |
+| `host` | string | `127.0.0.1` | **internal** listener 地址（`/api/*`、`/admin/*`、`/v1/chat/completions`；OpenAI 端走 upstream） |
 | `port` | int | `21434` | internal listener 端口 |
-| `external_host` | string \| null | `null` | **external** listener 地址（`/v1/messages`、`/v1/models`）。`null` = 不开独立端口（所有路由跑在 internal 上） |
+| `external_host` | string \| null | `null` | **external** listener 地址（`/v1/messages`、`/v1/models`、`/v1/chat/completions`；OpenAI 端命中 ollama_target 时走本机 Ollama）。`null` = 不开独立端口（所有路由跑在 internal 上） |
 | `external_port` | int \| null | `null` | external listener 端口 |
 | `external_access_tokens` | string[] | `[]` | 访问 `/v1/*` 反向代理需要的 token 池（`x-api-key` 或 `Authorization: Bearer`）。Web UI 可一键 Generate |
 | `advertised_version` | string | `0.6.4` | `/api/version` 返回值 |
@@ -132,6 +134,8 @@ python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
 - **不写该字段**（或为 `null`）：等同于"全部允许"，保持向后兼容。
 - 空数组 `[]`：该上游所有模型都不对外暴露。
 - 显式列表：仅列出的模型对外暴露。
+
+模型名匹配按 Ollama 规则处理：`model` 与 `model:latest` 等价；省略 tag 只代表 `latest`，不会匹配其他显式 tag（例如 `model:q4_K_M` / `model:q2_k_p`）。
 
 ### ollama_targets（反向：Anthropic → 本机 Ollama）
 
@@ -211,11 +215,13 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 
 适合**只支持 Anthropic Messages API** 的客户端（如 Claude Code）调用本机 Ollama 模型，或把上游 Anthropic 服务做带鉴权的转发壳。
 
-只要在 `config.json` 里配上 `ollama_targets`（见上），并填了至少一个 `external_access_tokens`，反向代理 `POST /v1/messages` 就开门工作：
+只要在 `config.json` 里配上 `ollama_targets`（见上），并填了至少一个 `external_access_tokens`，反向代理 `POST /v1/messages` 与 external 端口的 `POST /v1/chat/completions` 就开门工作：
 
 - `model` 命中某个 `ollama_targets[*].models` → 转换为 Ollama `/api/chat`，再把响应翻译回 Anthropic 的 `message_*` SSE / 非流式 JSON。
 - `model` 命中某个 upstream 的 `expose_external` 列表 → 透传到该 Anthropic 上游（相当于一个本机鉴权转发壳）。
 - 其他情况 → 404 `model '...' is not exposed externally`。
+
+端口分流规则：启用 `external_port` 后，internal 端口上的 `/v1/chat/completions` 保持 forward proxy 语义，走 upstream API；external 端口上的 `/v1/chat/completions` 走反向代理语义，优先命中 `ollama_targets` 并调用本机 Ollama。
 
 支持的转换：
 

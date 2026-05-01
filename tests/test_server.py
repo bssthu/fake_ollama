@@ -107,6 +107,52 @@ def test_chat_non_streaming(settings):
     assert captured["body"]["max_tokens"] == 1024  # from default
 
 
+def test_chat_tagless_alias_uses_configured_tagged_model():
+    from fake_ollama.config import Settings
+
+    settings = Settings(
+        default_max_tokens=1024,
+        upstreams=[
+            {
+                "name": "tagged",
+                "base_url": "http://upstream.test",
+                "auth_token": "test-token",
+                "models": ["qwen3.5-2b:latest"],
+            }
+        ],
+    )
+    captured: Dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "pong"}],
+                "model": "qwen3.5-2b:latest",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    client = _make_client(settings, httpx.MockTransport(handler))
+    with client:
+        resp = client.post(
+            "/api/chat",
+            json={
+                "model": "qwen3.5-2b",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": False,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert captured["body"]["model"] == "qwen3.5-2b:latest"
+
+
 def test_chat_streaming(settings):
     sse_events = [
         {
@@ -283,6 +329,62 @@ def test_openai_chat_completions_streaming(settings):
     text = "".join(f["choices"][0]["delta"].get("content", "") for f in frames)
     assert text == "Hi!"
     assert frames[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_openai_chat_streaming_upstream_disconnect_yields_error_choice(settings):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(
+            "Server disconnected without sending a response.",
+            request=request,
+        )
+
+    client = _make_client(settings, httpx.MockTransport(handler))
+    with client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            raw = b"".join(resp.iter_bytes()).decode("utf-8")
+
+    assert raw.endswith("data: [DONE]\n\n")
+    frames = [
+        json.loads(line[len("data: "):])
+        for line in raw.splitlines()
+        if line.startswith("data: ") and not line.endswith("[DONE]")
+    ]
+    assert len(frames) == 1
+    choice = frames[0]["choices"][0]
+    assert choice["delta"]["content"].startswith("[upstream error:")
+    assert "Server disconnected without sending a response." in choice["delta"]["content"]
+    assert choice["finish_reason"] == "stop"
+
+
+def test_openai_chat_non_streaming_upstream_disconnect_returns_502(settings):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(
+            "Server disconnected without sending a response.",
+            request=request,
+        )
+
+    client = _make_client(settings, httpx.MockTransport(handler))
+    with client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            },
+        )
+
+    assert resp.status_code == 502
+    assert "Server disconnected without sending a response." in resp.json()["error"]
 
 
 def test_openai_models_list(settings):

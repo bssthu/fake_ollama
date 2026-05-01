@@ -28,6 +28,7 @@ ENV/
 
 # Test / coverage
 .pytest_cache/
+.tmp/
 .coverage
 .coverage.*
 htmlcov/
