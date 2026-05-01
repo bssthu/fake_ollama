@@ -37,7 +37,7 @@
 
 - **多上游路由**：把 Anthropic / DeepSeek / 自建网关合并到同一个 Ollama 端口
 - **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限
-- **每上游每模型可控外露**（`Upstream.expose_external`）：上游里某些模型只想本机用、不想出现在反向代理 `/v1/models` 里？勾上即可
+- **每个模型可控外露**（`expose_external`，upstream 与 ollama_target 都支持）：某些模型只想本机用、不想出现在反向代理 `/v1/models` 里？勾上即可
 - **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权 `/v1/messages` 与 `/v1/models`
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP），不再硬编码 `image/png`
 - **零依赖 Web 编辑器**：字段说明 / 默认值回退 / 上游 detect-models / model_profiles key 自动补全
@@ -126,9 +126,9 @@ python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
 路由规则：
 - `/api/tags`（正向 Ollama 端）：返回所有 upstream `models` 的并集（去重，保留首次出现位置）。**不**受 `expose_external` 限制——本机使用时全可见。
 - 一次正向请求按 `model` 字段查找：第一个 `models` 中包含该名字的 upstream 胜出；没匹配回退第一个 upstream。
-- `/v1/models`（反向 Anthropic 端）与 `/v1/messages` 透传：**只**返回 / 接受被 `expose_external` 允许的上游模型 + 所有 `ollama_targets` 模型。
+- `/v1/models`（反向 Anthropic 端）与 `/v1/messages` 透传：**只**返回 / 接受被 `expose_external` 允许的上游模型 + 被 `expose_external` 允许的 ollama_target 模型。
 
-`expose_external` 语义：
+`expose_external` 语义（upstream 与 ollama_target 同款）：
 - **不写该字段**（或为 `null`）：等同于"全部允许"，保持向后兼容。
 - 空数组 `[]`：该上游所有模型都不对外暴露。
 - 显式列表：仅列出的模型对外暴露。
@@ -140,11 +140,12 @@ python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
   "name": "local",                                  // 唯一名字
   "base_url": "http://127.0.0.1:11434",              // 本机 Ollama URL
   "models": ["llama3.1", "qwen2.5-coder"],          // Anthropic 端可见的显示名
+  "expose_external": ["llama3.1"],                  // 可选：哪些模型对外暴露（同 upstream 语义）
   "model_map": { "llama3.1": "llama3.1:8b" }        // 可选：显示名 → Ollama tag
 }
 ```
 
-ollama_targets 默认全部对外暴露（这是它们存在的意义）。访问鉴权统一走顶层的 `external_access_tokens`，**不再有 per-target 的 `api_token` 字段**——旧版 `api_token` 在加载时会被自动 hoist 到 `external_access_tokens` 并打 WARN，存盘后清理。
+ollama_targets 默认全部对外暴露（不写 `expose_external`，保持向后兼容）；想做"本机才能用"的隔离就把 `expose_external` 勾上并留空，或只勾选允许暴露的子集。访问鉴权统一走顶层的 `external_access_tokens`，**不再有 per-target 的 `api_token` 字段**——旧版 `api_token` 在加载时会被自动 hoist 到 `external_access_tokens` 并打 WARN，存盘后清理。
 
 请求头形式（与 Anthropic 官方一致）：
 
@@ -239,7 +240,7 @@ claude
 - 右侧是输入控件（按字段类型自适应：文本 / 数字 / 复选框 / 多行列表 / key-value 表 / 嵌套对象列表 / **从兄弟字段拉取的复选框列表**）。
 - `upstreams`、`ollama_targets`、`model_profiles` 是可重复组，自带 +add / Remove。
 - **Detect models**：upstream / ollama_target 卡片右上角点一下，自动从上游 `/v1/models` 或本机 `/api/tags` 拉模型列表，弹窗里勾选后合并或替换 `models` 字段。
-- **expose_external**：在 upstream 卡片里点 "Refresh from models" 拉出当前 `models` 的复选框列表，勾选哪些模型对外暴露；不勾选该字段（默认）= 全部暴露（保持旧行为）。
+- **expose_external**：upstream 与 ollama_target 卡片里都支持。点 "Refresh from models" 拉出当前 `models` 的复选框列表，勾选哪些模型对外暴露；不勾选该字段（默认）= 全部暴露（保持旧行为），勾上后留空 = 全部隐藏（仅本机内部可用）。
 - **model_profiles 添加**：key 输入框带浏览器原生 datalist 自动补全，候选从 `upstreams` / `ollama_targets` 的 `models` 收集。
 - **external_access_tokens**：每行带 Show / Generate 按钮；列表底部还有"+ generate token"直接追加随机 token。
 - 顶部三个按钮：
@@ -296,7 +297,7 @@ curl -X POST http://127.0.0.1:21435/v1/messages `
 
 ## 故障排查
 
-- **/v1/messages 返回 404 `model '...' is not exposed externally`**：该模型来自 upstream，但其 upstream 的 `expose_external` 没把它列进去。在 admin UI 里勾选，或干脆删掉 `expose_external` 字段恢复"全部暴露"。
+- **/v1/messages 返回 404 `model '...' is not exposed externally`**：该模型来自 upstream 或 ollama_target，但其所属节点的 `expose_external` 没把它列进去。在 admin UI 里勾选，或干脆删掉 `expose_external` 字段恢复"全部暴露"。
 - **/v1/messages 返回 401**：`external_access_tokens` 为空（且 `external_port` 已设置 → 启动时已 WARN），或请求头里的 token 不在池里。检查 `x-api-key` / `Authorization: Bearer` 是否带对了。
 - **/v1/messages 在 internal 端口返回 404**：你启用了 `external_port`，反向代理已经只在 external 端口可达。请改连 external 端口。
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`（默认）。

@@ -148,6 +148,12 @@ class OllamaTarget(BaseModel):
     models: List[str] = Field(default_factory=list)
     # Anthropic-side display name -> Ollama-side model id.
     model_map: Dict[str, str] = Field(default_factory=dict)
+    # Subset of ``models`` visible on the EXTERNAL reverse-proxy surface
+    # (/v1/models, /v1/messages). Same semantics as ``Upstream.expose_external``:
+    #   None  -> expose all (default; back-compat).
+    #   []    -> expose nothing externally (target becomes internal-only).
+    #   [...] -> expose only the listed display names.
+    expose_external: Optional[List[str]] = None
 
     model_config = {"extra": "ignore"}  # tolerate legacy ``api_token`` field
 
@@ -240,10 +246,13 @@ class Settings(BaseModel):
 
     @property
     def reverse_proxy_models(self) -> List[str]:
-        """Union of model display names served by ``ollama_targets``."""
+        """ollama_target model names visible on /v1/* (subject to expose_external)."""
         seen: Dict[str, None] = {}
         for t in self.ollama_targets:
-            for m in t.models:
+            allowed = t.models if t.expose_external is None else [
+                m for m in t.models if m in set(t.expose_external)
+            ]
+            for m in allowed:
                 if m not in seen:
                     seen[m] = None
         return list(seen.keys())
@@ -270,11 +279,16 @@ class Settings(BaseModel):
     def is_externally_exposed(self, display_name: str) -> bool:
         """True iff a model is reachable on the /v1/* reverse-proxy surface.
 
-        ollama_targets are always exposed; upstream models follow each
-        upstream's ``expose_external`` whitelist.
+        Both ollama_targets and upstreams honour their own
+        ``expose_external`` whitelist (None = expose all, [] = none,
+        [...] = subset).
         """
         for t in self.ollama_targets:
-            if t.serves(display_name):
+            if not t.serves(display_name):
+                continue
+            if t.expose_external is None:
+                return True
+            if display_name in t.expose_external:
                 return True
         for up in self.upstreams:
             if up.expose_external is None:
