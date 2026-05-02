@@ -456,6 +456,39 @@ def _apply_thinking_config(
         upstream_payload["thinking"] = {"type": "disabled"}
 
 
+def _apply_ollama_thinking_config(
+    settings: Settings,
+    display_model: str,
+    anthropic_payload: Dict[str, Any],
+    ollama_payload: Dict[str, Any],
+) -> None:
+    """Map Anthropic/profile thinking preferences onto Ollama's API.
+
+    Newer Ollama models may stream reasoning on ``message.thinking`` before
+    visible ``message.content``. If a model profile disables thinking, pass
+    ``think: false`` so clients do not see an apparently empty response when
+    their output budget is consumed by hidden reasoning.
+    """
+    if "think" in ollama_payload:
+        return
+
+    requested = anthropic_payload.get("thinking")
+    if isinstance(requested, dict):
+        req_type = str(requested.get("type") or "").lower()
+        if req_type == "disabled":
+            ollama_payload["think"] = False
+            return
+        if req_type == "enabled":
+            ollama_payload["think"] = True
+            return
+
+    profile = settings.profile_for(display_model)
+    if profile.thinking_mode == "disabled" or not profile.show_thinking:
+        ollama_payload["think"] = False
+    elif profile.thinking_mode == "enabled":
+        ollama_payload["think"] = True
+
+
 async def _handle(request: Request, *, mode: str) -> Any:
     app = request.app
     settings: Settings = app.state.settings
@@ -587,6 +620,9 @@ async def _handle_openai_chat(request: Request) -> Any:
             anthropic_payload,
             target_model=target.resolve_model(openai_model),
             default_max_tokens=settings.default_max_tokens,
+        )
+        _apply_ollama_thinking_config(
+            settings, openai_model, anthropic_payload, ollama_payload
         )
         if not stream:
             try:
@@ -750,6 +786,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
             target_model=target.resolve_model(anth_model),
             default_max_tokens=settings.default_max_tokens,
         )
+        _apply_ollama_thinking_config(settings, anth_model, payload, ollama_payload)
         if not stream:
             try:
                 resp = await oc.chat(ollama_payload)

@@ -68,11 +68,15 @@ def test_admin_schema(admin_settings):
     assert upstreams["required"] is True
     assert upstreams["type"] == "object_list"
     assert {f["key"] for f in upstreams["item_schema"]} >= {"name", "base_url"}
+    upstream_models = next(f for f in upstreams["item_schema"] if f["key"] == "models")
+    assert upstream_models["autocomplete"] == "model_names"
     # ollama_target items no longer carry per-target api_token.
     ollama = next(f for f in fields if f["key"] == "ollama_targets")
     item_keys = {f["key"] for f in ollama["item_schema"]}
     assert "api_token" not in item_keys
     assert {"name", "base_url", "models"} <= item_keys
+    ollama_models = next(f for f in ollama["item_schema"] if f["key"] == "models")
+    assert ollama_models["autocomplete"] == "model_names"
     # external_access_tokens lives at the Settings level with secret_each + generate_each.
     ext = next(f for f in fields if f["key"] == "external_access_tokens")
     assert ext["type"] == "string_list"

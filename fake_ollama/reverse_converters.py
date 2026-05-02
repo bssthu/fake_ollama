@@ -4,9 +4,10 @@ This is the mirror of `converters.py`: it accepts requests in the Anthropic
 Messages format and converts them to/from a local Ollama-compatible server.
 
 Scope (MVP):
-- Text and tool-calling content blocks. Image blocks are dropped with a
-  text placeholder because most local Ollama models cannot read images and
-  it is safer to surface a visible "[image dropped]" marker than to crash.
+- Text, tool-calling content blocks, and base64 image blocks. Image blocks
+    are forwarded to Ollama's per-message ``images`` array when possible; URL
+    image sources are surfaced as a visible placeholder because Ollama's chat
+    API expects base64 image data.
 - Streaming and non-streaming requests.
 """
 
@@ -23,14 +24,38 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 
-def _flatten_text_content(content: Any) -> Tuple[str, List[Dict[str, Any]]]:
-    """Return (joined_text, tool_call_blocks) from an Anthropic content list."""
+def _strip_data_uri(value: str) -> str:
+    if value.startswith("data:") and "," in value:
+        return value.split(",", 1)[1]
+    return value
+
+
+def _image_data_from_block(block: Dict[str, Any]) -> Optional[str]:
+    """Return base64 image data from an Anthropic/OpenAI-style image block."""
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    data = source.get("data")
+    if isinstance(data, str) and data:
+        return _strip_data_uri(data)
+    url = source.get("url")
+    if isinstance(url, str) and url.startswith("data:"):
+        return _strip_data_uri(url)
+
+    image_url = block.get("image_url") if isinstance(block.get("image_url"), dict) else {}
+    url = image_url.get("url")
+    if isinstance(url, str) and url.startswith("data:"):
+        return _strip_data_uri(url)
+    return None
+
+
+def _flatten_text_content(content: Any) -> Tuple[str, List[Dict[str, Any]], List[str]]:
+    """Return (joined_text, tool_call_blocks, images) from Anthropic content."""
     if isinstance(content, str):
-        return content, []
+        return content, [], []
     text_parts: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
+    images: List[str] = []
     if not isinstance(content, list):
-        return "", []
+        return "", [], []
     for block in content:
         if not isinstance(block, dict):
             continue
@@ -42,9 +67,13 @@ def _flatten_text_content(content: Any) -> Tuple[str, List[Dict[str, Any]]]:
             continue
         elif btype == "tool_use":
             tool_calls.append(block)
-        elif btype == "image":
-            text_parts.append("[image dropped: local Ollama has no vision]")
-    return "".join(text_parts), tool_calls
+        elif btype in ("image", "image_url"):
+            image = _image_data_from_block(block)
+            if image:
+                images.append(image)
+            else:
+                text_parts.append("[image omitted: Ollama requires base64 image data]")
+    return "".join(text_parts), tool_calls, images
 
 
 def _flatten_tool_result(content: Any) -> str:
@@ -105,15 +134,27 @@ def anthropic_to_ollama_chat(
             isinstance(b, dict) and b.get("type") == "tool_result" for b in content
         ):
             text_buffer: List[str] = []
+            image_buffer: List[str] = []
+
+            def flush_user_message() -> None:
+                nonlocal text_buffer, image_buffer
+                if not text_buffer and not image_buffer:
+                    return
+                user_msg: Dict[str, Any] = {
+                    "role": "user",
+                    "content": "".join(text_buffer),
+                }
+                if image_buffer:
+                    user_msg["images"] = list(image_buffer)
+                messages.append(user_msg)
+                text_buffer = []
+                image_buffer = []
+
             for block in content:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "tool_result":
-                    if text_buffer:
-                        messages.append(
-                            {"role": "user", "content": "".join(text_buffer)}
-                        )
-                        text_buffer = []
+                    flush_user_message()
                     messages.append(
                         {
                             "role": "tool",
@@ -121,15 +162,20 @@ def anthropic_to_ollama_chat(
                             "tool_call_id": block.get("tool_use_id", ""),
                         }
                     )
-                elif block.get("type") == "text":
-                    text_buffer.append(block.get("text", ""))
-            if text_buffer:
-                messages.append({"role": "user", "content": "".join(text_buffer)})
+                else:
+                    text, _, images = _flatten_text_content([block])
+                    if text:
+                        text_buffer.append(text)
+                    if images:
+                        image_buffer.extend(images)
+            flush_user_message()
             continue
 
-        text, tool_calls = _flatten_text_content(content)
+        text, tool_calls, images = _flatten_text_content(content)
         if role == "assistant" and tool_calls:
             ollama_msg: Dict[str, Any] = {"role": "assistant", "content": text}
+            if images:
+                ollama_msg["images"] = images
             ollama_msg["tool_calls"] = [
                 {
                     "function": {
@@ -142,7 +188,10 @@ def anthropic_to_ollama_chat(
             ]
             messages.append(ollama_msg)
         else:
-            messages.append({"role": role, "content": text})
+            ollama_msg = {"role": role, "content": text}
+            if images:
+                ollama_msg["images"] = images
+            messages.append(ollama_msg)
 
     # Tools
     tools_out: List[Dict[str, Any]] = []

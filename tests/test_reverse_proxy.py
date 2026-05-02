@@ -143,6 +143,116 @@ def test_reverse_non_stream_text(reverse_settings):
     assert sent["options"]["num_predict"] == 100
 
 
+def test_reverse_forwards_base64_image_to_ollama(reverse_settings):
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "it is an image"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    image_data = "ZmFrZS1wbmc="
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_data,
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["messages"] == [
+        {"role": "user", "content": "what is this?", "images": [image_data]}
+    ]
+
+
+def test_reverse_target_disables_ollama_thinking_from_profile(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["model_profiles"] = {
+        "llama3.1": {
+            "capabilities": ["completion", "tools"],
+            "thinking_mode": "disabled",
+            "show_thinking": False,
+        }
+    }
+    settings = Settings(**data)
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    client = _build_client(settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["think"] is False
+
+
+def test_openai_target_disables_ollama_thinking_from_profile(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["model_profiles"] = {
+        "llama3.1": {
+            "capabilities": ["completion", "tools"],
+            "thinking_mode": "disabled",
+            "show_thinking": False,
+        }
+    }
+    settings = Settings(**data)
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    client = _build_client(settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "llama3.1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["think"] is False
+
+
 def test_openai_chat_non_stream_routes_to_ollama_target(reverse_settings):
     fake = _FakeOllamaClient(
         chat_response={
@@ -186,6 +296,47 @@ def test_openai_chat_non_stream_routes_to_ollama_target(reverse_settings):
         {"role": "user", "content": "hello"},
     ]
     assert sent["options"]["num_predict"] == 50
+
+
+def test_openai_chat_image_routes_to_ollama_target(reverse_settings):
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "saw it"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    client = _build_client(reverse_settings, fake_ollama=fake)
+    image_data = "ZmFrZS1qcGVn"
+    with client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "llama3.1",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_data}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "stream": False,
+                "max_tokens": 50,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["messages"] == [
+        {"role": "user", "content": "what is this?", "images": [image_data]}
+    ]
 
 
 def test_openai_chat_stream_routes_to_ollama_target(reverse_settings):

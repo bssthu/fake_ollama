@@ -56,7 +56,8 @@ UPSTREAM_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "auth_token", "type": "string", "default": "", "secret": True,
      "description": "上游 API token；建议放 .env 而非提交到仓库"},
     {"key": "models", "type": "string_list", "default": [],
-     "description": "【Internal】本机 /api/tags 可见的模型显示名（一行一个）。Ollama 客户端 / Copilot 等从这里看到模型，不受 expose_external 限制"},
+     "autocomplete": "model_names",
+     "description": "【Forward / Ollama 兼容入口】本机 /api/tags 可见、并路由到该 upstream 的模型显示名（一行一个）。不受 expose_external 限制"},
     {"key": "expose_external", "type": "string_list_subset_of",
      "default": None, "subset_of": "models",
      "description": "【External 反向代理】从 models 里选出允许出现在 /v1/models 与 /v1/messages 的子集。不勾该字段 = 全部暴露到外部（默认）；勾上后留空 = 全部隐藏（仅本机可用）；勾上后选部分 = 只暴露选中的"},
@@ -70,7 +71,8 @@ OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "base_url", "type": "string", "default": "http://127.0.0.1:11434",
      "description": "本机 Ollama 服务 URL"},
     {"key": "models", "type": "string_list", "default": [],
-     "description": "【Internal】本机 /api/tags 可见的模型显示名（一行一个）。Ollama 客户端 / Copilot 等从这里看到模型，不受 expose_external 限制"},
+     "autocomplete": "model_names",
+     "description": "【Reverse / Anthropic 兼容入口】该本机 Ollama target 可服务的模型显示名（一行一个），用于 /v1/messages 与 external 端口的 /v1/chat/completions"},
     {"key": "expose_external", "type": "string_list_subset_of",
      "default": None, "subset_of": "models",
      "description": "【External 反向代理】从 models 里选出允许出现在 /v1/models 与 /v1/messages 的子集。不勾该字段 = 全部暴露到外部（默认）；勾上后留空 = 全部隐藏（仅本机可用）；勾上后选部分 = 只暴露选中的"},
@@ -275,6 +277,7 @@ const $sidenav = document.getElementById('sidenav');
 let SCHEMA = [];
 let GROUPS = [];
 let RAW_MODE = false;
+const PROBED_MODEL_NAMES = new Set();
 
 function setStatus(text, kind) {
   $status.textContent = text;
@@ -389,6 +392,11 @@ function makeStringList(field, value) {
       type: isSecret ? 'password' : 'text',
       placeholder: field.key,
     });
+    if (field.autocomplete === 'model_names') {
+      input.setAttribute('list', 'dl-model-names');
+      input.addEventListener('focus', refreshModelDatalist);
+      input.addEventListener('input', refreshModelDatalist);
+    }
     input.value = text == null ? '' : String(text);
     const entry = {input};
     const extras = [];
@@ -619,6 +627,8 @@ function makeObjectList(field, value) {
           if (!r.ok) throw new Error(await r.text());
           const j = await r.json();
           const candidates = j.models || [];
+          for (const n of candidates) if (n) PROBED_MODEL_NAMES.add(n);
+          refreshModelDatalist();
           setStatus('detected ' + candidates.length + ' models, choose...', 'ok');
           const modelsR = renderer.getRenderer('models');
           const existing = modelsR && modelsR.get ? modelsR.get() : [];
@@ -772,6 +782,7 @@ function makeStringListSubsetOf(field, value, ctx) {
 // ---- Global model-name autocomplete (datalist for model_profiles keys) ----
 function collectKnownModelNames() {
   const out = new Set();
+  for (const n of PROBED_MODEL_NAMES) if (n) out.add(n);
   function walkList(renderer) {
     if (!renderer || typeof renderer.read !== 'function') return;
     const arr = renderer.read();

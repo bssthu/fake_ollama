@@ -68,6 +68,36 @@ def test_chat_to_anthropic_image_blocks():
     assert content[1] == {"type": "text", "text": "what is this?"}
 
 
+def test_chat_to_anthropic_accepts_multipart_image_content():
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/jpeg;base64,ZmFrZS1qcGVn"
+                        },
+                    },
+                ],
+            }
+        ]
+    }
+    body = ollama_chat_to_anthropic(payload, upstream_model="m", default_max_tokens=10)
+    content = body["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "what is this?"}
+    assert content[1] == {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": "ZmFrZS1qcGVn",
+        },
+    }
+
+
 def test_generate_to_anthropic_includes_system_and_prompt():
     payload = {
         "prompt": "tell me a joke",

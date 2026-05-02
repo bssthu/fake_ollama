@@ -41,7 +41,7 @@
 - **每个模型可控外露**（`expose_external`，upstream 与 ollama_target 都支持）：某些模型只想本机用、不想出现在反向代理 `/v1/models` 里？勾上即可
 - **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权 external 端口上的 `/v1/messages`、`/v1/models` 与 `/v1/chat/completions`
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP），不再硬编码 `image/png`
-- **零依赖 Web 编辑器**：字段说明 / 默认值回退 / 上游 detect-models / model_profiles key 自动补全
+- **零依赖 Web 编辑器**：字段说明 / 默认值回退 / 上游 detect-models / models 与 model_profiles key 自动补全
 - `pytest` + `httpx.MockTransport` 离线单测
 - **网络错误安全降级**：上游连接断开 / 超时等非 HTTP 错误统一返回 502 / 流式错误帧，不会抛出未处理异常
 
@@ -116,7 +116,7 @@ python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
   "name": "anthropic",                              // 唯一名字
   "base_url": "https://api.anthropic.com",           // 上游 base URL
   "auth_token": "sk-ant-...",                        // 鉴权 token（也可走 ANTHROPIC_AUTH_TOKEN）
-  "models": ["claude-3-5-sonnet-20241022",           // 该上游对外暴露的显示名
+  "models": ["claude-3-5-sonnet-20241022",           // 本机 Ollama 兼容入口可见、并路由到该 upstream 的显示名
              "claude-3-5-haiku-20241022"],
   "expose_external": ["claude-3-5-haiku-20241022"],  // 可选：哪些模型出现在反向代理 /v1/models
   "model_map": {                                     // 可选：显示名 → 上游真实模型 ID
@@ -161,6 +161,17 @@ Authorization: Bearer tk-...
 
 详见下文「[反向代理](#反向代理把本地-ollama-当-anthropic-api-用)」。
 
+#### Copilot 走 upstream 调用 Ollama 模型
+
+如果希望 GitHub Copilot 仍然只连接 internal Ollama 兼容入口（`/api/chat`），但实际模型在本机或另一台机器的 Ollama 上，可以把一个 `upstreams` 项指向 fake_ollama 的 **external listener**：
+
+- 同机部署：`upstreams[*].base_url = "http://127.0.0.1:<external_port>"`
+- 跨机器部署：`upstreams[*].base_url = "http://<ollama-host>:<external_port>"`
+- `upstreams[*].auth_token` 填目标 fake_ollama 的 `external_access_tokens` 之一
+- 目标 fake_ollama 的 `ollama_targets[*].models` 包含这些模型
+
+这样请求路径仍然是 upstream 语义：Copilot → internal `/api/chat` → upstream `/v1/messages` → 目标机器 Ollama。不要为了图片能力把 internal `/api/chat` 直接改成本机 `ollama_targets`，否则跨机器部署会失去这一层转发边界。
+
 ### model_profiles
 
 key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客户端会读 `/api/show` 的 `capabilities` 决定模型在 UI 中是否可选、能否做 tool-calling / 视觉。
@@ -196,7 +207,7 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 
 > token 估算用 `字符数 / 3` 的保守启发式（中英都偏高估），目的是宁可早拦也不漏拦——它**不**保证与上游计费完全一致。如需关闭拦截设 `enforce_context_limit: false`。
 
-> Web 编辑器添加 model_profiles 时，key 输入框带 **HTML5 datalist 自动补全**，候选来自 `upstreams[*].models` 与 `ollama_targets[*].models` 的并集。
+> Web 编辑器里 `upstreams[*].models`、`ollama_targets[*].models` 与添加 `model_profiles` 时的 key 输入框都带 **HTML5 datalist 自动补全**。候选来自当前配置里的模型名、已探测到的模型名，以及已有 `model_profiles` key。
 
 ### 环境变量
 
@@ -227,7 +238,7 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 
 - 文本消息、`system`、`max_tokens` / `temperature` / `top_p` / `top_k` / `stop_sequences`
 - **工具调用**：`tools` + `tool_use` + `tool_result`（流式与非流式都支持；Ollama 仅在 `done` 时一次性返回 `tool_calls`，所以 `input_json_delta` 也是在 done 时一次性发出）
-- Anthropic 的 `image` 块会被替换为占位文本 `"[image dropped: local Ollama has no vision]"`（多数本地模型无视觉能力，安全降级而非 500）
+- Anthropic 的 base64 `image` 块会转成 Ollama 消息里的 `images` 数组；URL 图片源无法直接交给 Ollama，会替换为占位文本（安全降级而非 500）
 
 让 Claude Code 走它（外部端口默认 21435）：
 
@@ -260,7 +271,9 @@ claude
 ## 视觉输入（图片）
 
 - `/api/chat`、`/api/generate`：消息里传 `images: ["<base64>", ...]`，服务端从 base64 magic bytes 嗅探 PNG / JPEG / GIF / WEBP 并设置正确的 `media_type`。
+- `/api/chat` 也兼容 OpenAI 风格的多段 `content`：`{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}` 会转成 Anthropic 图片块。
 - `/v1/chat/completions`：`content` 用 OpenAI 风格 `{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}`，data URI 的 `media_type` 直接透传；也支持 HTTP(S) URL，转为 Anthropic `source.type=url` 块。
+- `/v1/messages` 反向代理到本机 Ollama 时：Anthropic base64 `image` 块会转成 Ollama `images` 数组；external 端口的 `/v1/chat/completions` 命中 `ollama_targets` 时也同样转发 data URI 图片。
 - 上游不支持图片时（如 DeepSeek）会返回错误，fake-ollama 不预拦截。
 
 ## 测试

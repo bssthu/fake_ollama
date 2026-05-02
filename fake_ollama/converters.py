@@ -50,6 +50,67 @@ def _detect_image_media_type(b64_data: str) -> str:
     return "image/png"
 
 
+def _strip_data_uri(value: str) -> str:
+    if value.startswith("data:") and "," in value:
+        return value.split(",", 1)[1]
+    return value
+
+
+def _image_url_to_anthropic_block(url: str) -> Optional[Dict[str, Any]]:
+    if not url:
+        return None
+    if url.startswith("data:"):
+        try:
+            header, b64 = url.split(",", 1)
+            media_type = header.split(";", 1)[0][len("data:"):] or "image/png"
+        except ValueError:
+            media_type, b64 = "image/png", ""
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": b64,
+            },
+        }
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def _multipart_content_to_anthropic_blocks(content: Any) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    if not isinstance(content, list):
+        return blocks
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            blocks.append({"type": "text", "text": part.get("text", "")})
+        elif ptype == "image_url":
+            block = _image_url_to_anthropic_block(
+                ((part.get("image_url") or {}).get("url") or "")
+            )
+            if block:
+                blocks.append(block)
+        elif ptype == "image":
+            source = part.get("source")
+            if isinstance(source, dict):
+                blocks.append({"type": "image", "source": dict(source)})
+            elif isinstance(part.get("data"), str):
+                data = _strip_data_uri(part["data"])
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": part.get("media_type") or "image/png",
+                            "data": data,
+                        },
+                    }
+                )
+    return blocks
+
+
 # ---------------------------------------------------------------------------
 # Ollama -> Anthropic
 # ---------------------------------------------------------------------------
@@ -228,28 +289,33 @@ def _prepend_assistant_thinking(
 
 def _content_to_anthropic(message: Dict[str, Any]) -> Any:
     """Convert one Ollama message's content into Anthropic content blocks."""
-    text = message.get("content", "") or ""
+    content = message.get("content", "")
     images = message.get("images") or []
-    if not images:
-        return text
     blocks: List[Dict[str, Any]] = []
     for img in images:
         # Ollama sends raw base64 strings; sniff the actual format from the
         # decoded magic bytes so we don't mislabel JPEGs / GIFs / WEBPs as
         # PNG (which can cause vision-capable upstreams to reject them).
+        img_data = _strip_data_uri(img) if isinstance(img, str) else ""
         blocks.append(
             {
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": _detect_image_media_type(img),
-                    "data": img,
+                    "media_type": _detect_image_media_type(img_data),
+                    "data": img_data,
                 },
             }
         )
-    if text:
-        blocks.append({"type": "text", "text": text})
-    return blocks
+    if isinstance(content, list):
+        blocks.extend(_multipart_content_to_anthropic_blocks(content))
+        return blocks or ""
+    text = content or ""
+    if blocks:
+        if text:
+            blocks.append({"type": "text", "text": text})
+        return blocks
+    return text
 
 
 def ollama_messages_to_anthropic(
@@ -767,30 +833,9 @@ def _openai_message_to_anthropic_content(msg: Dict[str, Any]) -> Any:
             blocks.append({"type": "text", "text": part.get("text", "")})
         elif ptype == "image_url":
             url = (part.get("image_url") or {}).get("url", "")
-            if url.startswith("data:"):
-                # data:image/png;base64,XXXX
-                try:
-                    header, b64 = url.split(",", 1)
-                    media_type = header.split(";", 1)[0][len("data:"):] or "image/png"
-                except ValueError:
-                    media_type, b64 = "image/png", ""
-                blocks.append(
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": b64,
-                        },
-                    }
-                )
-            elif url:
-                blocks.append(
-                    {
-                        "type": "image",
-                        "source": {"type": "url", "url": url},
-                    }
-                )
+            block = _image_url_to_anthropic_block(url)
+            if block:
+                blocks.append(block)
     return blocks or ""
 
 
