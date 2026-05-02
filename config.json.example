@@ -43,7 +43,32 @@
       "models": ["llama3.1", "qwen2.5-coder"],
       "model_map": {
         "llama3.1": "llama3.1:8b"
-      }
+      },
+      "auto_start": false,
+      "start_command": null,
+      "stop_command": null,
+      "idle_timeout_seconds": null,
+      "startup_timeout_seconds": 60,
+      "health_path": "/api/version",
+      "cwd": null
+    }
+  ],
+
+  "llama_cpp_targets": [
+    {
+      "name": "qwen36-llamacpp",
+      "base_url": "http://127.0.0.1:21436",
+      "auth_token": "",
+      "models": ["qwen3.6-27b-hauhau-q2kp"],
+      "model_map": {},
+      "expose_external": ["qwen3.6-27b-hauhau-q2kp"],
+      "auto_start": true,
+      "start_command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"I:\\Projects\\llama.cpp\\start_qwen36_server.ps1\" -ListenHost 127.0.0.1 -Port 21436",
+      "stop_command": null,
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 600,
+      "health_path": "/health",
+      "cwd": "I:\\Projects\\llama.cpp"
     }
   ],
 

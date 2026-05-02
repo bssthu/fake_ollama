@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List
@@ -25,12 +26,16 @@ from .converters import (
     ollama_generate_to_anthropic,
     openai_chat_to_anthropic,
 )
+from .llama_cpp_client import LlamaCppClient
 from .ollama_client import OllamaClient
 from .reverse_converters import (
     anthropic_to_ollama_chat as anthropic_to_ollama_chat_payload,
+    anthropic_to_openai_chat as anthropic_to_openai_chat_payload,
     ollama_chat_to_anthropic as ollama_chat_to_anthropic_response,
     ollama_stream_to_anthropic_events,
     ollama_stream_to_anthropic_sse,
+    openai_chat_to_anthropic as openai_chat_to_anthropic_response,
+    openai_stream_to_anthropic_sse,
 )
 
 logger = logging.getLogger("fake_ollama")
@@ -43,10 +48,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owned_names: list[str] = []
         owned_target_names: list[str] = []
+        owned_llama_cpp_names: list[str] = []
         if not getattr(app.state, "clients", None):
             app.state.clients = {}
         if not getattr(app.state, "ollama_clients", None):
             app.state.ollama_clients = {}
+        if not getattr(app.state, "llama_cpp_clients", None):
+            app.state.llama_cpp_clients = {}
         for up in app.state.settings.upstreams:
             if up.name in app.state.clients:
                 continue
@@ -64,11 +72,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 tgt.base_url,
                 timeout=app.state.settings.timeout_seconds,
                 trust_env=app.state.settings.use_system_proxy,
+                auto_start=tgt.auto_start,
+                start_command=tgt.start_command,
+                stop_command=tgt.stop_command,
+                idle_timeout_seconds=tgt.idle_timeout_seconds,
+                startup_timeout_seconds=tgt.startup_timeout_seconds,
+                health_path=tgt.health_path,
+                cwd=tgt.cwd,
             )
             owned_target_names.append(tgt.name)
+        for tgt in app.state.settings.llama_cpp_targets:
+            if tgt.name in app.state.llama_cpp_clients:
+                continue
+            app.state.llama_cpp_clients[tgt.name] = LlamaCppClient(
+                tgt.base_url,
+                auth_token=tgt.auth_token,
+                timeout=app.state.settings.timeout_seconds,
+                trust_env=app.state.settings.use_system_proxy,
+                auto_start=tgt.auto_start,
+                start_command=tgt.start_command,
+                stop_command=tgt.stop_command,
+                idle_timeout_seconds=tgt.idle_timeout_seconds,
+                startup_timeout_seconds=tgt.startup_timeout_seconds,
+                health_path=tgt.health_path,
+                cwd=tgt.cwd,
+            )
+            owned_llama_cpp_names.append(tgt.name)
+        _sync_local_target_idle_monitor(app)
         try:
             yield
         finally:
+            idle_monitor = getattr(app.state, "local_target_idle_monitor", None)
+            if idle_monitor is not None:
+                idle_monitor.cancel()
+                try:
+                    await idle_monitor
+                except asyncio.CancelledError:
+                    pass
+                app.state.local_target_idle_monitor = None
             for name in owned_names:
                 client = app.state.clients.pop(name, None)
                 if client is not None:
@@ -77,9 +118,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 oc = app.state.ollama_clients.pop(name, None)
                 if oc is not None:
                     await oc.aclose()
+            for name in owned_llama_cpp_names:
+                lc = app.state.llama_cpp_clients.pop(name, None)
+                if lc is not None:
+                    await lc.aclose()
 
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
     app.state.settings = settings
+    app.state.ensure_local_target_idle_monitor = _sync_local_target_idle_monitor
     _install_port_router(app)
     _register_routes(app)
     return app
@@ -95,6 +141,46 @@ def _client_for(app: FastAPI, settings: Settings, model_name: str) -> AnthropicC
         # under any key working.
         return next(iter(clients.values()))
     return clients[name]
+
+
+async def _local_target_idle_monitor(app: FastAPI) -> None:
+    while True:
+        try:
+            await asyncio.sleep(5.0)
+            client_groups = (
+                getattr(app.state, "ollama_clients", {}),
+                getattr(app.state, "llama_cpp_clients", {}),
+            )
+            for clients in client_groups:
+                for client in list(clients.values()):
+                    stop_if_idle = getattr(client, "stop_if_idle", None)
+                    if stop_if_idle is not None:
+                        await stop_if_idle()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("local target idle lifecycle check failed")
+
+
+def _sync_local_target_idle_monitor(app: FastAPI) -> None:
+    client_groups = (
+        getattr(app.state, "ollama_clients", {}),
+        getattr(app.state, "llama_cpp_clients", {}),
+    )
+    needs_monitor = any(
+        getattr(c, "idle_timeout_seconds", None)
+        for clients in client_groups
+        for c in clients.values()
+    )
+    task = getattr(app.state, "local_target_idle_monitor", None)
+    task_running = task is not None and not task.done()
+    if needs_monitor and not task_running:
+        app.state.local_target_idle_monitor = asyncio.create_task(
+            _local_target_idle_monitor(app)
+        )
+    elif not needs_monitor and task_running:
+        task.cancel()
+        app.state.local_target_idle_monitor = None
 
 
 def _bearer_or_api_key(request: Request) -> str:
@@ -489,6 +575,46 @@ def _apply_ollama_thinking_config(
         ollama_payload["think"] = True
 
 
+def _apply_llama_cpp_thinking_config(
+    settings: Settings,
+    display_model: str,
+    source_payload: Dict[str, Any],
+    openai_payload: Dict[str, Any],
+) -> None:
+    """Map thinking preferences onto llama.cpp's chat-template kwargs.
+
+    Recent llama.cpp server builds support per-request
+    ``chat_template_kwargs.enable_thinking`` for Qwen-style templates. This
+    mirrors the Ollama ``think`` mapping so low ``max_tokens`` requests do not
+    spend their entire budget on hidden reasoning when a profile disables it.
+    """
+    existing = openai_payload.get("chat_template_kwargs")
+    if isinstance(existing, dict) and "enable_thinking" in existing:
+        return
+
+    enabled: bool | None = None
+    requested = source_payload.get("thinking")
+    if isinstance(requested, dict):
+        req_type = str(requested.get("type") or "").lower()
+        if req_type == "disabled":
+            enabled = False
+        elif req_type == "enabled":
+            enabled = True
+
+    if enabled is None:
+        profile = settings.profile_for(display_model)
+        if profile.thinking_mode == "disabled" or not profile.show_thinking:
+            enabled = False
+        elif profile.thinking_mode == "enabled":
+            enabled = True
+
+    if enabled is None:
+        return
+    kwargs = dict(existing) if isinstance(existing, dict) else {}
+    kwargs["enable_thinking"] = enabled
+    openai_payload["chat_template_kwargs"] = kwargs
+
+
 async def _handle(request: Request, *, mode: str) -> Any:
     app = request.app
     settings: Settings = app.state.settings
@@ -595,8 +721,22 @@ async def _handle_openai_chat(request: Request) -> Any:
     target = settings.ollama_target_for(openai_model) if reverse_openai else None
     if external_request and target is not None and not target.exposes(openai_model):
         target = None
+    llama_target = None
+    if reverse_openai and target is None:
+        llama_target = settings.llama_cpp_target_for(openai_model)
+        if (
+            external_request
+            and llama_target is not None
+            and not llama_target.exposes(openai_model)
+        ):
+            llama_target = None
 
-    if external_request and target is None and not settings.is_externally_exposed(openai_model):
+    if (
+        external_request
+        and target is None
+        and llama_target is None
+        and not settings.is_externally_exposed(openai_model)
+    ):
         raise HTTPException(
             status_code=404,
             detail=f"model '{openai_model}' is not exposed externally",
@@ -677,6 +817,62 @@ async def _handle_openai_chat(request: Request) -> Any:
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(body_local(), media_type="text/event-stream")
+
+    if llama_target is not None:
+        lc: LlamaCppClient = app.state.llama_cpp_clients.get(llama_target.name)
+        if lc is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"llama_cpp_target '{llama_target.name}' is not initialised",
+            )
+        llama_payload = dict(payload)
+        llama_payload["model"] = llama_target.resolve_model(openai_model)
+        stream = bool(payload.get("stream", False))
+        llama_payload["stream"] = stream
+        _apply_llama_cpp_thinking_config(
+            settings, openai_model, payload, llama_payload
+        )
+        if not stream:
+            try:
+                resp = await lc.chat(llama_payload)
+            except httpx.HTTPError as exc:
+                _log_upstream_error(exc, llama_payload)
+                return _upstream_error(exc)
+            if isinstance(resp, dict):
+                resp = dict(resp)
+                resp["model"] = openai_model
+            return JSONResponse(resp)
+
+        async def body_llama_openai() -> AsyncIterator[bytes]:
+            try:
+                async for line in lc.stream_chat(llama_payload):
+                    if line.startswith("data:"):
+                        yield (line + "\n\n").encode("utf-8")
+                    else:
+                        yield ("data: " + line + "\n\n").encode("utf-8")
+            except httpx.HTTPError as exc:
+                _log_upstream_error(exc, llama_payload)
+                err_frame = {
+                    "id": "chatcmpl-fake",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now(timezone.utc).timestamp()),
+                    "model": openai_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": f"[upstream error: {_read_error_text(exc)}]"
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                yield (
+                    "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
+                ).encode("utf-8")
+                yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(body_llama_openai(), media_type="text/event-stream")
 
     upstream_model = settings.resolve_model(openai_model)
     client = _client_for(app, settings, openai_model)
@@ -820,6 +1016,70 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                 ).encode("utf-8")
 
         return StreamingResponse(body(), media_type="text/event-stream")
+
+    llama_target = settings.llama_cpp_target_for(anth_model)
+    if llama_target is not None:
+        presented = _bearer_or_api_key(request)
+        if not settings.is_valid_external_token(presented):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+        lc: LlamaCppClient = app.state.llama_cpp_clients.get(llama_target.name)
+        if lc is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"llama_cpp_target '{llama_target.name}' is not initialised",
+            )
+        llama_payload = anthropic_to_openai_chat_payload(
+            payload,
+            target_model=llama_target.resolve_model(anth_model),
+            default_max_tokens=settings.default_max_tokens,
+        )
+        _apply_llama_cpp_thinking_config(settings, anth_model, payload, llama_payload)
+        profile = settings.profile_for(anth_model)
+        if not stream:
+            try:
+                resp = await lc.chat(llama_payload)
+            except httpx.HTTPError as exc:
+                _log_upstream_error(exc, llama_payload)
+                return _upstream_error(exc)
+            return JSONResponse(
+                openai_chat_to_anthropic_response(
+                    resp,
+                    anthropic_model=anth_model,
+                    show_thinking=profile.show_thinking,
+                )
+            )
+
+        async def body_llama_anthropic() -> AsyncIterator[bytes]:
+            try:
+                lines = lc.stream_chat(llama_payload)
+                async for chunk in openai_stream_to_anthropic_sse(
+                    lines,
+                    anthropic_model=anth_model,
+                    show_thinking=profile.show_thinking,
+                ):
+                    yield chunk
+            except httpx.HTTPError as exc:
+                _log_upstream_error(exc, llama_payload)
+                err = {
+                    "type": "error",
+                    "error": {
+                        "type": "upstream_error",
+                        "message": _read_error_text(exc),
+                    },
+                }
+                yield (
+                    "event: error\ndata: "
+                    + json.dumps(err, ensure_ascii=False)
+                    + "\n\n"
+                ).encode("utf-8")
+
+        return StreamingResponse(body_llama_anthropic(), media_type="text/event-stream")
 
     # Pass-through to the matching upstream Anthropic server.
     # Reverse-proxy surface: refuse models that are not opted in via

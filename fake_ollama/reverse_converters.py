@@ -229,6 +229,198 @@ def anthropic_to_ollama_chat(
 
 
 # ---------------------------------------------------------------------------
+# Anthropic request -> OpenAI-compatible chat payload (llama.cpp)
+# ---------------------------------------------------------------------------
+
+
+def _image_block_to_openai_part(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    data = source.get("data")
+    if isinstance(data, str) and data:
+        media_type = source.get("media_type") or "image/png"
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{_strip_data_uri(data)}"},
+        }
+    url = source.get("url")
+    if isinstance(url, str) and url:
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    image_url = block.get("image_url") if isinstance(block.get("image_url"), dict) else {}
+    url = image_url.get("url")
+    if isinstance(url, str) and url:
+        return {"type": "image_url", "image_url": {"url": url}}
+    return None
+
+
+def _anthropic_content_to_openai(content: Any) -> Tuple[Any, List[Dict[str, Any]]]:
+    """Return (OpenAI content, Anthropic tool_use blocks)."""
+    if isinstance(content, str):
+        return content, []
+    if not isinstance(content, list):
+        return "", []
+
+    text_parts: List[str] = []
+    multipart: List[Dict[str, Any]] = []
+    tool_uses: List[Dict[str, Any]] = []
+    saw_image = False
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text", "")
+            text_parts.append(text)
+            multipart.append({"type": "text", "text": text})
+        elif btype == "thinking":
+            continue
+        elif btype == "tool_use":
+            tool_uses.append(block)
+        elif btype in ("image", "image_url"):
+            part = _image_block_to_openai_part(block)
+            if part:
+                multipart.append(part)
+                saw_image = True
+            else:
+                text = "[image omitted: OpenAI-compatible target needs image data or URL]"
+                text_parts.append(text)
+                multipart.append({"type": "text", "text": text})
+
+    if saw_image:
+        return multipart, tool_uses
+    return "".join(text_parts), tool_uses
+
+
+def _tool_use_to_openai_call(block: Dict[str, Any], index: int) -> Dict[str, Any]:
+    return {
+        "id": block.get("id") or f"call_{index}",
+        "type": "function",
+        "function": {
+            "name": block.get("name", ""),
+            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+        },
+    }
+
+
+def _anthropic_tool_choice_to_openai(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    kind = value.get("type")
+    if kind == "auto":
+        return "auto"
+    if kind == "any":
+        return "required"
+    if kind == "tool":
+        return {
+            "type": "function",
+            "function": {"name": value.get("name", "")},
+        }
+    return value
+
+
+def anthropic_to_openai_chat(
+    payload: Dict[str, Any],
+    *,
+    target_model: str,
+    default_max_tokens: int = 1024,
+) -> Dict[str, Any]:
+    messages: List[Dict[str, Any]] = []
+
+    sys = _system_to_string(payload.get("system"))
+    if sys:
+        messages.append({"role": "system", "content": sys})
+
+    for msg in payload.get("messages") or []:
+        role = msg.get("role", "user")
+        content = msg.get("content")
+
+        if role == "user" and isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            pending_blocks: List[Dict[str, Any]] = []
+
+            def flush_user_message() -> None:
+                nonlocal pending_blocks
+                if not pending_blocks:
+                    return
+                converted, _ = _anthropic_content_to_openai(pending_blocks)
+                if converted:
+                    messages.append({"role": "user", "content": converted})
+                pending_blocks = []
+
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_result":
+                    flush_user_message()
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": block.get("tool_use_id", ""),
+                            "content": _flatten_tool_result(block.get("content")),
+                        }
+                    )
+                else:
+                    pending_blocks.append(block)
+            flush_user_message()
+            continue
+
+        converted, tool_uses = _anthropic_content_to_openai(content)
+        if role == "assistant" and tool_uses:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": converted if isinstance(converted, str) else "",
+                    "tool_calls": [
+                        _tool_use_to_openai_call(block, i)
+                        for i, block in enumerate(tool_uses)
+                    ],
+                }
+            )
+            continue
+        if role not in ("system", "user", "assistant", "tool"):
+            role = "user"
+        messages.append({"role": role, "content": converted})
+
+    body: Dict[str, Any] = {
+        "model": target_model,
+        "messages": messages,
+        "stream": bool(payload.get("stream", False)),
+        "max_tokens": int(payload.get("max_tokens") or default_max_tokens),
+    }
+    for src, dst in (
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+    ):
+        if payload.get(src) is not None:
+            body[dst] = payload[src]
+    if payload.get("stop_sequences"):
+        body["stop"] = payload["stop_sequences"]
+    if payload.get("tool_choice") is not None:
+        body["tool_choice"] = _anthropic_tool_choice_to_openai(payload["tool_choice"])
+
+    tools_out: List[Dict[str, Any]] = []
+    for t in payload.get("tools") or []:
+        if not isinstance(t, dict):
+            continue
+        tools_out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema") or {"type": "object"},
+                },
+            }
+        )
+    if tools_out:
+        body["tools"] = tools_out
+    return body
+
+
+# ---------------------------------------------------------------------------
 # Ollama response -> Anthropic Messages response
 # ---------------------------------------------------------------------------
 
@@ -299,6 +491,77 @@ def ollama_chat_to_anthropic(
     }
 
 
+_OPENAI_FINISH_TO_STOP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "function_call": "tool_use",
+    None: "end_turn",
+    "": "end_turn",
+}
+
+
+def _parse_openai_arguments(value: Any) -> Dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value) if value else {}
+        except json.JSONDecodeError:
+            return {"_raw": value}
+        return parsed if isinstance(parsed, dict) else {"_value": parsed}
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    return {"_value": value}
+
+
+def openai_chat_to_anthropic(
+    response: Dict[str, Any],
+    *,
+    anthropic_model: str,
+    show_thinking: bool = True,
+) -> Dict[str, Any]:
+    choices = response.get("choices") or []
+    choice = choices[0] if choices else {}
+    msg = choice.get("message") or {}
+    text = msg.get("content") or ""
+    thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    blocks: List[Dict[str, Any]] = []
+    if thinking and show_thinking:
+        blocks.append({"type": "thinking", "thinking": thinking})
+    if text:
+        blocks.append({"type": "text", "text": text})
+    for i, tc in enumerate(msg.get("tool_calls") or []):
+        fn = (tc.get("function") if isinstance(tc, dict) else None) or {}
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": tc.get("id") or f"call_{i}",
+                "name": fn.get("name", ""),
+                "input": _parse_openai_arguments(fn.get("arguments")),
+            }
+        )
+
+    usage = response.get("usage") or {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    return {
+        "id": response.get("id") or _new_msg_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": anthropic_model,
+        "content": blocks,
+        "stop_reason": _OPENAI_FINISH_TO_STOP.get(
+            choice.get("finish_reason"), "end_turn"
+        ),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Streaming: Ollama NDJSON -> Anthropic SSE
 # ---------------------------------------------------------------------------
@@ -320,6 +583,197 @@ async def ollama_stream_to_anthropic_sse(
         lines, anthropic_model=anthropic_model
     ):
         yield _sse(event, data)
+
+
+async def openai_stream_to_anthropic_sse(
+    lines: AsyncIterator[str | bytes],
+    *,
+    anthropic_model: str,
+    show_thinking: bool = True,
+) -> AsyncIterator[bytes]:
+    async for event, data in openai_stream_to_anthropic_events(
+        lines, anthropic_model=anthropic_model, show_thinking=show_thinking
+    ):
+        yield _sse(event, data)
+
+
+async def openai_stream_to_anthropic_events(
+    lines: AsyncIterator[str | bytes],
+    *,
+    anthropic_model: str,
+    show_thinking: bool = True,
+) -> AsyncIterator[Tuple[str, Dict[str, Any]]]:
+    msg_id = _new_msg_id()
+    yield (
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": anthropic_model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+    )
+
+    next_index = 0
+    text_index: Optional[int] = None
+    thinking_index: Optional[int] = None
+    text_open = False
+    thinking_open = False
+    pending_tools: Dict[int, Dict[str, Any]] = {}
+    stop_reason = "end_turn"
+    input_tokens = 0
+    output_tokens = 0
+
+    async for raw in lines:
+        line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        line = line.strip()
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        else:
+            continue
+        if line == "[DONE]":
+            break
+        try:
+            chunk = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        usage = chunk.get("usage") or {}
+        input_tokens = int(usage.get("prompt_tokens") or input_tokens)
+        output_tokens = int(usage.get("completion_tokens") or output_tokens)
+
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        finish = choice.get("finish_reason")
+        if finish:
+            stop_reason = _OPENAI_FINISH_TO_STOP.get(finish, "end_turn")
+
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+        if reasoning and show_thinking:
+            if text_open:
+                yield ("content_block_stop", {"type": "content_block_stop", "index": text_index})
+                text_open = False
+            if not thinking_open:
+                thinking_index = next_index
+                next_index += 1
+                yield (
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": thinking_index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    },
+                )
+                thinking_open = True
+            yield (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": thinking_index,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                },
+            )
+
+        content = delta.get("content") or ""
+        if content:
+            if thinking_open:
+                yield (
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": thinking_index},
+                )
+                thinking_open = False
+            if not text_open:
+                text_index = next_index
+                next_index += 1
+                yield (
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": text_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
+                text_open = True
+            yield (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": text_index,
+                    "delta": {"type": "text_delta", "text": content},
+                },
+            )
+
+        for tc in delta.get("tool_calls") or []:
+            idx = int(tc.get("index") or 0)
+            acc = pending_tools.setdefault(
+                idx,
+                {"id": tc.get("id") or f"call_{idx}", "name": "", "arguments": ""},
+            )
+            if tc.get("id"):
+                acc["id"] = tc["id"]
+            fn = (tc.get("function") if isinstance(tc, dict) else None) or {}
+            if fn.get("name"):
+                acc["name"] = fn["name"]
+            if fn.get("arguments"):
+                acc["arguments"] += fn["arguments"]
+
+    if thinking_open:
+        yield ("content_block_stop", {"type": "content_block_stop", "index": thinking_index})
+    if text_open:
+        yield ("content_block_stop", {"type": "content_block_stop", "index": text_index})
+
+    for idx in sorted(pending_tools):
+        tool = pending_tools[idx]
+        block_index = next_index
+        next_index += 1
+        args = _parse_openai_arguments(tool.get("arguments"))
+        yield (
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool.get("id") or f"call_{idx}",
+                    "name": tool.get("name", ""),
+                    "input": {},
+                },
+            },
+        )
+        yield (
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": json.dumps(args, ensure_ascii=False),
+                },
+            },
+        )
+        yield ("content_block_stop", {"type": "content_block_stop", "index": block_index})
+
+    yield (
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        },
+    )
+    yield ("message_stop", {"type": "message_stop"})
 
 
 async def ollama_stream_to_anthropic_events(
@@ -479,7 +933,11 @@ async def ollama_stream_to_anthropic_events(
 
 __all__ = [
     "anthropic_to_ollama_chat",
+    "anthropic_to_openai_chat",
     "ollama_chat_to_anthropic",
+    "openai_chat_to_anthropic",
     "ollama_stream_to_anthropic_events",
     "ollama_stream_to_anthropic_sse",
+    "openai_stream_to_anthropic_events",
+    "openai_stream_to_anthropic_sse",
 ]

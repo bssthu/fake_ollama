@@ -197,6 +197,15 @@ class OllamaTarget(BaseModel):
     #   []    -> expose nothing externally (target becomes internal-only).
     #   [...] -> expose only the listed display names.
     expose_external: Optional[List[str]] = None
+    # Optional daemon lifecycle management. Leave ``auto_start`` false when
+    # Ollama is installed as a separately managed service / desktop app.
+    auto_start: bool = False
+    start_command: Optional[str] = None
+    stop_command: Optional[str] = None
+    idle_timeout_seconds: Optional[float] = None
+    startup_timeout_seconds: float = 60.0
+    health_path: str = "/api/version"
+    cwd: Optional[str] = None
 
     model_config = {"extra": "ignore"}  # tolerate legacy ``api_token`` field
 
@@ -204,6 +213,80 @@ class OllamaTarget(BaseModel):
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @field_validator("health_path")
+    @classmethod
+    def _normalise_health_path(cls, v: str) -> str:
+        if not v:
+            return "/api/version"
+        return v if v.startswith("/") else "/" + v
+
+    def matching_model(self, display_name: str) -> Optional[str]:
+        return _find_configured_model(display_name, self.models)
+
+    def resolve_model(self, display_name: str) -> str:
+        configured = self.matching_model(display_name)
+        for key in (display_name, configured, _model_base(display_name)):
+            if key and key in self.model_map:
+                return self.model_map[key]
+        if configured:
+            base = _model_base(configured)
+            if base in self.model_map:
+                return self.model_map[base]
+            return configured
+        return display_name
+
+    def serves(self, display_name: str) -> bool:
+        return self.matching_model(display_name) is not None
+
+    def exposes(self, display_name: str) -> bool:
+        configured = self.matching_model(display_name)
+        if not configured:
+            return False
+        if self.expose_external is None:
+            return True
+        return _find_configured_model(configured, self.expose_external) is not None
+
+
+class LlamaCppTarget(BaseModel):
+    """A llama.cpp server exposed through fake-ollama's reverse proxy.
+
+    llama.cpp server speaks OpenAI-compatible ``/v1/chat/completions`` and
+    ``/v1/models``. fake-ollama aggregates these targets on the same external
+    ``/v1/*`` surface as ``ollama_targets`` and can optionally manage the
+    server process lifecycle with a configured start command and idle timeout.
+    """
+
+    name: str
+    base_url: str = "http://127.0.0.1:8080"
+    auth_token: str = ""
+    models: List[str] = Field(default_factory=list)
+    model_map: Dict[str, str] = Field(default_factory=dict)
+    expose_external: Optional[List[str]] = None
+
+    # Optional lifecycle management. If ``auto_start`` is true and the health
+    # check fails, fake-ollama runs ``start_command`` before forwarding the
+    # request. ``idle_timeout_seconds`` stops only processes started by this
+    # fake-ollama instance unless ``stop_command`` is configured.
+    auto_start: bool = False
+    start_command: Optional[str] = None
+    stop_command: Optional[str] = None
+    idle_timeout_seconds: Optional[float] = None
+    startup_timeout_seconds: float = 120.0
+    health_path: str = "/health"
+    cwd: Optional[str] = None
+
+    @field_validator("base_url")
+    @classmethod
+    def _strip_trailing_slash(cls, v: str) -> str:
+        return v.rstrip("/")
+
+    @field_validator("health_path")
+    @classmethod
+    def _normalise_health_path(cls, v: str) -> str:
+        if not v:
+            return "/health"
+        return v if v.startswith("/") else "/" + v
 
     def matching_model(self, display_name: str) -> Optional[str]:
         return _find_configured_model(display_name, self.models)
@@ -259,6 +342,7 @@ class Settings(BaseModel):
     enforce_context_limit: bool = True
     upstreams: List[Upstream] = Field(default_factory=list)
     ollama_targets: List[OllamaTarget] = Field(default_factory=list)
+    llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
     model_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
     # Web admin UI (mounted at /admin). Set to false to disable entirely.
@@ -281,6 +365,9 @@ class Settings(BaseModel):
         target_names = [t.name for t in self.ollama_targets]
         if len(set(target_names)) != len(target_names):
             raise ValueError(f"Duplicate ollama_target names: {target_names}")
+        llama_target_names = [t.name for t in self.llama_cpp_targets]
+        if len(set(llama_target_names)) != len(llama_target_names):
+            raise ValueError(f"Duplicate llama_cpp_target names: {llama_target_names}")
         # Normalize tokens: drop blanks and dedupe.
         seen: Dict[str, None] = {}
         for tk in self.external_access_tokens:
@@ -307,9 +394,9 @@ class Settings(BaseModel):
 
     @property
     def reverse_proxy_models(self) -> List[str]:
-        """ollama_target model names visible on /v1/* (subject to expose_external)."""
+        """Local target model names visible on /v1/* (subject to expose_external)."""
         seen: Dict[str, None] = {}
-        for t in self.ollama_targets:
+        for t in [*self.ollama_targets, *self.llama_cpp_targets]:
             allowed = t.models if t.expose_external is None else [
                 m for m in t.models if m in set(t.expose_external)
             ]
@@ -345,6 +432,9 @@ class Settings(BaseModel):
         [...] = subset).
         """
         for t in self.ollama_targets:
+            if t.exposes(display_name):
+                return True
+        for t in self.llama_cpp_targets:
             if t.exposes(display_name):
                 return True
         for up in self.upstreams:
@@ -413,6 +503,14 @@ class Settings(BaseModel):
                 return t
         return None
 
+    def llama_cpp_target_for(self, display_name: str):
+        """Return the LlamaCppTarget that should serve the given display name,
+        or ``None`` if no target serves it."""
+        for t in self.llama_cpp_targets:
+            if t.serves(display_name):
+                return t
+        return None
+
     def profile_for(self, display_name: str) -> ModelProfile:
         raw = self.model_profiles.get(display_name)
         if raw is None:
@@ -429,6 +527,12 @@ class Settings(BaseModel):
                     break
         if raw is None:
             for target in self.ollama_targets:
+                configured = target.matching_model(display_name)
+                if configured and configured in self.model_profiles:
+                    raw = self.model_profiles[configured]
+                    break
+        if raw is None:
+            for target in self.llama_cpp_targets:
                 configured = target.matching_model(display_name)
                 if configured and configured in self.model_profiles:
                     raw = self.model_profiles[configured]

@@ -33,6 +33,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .anthropic_client import AnthropicClient
 from .config import Settings
+from .llama_cpp_client import LlamaCppClient
 from .ollama_client import OllamaClient
 
 
@@ -78,6 +79,51 @@ OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "【External 反向代理】从 models 里选出允许出现在 /v1/models 与 /v1/messages 的子集。不勾该字段 = 全部暴露到外部（默认）；勾上后留空 = 全部隐藏（仅本机可用）；勾上后选部分 = 只暴露选中的"},
     {"key": "model_map", "type": "string_map", "default": {},
      "description": "可选：显示名 → Ollama 模型 ID（如 llama3.1 → llama3.1:8b）"},
+    {"key": "auto_start", "type": "bool", "default": False,
+     "description": "请求到来且 health 检查失败时，是否执行 start_command 启动 Ollama daemon"},
+    {"key": "start_command", "type": "string", "default": None,
+     "description": "可选：启动 Ollama daemon 的命令，例如完整路径的 ollama.exe serve"},
+    {"key": "stop_command", "type": "string", "default": None,
+     "description": "可选：停止命令。未配置时，仅会回收 fake-ollama 自己启动的进程"},
+    {"key": "idle_timeout_seconds", "type": "float", "default": None,
+     "description": "可选：空闲超过该秒数后停止 Ollama daemon。通常留空，让 Ollama 自己管理模型卸载"},
+    {"key": "startup_timeout_seconds", "type": "float", "default": 60.0,
+     "description": "auto_start 后等待 health 变为可用的最长秒数"},
+    {"key": "health_path", "type": "string", "default": "/api/version",
+     "description": "健康检查路径；Ollama 默认为 /api/version"},
+    {"key": "cwd", "type": "string", "default": None,
+     "description": "可选：执行 start_command / stop_command 时的工作目录"},
+]
+
+LLAMA_CPP_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "name", "type": "string", "default": "", "required": True,
+     "description": "唯一名字"},
+    {"key": "base_url", "type": "string", "default": "http://127.0.0.1:8080",
+     "description": "llama.cpp server URL，例如 http://127.0.0.1:21436"},
+    {"key": "auth_token", "type": "string", "default": "", "secret": True,
+     "description": "可选：llama.cpp --api-key；fake-ollama 调用该 target 时会带上 Bearer / x-api-key"},
+    {"key": "models", "type": "string_list", "default": [],
+     "autocomplete": "model_names",
+     "description": "【Reverse / OpenAI 兼容入口】该 llama.cpp target 可服务的模型显示名（一行一个），用于 /v1/messages 与 external 端口的 /v1/chat/completions"},
+    {"key": "expose_external", "type": "string_list_subset_of",
+     "default": None, "subset_of": "models",
+     "description": "【External 反向代理】从 models 里选出允许出现在 /v1/models 与 /v1/messages 的子集。不勾该字段 = 全部暴露到外部（默认）；勾上后留空 = 全部隐藏；勾上后选部分 = 只暴露选中的"},
+    {"key": "model_map", "type": "string_map", "default": {},
+     "description": "可选：显示名 → llama.cpp --alias / OpenAI model ID"},
+    {"key": "auto_start", "type": "bool", "default": False,
+     "description": "请求到来且 health 检查失败时，是否执行 start_command 启动 llama.cpp"},
+    {"key": "start_command", "type": "string", "default": None,
+     "description": "可选：启动 llama.cpp server 的命令；长驻进程会由 fake-ollama 持有"},
+    {"key": "stop_command", "type": "string", "default": None,
+     "description": "可选：停止命令。未配置时，仅会回收 fake-ollama 自己启动的进程"},
+    {"key": "idle_timeout_seconds", "type": "float", "default": None,
+     "description": "可选：空闲超过该秒数后停止 llama.cpp。留空表示不做 idle 回收"},
+    {"key": "startup_timeout_seconds", "type": "float", "default": 120.0,
+     "description": "auto_start 后等待 health 变为可用的最长秒数"},
+    {"key": "health_path", "type": "string", "default": "/health",
+     "description": "健康检查路径；llama.cpp server 默认为 /health"},
+    {"key": "cwd", "type": "string", "default": None,
+     "description": "可选：执行 start_command / stop_command 时的工作目录"},
 ]
 
 MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
@@ -131,6 +177,10 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
      "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
      "detect_models": "ollama",
      "description": "本机 Ollama 服务，用于反向代理 POST /v1/messages。访问鉴权使用上方 external_access_tokens"},
+    {"key": "llama_cpp_targets", "type": "object_list", "default": [], "group": "llamacpp",
+     "item_schema": LLAMA_CPP_TARGET_ITEM_SCHEMA,
+     "detect_models": "llama_cpp",
+     "description": "llama.cpp server（OpenAI 兼容），用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions；可选接管启动与 idle 回收"},
     {"key": "model_profiles", "type": "object_map", "default": {}, "group": "profiles",
      "item_schema": MODEL_PROFILE_ITEM_SCHEMA,
      "key_autocomplete": "model_names",
@@ -143,6 +193,7 @@ GROUP_LABELS: List[Dict[str, str]] = [
     {"key": "behavior", "label": "Behavior", "hint": "超时、max_tokens、代理、context 限制"},
     {"key": "upstreams", "label": "Upstreams (forward)", "hint": "Anthropic 兼容上游"},
     {"key": "ollama", "label": "Ollama Targets (reverse)", "hint": "本机 Ollama 反向代理"},
+    {"key": "llamacpp", "label": "llama.cpp Targets (reverse)", "hint": "本机 / 远端 llama.cpp OpenAI 兼容服务 + 生命周期"},
     {"key": "profiles", "label": "Model Profiles", "hint": "每个模型的能力与上下文"},
 ]
 
@@ -792,7 +843,7 @@ function collectKnownModelNames() {
     }
   }
   for (const {field, r} of topRenderers) {
-    if (field.key === 'upstreams' || field.key === 'ollama_targets') walkList(r);
+    if (field.key === 'upstreams' || field.key === 'ollama_targets' || field.key === 'llama_cpp_targets') walkList(r);
     if (field.key === 'model_profiles' && r && typeof r.read === 'function') {
       const m = r.read();
       if (m && typeof m === 'object') for (const k of Object.keys(m)) if (k) out.add(k);
@@ -1064,6 +1115,7 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     """Atomically replace app.state.settings and rebuild client pools."""
     old_clients: Dict[str, AnthropicClient] = dict(getattr(app.state, "clients", {}))
     old_ollama: Dict[str, OllamaClient] = dict(getattr(app.state, "ollama_clients", {}))
+    old_llama_cpp: Dict[str, LlamaCppClient] = dict(getattr(app.state, "llama_cpp_clients", {}))
 
     new_clients: Dict[str, AnthropicClient] = {}
     for up in new_settings.upstreams:
@@ -1079,11 +1131,37 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             tgt.base_url,
             timeout=new_settings.timeout_seconds,
             trust_env=new_settings.use_system_proxy,
+          auto_start=tgt.auto_start,
+          start_command=tgt.start_command,
+          stop_command=tgt.stop_command,
+          idle_timeout_seconds=tgt.idle_timeout_seconds,
+          startup_timeout_seconds=tgt.startup_timeout_seconds,
+          health_path=tgt.health_path,
+          cwd=tgt.cwd,
+        )
+    new_llama_cpp: Dict[str, LlamaCppClient] = {}
+    for tgt in new_settings.llama_cpp_targets:
+        new_llama_cpp[tgt.name] = LlamaCppClient(
+            tgt.base_url,
+            auth_token=tgt.auth_token,
+            timeout=new_settings.timeout_seconds,
+            trust_env=new_settings.use_system_proxy,
+            auto_start=tgt.auto_start,
+            start_command=tgt.start_command,
+            stop_command=tgt.stop_command,
+            idle_timeout_seconds=tgt.idle_timeout_seconds,
+            startup_timeout_seconds=tgt.startup_timeout_seconds,
+            health_path=tgt.health_path,
+            cwd=tgt.cwd,
         )
 
     app.state.settings = new_settings
     app.state.clients = new_clients
     app.state.ollama_clients = new_ollama
+    app.state.llama_cpp_clients = new_llama_cpp
+    ensure_idle_monitor = getattr(app.state, "ensure_local_target_idle_monitor", None)
+    if ensure_idle_monitor is not None:
+      ensure_idle_monitor(app)
 
     for c in old_clients.values():
         try:
@@ -1091,6 +1169,11 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
         except Exception:  # pragma: no cover
             pass
     for c in old_ollama.values():
+        try:
+            await c.aclose()
+        except Exception:  # pragma: no cover
+            pass
+    for c in old_llama_cpp.values():
         try:
             await c.aclose()
         except Exception:  # pragma: no cover
@@ -1191,6 +1274,25 @@ def register_admin_routes(app: FastAPI) -> None:
                         for m in (data.get("data") or [])
                         if isinstance(m, dict) and m.get("id")
                     ]
+                elif kind == "llama_cpp":
+                    headers = {}
+                    if token:
+                        headers["x-api-key"] = token
+                        headers["authorization"] = f"Bearer {token}"
+                    resp = await cli.get(base_url + "/v1/models", headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    names = [
+                        m.get("id")
+                        for m in (data.get("data") or [])
+                        if isinstance(m, dict) and m.get("id")
+                    ]
+                    if not names:
+                        names = [
+                            m.get("name") or m.get("model")
+                            for m in (data.get("models") or [])
+                            if isinstance(m, dict) and (m.get("name") or m.get("model"))
+                        ]
                 else:
                     raise HTTPException(
                         status_code=400, detail=f"unknown kind: {kind!r}"

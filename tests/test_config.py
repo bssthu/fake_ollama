@@ -190,6 +190,10 @@ def test_tagless_request_only_matches_latest_tag():
                 "name": "local",
                 "base_url": "http://127.0.0.1:11434",
                 "models": ["qwen3.6-27b:q2_k_p"],
+                "auto_start": True,
+                "start_command": "ollama serve",
+                "idle_timeout_seconds": 900,
+                "health_path": "api/version",
             }
         ],
     )
@@ -198,6 +202,44 @@ def test_tagless_request_only_matches_latest_tag():
     assert s.upstream_name_for("qwen3.6-27b") == "u1"
     assert s.ollama_target_for("qwen3.6-27b:q2_k_p") is not None
     assert s.ollama_target_for("qwen3.6-27b") is None
+    target = s.ollama_target_for("qwen3.6-27b:q2_k_p")
+    assert target.auto_start is True
+    assert target.start_command == "ollama serve"
+    assert target.health_path == "/api/version"
+
+
+def test_llama_cpp_target_routing_and_profile():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u1",
+                "base_url": "https://first.example.com",
+                "auth_token": "tok",
+                "models": ["fallback"],
+            }
+        ],
+        llama_cpp_targets=[
+            {
+                "name": "qwen36",
+                "base_url": "http://127.0.0.1:21436/",
+                "models": ["qwen3.6:latest"],
+                "model_map": {"qwen3.6": "qwen3.6-alias"},
+                "auto_start": True,
+                "start_command": "run-qwen36",
+                "idle_timeout_seconds": 1800,
+                "health_path": "health",
+            }
+        ],
+        model_profiles={"qwen3.6:latest": {"context_length": 262144}},
+    )
+
+    target = s.llama_cpp_target_for("qwen3.6")
+    assert target is not None
+    assert target.base_url == "http://127.0.0.1:21436"
+    assert target.health_path == "/health"
+    assert target.resolve_model("qwen3.6") == "qwen3.6-alias"
+    assert s.reverse_proxy_models == ["qwen3.6:latest"]
+    assert s.profile_for("qwen3.6").context_length == 262144
 
 
 def test_routes_request_to_correct_upstream(monkeypatch, tmp_path):

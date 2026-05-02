@@ -63,7 +63,14 @@ def test_admin_schema(admin_settings):
     schema = resp.json()
     fields = schema["fields"]
     keys = {f["key"] for f in fields}
-    assert {"host", "port", "upstreams", "ollama_targets", "model_profiles"} <= keys
+    assert {
+        "host",
+        "port",
+        "upstreams",
+        "ollama_targets",
+        "llama_cpp_targets",
+        "model_profiles",
+    } <= keys
     upstreams = next(f for f in fields if f["key"] == "upstreams")
     assert upstreams["required"] is True
     assert upstreams["type"] == "object_list"
@@ -74,9 +81,31 @@ def test_admin_schema(admin_settings):
     ollama = next(f for f in fields if f["key"] == "ollama_targets")
     item_keys = {f["key"] for f in ollama["item_schema"]}
     assert "api_token" not in item_keys
-    assert {"name", "base_url", "models"} <= item_keys
+    assert {
+        "name",
+        "base_url",
+        "models",
+        "auto_start",
+        "start_command",
+        "idle_timeout_seconds",
+        "health_path",
+    } <= item_keys
     ollama_models = next(f for f in ollama["item_schema"] if f["key"] == "models")
     assert ollama_models["autocomplete"] == "model_names"
+    llama_cpp = next(f for f in fields if f["key"] == "llama_cpp_targets")
+    assert llama_cpp["detect_models"] == "llama_cpp"
+    llama_item_keys = {f["key"] for f in llama_cpp["item_schema"]}
+    assert {
+        "name",
+        "base_url",
+        "auth_token",
+        "models",
+        "auto_start",
+        "start_command",
+        "idle_timeout_seconds",
+    } <= llama_item_keys
+    llama_models = next(f for f in llama_cpp["item_schema"] if f["key"] == "models")
+    assert llama_models["autocomplete"] == "model_names"
     # external_access_tokens lives at the Settings level with secret_each + generate_each.
     ext = next(f for f in fields if f["key"] == "external_access_tokens")
     assert ext["type"] == "string_list"
@@ -117,6 +146,10 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
             {"name": "local", "base_url": "http://127.0.0.1:11434",
              "models": ["llama3.1"]}
         ],
+        "llama_cpp_targets": [
+            {"name": "qwen36", "base_url": "http://127.0.0.1:21436",
+             "models": ["qwen3.6"], "auto_start": False}
+        ],
     }
     with client:
         resp = client.put("/admin/config", json=new_cfg)
@@ -126,6 +159,7 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
         assert app.state.settings.upstreams[0].name == "newup"
         assert "newup" in app.state.clients
         assert "local" in app.state.ollama_clients
+        assert "qwen36" in app.state.llama_cpp_clients
         # File on disk must reflect the change.
         cfg_path = Path(admin_settings.config_path)
         on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -240,6 +274,48 @@ def test_admin_probe_models_anthropic(admin_settings, monkeypatch: pytest.Monkey
     ]
     # Auth header forwarded.
     assert captured["headers"].get("x-api-key") == "sk-ant-test"
+    assert captured["url"].endswith("/v1/models")
+
+
+def test_admin_probe_models_llama_cpp(admin_settings, monkeypatch: pytest.MonkeyPatch):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "qwen3.6-27b-hauhau-q2kp", "object": "model"}
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client_cls = httpx.AsyncClient
+
+    def fake_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        kwargs.pop("trust_env", None)
+        return real_client_cls(**kwargs)
+
+    monkeypatch.setattr("fake_ollama.admin.httpx.AsyncClient", fake_async_client)
+
+    client = TestClient(create_app(admin_settings))
+    with client:
+        resp = client.post(
+            "/admin/probe-models",
+            json={
+                "kind": "llama_cpp",
+                "base_url": "http://127.0.0.1:21436",
+                "auth_token": "local-key",
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"models": ["qwen3.6-27b-hauhau-q2kp"]}
+    assert captured["headers"].get("authorization") == "Bearer local-key"
     assert captured["url"].endswith("/v1/models")
 
 

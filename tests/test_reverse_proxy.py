@@ -47,6 +47,33 @@ class _FakeOllamaClient:
         return None
 
 
+class _FakeLlamaCppClient:
+    idle_timeout_seconds = None
+
+    def __init__(
+        self,
+        chat_response: Optional[Dict[str, Any]] = None,
+        stream_chunks: Optional[List[Dict[str, Any]]] = None,
+    ):
+        self.chat_response = chat_response or {}
+        self.stream_chunks = stream_chunks or []
+        self.last_chat_payload: Optional[Dict[str, Any]] = None
+        self.last_stream_payload: Optional[Dict[str, Any]] = None
+
+    async def chat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self.last_chat_payload = payload
+        return self.chat_response
+
+    async def stream_chat(self, payload: Dict[str, Any]) -> AsyncIterator[str]:
+        self.last_stream_payload = payload
+        for chunk in self.stream_chunks:
+            yield "data: " + json.dumps(chunk)
+        yield "data: [DONE]"
+
+    async def aclose(self) -> None:  # pragma: no cover - nothing to do
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Settings helpers
 # ---------------------------------------------------------------------------
@@ -81,6 +108,7 @@ def _build_client(
     settings: Settings,
     *,
     fake_ollama: Optional[_FakeOllamaClient] = None,
+    fake_llama_cpp: Optional[_FakeLlamaCppClient] = None,
     upstream_transport: Optional[httpx.MockTransport] = None,
     base_url: str = "http://testserver",
 ) -> TestClient:
@@ -90,6 +118,11 @@ def _build_client(
     app.state.ollama_clients = (
         {tgt.name: fake_ollama for tgt in settings.ollama_targets}
         if fake_ollama is not None
+        else {}
+    )
+    app.state.llama_cpp_clients = (
+        {tgt.name: fake_llama_cpp for tgt in settings.llama_cpp_targets}
+        if fake_llama_cpp is not None
         else {}
     )
     if upstream_transport is not None:
@@ -378,6 +411,231 @@ def test_openai_chat_stream_routes_to_ollama_target(reverse_settings):
         f["choices"][0]["delta"].get("content", "") or "" for f in frames
     ) == "hello"
     assert frames[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {
+            "name": "qwen36",
+            "base_url": "http://127.0.0.1:21436",
+            "models": ["qwen3.6"],
+            "model_map": {"qwen3.6": "qwen3.6-alias"},
+        }
+    ]
+    data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
+    settings = Settings(**data)
+    fake = _FakeLlamaCppClient(
+        chat_response={
+            "id": "chatcmpl_local",
+            "object": "chat.completion",
+            "model": "qwen3.6-alias",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "hi from llama.cpp",
+                        "reasoning_content": "hidden",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
+        }
+    )
+    client = _build_client(settings, fake_llama_cpp=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.6",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model"] == "qwen3.6"
+    assert body["content"] == [{"type": "text", "text": "hi from llama.cpp"}]
+    assert body["usage"] == {"input_tokens": 8, "output_tokens": 4}
+    sent = fake.last_chat_payload
+    assert sent["model"] == "qwen3.6-alias"
+    assert sent["messages"] == [{"role": "user", "content": "hello"}]
+    assert sent["max_tokens"] == 100
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_reverse_forwards_base64_image_to_llama_cpp(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {"name": "qwen36", "models": ["qwen3.6"], "base_url": "http://x.test"}
+    ]
+    settings = Settings(**data)
+    fake = _FakeLlamaCppClient(
+        chat_response={
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "saw it"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+    )
+    image_data = "ZmFrZS1wbmc="
+    client = _build_client(settings, fake_llama_cpp=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.6",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_data,
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                },
+            ],
+        }
+    ]
+
+
+def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {
+            "name": "qwen36",
+            "base_url": "http://127.0.0.1:21436",
+            "models": ["qwen3.6"],
+            "model_map": {"qwen3.6": "qwen3.6-alias"},
+        }
+    ]
+    settings = Settings(**data)
+    fake = _FakeLlamaCppClient(
+        chat_response={
+            "id": "chatcmpl_local",
+            "object": "chat.completion",
+            "model": "qwen3.6-alias",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "direct openai"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+    client = _build_client(settings, fake_llama_cpp=fake)
+    with client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3.6",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "qwen3.6"
+    assert resp.json()["choices"][0]["message"]["content"] == "direct openai"
+    assert fake.last_chat_payload["model"] == "qwen3.6-alias"
+
+
+def test_reverse_streaming_routes_to_llama_cpp_target(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "models": ["qwen3.6"]}
+    ]
+    data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
+    settings = Settings(**data)
+    fake = _FakeLlamaCppClient(
+        stream_chunks=[
+            {
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {"index": 0, "delta": {"content": "hel"}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {"index": 0, "delta": {"content": "lo"}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+            },
+        ]
+    )
+    client = _build_client(settings, fake_llama_cpp=fake)
+    with client:
+        with client.stream(
+            "POST",
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.6",
+                "stream": True,
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            raw = b"".join(resp.iter_bytes()).decode("utf-8")
+
+    assert fake.last_stream_payload["model"] == "qwen3.6"
+    assert "event: message_start" in raw
+    assert '"text": "hel"' in raw
+    assert '"text": "lo"' in raw
+    assert '"stop_reason": "end_turn"' in raw
+
+
+def test_v1_models_includes_llama_cpp_targets_when_authed(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "models": ["qwen3.6"]}
+    ]
+    settings = Settings(**data)
+    client = _build_client(settings, fake_llama_cpp=_FakeLlamaCppClient())
+    with client:
+        r = client.get("/v1/models", headers=_AUTH)
+    assert r.status_code == 200
+    ids = [m["id"] for m in r.json()["data"]]
+    assert "qwen3.6" in ids
 
 
 def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
