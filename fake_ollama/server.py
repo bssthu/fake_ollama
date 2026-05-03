@@ -194,6 +194,8 @@ def _bearer_or_api_key(request: Request) -> str:
     return ""
 
 
+# Path prefixes that are only served by the admin listener when admin_port is set.
+_ADMIN_ONLY_PATH_PREFIXES = ("/admin",)
 # Path prefixes that are only served by the external reverse-proxy listener.
 _EXTERNAL_ONLY_PATH_PREFIXES = ("/v1/messages", "/v1/models")
 # Paths available on both listeners. The handler may still choose different
@@ -215,26 +217,38 @@ def _is_external_request(request: Request) -> bool:
 
 
 def _install_port_router(app: FastAPI) -> None:
-    """When an external listener is configured, split routes by listen port.
+    """Split admin/internal/external routes by listen port.
 
+    - Admin port (settings.admin_port) serves only /admin/*.
     - External port (settings.external_port) serves the external-only routes
       plus selected shared /v1 routes.
     - Internal port serves everything EXCEPT the external-only routes; shared
       /v1 routes can use the local port to choose their backend.
 
-    No-op when no external listener is configured (single-port mode).
+    If admin_port is null, /admin stays on the internal listener as an
+    explicit legacy/single-port choice.
     """
 
     @app.middleware("http")
     async def _split(request: Request, call_next):
         settings: Settings = request.app.state.settings
-        if not settings.external_listener_enabled:
-            return await call_next(request)
         # ASGI scope["server"] is (host, port) of the local socket.
         server = request.scope.get("server") or (None, None)
         local_port = server[1] if isinstance(server, (tuple, list)) and len(server) > 1 else None
-        external = local_port == settings.external_port
         path = request.url.path
+
+        admin_only = _has_path_prefix(path, _ADMIN_ONLY_PATH_PREFIXES)
+        if settings.admin_listener_enabled:
+            admin = local_port == settings.admin_port
+            if admin and not admin_only:
+                return JSONResponse({"detail": "not found"}, status_code=404)
+            if (not admin) and admin_only:
+                return JSONResponse({"detail": "not found"}, status_code=404)
+
+        if not settings.external_listener_enabled:
+            return await call_next(request)
+
+        external = local_port == settings.external_port
         external_only = _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES)
         shared = _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES)
         if external and not (external_only or shared):

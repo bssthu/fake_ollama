@@ -12,13 +12,13 @@ Three small endpoints back the UI:
 The HTML page reads ``schema`` and ``config`` and renders one labelled
 input per field (with description and a "use this field" checkbox so the
 user can drop a field back to its default). Object lists
-(``upstreams`` / ``ollama_targets``) and the ``model_profiles`` map are
+(``upstreams`` / ``ollama_targets`` / ``llama_cpp_targets``) and the ``model_profiles`` map are
 rendered as repeatable groups with add/remove buttons. A "raw JSON"
 toggle is kept as an escape hatch.
 
-Security: there is **no** authentication. Disable via
-``"admin_enabled": false`` if the service is reachable from anything
-other than localhost.
+Security: there is **no** authentication. Keep the admin listener on
+localhost, or disable via ``"admin_enabled": false`` if the service is
+reachable from anything untrusted.
 """
 
 from __future__ import annotations
@@ -143,58 +143,66 @@ MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 CONFIG_SCHEMA: List[Dict[str, Any]] = [
-    {"key": "host", "type": "string", "default": "127.0.0.1", "group": "server",
-     "description": "内部监听地址（/admin + Ollama 兼容 /api/*）。生产环境请保持 127.0.0.1"},
-    {"key": "port", "type": "int", "default": 21434, "group": "server",
-     "description": "内部监听端口"},
-    {"key": "advertised_version", "type": "string", "default": "0.6.4", "group": "server",
-     "description": "GET /api/version 返回的版本号"},
-    {"key": "admin_enabled", "type": "bool", "default": True, "group": "server",
-     "description": "是否启用本 /admin 编辑器（关闭后需手动改 config.json）"},
+  {"key": "host", "type": "string", "default": "127.0.0.1", "group": "forward_listener",
+   "description": "正向代理的内部监听地址（Ollama 兼容 /api/*）。生产环境请保持 127.0.0.1"},
+  {"key": "port", "type": "int", "default": 21434, "group": "forward_listener",
+   "description": "正向代理的内部监听端口"},
+  {"key": "advertised_version", "type": "string", "default": "0.6.4", "group": "forward_listener",
+   "description": "仅用于 Ollama 兼容入口的 GET /api/version 返回值，不影响 /v1/* 接口"},
 
-    {"key": "external_host", "type": "string", "default": None, "group": "external",
-     "description": "对外服务监听地址。填 127.0.0.1 仅本机（推荐 + Nginx）；填 0.0.0.0 直接对外。不填则不启用独立对外端口"},
-    {"key": "external_port", "type": "int", "default": None, "group": "external",
-     "description": "对外服务监听端口。填了才会启用独立端口（/v1/messages + /v1/models 仅在该端口提供，其他路由仅在内部端口）"},
-    {"key": "external_access_tokens", "type": "string_list", "default": [], "group": "external",
-     "secret_each": True, "generate_each": True,
-     "description": "外部访问 token 湠；客户端调用 /v1/messages 或 /v1/models 需携带其中任一（x-api-key 或 Authorization: Bearer）。启用独立对外端口时必填至少一个"},
+  {"key": "upstreams", "type": "object_list", "default": [], "group": "forward_upstreams",
+   "required": True, "item_schema": UPSTREAM_ITEM_SCHEMA,
+   "detect_models": "anthropic",
+   "description": "至少一个远端 Anthropic 兼容上游；用于把远端 API 伪装成本机 Ollama"},
 
-    {"key": "default_max_tokens", "type": "int", "default": 4096, "group": "behavior",
-     "description": "客户端没传 num_predict 时使用"},
-    {"key": "timeout_seconds", "type": "float", "default": 300.0, "group": "behavior",
-     "description": "上游请求超时（秒）"},
-    {"key": "use_system_proxy", "type": "bool", "default": False, "group": "behavior",
-     "description": "是否走系统代理（Clash/V2Ray 用户通常关）"},
-    {"key": "enforce_context_limit", "type": "bool", "default": True, "group": "behavior",
-     "description": "估算输入+max_tokens 超过 context_length 时直接 400"},
+  {"key": "external_host", "type": "string", "default": None, "group": "reverse_listener",
+   "description": "反向代理对外服务监听地址。填 127.0.0.1 仅本机（推荐 + Nginx）；填 0.0.0.0 直接对外。不填则不启用独立对外端口"},
+  {"key": "external_port", "type": "int", "default": None, "group": "reverse_listener",
+   "description": "反向代理对外服务监听端口。填了才会启用独立端口（/v1/messages + /v1/models 仅在该端口提供）"},
+  {"key": "external_access_tokens", "type": "string_list", "default": [], "group": "reverse_listener",
+   "secret_each": True, "generate_each": True,
+   "description": "external /v1/* 访问 token 池；客户端调用 /v1/messages、/v1/models 或 external 端口的 /v1/chat/completions 时需携带其中任一（x-api-key 或 Authorization: Bearer）"},
 
-    {"key": "upstreams", "type": "object_list", "default": [], "group": "upstreams",
-     "required": True, "item_schema": UPSTREAM_ITEM_SCHEMA,
-     "detect_models": "anthropic",
-     "description": "至少一个 Anthropic 兼容上游"},
-    {"key": "ollama_targets", "type": "object_list", "default": [], "group": "ollama",
-     "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
-     "detect_models": "ollama",
-     "description": "本机 Ollama 服务，用于反向代理 POST /v1/messages。访问鉴权使用上方 external_access_tokens"},
-    {"key": "llama_cpp_targets", "type": "object_list", "default": [], "group": "llamacpp",
-     "item_schema": LLAMA_CPP_TARGET_ITEM_SCHEMA,
-     "detect_models": "llama_cpp",
-     "description": "llama.cpp server（OpenAI 兼容），用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions；可选接管启动与 idle 回收"},
-    {"key": "model_profiles", "type": "object_map", "default": {}, "group": "profiles",
-     "item_schema": MODEL_PROFILE_ITEM_SCHEMA,
-     "key_autocomplete": "model_names",
-     "description": "每个模型的 capabilities / 上下文 / 思维链等设置；key 是模型显示名（输入时会提示已知模型名）"},
+  {"key": "ollama_targets", "type": "object_list", "default": [], "group": "reverse_ollama",
+   "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
+   "detect_models": "ollama",
+   "description": "本机或远端 Ollama 服务；用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions"},
+  {"key": "llama_cpp_targets", "type": "object_list", "default": [], "group": "reverse_llamacpp",
+   "item_schema": LLAMA_CPP_TARGET_ITEM_SCHEMA,
+   "detect_models": "llama_cpp",
+   "description": "llama.cpp server（OpenAI 兼容）；用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions；可选接管启动与 idle 回收"},
+
+  {"key": "default_max_tokens", "type": "int", "default": 4096, "group": "shared_runtime",
+   "description": "缺省的 max_tokens / num_predict；正向与反向转换都会用到"},
+  {"key": "timeout_seconds", "type": "float", "default": 300.0, "group": "shared_runtime",
+   "description": "所有出站 HTTP 调用的超时（上游与本地 target 都会用到）"},
+  {"key": "use_system_proxy", "type": "bool", "default": False, "group": "shared_runtime",
+   "description": "所有出站 HTTP 调用是否走系统代理（Clash/V2Ray 用户通常关）"},
+  {"key": "enforce_context_limit", "type": "bool", "default": True, "group": "shared_runtime",
+   "description": "在带 context_length 的请求上，估算输入+max_tokens 超限时直接 400"},
+
+  {"key": "model_profiles", "type": "object_map", "default": {}, "group": "profiles",
+   "item_schema": MODEL_PROFILE_ITEM_SCHEMA,
+   "key_autocomplete": "model_names",
+   "description": "正向/反向共用的模型 capabilities / 上下文 / 思维链等设置；key 是模型显示名（输入时会提示已知模型名）"},
+
+  {"key": "admin_enabled", "type": "bool", "default": True, "group": "admin",
+   "description": "是否启用本 /admin 编辑器（关闭后需手动改 config.json）"},
+  {"key": "admin_host", "type": "string", "default": "127.0.0.1", "group": "admin",
+   "description": "Admin UI 监听地址。强烈建议保持 127.0.0.1；/admin 没有内置鉴权"},
+  {"key": "admin_port", "type": "int", "default": 21433, "group": "admin",
+   "description": "Admin UI 独立监听端口。设为 null 才会把 /admin 挂回 internal 端口（旧行为，不推荐）"},
 ]
 
 GROUP_LABELS: List[Dict[str, str]] = [
-    {"key": "server", "label": "Server (internal)", "hint": "/admin + Ollama 兼容 /api/* 的监听地址 / 端口"},
-    {"key": "external", "label": "External (reverse proxy)", "hint": "对外暴露的 Anthropic 兼容 /v1/* 端口 + 访问 token"},
-    {"key": "behavior", "label": "Behavior", "hint": "超时、max_tokens、代理、context 限制"},
-    {"key": "upstreams", "label": "Upstreams (forward)", "hint": "Anthropic 兼容上游"},
-    {"key": "ollama", "label": "Ollama Targets (reverse)", "hint": "本机 Ollama 反向代理"},
-    {"key": "llamacpp", "label": "llama.cpp Targets (reverse)", "hint": "本机 / 远端 llama.cpp OpenAI 兼容服务 + 生命周期"},
-    {"key": "profiles", "label": "Model Profiles", "hint": "每个模型的能力与上下文"},
+  {"key": "forward_listener", "label": "Local Ollama Facade", "hint": "本机暴露的 Ollama 兼容入口；advertised_version 只影响这里的 /api/version", "section": "forward", "section_label": "Forward Proxy", "section_hint": "远端 Anthropic API -> 本机 Ollama 兼容入口"},
+  {"key": "forward_upstreams", "label": "Remote Upstreams", "hint": "当前为 Anthropic 兼容远端上游；由它们驱动本机 Ollama 兼容入口", "section": "forward", "section_label": "Forward Proxy", "section_hint": "远端 Anthropic API -> 本机 Ollama 兼容入口"},
+  {"key": "reverse_listener", "label": "External API", "hint": "对外暴露的 Anthropic / OpenAI 兼容端口与访问 token", "section": "reverse", "section_label": "Reverse Proxy", "section_hint": "本机模型服务 -> 对外 Anthropic / OpenAI 兼容 API"},
+  {"key": "reverse_ollama", "label": "Ollama Targets", "hint": "反向代理到本机或远端 Ollama 服务", "section": "reverse", "section_label": "Reverse Proxy", "section_hint": "本机模型服务 -> 对外 Anthropic / OpenAI 兼容 API"},
+  {"key": "reverse_llamacpp", "label": "llama.cpp Targets", "hint": "反向代理到 llama.cpp OpenAI 兼容服务，可选生命周期接管", "section": "reverse", "section_label": "Reverse Proxy", "section_hint": "本机模型服务 -> 对外 Anthropic / OpenAI 兼容 API"},
+  {"key": "shared_runtime", "label": "Shared Runtime", "hint": "跨正向 / 反向共用的缺省参数与出站网络设置", "section": "shared", "section_label": "Shared Settings", "section_hint": "两条代理链路都会用到的公共配置"},
+  {"key": "profiles", "label": "Model Profiles", "hint": "跨正向 / 反向共用的模型能力、上下文与 thinking 策略", "section": "shared", "section_label": "Shared Settings", "section_hint": "两条代理链路都会用到的公共配置"},
+  {"key": "admin", "label": "Admin UI", "hint": "配置页面自身的开关与监听地址（无内置鉴权）", "section": "admin", "section_label": "Admin UI", "section_hint": "仅影响 /admin 配置页面本身"},
 ]
 
 
@@ -220,11 +228,20 @@ _INDEX_HTML = r"""<!doctype html>
    border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0; background: rgba(127,127,127,0.04); }
  .sidenav h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888;
    margin: 0.2rem 0.8rem 0.3rem; font-weight: 600; }
- .sidenav a { display: block; padding: 0.4rem 0.8rem; text-decoration: none; color: inherit;
+ .sidenav .nav-section { padding: 0.55rem 0.8rem 0.15rem; font-size: 0.74rem; text-transform: uppercase;
+   letter-spacing: 0.05em; color: #666; font-weight: 700; }
+ .sidenav .nav-section small { display: block; margin-top: 0.12rem; color: #888; font-size: 0.74rem;
+   font-weight: 400; text-transform: none; letter-spacing: normal; line-height: 1.3; }
+ .sidenav a { display: block; padding: 0.4rem 0.8rem 0.4rem 1.1rem; text-decoration: none; color: inherit;
    border-left: 3px solid transparent; font-size: 0.92rem; line-height: 1.25; }
  .sidenav a:hover { background: rgba(127,127,127,0.1); }
  .sidenav a.active { border-left-color: var(--accent); background: rgba(58,123,213,0.1); font-weight: 600; }
  .sidenav a small { display: block; font-size: 0.75rem; color: #888; font-weight: 400; margin-top: 0.1rem; }
+ .section-super { margin: 0 0 0.9rem 0; padding: 0.65rem 0.8rem; border: 1px solid var(--border);
+   border-radius: 6px; background: rgba(58,123,213,0.05); }
+ .section-super .section-title { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;
+   color: #2f5f98; font-weight: 700; }
+ .section-super .section-hint { margin-top: 0.2rem; color: #666; font-size: 0.86rem; }
  section.group-section { margin-bottom: 1.6rem; scroll-margin-top: 5.5rem; }
  section.group-section > h2 { margin: 0 0 0.2rem 0; font-size: 1.1rem; padding-bottom: 0.3rem; border-bottom: 2px solid var(--accent); }
  section.group-section > .group-hint { color: #888; font-size: 0.85rem; margin-bottom: 0.6rem; }
@@ -292,7 +309,7 @@ _INDEX_HTML = r"""<!doctype html>
 
 <div class="sub">file: <code id="path">(loading...)</code></div>
 <div class="warn">
-  <b>Warning:</b> 本编辑器没有鉴权。请仅在 <code>127.0.0.1</code> 使用，或在 <code>config.json</code> 里设置
+  <b>Warning:</b> 本编辑器没有鉴权。请保持 <code>admin_host=127.0.0.1</code>，或在 <code>config.json</code> 里设置
   <code>"admin_enabled": false</code>。保存会原子重建上游连接池。
 </div>
 
@@ -957,10 +974,24 @@ function renderForm(config) {
   }
 
   const sectionEls = [];
+  const renderedSectionBlocks = new Set();
   for (const k of groupOrder) {
     const fields = buckets[k];
     if (!fields || !fields.length) continue;
     const meta = groupMeta[k] || {label: k, hint: ''};
+    const parentSection = meta.section || 'misc';
+    if (!renderedSectionBlocks.has(parentSection)) {
+      renderedSectionBlocks.add(parentSection);
+      const parentLabel = meta.section_label || parentSection;
+      const parentHint = meta.section_hint || '';
+      $form.append(el('div', {class: 'section-super'},
+        el('div', {class: 'section-title'}, parentLabel),
+        parentHint ? el('div', {class: 'section-hint'}, parentHint) : null,
+      ));
+      const navSection = el('div', {class: 'nav-section'}, parentLabel);
+      if (parentHint) navSection.append(el('small', {}, parentHint));
+      $sidenav.append(navSection);
+    }
     const sectionId = 'grp-' + slug(k);
     const section = el('section', {class: 'group-section', id: sectionId},
       el('h2', {}, meta.label || k),

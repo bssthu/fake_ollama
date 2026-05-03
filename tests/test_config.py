@@ -102,6 +102,50 @@ def test_legacy_env_only_creates_default_upstream(monkeypatch):
     assert s.upstreams[0].models == ["claude-3-5-sonnet-20241022"]
 
 
+def test_admin_listener_defaults_and_legacy_null_mode():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u",
+                "base_url": "http://upstream.test",
+                "auth_token": "tk",
+                "models": ["m"],
+            }
+        ]
+    )
+    assert s.admin_host == "127.0.0.1"
+    assert s.admin_port == 21433
+    assert s.admin_listener_enabled is True
+
+    legacy = Settings(
+        admin_port=None,
+        upstreams=[
+            {
+                "name": "u",
+                "base_url": "http://upstream.test",
+                "auth_token": "tk",
+                "models": ["m"],
+            }
+        ],
+    )
+    assert legacy.admin_listener_enabled is False
+
+
+def test_listener_ports_must_be_distinct():
+    with pytest.raises(ValueError, match="conflicts"):
+        Settings(
+            admin_port=21434,
+            upstreams=[
+                {
+                    "name": "u",
+                    "base_url": "http://upstream.test",
+                    "auth_token": "tk",
+                    "models": ["m"],
+                }
+            ],
+        )
+
+
 def test_no_upstream_raises(monkeypatch, tmp_path):
     monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(tmp_path / "missing.json"))
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)

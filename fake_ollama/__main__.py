@@ -28,6 +28,8 @@ def main() -> None:
     )
     parser.add_argument("--host", default=None, help="internal bind host (default from config)")
     parser.add_argument("--port", type=int, default=None, help="internal bind port (default from config)")
+    parser.add_argument("--admin-host", default=None, help="admin bind host (default from config)")
+    parser.add_argument("--admin-port", type=int, default=None, help="admin bind port (default from config)")
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
 
@@ -37,35 +39,59 @@ def main() -> None:
     )
 
     settings = load_settings(config_path=args.config)
-    host = args.host or settings.host
-    port = args.port or settings.port
+    updates = {}
+    if args.host is not None:
+        updates["host"] = args.host
+    if args.port is not None:
+        updates["port"] = args.port
+    if args.admin_host is not None:
+        updates["admin_host"] = args.admin_host
+    if args.admin_port is not None:
+        updates["admin_port"] = args.admin_port
+    if updates:
+        data = settings.model_dump()
+        data.update(updates)
+        settings = type(settings)(**data)
+
+    host = settings.host
+    port = settings.port
 
     app = create_app(settings)
 
-    # Internal listener: /admin + /api/* (+ /v1/* if no external listener).
+    # Internal listener: /api/* (+ /v1/* if no external listener).
     internal_cfg = uvicorn.Config(app, host=host, port=port, log_level=args.log_level)
 
-    if not settings.external_listener_enabled:
-        uvicorn.Server(internal_cfg).run()
+    configs = [("internal", host, port, internal_cfg)]
+    if settings.external_listener_enabled:
+        ext_host = settings.external_host or "127.0.0.1"
+        ext_port = int(settings.external_port)  # type: ignore[arg-type]
+        external_cfg = uvicorn.Config(
+            app, host=ext_host, port=ext_port, log_level=args.log_level
+        )
+        configs.append(("external", ext_host, ext_port, external_cfg))
+    if settings.admin_listener_enabled:
+        admin_cfg = uvicorn.Config(
+            app,
+            host=settings.admin_host,
+            port=int(settings.admin_port),  # type: ignore[arg-type]
+            log_level=args.log_level,
+        )
+        configs.append(("admin", settings.admin_host, int(settings.admin_port), admin_cfg))
+
+    logger.info(
+        "fake-ollama listening on %s",
+        ", ".join(f"{name}={cfg_host}:{cfg_port}" for name, cfg_host, cfg_port, _ in configs),
+    )
+
+    if len(configs) == 1:
+        uvicorn.Server(configs[0][3]).run()
         return
 
-    ext_host = settings.external_host or "127.0.0.1"
-    ext_port = settings.external_port  # type: ignore[assignment]
-    external_cfg = uvicorn.Config(
-        app, host=ext_host, port=int(ext_port), log_level=args.log_level
-    )
-    logger.info(
-        "fake-ollama listening on internal=%s:%s, external=%s:%s",
-        host, port, ext_host, ext_port,
-    )
-
-    async def _run_both() -> None:
-        s1 = uvicorn.Server(internal_cfg)
-        s2 = uvicorn.Server(external_cfg)
-        await asyncio.gather(s1.serve(), s2.serve())
+    async def _run_all() -> None:
+        await asyncio.gather(*(uvicorn.Server(cfg).serve() for _, _, _, cfg in configs))
 
     try:
-        asyncio.run(_run_both())
+        asyncio.run(_run_all())
     except KeyboardInterrupt:
         logger.info("interrupted; exiting")
 

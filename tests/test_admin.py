@@ -13,6 +13,10 @@ from fake_ollama.config import Settings, load_settings
 from fake_ollama.server import create_app
 
 
+def _admin_client(settings: Settings) -> TestClient:
+    return TestClient(create_app(settings), base_url="http://testserver:21433")
+
+
 @pytest.fixture
 def admin_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
     cfg_path = tmp_path / "config.json"
@@ -38,7 +42,7 @@ def admin_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
 
 
 def test_admin_index_html(admin_settings):
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         resp = client.get("/admin/")
     assert resp.status_code == 200
@@ -48,7 +52,7 @@ def test_admin_index_html(admin_settings):
 def test_admin_index_no_trailing_slash(admin_settings):
     """Regression: /admin (no slash) must also serve the page so that the
     JS's relative URL resolution still hits /admin/config not /config."""
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         resp = client.get("/admin", follow_redirects=False)
     # Either it directly serves (200) or redirects to /admin/.
@@ -56,7 +60,7 @@ def test_admin_index_no_trailing_slash(admin_settings):
 
 
 def test_admin_schema(admin_settings):
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         resp = client.get("/admin/schema")
     assert resp.status_code == 200
@@ -66,6 +70,8 @@ def test_admin_schema(admin_settings):
     assert {
         "host",
         "port",
+        "admin_host",
+        "admin_port",
         "upstreams",
         "ollama_targets",
         "llama_cpp_targets",
@@ -111,15 +117,35 @@ def test_admin_schema(admin_settings):
     assert ext["type"] == "string_list"
     assert ext["secret_each"] is True
     assert ext["generate_each"] is True
-    # Groups list is non-empty and every field's group is declared.
-    group_keys = {g["key"] for g in schema["groups"]}
-    assert group_keys
+    # The config page is organized by proxy direction first, then shared/admin.
+    group_order = [g["key"] for g in schema["groups"]]
+    assert group_order == [
+        "forward_listener",
+        "forward_upstreams",
+        "reverse_listener",
+        "reverse_ollama",
+        "reverse_llamacpp",
+        "shared_runtime",
+        "profiles",
+        "admin",
+    ]
+    section_order = []
+    for group in schema["groups"]:
+        if group["section"] not in section_order:
+            section_order.append(group["section"])
+    assert section_order == ["forward", "reverse", "shared", "admin"]
+    field_order = [f["key"] for f in fields]
+    assert field_order[:4] == ["host", "port", "advertised_version", "upstreams"]
+    assert field_order[4:7] == ["external_host", "external_port", "external_access_tokens"]
+    assert field_order[-4] == "model_profiles"
+    assert field_order[-3:] == ["admin_enabled", "admin_host", "admin_port"]
+    group_keys = set(group_order)
     for f in fields:
         assert f["group"] in group_keys
 
 
 def test_admin_get_config(admin_settings):
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         resp = client.get("/admin/config")
     assert resp.status_code == 200
@@ -130,7 +156,7 @@ def test_admin_get_config(admin_settings):
 
 def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
     app = create_app(admin_settings)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://testserver:21433")
     new_cfg = {
         "host": "127.0.0.1",
         "port": 21999,
@@ -167,7 +193,7 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
 
 
 def test_admin_put_invalid_returns_400(admin_settings):
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         # Missing required upstreams -> Settings validator raises.
         resp = client.put("/admin/config", json={"host": "127.0.0.1", "upstreams": []})
@@ -194,10 +220,20 @@ def test_admin_disabled_returns_404(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     )
     monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg_path))
     s = load_settings(config_path=str(cfg_path))
-    client = TestClient(create_app(s))
+    client = _admin_client(s)
     with client:
         resp = client.get("/admin/")
     assert resp.status_code == 404
+
+
+def test_admin_routes_are_only_on_admin_port(admin_settings):
+    app = create_app(admin_settings)
+    with TestClient(app, base_url="http://testserver:21434") as internal:
+        assert internal.get("/admin/").status_code == 404
+        assert internal.get("/api/version").status_code == 200
+    with TestClient(app, base_url="http://testserver:21433") as admin:
+        assert admin.get("/admin/").status_code == 200
+        assert admin.get("/api/version").status_code == 404
 
 
 def test_admin_probe_models_ollama(admin_settings, monkeypatch: pytest.MonkeyPatch):
@@ -226,7 +262,7 @@ def test_admin_probe_models_ollama(admin_settings, monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr("fake_ollama.admin.httpx.AsyncClient", fake_async_client)
 
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         resp = client.post(
             "/admin/probe-models",
@@ -257,7 +293,7 @@ def test_admin_probe_models_anthropic(admin_settings, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("fake_ollama.admin.httpx.AsyncClient", fake_async_client)
 
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         resp = client.post(
             "/admin/probe-models",
@@ -303,7 +339,7 @@ def test_admin_probe_models_llama_cpp(admin_settings, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("fake_ollama.admin.httpx.AsyncClient", fake_async_client)
 
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         resp = client.post(
             "/admin/probe-models",
@@ -320,7 +356,7 @@ def test_admin_probe_models_llama_cpp(admin_settings, monkeypatch: pytest.Monkey
 
 
 def test_admin_probe_models_missing_base_url(admin_settings):
-    client = TestClient(create_app(admin_settings))
+    client = _admin_client(admin_settings)
     with client:
         resp = client.post("/admin/probe-models", json={"kind": "ollama"})
     assert resp.status_code == 400

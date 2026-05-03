@@ -321,7 +321,7 @@ class LlamaCppTarget(BaseModel):
 
 
 class Settings(BaseModel):
-    # ---- Internal listener (admin UI + Ollama-compatible /api/*) --------
+    # ---- Internal listener (Ollama-compatible /api/*) -------------------
     host: str = "127.0.0.1"
     port: int = 21434
     # ---- External listener (reverse-proxy /v1/*; optional) --------------
@@ -334,6 +334,14 @@ class Settings(BaseModel):
     # Required when an external listener is configured. Optional otherwise:
     # if non-empty, /v1/* on the internal listener also requires auth.
     external_access_tokens: List[str] = Field(default_factory=list)
+
+    # ---- Admin listener (/admin/* only) ---------------------------------
+    # The admin UI has no authentication, so it lives on its own localhost
+    # listener by default instead of sharing the Ollama-compatible port.
+    # Set admin_port=null to intentionally mount /admin on the internal
+    # listener (legacy/single-port mode).
+    admin_host: str = "127.0.0.1"
+    admin_port: Optional[int] = 21433
 
     advertised_version: str = "0.6.4"
     default_max_tokens: int = 4096
@@ -368,6 +376,19 @@ class Settings(BaseModel):
         llama_target_names = [t.name for t in self.llama_cpp_targets]
         if len(set(llama_target_names)) != len(llama_target_names):
             raise ValueError(f"Duplicate llama_cpp_target names: {llama_target_names}")
+        enabled_ports = {"internal": self.port}
+        if self.external_port is not None:
+            enabled_ports["external"] = self.external_port
+        if self.admin_enabled and self.admin_port is not None:
+            enabled_ports["admin"] = self.admin_port
+        seen_ports: Dict[int, str] = {}
+        for label, port in enabled_ports.items():
+            if port in seen_ports:
+                raise ValueError(
+                    f"{label}_port={port} conflicts with {seen_ports[port]}_port; "
+                    "internal, external, and admin listeners must use distinct ports"
+                )
+            seen_ports[port] = label
         # Normalize tokens: drop blanks and dedupe.
         seen: Dict[str, None] = {}
         for tk in self.external_access_tokens:
@@ -391,6 +412,10 @@ class Settings(BaseModel):
     @property
     def external_listener_enabled(self) -> bool:
         return self.external_port is not None
+
+    @property
+    def admin_listener_enabled(self) -> bool:
+        return self.admin_enabled and self.admin_port is not None
 
     @property
     def reverse_proxy_models(self) -> List[str]:
@@ -558,6 +583,8 @@ def _parse_bool(value: str) -> bool:
 _ENV_SCALARS: Dict[str, tuple] = {
     "FAKE_OLLAMA_HOST": ("host", str),
     "FAKE_OLLAMA_PORT": ("port", int),
+    "FAKE_OLLAMA_ADMIN_HOST": ("admin_host", str),
+    "FAKE_OLLAMA_ADMIN_PORT": ("admin_port", int),
     "FAKE_OLLAMA_EXTERNAL_HOST": ("external_host", str),
     "FAKE_OLLAMA_EXTERNAL_PORT": ("external_port", int),
     "FAKE_OLLAMA_ADVERTISED_VERSION": ("advertised_version", str),

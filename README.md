@@ -7,19 +7,21 @@
 
 附带一个零依赖的 Web 配置编辑器（`/admin`），不必再手改 JSON。
 
-## 双端口架构
+## 三端口架构
 
-两个方向的部署语义完全不对称，因此监听被拆成两个独立端口：
+配置页面、对内 Ollama 兼容入口、对外反向代理的安全边界不同，因此监听被拆成三个端口：
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  fake_ollama 进程（asyncio.gather 同时跑两个 uvicorn）  │
+│  fake_ollama 进程（asyncio.gather 同时跑多个 uvicorn）  │
+│                                                         │
+│  admin listener     (默认 127.0.0.1:21433)              │
+│    /admin/*     Web 配置编辑器（无内置鉴权）            │
 │                                                         │
 │  internal listener  (默认 127.0.0.1:21434)              │
 │    /                                                    │
 │    /api/*       Ollama 兼容（正向；本机消费）           │
 │    /v1/chat/completions  /v1/embeddings                 │
-│    /admin/*     Web 配置编辑器                          │
 │                                                         │
 │  external listener  (可选；推荐 127.0.0.1:21435)        │
 │    /v1/messages Anthropic 兼容（反向；可对外）          │
@@ -29,9 +31,11 @@
 └─────────────────────────────────────────────────────────┘
 ```
 
-- **internal listener**（必开）：服务正向调用方（本机 IDE / Copilot），以及 Web 编辑器。生产环境**保持 `127.0.0.1`**。
-- **external listener**（可选）：单独承载反向代理 `/v1/messages`、`/v1/models`，以及反向模式的 `/v1/chat/completions`。`external_port` 设为 `null` 即退化成单端口模式，所有路由都跑在 internal 上（适合纯本机使用）。
-- 设置 `external_port` 后，`/v1/messages` 与 `/v1/models` **只在 external 端口**可达；它们在 internal 端口返回 404。`/v1/chat/completions` 两个端口都可达，但按端口分流：internal 端口走 upstream API，external 端口命中 `ollama_targets` / `llama_cpp_targets` 时走本机模型服务。`/admin` 只在 internal 端口暴露——这是这个拆分最重要的安全收益。
+- **admin listener**（默认启用）：只服务 `/admin/*`。配置页面没有内置鉴权，所以默认独立绑定 `127.0.0.1:21433`。不需要 UI 可设 `admin_enabled: false`。
+- **internal listener**（必开）：服务正向调用方（本机 IDE / Copilot）。生产环境**保持 `127.0.0.1`**。
+- **external listener**（可选）：单独承载反向代理 `/v1/messages`、`/v1/models`，以及反向模式的 `/v1/chat/completions`。`external_port` 设为 `null` 时，反向 `/v1/*` API 跟随 internal 端口（适合纯本机使用）；admin 仍默认在独立 admin 端口。
+- 设置 `admin_port` 后，`/admin/*` **只在 admin 端口**可达；internal/external 端口都返回 404。把 `admin_port` 设为 `null` 才会恢复旧的“/admin 挂在 internal 端口”模式，不推荐。
+- 设置 `external_port` 后，`/v1/messages` 与 `/v1/models` **只在 external 端口**可达；它们在 internal/admin 端口返回 404。`/v1/chat/completions` 在 internal/external 两个 API 端口都可达，但按端口分流：internal 端口走 upstream API，external 端口命中 `ollama_targets` / `llama_cpp_targets` 时走本机模型服务。
 - 想让别的机器访问反向代理：把 `external_host` 改 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
 
 ## 特性一览
@@ -63,11 +67,13 @@ Copy-Item .env.example .env
 python -m fake_ollama
 # 可选：覆盖 internal listener 的 host/port
 python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
+# 可选：覆盖 admin listener
+python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port 21433
 ```
 
 启动后：
 - Ollama 客户端连 `http://127.0.0.1:21434`
-- 浏览器打开 <http://127.0.0.1:21434/admin> 用 Web UI 调配置
+- 浏览器打开 <http://127.0.0.1:21433/admin> 用 Web UI 调配置
 - Anthropic 客户端连 **external listener**：`http://127.0.0.1:21435/v1/messages`（默认）
 
 ## 配置（config.json）
@@ -82,23 +88,63 @@ python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
 
 ### 顶层字段
 
+配置页和示例 `config.json` 现在按四个层次排：
+
+- **正向代理**：远端 Anthropic API -> 本机 Ollama 兼容入口
+- **反向代理**：本机 Ollama / llama.cpp -> 对外 Anthropic / OpenAI 兼容 API
+- **共享设置**：两条链路都会用到的运行默认值和模型 profile
+- **Admin UI**：只影响 `/admin` 配置页面本身
+
+#### 正向代理：远端 API -> 本机 Ollama
+
+##### 本机 Ollama 兼容入口
+
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `host` | string | `127.0.0.1` | **internal** listener 地址（`/api/*`、`/admin/*`、`/v1/chat/completions`；OpenAI 端走 upstream） |
+| `host` | string | `127.0.0.1` | **internal** listener 地址（`/api/*`、`/v1/chat/completions`；OpenAI 端走 upstream） |
 | `port` | int | `21434` | internal listener 端口 |
-| `external_host` | string \| null | `null` | **external** listener 地址（`/v1/messages`、`/v1/models`、`/v1/chat/completions`；OpenAI 端命中本地 target 时走本机模型服务）。`null` = 不开独立端口（所有路由跑在 internal 上） |
-| `external_port` | int \| null | `null` | external listener 端口 |
-| `external_access_tokens` | string[] | `[]` | 访问 `/v1/*` 反向代理需要的 token 池（`x-api-key` 或 `Authorization: Bearer`）。Web UI 可一键 Generate |
-| `advertised_version` | string | `0.6.4` | `/api/version` 返回值 |
-| `default_max_tokens` | int | `4096` | 客户端没传 `num_predict` 时的默认 |
-| `timeout_seconds` | float | `300` | 上游请求超时 |
-| `use_system_proxy` | bool | `false` | 是否走系统代理（Clash/V2Ray 用户保持 false） |
-| `enforce_context_limit` | bool | `true` | 估算 token 超过 `context_length` 直接 400，避免误传巨 prompt |
-| `admin_enabled` | bool | `true` | 是否注册 `/admin` Web UI |
+| `advertised_version` | string | `0.6.4` | **仅用于 Ollama 兼容入口**的 `/api/version` 返回值；不影响 `/v1/*` |
+
+##### 远端上游
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
 | `upstreams` | array | — | **必填**，至少一个 Anthropic 兼容上游（见下） |
-| `ollama_targets` | array | `[]` | 反向代理的本机 Ollama 服务（见下） |
+
+#### 反向代理：本机模型 -> 对外 API
+
+##### 对外 API listener 与鉴权
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `external_host` | string \| null | `null` | **external** listener 地址（`/v1/messages`、`/v1/models`、`/v1/chat/completions`；OpenAI 端命中本地 target 时走本机模型服务）。`null` = 不开独立 external 端口，反向 `/v1/*` API 跟随 internal 端口 |
+| `external_port` | int \| null | `null` | external listener 端口 |
+| `external_access_tokens` | string[] | `[]` | 访问 external `/v1/*` 反向代理需要的 token 池（`x-api-key` 或 `Authorization: Bearer`）。Web UI 可一键 Generate |
+
+##### 本地模型 targets
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `ollama_targets` | array | `[]` | 反向代理的本机或远端 Ollama 服务（见下） |
 | `llama_cpp_targets` | array | `[]` | 反向代理的 llama.cpp server（OpenAI 兼容，见下） |
-| `model_profiles` | object | `{}` | 每模型的 capabilities / 上下文 / 思维链等设置 |
+
+#### 共享设置
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `default_max_tokens` | int | `4096` | 客户端没传 `num_predict` 时的默认 |
+| `timeout_seconds` | float | `300` | 所有出站 HTTP 请求超时（上游与本地 target 都会用到） |
+| `use_system_proxy` | bool | `false` | 所有出站 HTTP 请求是否走系统代理（Clash/V2Ray 用户保持 false） |
+| `enforce_context_limit` | bool | `true` | 估算 token 超过 `context_length` 直接 400，避免误传巨 prompt |
+| `model_profiles` | object | `{}` | 正向 / 反向共用的每模型 capabilities / 上下文 / 思维链等设置 |
+
+#### Admin UI
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `admin_enabled` | bool | `true` | 是否注册 `/admin` Web UI |
+| `admin_host` | string | `127.0.0.1` | **admin** listener 地址（`/admin/*`；无内置鉴权，建议保持 localhost） |
+| `admin_port` | int \| null | `21433` | admin listener 端口。`null` = 把 `/admin` 挂回 internal 端口（旧行为，不推荐） |
 
 #### 鉴权与端口的几种组合
 
@@ -106,8 +152,8 @@ python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
 | --- | --- | --- |
 | `null` | `[]` | 单端口；`/v1/*` 不需 token（**最宽松**，仅推荐绑 `127.0.0.1` 时） |
 | `null` | 非空 | 单端口；`/v1/*` 需 token |
-| 设置 | 非空 | 双端口；`/v1/*` 仅在 external 端口暴露并需 token（**推荐**） |
-| 设置 | `[]` | 双端口；`/v1/*` 拒绝所有请求（启动时 WARN） |
+| 设置 | 非空 | external 独立端口；`/v1/*` 仅在 external 端口暴露并需 token（**推荐**） |
+| 设置 | `[]` | external 独立端口；`/v1/*` 拒绝所有请求（启动时 WARN） |
 
 ### upstreams（正向：Ollama → Anthropic 上游）
 
@@ -260,9 +306,10 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 | `FAKE_OLLAMA_CONFIG` | 同 `--config` |
 | `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` | 兼容旧版：自动建一个名为 `default` 的 upstream（如 JSON 已有同名 upstream，env 字段覆盖之） |
 | `FAKE_OLLAMA_HOST` / `_PORT` | 覆盖 internal listener |
+| `FAKE_OLLAMA_ADMIN_HOST` / `_ADMIN_PORT` | 覆盖 admin listener |
 | `FAKE_OLLAMA_EXTERNAL_HOST` / `_EXTERNAL_PORT` | 覆盖 external listener |
 | `FAKE_OLLAMA_EXTERNAL_ACCESS_TOKENS` | CSV 列表，覆盖 `external_access_tokens` |
-| `FAKE_OLLAMA_DEFAULT_MAX_TOKENS` / `_TIMEOUT` / `_USE_SYSTEM_PROXY` / `_ENFORCE_CONTEXT_LIMIT` / `_ADVERTISED_VERSION` | 同名标量覆盖 |
+| `FAKE_OLLAMA_DEFAULT_MAX_TOKENS` / `_TIMEOUT` / `_USE_SYSTEM_PROXY` / `_ENFORCE_CONTEXT_LIMIT` / `_ADVERTISED_VERSION` | 同名标量覆盖；其中 `_ADVERTISED_VERSION` 只影响 Ollama 兼容 `/api/version` |
 
 ## 反向代理：把本地 Ollama / llama.cpp 当远端 API 用
 
@@ -294,7 +341,7 @@ claude
 
 ## Web 配置编辑器（/admin）
 
-启动后浏览器打开 <http://127.0.0.1:21434/admin>。每个字段一行：
+启动后浏览器打开 <http://127.0.0.1:21433/admin>。左侧侧栏现在是二级目录：一级按“Forward Proxy / Reverse Proxy / Shared Settings / Admin UI”分块，二级再列具体配置组；每个字段一行：
 
 - 左侧复选框 = **是否包含该字段**；取消勾选会从保存的 JSON 里移除，让它回退到默认值。
 - 右侧是输入控件（按字段类型自适应：文本 / 数字 / 复选框 / 多行列表 / key-value 表 / 嵌套对象列表 / **从兄弟字段拉取的复选框列表**）。
@@ -309,7 +356,7 @@ claude
   - **Toggle raw JSON**：当 schema 不够覆盖你的需求时，切回原始 JSON 文本框直接编辑。
 - 校验失败会显示来自 Pydantic 的具体错误，配置不会被写入。
 
-不需要这个 UI 的话设 `"admin_enabled": false`，相关路由不会注册。`/admin` 永远只挂在 internal listener 上，**不会被 external 端口暴露**。
+不需要这个 UI 的话设 `"admin_enabled": false`，相关路由不会注册。默认情况下 `/admin` 只挂在 admin listener 上，**不会被 internal 或 external 端口暴露**。只有显式设置 `"admin_port": null` 时才会回到旧的 internal 单端口模式。
 
 ## 视觉输入（图片）
 
@@ -359,7 +406,7 @@ curl -X POST http://127.0.0.1:21435/v1/chat/completions `
 - `.env` / `config.json` 已加入 `.gitignore`，请勿提交真实 token。
 - **internal listener 默认仅绑 `127.0.0.1`**；要局域网共享请显式 `--host 0.0.0.0` 并自行做访问控制。
 - **external listener** 默认也是 `127.0.0.1`。要对外暴露反向代理：要么 `external_host: "0.0.0.0"`，要么保持 `127.0.0.1` + 用 Nginx/Caddy 反代（更推荐，可以加 TLS）。
-- **`/admin` Web UI 没有任何鉴权**。它只挂在 internal listener 上；如果你的 internal listener 也对外，必须 `"admin_enabled": false`，或在前面加一层带认证的反向代理（nginx/Caddy basic auth 等）。
+- **`/admin` Web UI 没有任何鉴权**。它默认只挂在独立 admin listener 上，并默认绑定 `127.0.0.1`。如果你把 `admin_host` 改成 `0.0.0.0` 或设置 `admin_port: null`，必须自行加一层带认证的反向代理（nginx/Caddy basic auth 等），或直接 `"admin_enabled": false`。
 - 反向代理 token：建议在 Web UI 用 Generate 生成 ≥24 字节的随机串，不要复用其他系统的 token。Token 池里可以放多个，便于按客户端轮换。
 
 ## 故障排查
