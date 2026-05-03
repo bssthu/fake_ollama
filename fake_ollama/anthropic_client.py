@@ -72,6 +72,27 @@ class AnthropicClient:
             resp.raise_for_status()
         return resp.json()
 
+    async def count_tokens(
+        self,
+        payload: Dict[str, Any],
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        url = f"{self.base_url}/v1/messages/count_tokens"
+        resp = await self._client.post(
+            url,
+            json=payload,
+            headers=self._headers(),
+            params=params,
+        )
+        if resp.status_code >= 400:
+            try:
+                await resp.aread()
+            except Exception:
+                pass
+            resp.raise_for_status()
+        return resp.json()
+
     async def stream_messages(
         self, payload: Dict[str, Any]
     ) -> AsyncIterator[Tuple[str, Dict[str, Any]]]:

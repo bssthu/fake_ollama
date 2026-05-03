@@ -9,7 +9,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from fake_ollama.config import OllamaTarget, Settings, load_settings
+from fake_ollama.config import (
+    OllamaTarget,
+    Settings,
+    estimate_tokens_from_anthropic_payload,
+    load_settings,
+)
 from fake_ollama.server import create_app
 
 
@@ -174,6 +179,76 @@ def test_reverse_non_stream_text(reverse_settings):
     assert sent["model"] == "llama3.1:8b"
     assert sent["messages"] == [{"role": "user", "content": "hello"}]
     assert sent["options"]["num_predict"] == 100
+
+
+def test_reverse_count_tokens_estimates_for_ollama_target(reverse_settings):
+    client = _build_client(reverse_settings)
+    payload = {
+        "model": "llama3.1",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {
+                        "type": "tool_result",
+                        "content": [{"type": "text", "text": "tool output"}],
+                    },
+                ],
+            }
+        ],
+        "tools": [
+            {
+                "name": "lookup",
+                "description": "look something up",
+                "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }
+        ],
+    }
+    with client:
+        resp = client.post("/v1/messages/count_tokens?beta=true", headers=_AUTH, json=payload)
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "input_tokens": estimate_tokens_from_anthropic_payload(payload)
+    }
+
+
+def test_reverse_count_tokens_passthrough_to_upstream(reverse_settings):
+    captured: Dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["query"] = request.url.query.decode()
+        captured["headers"] = dict(request.headers)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"input_tokens": 42})
+
+    client = _build_client(
+        reverse_settings,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+    with client:
+        resp = client.post(
+            "/v1/messages/count_tokens?beta=true",
+            headers=_AUTH,
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"input_tokens": 42}
+    assert captured["path"] == "/v1/messages/count_tokens"
+    assert captured["query"] == "beta=true"
+    assert captured["headers"]["x-api-key"] == "tk"
+    assert captured["body"] == {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
 
 
 def test_reverse_forwards_base64_image_to_ollama(reverse_settings):

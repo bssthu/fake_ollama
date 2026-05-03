@@ -44,7 +44,7 @@
 - **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限
 - **每个模型可控外露**（`expose_external`，upstream / `ollama_targets` / `llama_cpp_targets` 都支持）：某些模型只想本机用、不想出现在反向代理 `/v1/models` 里？勾上即可
 - **本地 target 生命周期接管**：Ollama / llama.cpp 都可配置 health check、按需启动脚本、启动超时、空闲回收；不配置时就只转发到你单独启动的服务
-- **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权 external 端口上的 `/v1/messages`、`/v1/models` 与 `/v1/chat/completions`
+- **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权 external 端口上的 `/v1/messages`、`/v1/messages/count_tokens`、`/v1/models` 与 `/v1/chat/completions`
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP），不再硬编码 `image/png`
 - **零依赖 Web 编辑器**：字段说明 / 默认值回退 / 上游 detect-models / models 与 model_profiles key 自动补全
 - `pytest` + `httpx.MockTransport` 离线单测
@@ -315,12 +315,14 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 
 适合**只支持 Anthropic Messages API** 的客户端（如 Claude Code）调用本机 Ollama / llama.cpp 模型，或把上游 Anthropic 服务做带鉴权的转发壳。
 
-只要在 `config.json` 里配上 `ollama_targets` 或 `llama_cpp_targets`（见上），并填了至少一个 `external_access_tokens`，反向代理 `POST /v1/messages` 与 external 端口的 `POST /v1/chat/completions` 就开门工作：
+只要在 `config.json` 里配上 `ollama_targets` 或 `llama_cpp_targets`（见上），并填了至少一个 `external_access_tokens`，反向代理 `POST /v1/messages`、`POST /v1/messages/count_tokens` 与 external 端口的 `POST /v1/chat/completions` 就开门工作：
 
 - `model` 命中某个 `ollama_targets[*].models` → 转换为 Ollama `/api/chat`，再把响应翻译回 Anthropic 的 `message_*` SSE / 非流式 JSON。
 - `model` 命中某个 `llama_cpp_targets[*].models` → 调用 llama.cpp `/v1/chat/completions`；Anthropic 入口会做格式转换，OpenAI 入口则基本直通。
 - `model` 命中某个 upstream 的 `expose_external` 列表 → 透传到该 Anthropic 上游（相当于一个本机鉴权转发壳）。
 - 其他情况 → 404 `model '...' is not exposed externally`。
+
+`POST /v1/messages/count_tokens` 按 Anthropic 官方格式返回 `{"input_tokens": ...}`：命中本地 Ollama / llama.cpp target 时用本地估算，不会为了计数唤起模型；命中外露 upstream 时透传到上游的 count_tokens 接口，所以官方 Anthropic 端可以返回精确值。客户端附带的 `?beta=true` 会被接受；透传 upstream 时会保留这个 query。
 
 端口分流规则：启用 `external_port` 后，internal 端口上的 `/v1/chat/completions` 保持 forward proxy 语义，走 upstream API；external 端口上的 `/v1/chat/completions` 走反向代理语义，优先命中 `ollama_targets`，再命中 `llama_cpp_targets`。
 
@@ -394,6 +396,9 @@ curl http://127.0.0.1:21435/v1/models -H "x-api-key: tk-..."
 curl -X POST http://127.0.0.1:21435/v1/messages `
   -H "Content-Type: application/json" -H "x-api-key: tk-..." `
   -d '{"model":"llama3.1","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+curl -X POST "http://127.0.0.1:21435/v1/messages/count_tokens?beta=true" `
+  -H "Content-Type: application/json" -H "x-api-key: tk-..." `
+  -d '{"model":"llama3.1","messages":[{"role":"user","content":"hi"}]}'
 
 # llama.cpp OpenAI 端（同一个 external 端口）
 curl -X POST http://127.0.0.1:21435/v1/chat/completions `

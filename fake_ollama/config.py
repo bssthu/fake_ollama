@@ -739,37 +739,64 @@ def estimate_tokens_from_anthropic_payload(body: Dict[str, Any]) -> int:
     """Rough token estimate of an Anthropic /v1/messages request body."""
     chars = 0
     images = 0
-    sys = body.get("system")
-    if isinstance(sys, str):
-        chars += len(sys)
-    elif isinstance(sys, list):
-        for block in sys:
-            if isinstance(block, dict) and block.get("type") == "text":
-                chars += len(block.get("text", ""))
-    for msg in body.get("messages") or []:
-        content = msg.get("content")
+
+    def add_text(value: Any) -> None:
+        nonlocal chars
+        if value is not None:
+            chars += len(str(value))
+
+    def add_json(value: Any) -> None:
+        nonlocal chars
+        if value is not None:
+            chars += len(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+    def add_content(content: Any) -> None:
+        nonlocal images
         if isinstance(content, str):
-            chars += len(content)
-            continue
+            add_text(content)
+            return
         if not isinstance(content, Iterable):
-            continue
+            return
         for block in content:
             if not isinstance(block, dict):
                 continue
             btype = block.get("type")
             if btype == "text":
-                chars += len(block.get("text", ""))
+                add_text(block.get("text", ""))
+            elif btype == "thinking":
+                add_text(block.get("thinking", ""))
             elif btype == "image":
                 images += 1
+            elif btype == "document":
+                source = block.get("source") or {}
+                if isinstance(source, dict):
+                    if source.get("type") == "text":
+                        add_text(source.get("data", ""))
+                    else:
+                        images += 1
             elif btype == "tool_result":
-                inner = block.get("content", "")
-                if isinstance(inner, str):
-                    chars += len(inner)
-                elif isinstance(inner, list):
-                    for sub in inner:
-                        if isinstance(sub, dict) and sub.get("type") == "text":
-                            chars += len(sub.get("text", ""))
+                add_content(block.get("content", ""))
             elif btype == "tool_use":
-                chars += len(json.dumps(block.get("input") or {}))
+                add_text(block.get("name", ""))
+                add_json(block.get("input") or {})
+
+    sys = body.get("system")
+    if isinstance(sys, str):
+        add_text(sys)
+    elif isinstance(sys, list):
+        for block in sys:
+            if isinstance(block, dict) and block.get("type") == "text":
+                add_text(block.get("text", ""))
+    for msg in body.get("messages") or []:
+        if isinstance(msg, dict):
+            add_content(msg.get("content"))
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        add_text(tool.get("name", ""))
+        add_text(tool.get("description", ""))
+        add_json(tool.get("input_schema") or {})
+    add_json(body.get("tool_choice"))
+    add_json(body.get("thinking"))
     overhead = 4 * len(body.get("messages") or [])
     return math.ceil(chars / 3) + overhead + images * 1500

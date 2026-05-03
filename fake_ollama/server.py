@@ -428,6 +428,10 @@ def _register_routes(app: FastAPI) -> None:
     async def anthropic_messages(request: Request) -> Any:
         return await _handle_anthropic_messages(request)
 
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(request: Request) -> Any:
+        return await _handle_anthropic_count_tokens(request)
+
     # ---- Web admin UI ---------------------------------------------------
 
     from . import admin as _admin
@@ -627,6 +631,25 @@ def _apply_llama_cpp_thinking_config(
     kwargs = dict(existing) if isinstance(existing, dict) else {}
     kwargs["enable_thinking"] = enabled
     openai_payload["chat_template_kwargs"] = kwargs
+
+
+_COUNT_TOKENS_BODY_KEYS = {
+    "cache_control",
+    "messages",
+    "model",
+    "output_config",
+    "system",
+    "thinking",
+    "tool_choice",
+    "tools",
+}
+
+
+def _count_tokens_payload(payload: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Build an Anthropic count_tokens body, dropping generation-only fields."""
+    out = {k: payload[k] for k in _COUNT_TOKENS_BODY_KEYS if k in payload}
+    out["model"] = model
+    return out
 
 
 async def _handle(request: Request, *, mode: str) -> Any:
@@ -949,6 +972,74 @@ async def _handle_openai_chat(request: Request) -> Any:
 # ---------------------------------------------------------------------------
 # Reverse proxy: Anthropic Messages API in -> local Ollama out (or pass-through)
 # ---------------------------------------------------------------------------
+
+
+async def _handle_anthropic_count_tokens(request: Request) -> Any:
+    """Handle ``POST /v1/messages/count_tokens``.
+
+    Anthropic returns ``{"input_tokens": int}``. For local targets we return
+    the project's conservative local estimate without starting the model. For
+    upstream passthrough models, use the upstream count_tokens endpoint so
+    official Anthropic-compatible servers can provide exact counts.
+    """
+    app = request.app
+    settings: Settings = app.state.settings
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+
+    anth_model = payload.get("model")
+    if not anth_model:
+        raise HTTPException(status_code=400, detail="missing 'model'")
+
+    target = settings.ollama_target_for(anth_model)
+    llama_target = settings.llama_cpp_target_for(anth_model)
+    if target is not None or llama_target is not None:
+        presented = _bearer_or_api_key(request)
+        if not settings.is_valid_external_token(presented):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+        return JSONResponse(
+            {"input_tokens": estimate_tokens_from_anthropic_payload(payload)}
+        )
+
+    if not settings.is_externally_exposed(anth_model):
+        raise HTTPException(
+            status_code=404,
+            detail=f"model '{anth_model}' is not exposed externally",
+        )
+    if settings.auth_required_for_v1:
+        presented = _bearer_or_api_key(request)
+        if not settings.is_valid_external_token(presented):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+
+    upstream_payload = _count_tokens_payload(
+        payload,
+        model=settings.resolve_model(anth_model),
+    )
+    client = _client_for(app, settings, anth_model)
+    try:
+        data = await client.count_tokens(
+            upstream_payload,
+            params=dict(request.query_params),
+        )
+    except httpx.HTTPError as exc:
+        _log_upstream_error(exc, upstream_payload)
+        return _upstream_error(exc)
+    return JSONResponse({"input_tokens": int(data.get("input_tokens") or 0)})
 
 
 async def _handle_anthropic_messages(request: Request) -> Any:
