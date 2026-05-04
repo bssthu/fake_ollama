@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from fake_ollama.ollama_client import OllamaClient
+from fake_ollama.llama_cpp_client import LlamaCppClient
 
 
 class _FakeProcess:
@@ -102,6 +103,74 @@ async def test_ollama_client_does_not_start_when_disabled(monkeypatch: pytest.Mo
     try:
         with pytest.raises(httpx.ConnectError):
             await client.chat({"model": "qwen3.5:2b", "messages": []})
+    finally:
+        await client.aclose()
+
+    assert commands == []
+
+
+@pytest.mark.asyncio
+async def test_ollama_client_does_not_auto_start_during_shutdown(monkeypatch: pytest.MonkeyPatch):
+    commands: list[str] = []
+
+    async def fake_create_subprocess_shell(command: str, **kwargs: Any) -> _FakeProcess:
+        commands.append(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(
+        "fake_ollama.ollama_client.asyncio.create_subprocess_shell",
+        fake_create_subprocess_shell,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("daemon down", request=request)
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OllamaClient(
+        "http://127.0.0.1:11434",
+        auto_start=True,
+        start_command="ollama serve",
+        client=async_client,
+    )
+    client.begin_shutdown()
+
+    try:
+        with pytest.raises(httpx.ConnectError, match="shutting down"):
+            await client.chat({"model": "qwen3.5:2b", "messages": []})
+    finally:
+        await client.aclose()
+
+    assert commands == []
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_client_does_not_auto_start_during_shutdown(monkeypatch: pytest.MonkeyPatch):
+    commands: list[str] = []
+
+    async def fake_create_subprocess_shell(command: str, **kwargs: Any) -> _FakeProcess:
+        commands.append(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(
+        "fake_ollama.llama_cpp_client.asyncio.create_subprocess_shell",
+        fake_create_subprocess_shell,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("daemon down", request=request)
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = LlamaCppClient(
+        "http://127.0.0.1:21436",
+        auto_start=True,
+        start_command="llama-server --model qwen.gguf",
+        client=async_client,
+    )
+    client.begin_shutdown()
+
+    try:
+        with pytest.raises(httpx.ConnectError, match="shutting down"):
+            await client.chat({"model": "qwen", "messages": []})
     finally:
         await client.aclose()
 

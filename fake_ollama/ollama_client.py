@@ -55,10 +55,14 @@ class OllamaClient:
         self._start_lock = asyncio.Lock()
         self._active = 0
         self._last_used = time.monotonic()
+        self._shutdown_requested = False
 
     @property
     def idle_timeout_seconds(self) -> Optional[float]:
         return self._idle_timeout
+
+    def begin_shutdown(self) -> None:
+        self._shutdown_requested = True
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -78,12 +82,22 @@ class OllamaClient:
     async def _ensure_ready(self) -> None:
         if await self._healthy():
             return
+        if self._shutdown_requested:
+            raise httpx.ConnectError(
+                "Ollama target is unavailable and fake-ollama is shutting down; "
+                "refusing auto-start"
+            )
         if not (self._auto_start and self._start_command):
             return
 
         async with self._start_lock:
             if await self._healthy():
                 return
+            if self._shutdown_requested:
+                raise httpx.ConnectError(
+                    "Ollama target is unavailable and fake-ollama is shutting down; "
+                    "refusing auto-start"
+                )
             if self._process is None or self._process.returncode is not None:
                 logger.info("starting Ollama target: %s", self._start_command)
                 self._process = await asyncio.create_subprocess_shell(

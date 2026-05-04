@@ -210,6 +210,7 @@ ollama_targets 默认全部对外暴露（不写 `expose_external`，保持向�
 Ollama target 有两种运行方式：
 - **单独运行模式**：`auto_start: false`（默认）。fake-ollama 只负责转发；Ollama Desktop / system service / 你自己的脚本负责 daemon 生命周期。
 - **接管启动模式**：`auto_start: true` 且配置 `start_command`。fake-ollama 在请求到来且 `health_path` 不通时执行启动命令。`idle_timeout_seconds` 留空时不主动停止 daemon；填了以后只会停止 fake-ollama 自己启动的进程，或执行你配置的 `stop_command`。
+- 进程开始关闭后（例如 Ctrl+C），fake-ollama 会拒绝新的请求工作并禁止再执行 `start_command`，避免在 shutdown drain 阶段把 Ollama 重新拉起。
 
 请求头形式（与 Anthropic 官方一致）：
 
@@ -247,7 +248,7 @@ llama.cpp server 自带 OpenAI 兼容接口，fake-ollama 会把它聚合到 ext
 路由行为：
 - `POST /v1/chat/completions` 命中 `llama_cpp_targets[*].models` 时，基本直通 llama.cpp 的 OpenAI API，只把显示名映射到 `model_map` 后的真实 alias。
 - `POST /v1/messages` 命中同一模型时，会把 Anthropic Messages 请求转换成 OpenAI Chat Completions，再把响应转换回 Anthropic JSON / SSE。
-- 生命周期有两种模式：`auto_start: false` 是单独运行模式，fake-ollama 不接管进程；`auto_start: true` + `start_command` 是接管模式，fake-ollama 负责按需唤起。`idle_timeout_seconds` 只在你配置后启用；没有 `stop_command` 时，fake-ollama 不会杀掉它没有亲自启动的外部 llama.cpp 进程。
+- 生命周期有两种模式：`auto_start: false` 是单独运行模式，fake-ollama 不接管进程；`auto_start: true` + `start_command` 是接管模式，fake-ollama 负责按需唤起。`idle_timeout_seconds` 只在你配置后启用；没有 `stop_command` 时，fake-ollama 不会杀掉它没有亲自启动的外部 llama.cpp 进程。进程开始关闭后同样会禁止再执行 `start_command`。
 
 #### Copilot 走 upstream 调用 Ollama 模型
 

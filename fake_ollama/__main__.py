@@ -5,14 +5,26 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from types import FrameType
+from typing import Callable
 
 import uvicorn
 from dotenv import load_dotenv
 
 from .config import load_settings
-from .server import create_app
+from .server import create_app, request_shutdown
 
 logger = logging.getLogger("fake_ollama")
+
+
+class _ShutdownAwareServer(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config, on_shutdown_requested: Callable[[], None]) -> None:
+        super().__init__(config)
+        self._on_shutdown_requested = on_shutdown_requested
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        self._on_shutdown_requested()
+        super().handle_exit(sig, frame)
 
 
 def main() -> None:
@@ -59,14 +71,24 @@ def main() -> None:
     app = create_app(settings)
 
     # Internal listener: /api/* (+ /v1/* if no external listener).
-    internal_cfg = uvicorn.Config(app, host=host, port=port, log_level=args.log_level)
+    internal_cfg = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level=args.log_level,
+        access_log=False,
+    )
 
     configs = [("internal", host, port, internal_cfg)]
     if settings.external_listener_enabled:
         ext_host = settings.external_host or "127.0.0.1"
         ext_port = int(settings.external_port)  # type: ignore[arg-type]
         external_cfg = uvicorn.Config(
-            app, host=ext_host, port=ext_port, log_level=args.log_level
+            app,
+            host=ext_host,
+            port=ext_port,
+            log_level=args.log_level,
+            access_log=False,
         )
         configs.append(("external", ext_host, ext_port, external_cfg))
     if settings.admin_listener_enabled:
@@ -75,6 +97,7 @@ def main() -> None:
             host=settings.admin_host,
             port=int(settings.admin_port),  # type: ignore[arg-type]
             log_level=args.log_level,
+            access_log=False,
         )
         configs.append(("admin", settings.admin_host, int(settings.admin_port), admin_cfg))
 
@@ -83,16 +106,21 @@ def main() -> None:
         ", ".join(f"{name}={cfg_host}:{cfg_port}" for name, cfg_host, cfg_port, _ in configs),
     )
 
+    def _request_shutdown() -> None:
+        request_shutdown(app)
+
     if len(configs) == 1:
-        uvicorn.Server(configs[0][3]).run()
+        _ShutdownAwareServer(configs[0][3], _request_shutdown).run()
         return
 
     async def _run_all() -> None:
-        await asyncio.gather(*(uvicorn.Server(cfg).serve() for _, _, _, cfg in configs))
+        servers = [_ShutdownAwareServer(cfg, _request_shutdown) for _, _, _, cfg in configs]
+        await asyncio.gather(*(server.serve() for server in servers))
 
     try:
         asyncio.run(_run_all())
     except KeyboardInterrupt:
+        _request_shutdown()
         logger.info("interrupted; exiting")
 
 

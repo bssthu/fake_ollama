@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from fake_ollama.server import create_app
+from fake_ollama.config import Settings
+from fake_ollama.server import create_app, request_shutdown
 
 
 def _build_sse(events: List[Dict[str, Any]]) -> bytes:
@@ -35,6 +37,30 @@ def _make_client(settings, transport: httpx.MockTransport) -> TestClient:
     return TestClient(app)
 
 
+def test_request_shutdown_rejects_new_requests(settings):
+    class FakeTargetClient:
+        idle_timeout_seconds = None
+
+        def __init__(self) -> None:
+            self.shutdown_requested = False
+
+        def begin_shutdown(self) -> None:
+            self.shutdown_requested = True
+
+    app = create_app(settings)
+    fake = FakeTargetClient()
+    app.state.ollama_clients = {"local": fake}
+    request_shutdown(app)
+
+    client = TestClient(app)
+    with client:
+        resp = client.get("/api/version")
+
+    assert fake.shutdown_requested is True
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "server is shutting down"}
+
+
 def test_tags_lists_models(settings):
     client = _make_client(settings, httpx.MockTransport(lambda req: httpx.Response(404)))
     with client:
@@ -52,6 +78,55 @@ def test_version_endpoint(settings):
         resp = client.get("/api/version")
     assert resp.status_code == 200
     assert resp.json() == {"version": settings.advertised_version}
+
+
+def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
+    settings = Settings(
+        upstreams=[
+            {
+                "name": "default",
+                "base_url": "http://upstream.test",
+                "auth_token": "tok",
+                "models": ["claude-3-5-sonnet-20241022"],
+            }
+        ],
+        external_host="127.0.0.1",
+        external_port=21435,
+        external_access_tokens=["rev-tk-1"],
+    )
+    app = create_app(settings)
+    caplog.set_level(logging.INFO, logger="fake_ollama")
+
+    with TestClient(app, base_url="http://testserver:21434") as internal:
+        assert internal.get("/api/version").status_code == 200
+    with TestClient(app, base_url="http://testserver:21435") as external:
+        assert external.get("/v1/models", headers={"x-api-key": "rev-tk-1"}).status_code == 200
+    with TestClient(app, base_url="http://testserver:21433") as admin:
+        assert admin.get("/admin/").status_code == 200
+
+    access_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "fake_ollama" and record.getMessage().startswith("access ")
+    ]
+    assert any(
+        "listener=internal" in message
+        and "surface=ollama" in message
+        and "path=/api/version" in message
+        for message in access_messages
+    )
+    assert any(
+        "listener=external" in message
+        and "surface=models" in message
+        and "path=/v1/models" in message
+        for message in access_messages
+    )
+    assert any(
+        "listener=admin" in message
+        and "surface=admin" in message
+        and "path=/admin/" in message
+        for message in access_messages
+    )
 
 
 def test_show_advertises_capabilities(settings):

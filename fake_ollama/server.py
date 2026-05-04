@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List
@@ -125,10 +126,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
     app.state.settings = settings
+    app.state.shutdown_requested = False
     app.state.ensure_local_target_idle_monitor = _sync_local_target_idle_monitor
     _install_port_router(app)
     _register_routes(app)
     return app
+
+
+def request_shutdown(app: FastAPI) -> None:
+    """Mark the app as shutting down and disable local target auto-starts."""
+    if getattr(app.state, "shutdown_requested", False):
+        return
+    app.state.shutdown_requested = True
+    for client_group in (
+        getattr(app.state, "ollama_clients", {}),
+        getattr(app.state, "llama_cpp_clients", {}),
+    ):
+        for client in list(client_group.values()):
+            begin_shutdown = getattr(client, "begin_shutdown", None)
+            if callable(begin_shutdown):
+                begin_shutdown()
 
 
 def _client_for(app: FastAPI, settings: Settings, model_name: str) -> AnthropicClient:
@@ -163,6 +180,13 @@ async def _local_target_idle_monitor(app: FastAPI) -> None:
 
 
 def _sync_local_target_idle_monitor(app: FastAPI) -> None:
+    if getattr(app.state, "shutdown_requested", False):
+        task = getattr(app.state, "local_target_idle_monitor", None)
+        if task is not None and not task.done():
+            task.cancel()
+        app.state.local_target_idle_monitor = None
+        return
+
     client_groups = (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
@@ -207,13 +231,86 @@ def _has_path_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
     return any(path == p or path.startswith(p + "/") for p in prefixes)
 
 
+def _local_port(request: Request) -> int | None:
+    server = request.scope.get("server") or (None, None)
+    return server[1] if isinstance(server, (tuple, list)) and len(server) > 1 else None
+
+
+def _listener_name(request: Request) -> str:
+    settings: Settings = request.app.state.settings
+    local_port = _local_port(request)
+    if settings.admin_listener_enabled and local_port == settings.admin_port:
+        return "admin"
+    if settings.external_listener_enabled and local_port == settings.external_port:
+        return "external"
+    if local_port in (None, settings.port):
+        return "internal"
+    return f"port-{local_port}"
+
+
+def _request_surface(path: str) -> str:
+    if _has_path_prefix(path, _ADMIN_ONLY_PATH_PREFIXES):
+        return "admin"
+    if path == "/v1/messages/count_tokens" or path.startswith("/v1/messages/count_tokens/"):
+        return "anthropic-count-tokens"
+    if _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES):
+        return "anthropic" if path.startswith("/v1/messages") else "models"
+    if _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES):
+        return "openai"
+    if path == "/":
+        return "root"
+    if path.startswith("/api/"):
+        return "ollama"
+    return "other"
+
+
+def _request_log_context(request: Request) -> Dict[str, Any]:
+    local_port = _local_port(request)
+    client = request.client.host if request.client is not None else "-"
+    return {
+        "listener": _listener_name(request),
+        "port": local_port if local_port is not None else "-",
+        "surface": _request_surface(request.url.path),
+        "client": client,
+        "method": request.method,
+        "path": request.url.path,
+    }
+
+
+def _log_request_access(request: Request, status_code: int, duration_ms: float) -> None:
+    ctx = _request_log_context(request)
+    logger.info(
+        "access listener=%s port=%s surface=%s client=%s method=%s path=%s status=%s duration_ms=%.2f",
+        ctx["listener"],
+        ctx["port"],
+        ctx["surface"],
+        ctx["client"],
+        ctx["method"],
+        ctx["path"],
+        status_code,
+        duration_ms,
+    )
+
+
+def _log_request_exception(request: Request, duration_ms: float) -> None:
+    ctx = _request_log_context(request)
+    logger.exception(
+        "access listener=%s port=%s surface=%s client=%s method=%s path=%s status=500 duration_ms=%.2f",
+        ctx["listener"],
+        ctx["port"],
+        ctx["surface"],
+        ctx["client"],
+        ctx["method"],
+        ctx["path"],
+        duration_ms,
+    )
+
+
 def _is_external_request(request: Request) -> bool:
     settings: Settings = request.app.state.settings
     if not settings.external_listener_enabled:
         return False
-    server = request.scope.get("server") or (None, None)
-    local_port = server[1] if isinstance(server, (tuple, list)) and len(server) > 1 else None
-    return local_port == settings.external_port
+    return _local_port(request) == settings.external_port
 
 
 def _install_port_router(app: FastAPI) -> None:
@@ -232,30 +329,46 @@ def _install_port_router(app: FastAPI) -> None:
     @app.middleware("http")
     async def _split(request: Request, call_next):
         settings: Settings = request.app.state.settings
-        # ASGI scope["server"] is (host, port) of the local socket.
-        server = request.scope.get("server") or (None, None)
-        local_port = server[1] if isinstance(server, (tuple, list)) and len(server) > 1 else None
+        local_port = _local_port(request)
         path = request.url.path
+        started_at = time.perf_counter()
 
-        admin_only = _has_path_prefix(path, _ADMIN_ONLY_PATH_PREFIXES)
-        if settings.admin_listener_enabled:
-            admin = local_port == settings.admin_port
-            if admin and not admin_only:
-                return JSONResponse({"detail": "not found"}, status_code=404)
-            if (not admin) and admin_only:
-                return JSONResponse({"detail": "not found"}, status_code=404)
+        def _finish(response):
+            _log_request_access(
+                request,
+                response.status_code,
+                (time.perf_counter() - started_at) * 1000.0,
+            )
+            return response
 
-        if not settings.external_listener_enabled:
-            return await call_next(request)
+        try:
+            if getattr(request.app.state, "shutdown_requested", False):
+                return _finish(
+                    JSONResponse({"detail": "server is shutting down"}, status_code=503)
+                )
 
-        external = local_port == settings.external_port
-        external_only = _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES)
-        shared = _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES)
-        if external and not (external_only or shared):
-            return JSONResponse({"detail": "not found"}, status_code=404)
-        if (not external) and external_only:
-            return JSONResponse({"detail": "not found"}, status_code=404)
-        return await call_next(request)
+            admin_only = _has_path_prefix(path, _ADMIN_ONLY_PATH_PREFIXES)
+            if settings.admin_listener_enabled:
+                admin = local_port == settings.admin_port
+                if admin and not admin_only:
+                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+                if (not admin) and admin_only:
+                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+
+            if not settings.external_listener_enabled:
+                return _finish(await call_next(request))
+
+            external = local_port == settings.external_port
+            external_only = _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES)
+            shared = _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES)
+            if external and not (external_only or shared):
+                return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+            if (not external) and external_only:
+                return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+            return _finish(await call_next(request))
+        except Exception:
+            _log_request_exception(request, (time.perf_counter() - started_at) * 1000.0)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -454,10 +567,11 @@ def _upstream_error_status(exc: httpx.HTTPError) -> int:
 
 
 def _log_upstream_error(
-    exc: httpx.HTTPError, upstream_payload: Dict[str, Any]
+    request: Request, exc: httpx.HTTPError, upstream_payload: Dict[str, Any]
 ) -> None:
     """Log enough context to debug 4xx/5xx responses from the upstream."""
     body = _read_error_text(exc)
+    ctx = _request_log_context(request)
     # Avoid dumping huge prompts; keep the diagnostic relevant fields only.
     summary = {
         "model": upstream_payload.get("model"),
@@ -473,7 +587,12 @@ def _log_upstream_error(
         "top_k": upstream_payload.get("top_k"),
     }
     logger.warning(
-        "upstream %s: %s | request=%s",
+        "upstream listener=%s port=%s surface=%s method=%s path=%s status=%s error=%s request=%s",
+        ctx["listener"],
+        ctx["port"],
+        ctx["surface"],
+        ctx["method"],
+        ctx["path"],
         _upstream_error_status(exc),
         body,
         json.dumps(summary, ensure_ascii=False),
@@ -691,7 +810,7 @@ async def _handle(request: Request, *, mode: str) -> Any:
         try:
             data = await client.messages(upstream_payload)
         except httpx.HTTPError as exc:
-            _log_upstream_error(exc, upstream_payload)
+            _log_upstream_error(request, exc, upstream_payload)
             return _upstream_error(exc)
         if mode == "chat":
             return JSONResponse(
@@ -714,7 +833,7 @@ async def _handle(request: Request, *, mode: str) -> Any:
                 for chunk in translator.feed_event(event_type, data):
                     yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
         except httpx.HTTPError as exc:
-            _log_upstream_error(exc, upstream_payload)
+            _log_upstream_error(request, exc, upstream_payload)
             err_chunk = {
                 "model": ollama_model,
                 "created_at": datetime.now(timezone.utc).strftime(
@@ -805,7 +924,7 @@ async def _handle_openai_chat(request: Request) -> Any:
             try:
                 resp = await oc.chat(ollama_payload)
             except httpx.HTTPError as exc:
-                _log_upstream_error(exc, ollama_payload)
+                _log_upstream_error(request, exc, ollama_payload)
                 return _upstream_error(exc)
             anthropic_resp = ollama_chat_to_anthropic_response(
                 resp, anthropic_model=openai_model
@@ -832,7 +951,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                             "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
                         ).encode("utf-8")
             except httpx.HTTPError as exc:
-                _log_upstream_error(exc, ollama_payload)
+                _log_upstream_error(request, exc, ollama_payload)
                 err_frame = {
                     "id": "chatcmpl-fake",
                     "object": "chat.completion.chunk",
@@ -873,7 +992,7 @@ async def _handle_openai_chat(request: Request) -> Any:
             try:
                 resp = await lc.chat(llama_payload)
             except httpx.HTTPError as exc:
-                _log_upstream_error(exc, llama_payload)
+                _log_upstream_error(request, exc, llama_payload)
                 return _upstream_error(exc)
             if isinstance(resp, dict):
                 resp = dict(resp)
@@ -888,7 +1007,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                     else:
                         yield ("data: " + line + "\n\n").encode("utf-8")
             except httpx.HTTPError as exc:
-                _log_upstream_error(exc, llama_payload)
+                _log_upstream_error(request, exc, llama_payload)
                 err_frame = {
                     "id": "chatcmpl-fake",
                     "object": "chat.completion.chunk",
@@ -928,7 +1047,7 @@ async def _handle_openai_chat(request: Request) -> Any:
         try:
             data = await client.messages(upstream_payload)
         except httpx.HTTPError as exc:
-            _log_upstream_error(exc, upstream_payload)
+            _log_upstream_error(request, exc, upstream_payload)
             return _upstream_error(exc)
         return JSONResponse(
             anthropic_to_openai_chat(
@@ -947,7 +1066,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                         "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
                     ).encode("utf-8")
         except httpx.HTTPError as exc:
-            _log_upstream_error(exc, upstream_payload)
+            _log_upstream_error(request, exc, upstream_payload)
             err_frame = {
                 "id": "chatcmpl-fake",
                 "object": "chat.completion.chunk",
@@ -1037,7 +1156,7 @@ async def _handle_anthropic_count_tokens(request: Request) -> Any:
             params=dict(request.query_params),
         )
     except httpx.HTTPError as exc:
-        _log_upstream_error(exc, upstream_payload)
+        _log_upstream_error(request, exc, upstream_payload)
         return _upstream_error(exc)
     return JSONResponse({"input_tokens": int(data.get("input_tokens") or 0)})
 
@@ -1092,7 +1211,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
             try:
                 resp = await oc.chat(ollama_payload)
             except httpx.HTTPError as exc:
-                _log_upstream_error(exc, ollama_payload)
+                _log_upstream_error(request, exc, ollama_payload)
                 return _upstream_error(exc)
             return JSONResponse(
                 ollama_chat_to_anthropic_response(resp, anthropic_model=anth_model)
@@ -1106,7 +1225,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                 ):
                     yield chunk
             except httpx.HTTPError as exc:
-                _log_upstream_error(exc, ollama_payload)
+                _log_upstream_error(request, exc, ollama_payload)
                 err = {
                     "type": "error",
                     "error": {
@@ -1150,7 +1269,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
             try:
                 resp = await lc.chat(llama_payload)
             except httpx.HTTPError as exc:
-                _log_upstream_error(exc, llama_payload)
+                _log_upstream_error(request, exc, llama_payload)
                 return _upstream_error(exc)
             return JSONResponse(
                 openai_chat_to_anthropic_response(
@@ -1170,7 +1289,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                 ):
                     yield chunk
             except httpx.HTTPError as exc:
-                _log_upstream_error(exc, llama_payload)
+                _log_upstream_error(request, exc, llama_payload)
                 err = {
                     "type": "error",
                     "error": {
@@ -1214,7 +1333,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
         try:
             data = await client.messages(upstream_payload)
         except httpx.HTTPError as exc:
-            _log_upstream_error(exc, upstream_payload)
+            _log_upstream_error(request, exc, upstream_payload)
             return _upstream_error(exc)
         return JSONResponse(data)
 
@@ -1227,7 +1346,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                     + "\n\n"
                 ).encode("utf-8")
         except httpx.HTTPError as exc:
-            _log_upstream_error(exc, upstream_payload)
+            _log_upstream_error(request, exc, upstream_payload)
             err = {
                 "type": "error",
                 "error": {
