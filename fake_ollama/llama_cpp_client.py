@@ -10,11 +10,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 
+from .process_utils import (
+    create_managed_subprocess_exec,
+    create_managed_subprocess_shell,
+    terminate_process_tree,
+)
+from .vram import VramCoordinator, VramReleaseCandidate
+
 logger = logging.getLogger("fake_ollama")
+
+
+@dataclass
+class _LoadedModel:
+    model: str
+    estimated_vram_gb: float
+    last_used_monotonic: float
 
 
 class LlamaCppClient:
@@ -27,23 +42,34 @@ class LlamaCppClient:
         trust_env: bool = False,
         auto_start: bool = False,
         start_command: Optional[str] = None,
+        start_argv: Optional[list] = None,
         stop_command: Optional[str] = None,
         idle_timeout_seconds: Optional[float] = None,
         startup_timeout_seconds: float = 120.0,
         health_path: str = "/health",
         cwd: Optional[str] = None,
+        launch_env: Optional[Dict[str, str]] = None,
+        target_name: str = "llama.cpp",
+        vram_coordinator: Optional[VramCoordinator] = None,
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._auth_token = auth_token
         self._timeout = timeout
         self._auto_start = auto_start
+        # Prefer argv (exec) over a shell string when both are provided:
+        # exec captures the actual server PID instead of a cmd.exe wrapper,
+        # which is essential for reliable termination on Windows.
+        self._start_argv = list(start_argv) if start_argv else None
         self._start_command = start_command
         self._stop_command = stop_command
         self._idle_timeout = idle_timeout_seconds
         self._startup_timeout = startup_timeout_seconds
         self._health_path = health_path if health_path.startswith("/") else "/" + health_path
         self._cwd = cwd
+        self._launch_env = launch_env
+        self.target_id = f"llama.cpp:{target_name}"
+        self._vram_coordinator = vram_coordinator
         self._client = client or httpx.AsyncClient(timeout=timeout, trust_env=trust_env)
         self._owns_client = client is None
         self._process: Optional[asyncio.subprocess.Process] = None
@@ -51,11 +77,45 @@ class LlamaCppClient:
         self._start_lock = asyncio.Lock()
         self._active = 0
         self._last_used = time.monotonic()
+        self._loaded_model: Optional[_LoadedModel] = None
         self._shutdown_requested = False
+        if self._vram_coordinator is not None:
+            self._vram_coordinator.register(self)
 
     @property
     def idle_timeout_seconds(self) -> Optional[float]:
         return self._idle_timeout
+
+    @property
+    def active_requests(self) -> int:
+        return self._active
+
+    @property
+    def last_used_monotonic(self) -> float:
+        return self._last_used
+
+    def has_vram_reservation(self, model: str) -> bool:
+        return self._loaded_model is not None
+
+    def vram_release_candidates(
+        self, *, now: float, idle_seconds: float
+    ) -> list[VramReleaseCandidate]:
+        if self._active or self._loaded_model is None:
+            return []
+        if now - self._loaded_model.last_used_monotonic < idle_seconds:
+            return []
+        if not (self._started_by_us or self._stop_command):
+            return []
+        loaded = self._loaded_model
+        return [
+            VramReleaseCandidate(
+                owner_id=self.target_id,
+                model=loaded.model,
+                estimated_vram_gb=loaded.estimated_vram_gb,
+                last_used_monotonic=loaded.last_used_monotonic,
+                release=self._release_server_for_vram,
+            )
+        ]
 
     def begin_shutdown(self) -> None:
         self._shutdown_requested = True
@@ -70,9 +130,46 @@ class LlamaCppClient:
         return headers
 
     async def aclose(self) -> None:
+        if self._vram_coordinator is not None:
+            self._vram_coordinator.unregister(self)
         if self._owns_client:
             await self._client.aclose()
         await self.stop_if_owned()
+
+    async def _ensure_vram(
+        self, model: Optional[str], estimated_vram_gb: Optional[float]
+    ) -> None:
+        if self._vram_coordinator is None or estimated_vram_gb is None:
+            return
+        await self._vram_coordinator.ensure_available(
+            self,
+            model=model or "",
+            estimated_vram_gb=estimated_vram_gb,
+        )
+
+    def _mark_vram_reserved(
+        self, model: Optional[str], estimated_vram_gb: Optional[float]
+    ) -> None:
+        if not model or estimated_vram_gb is None:
+            return
+        self._loaded_model = _LoadedModel(
+            model=model,
+            estimated_vram_gb=estimated_vram_gb,
+            last_used_monotonic=time.monotonic(),
+        )
+        if self._vram_coordinator is not None:
+            self._vram_coordinator.confirm_loaded(self.target_id, model)
+
+    def _discard_vram_pending(self, model: Optional[str]) -> None:
+        if not model or self._vram_coordinator is None:
+            return
+        self._vram_coordinator.discard_pending(self.target_id, model)
+
+    def _clear_all_vram_state(self) -> None:
+        loaded = self._loaded_model
+        self._loaded_model = None
+        if loaded is not None and self._vram_coordinator is not None:
+            self._vram_coordinator.discard_pending(self.target_id, loaded.model)
 
     async def _healthy(self) -> bool:
         try:
@@ -88,12 +185,13 @@ class LlamaCppClient:
     async def _ensure_ready(self) -> None:
         if await self._healthy():
             return
+        self._clear_all_vram_state()
         if self._shutdown_requested:
             raise httpx.ConnectError(
                 "llama.cpp target is unavailable and fake-ollama is shutting down; "
                 "refusing auto-start"
             )
-        if not (self._auto_start and self._start_command):
+        if not (self._auto_start and (self._start_argv or self._start_command)):
             return
 
         async with self._start_lock:
@@ -105,13 +203,23 @@ class LlamaCppClient:
                     "refusing auto-start"
                 )
             if self._process is None or self._process.returncode is not None:
-                logger.info("starting llama.cpp target: %s", self._start_command)
-                self._process = await asyncio.create_subprocess_shell(
-                    self._start_command,
-                    cwd=self._cwd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
+                if self._start_argv:
+                    logger.info(
+                        "starting llama.cpp target: %s",
+                        " ".join(self._start_argv),
+                    )
+                    self._process = await create_managed_subprocess_exec(
+                        self._start_argv,
+                        cwd=self._cwd,
+                        env=self._launch_env,
+                    )
+                else:
+                    logger.info("starting llama.cpp target: %s", self._start_command)
+                    self._process = await create_managed_subprocess_shell(
+                        self._start_command,
+                        cwd=self._cwd,
+                        env=self._launch_env,
+                    )
                 self._started_by_us = True
 
             deadline = time.monotonic() + self._startup_timeout
@@ -119,47 +227,104 @@ class LlamaCppClient:
                 if await self._healthy():
                     logger.info("llama.cpp target ready at %s", self._base)
                     return
+                # Surface early subprocess death instead of silently waiting
+                # the full startup_timeout. Common causes: binary_path points
+                # to a directory, missing GGUF, port already bound, etc.
+                proc = self._process
+                if proc is not None and proc.returncode is not None:
+                    rc = proc.returncode
+                    self._process = None
+                    self._started_by_us = False
+                    cmd_repr = (
+                        " ".join(self._start_argv)
+                        if self._start_argv
+                        else self._start_command
+                    )
+                    raise httpx.ConnectError(
+                        f"llama.cpp target process exited with code {rc} before "
+                        f"becoming healthy. Check the start_command / binary_path / "
+                        f"model_path. Command was: {cmd_repr}"
+                    )
+                if self._shutdown_requested:
+                    raise httpx.ConnectError(
+                        "fake-ollama is shutting down; aborting llama.cpp startup wait"
+                    )
                 await asyncio.sleep(1.0)
             raise httpx.ConnectError(
                 f"llama.cpp target did not become healthy within {self._startup_timeout}s"
             )
 
-    async def chat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        await self._ensure_ready()
+    async def chat(
+        self,
+        payload: Dict[str, Any],
+        *,
+        estimated_vram_gb: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        body = dict(payload)
+        body["stream"] = False
+        model = str(body.get("model") or "")
+        await self._ensure_vram(model, estimated_vram_gb)
+        try:
+            await self._ensure_ready()
+        except BaseException:
+            self._discard_vram_pending(model)
+            raise
         self._active += 1
         try:
-            body = dict(payload)
-            body["stream"] = False
-            resp = await self._client.post(
-                f"{self._base}/v1/chat/completions",
-                json=body,
-                headers=self._headers(),
-            )
-            await resp.aread()
-            resp.raise_for_status()
+            try:
+                resp = await self._client.post(
+                    f"{self._base}/v1/chat/completions",
+                    json=body,
+                    headers=self._headers(),
+                )
+                await resp.aread()
+                resp.raise_for_status()
+            except BaseException:
+                self._discard_vram_pending(model)
+                raise
+            self._mark_vram_reserved(model, estimated_vram_gb)
             return resp.json()
         finally:
             self._active -= 1
             self._last_used = time.monotonic()
 
-    async def stream_chat(self, payload: Dict[str, Any]) -> AsyncIterator[str]:
-        await self._ensure_ready()
-        self._active += 1
+    async def stream_chat(
+        self,
+        payload: Dict[str, Any],
+        *,
+        estimated_vram_gb: Optional[float] = None,
+    ) -> AsyncIterator[str]:
         body = dict(payload)
         body["stream"] = True
+        model = str(body.get("model") or "")
+        await self._ensure_vram(model, estimated_vram_gb)
         try:
-            async with self._client.stream(
-                "POST",
-                f"{self._base}/v1/chat/completions",
-                json=body,
-                headers=self._headers(stream=True),
-            ) as resp:
-                if resp.status_code >= 400:
-                    await resp.aread()
-                    resp.raise_for_status()
-                async for raw_line in resp.aiter_lines():
-                    if raw_line:
-                        yield raw_line
+            await self._ensure_ready()
+        except BaseException:
+            self._discard_vram_pending(model)
+            raise
+        self._active += 1
+        marked = False
+        try:
+            try:
+                async with self._client.stream(
+                    "POST",
+                    f"{self._base}/v1/chat/completions",
+                    json=body,
+                    headers=self._headers(stream=True),
+                ) as resp:
+                    if resp.status_code >= 400:
+                        await resp.aread()
+                        resp.raise_for_status()
+                    self._mark_vram_reserved(model, estimated_vram_gb)
+                    marked = True
+                    async for raw_line in resp.aiter_lines():
+                        if raw_line:
+                            yield raw_line
+            except BaseException:
+                if not marked:
+                    self._discard_vram_pending(model)
+                raise
         finally:
             self._active -= 1
             self._last_used = time.monotonic()
@@ -173,7 +338,17 @@ class LlamaCppClient:
             return
         await self.stop_if_owned()
 
-    async def stop_if_owned(self) -> None:
+    async def release_for_vram(self) -> bool:
+        return await self._release_server_for_vram()
+
+    async def _release_server_for_vram(self) -> bool:
+        if self._active:
+            return False
+        if not (self._started_by_us or self._stop_command):
+            return False
+        return await self.stop_if_owned()
+
+    async def stop_if_owned(self) -> bool:
         if self._stop_command:
             logger.info("stopping llama.cpp target with stop_command")
             proc = await asyncio.create_subprocess_shell(
@@ -182,17 +357,28 @@ class LlamaCppClient:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await proc.wait()
-            self._started_by_us = False
-            return
+            returncode = await proc.wait()
+            if returncode == 0:
+                self._started_by_us = False
+                self._clear_all_vram_state()
+                return True
+            logger.warning(
+                "llama.cpp target stop_command exited with status %s", returncode
+            )
+            return False
 
         if self._process is not None and self._started_by_us:
             if self._process.returncode is None:
-                logger.info("terminating owned llama.cpp target process")
-                self._process.terminate()
-                try:
-                    await asyncio.wait_for(self._process.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    self._process.kill()
-                    await self._process.wait()
-            self._started_by_us = False
+                logger.info("terminating owned llama.cpp target process tree")
+                if not await terminate_process_tree(self._process, timeout=10.0):
+                    logger.warning("failed to terminate owned llama.cpp target process tree")
+                    return False
+                self._started_by_us = False
+                self._clear_all_vram_state()
+                return True
+            logger.warning(
+                "owned llama.cpp target launcher process already exited; cannot stop "
+                "remaining detached server process without stop_command"
+            )
+            return False
+        return False

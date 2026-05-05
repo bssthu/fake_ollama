@@ -74,6 +74,7 @@ def test_admin_schema(admin_settings):
         "admin_port",
         "upstreams",
         "ollama_targets",
+        "llama_cpp_defaults",
         "llama_cpp_targets",
         "model_profiles",
     } <= keys
@@ -105,13 +106,27 @@ def test_admin_schema(admin_settings):
         "name",
         "base_url",
         "auth_token",
-        "models",
+        "model",
+        "model_alias",
         "auto_start",
         "start_command",
         "idle_timeout_seconds",
     } <= llama_item_keys
-    llama_models = next(f for f in llama_cpp["item_schema"] if f["key"] == "models")
-    assert llama_models["autocomplete"] == "model_names"
+    llama_model = next(f for f in llama_cpp["item_schema"] if f["key"] == "model")
+    assert llama_model["autocomplete"] == "model_names"
+    llama_defaults = next(f for f in fields if f["key"] == "llama_cpp_defaults")
+    assert llama_defaults["type"] == "object"
+    assert {f["key"] for f in llama_defaults["item_schema"]} >= {
+        "expose_external",
+        "auto_start",
+        "idle_timeout_seconds",
+        "startup_timeout_seconds",
+        "health_path",
+        "cwd",
+    }
+    profiles = next(f for f in fields if f["key"] == "model_profiles")
+    profile_item_keys = {f["key"] for f in profiles["item_schema"]}
+    assert "estimated_vram_gb" in profile_item_keys
     # external_access_tokens lives at the Settings level with secret_each + generate_each.
     ext = next(f for f in fields if f["key"] == "external_access_tokens")
     assert ext["type"] == "string_list"
@@ -172,9 +187,10 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
             {"name": "local", "base_url": "http://127.0.0.1:11434",
              "models": ["llama3.1"]}
         ],
+           "llama_cpp_defaults": {"auto_start": True, "health_path": "/health"},
         "llama_cpp_targets": [
             {"name": "qwen36", "base_url": "http://127.0.0.1:21436",
-             "models": ["qwen3.6"], "auto_start": False}
+               "model": "qwen3.6", "auto_start": False}
         ],
     }
     with client:

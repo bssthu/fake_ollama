@@ -44,6 +44,7 @@
 - **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限
 - **每个模型可控外露**（`expose_external`，upstream / `ollama_targets` / `llama_cpp_targets` 都支持）：某些模型只想本机用、不想出现在反向代理 `/v1/models` 里？勾上即可
 - **本地 target 生命周期接管**：Ollama / llama.cpp 都可配置 health check、按需启动脚本、启动超时、空闲回收；不配置时就只转发到你单独启动的服务
+- **本地显存预检**：本地 Ollama / llama.cpp 模型可在 `model_profiles` 里填写 `estimated_vram_gb`；启动或加载前会用 `nvidia-smi` 评估可用显存，并尝试回收空闲本地模型
 - **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权 external 端口上的 `/v1/messages`、`/v1/messages/count_tokens`、`/v1/models` 与 `/v1/chat/completions`
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP），不再硬编码 `image/png`
 - **零依赖 Web 编辑器**：字段说明 / 默认值回退 / 上游 detect-models / models 与 model_profiles key 自动补全
@@ -126,6 +127,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `ollama_targets` | array | `[]` | 反向代理的本机或远端 Ollama 服务（见下） |
+| `llama_cpp_defaults` | object | `{}` | `llama_cpp_targets` 的全局默认值；target 同名字段可覆盖 |
 | `llama_cpp_targets` | array | `[]` | 反向代理的 llama.cpp server（OpenAI 兼容，见下） |
 
 #### 共享设置
@@ -178,10 +180,10 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 - 一次正向请求按 `model` 字段查找：第一个 `models` 中包含该名字的 upstream 胜出；没匹配回退第一个 upstream。
 - `/v1/models`（反向 Anthropic 端）与 `/v1/messages` 透传：**只**返回 / 接受被 `expose_external` 允许的上游模型 + 被 `expose_external` 允许的本地 target 模型。
 
-`expose_external` 语义（upstream、`ollama_targets`、`llama_cpp_targets` 同款）：
+`expose_external` 语义：
 - **不写该字段**（或为 `null`）：等同于"全部允许"，保持向后兼容。
-- 空数组 `[]`：该上游所有模型都不对外暴露。
-- 显式列表：仅列出的模型对外暴露。
+- upstream / `ollama_targets` 使用列表：空数组 `[]` 表示全部隐藏；显式列表表示仅列出的模型对外暴露。
+- `llama_cpp_targets` 因为每个 target 只有一个 `model`，所以使用布尔值：`true` 暴露，`false` 隐藏；target 不写则继承 `llama_cpp_defaults.expose_external`，全局也不写时按旧行为暴露。
 
 模型名匹配按 Ollama 规则处理：`model` 与 `model:latest` 等价；省略 tag 只代表 `latest`，不会匹配其他显式 tag（例如 `model:q4_K_M` / `model:q2_k_p`）。
 
@@ -211,6 +213,8 @@ Ollama target 有两种运行方式：
 - **单独运行模式**：`auto_start: false`（默认）。fake-ollama 只负责转发；Ollama Desktop / system service / 你自己的脚本负责 daemon 生命周期。
 - **接管启动模式**：`auto_start: true` 且配置 `start_command`。fake-ollama 在请求到来且 `health_path` 不通时执行启动命令。`idle_timeout_seconds` 留空时不主动停止 daemon；填了以后只会停止 fake-ollama 自己启动的进程，或执行你配置的 `stop_command`。
 - 进程开始关闭后（例如 Ctrl+C），fake-ollama 会拒绝新的请求工作并禁止再执行 `start_command`，避免在 shutdown drain 阶段把 Ollama 重新拉起。
+- 每个本地模型的显存估算在 `model_profiles[模型名].estimated_vram_gb` 里配置，而不是在 target 上配置。请求命中该模型时，fake-ollama 会在触发本地模型加载前调用 `nvidia-smi` 汇总当前可用 GPU 显存。
+- 如果显存不足，会找出其他已填写 `estimated_vram_gb`、当前无请求、且上次使用在 60 秒之前的本地模型，按最久未使用优先尝试释放；Ollama 会先用 `/api/generate` + `keep_alive: 0` 卸载单个模型，失败时再按可控进程 / `stop_command` 停掉整个 target。每次释放后都会重新读取 `nvidia-smi` 的当前可用显存，只有真实 free VRAM 达标才继续启动新模型。
 
 请求头形式（与 Anthropic 官方一致）：
 
@@ -224,31 +228,39 @@ Authorization: Bearer tk-...
 
 ### llama_cpp_targets（反向：Anthropic / OpenAI → llama.cpp server）
 
-llama.cpp server 自带 OpenAI 兼容接口，fake-ollama 会把它聚合到 external listener。`llama_cpp_targets` 是数组，可以配置多个实例；每个实例用不同 `name`、`base_url`、`models` 区分，路由时按模型名命中对应 target。
+llama.cpp server 自带 OpenAI 兼容接口，fake-ollama 会把多个 server 实例聚合到 external listener。`llama_cpp_targets` 是数组，但**每一项只代表一个模型、一个 llama.cpp server 进程、一个端口和一组启停脚本**；要配置多个 llama.cpp 模型，就新增多个 target，分别设置不同的 `base_url` / 端口、`start_command` / `stop_command`，以及唯一的 `model`。
+
+`llama_cpp_defaults` 可以集中配置所有 target 的通用生命周期参数；target 里写了同名字段就覆盖全局值。`name` 仍然是 target 级标识，用于内部 client 字典、日志和去重，但通常不用写；不填时自动等于 `model`，它不是全局配置。
 
 ```jsonc
 {
-  "name": "qwen36-llamacpp",
-  "base_url": "http://127.0.0.1:21436",
-  "auth_token": "",                              // 可选：llama.cpp --api-key
-  "models": ["qwen3.6-27b-hauhau-q2kp"],         // external /v1/models 可见的显示名
-  "expose_external": ["qwen3.6-27b-hauhau-q2kp"],
-  "model_map": {},                                // 可选：显示名 → llama.cpp --alias
-
-  "auto_start": true,                             // health 失败时按需启动
-  "start_command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"I:\\Projects\\llama.cpp\\start_qwen36_server.ps1\" -ListenHost 127.0.0.1 -Port 21436",
-  "stop_command": null,                           // 可选；未填时只停止 fake-ollama 自己启动的进程
-  "idle_timeout_seconds": 1800,                   // 可选；留空表示不做空闲回收
-  "startup_timeout_seconds": 600,
-  "health_path": "/health",
-  "cwd": "I:\\Projects\\llama.cpp"
+  "llama_cpp_defaults": {
+    "expose_external": true,
+    "auto_start": true,                           // health 失败时按需启动
+    "idle_timeout_seconds": 1800,                 // 留空表示不做空闲回收
+    "startup_timeout_seconds": 600,
+    "health_path": "/health",
+    "cwd": "I:\\Projects\\llama.cpp"
+  },
+  "llama_cpp_targets": [
+    {
+      "base_url": "http://127.0.0.1:21436",
+      "auth_token": "",                          // 可选：llama.cpp --api-key
+      "model": "qwen3.6-27b-hauhau-q2kp",         // 必填；一个 target = 一个模型进程
+      "model_alias": null,                        // 可选：发送给 llama.cpp 的 --alias / OpenAI model ID
+      "start_command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"I:\\Projects\\llama.cpp\\start_qwen36_server.ps1\" -ListenHost 127.0.0.1 -Port 21436",
+      "stop_command": null                        // 可选；未填时只停止 fake-ollama 自己启动的进程
+    }
+  ]
 }
 ```
 
 路由行为：
-- `POST /v1/chat/completions` 命中 `llama_cpp_targets[*].models` 时，基本直通 llama.cpp 的 OpenAI API，只把显示名映射到 `model_map` 后的真实 alias。
+- `POST /v1/chat/completions` 命中 `llama_cpp_targets[*].model` 时，基本直通 llama.cpp 的 OpenAI API，只把显示名映射到 `model_alias` 后的真实 alias。
 - `POST /v1/messages` 命中同一模型时，会把 Anthropic Messages 请求转换成 OpenAI Chat Completions，再把响应转换回 Anthropic JSON / SSE。
-- 生命周期有两种模式：`auto_start: false` 是单独运行模式，fake-ollama 不接管进程；`auto_start: true` + `start_command` 是接管模式，fake-ollama 负责按需唤起。`idle_timeout_seconds` 只在你配置后启用；没有 `stop_command` 时，fake-ollama 不会杀掉它没有亲自启动的外部 llama.cpp 进程。进程开始关闭后同样会禁止再执行 `start_command`。
+- `llama_cpp_targets[*].model` 是单个字符串；旧版 `models: ["..."]` 会在读取时兼容，但新配置请不要再写列表。原因是 llama.cpp server 进程本身加载单个模型，端口、启动脚本、停止脚本和显存回收都应跟这个模型一一对应。
+- 生命周期有两种模式：`auto_start: false` 是单独运行模式，fake-ollama 不接管进程；`auto_start: true` + `start_command` 是接管模式，fake-ollama 负责按需唤起该模型对应的 server 进程。`idle_timeout_seconds` 只在你配置后启用；没有 `stop_command` 时，fake-ollama 不会杀掉它没有亲自启动的外部 llama.cpp 进程。Windows 上由 fake-ollama 启动的 PowerShell/cmd 包装进程会按进程树停止，避免只结束 shell 而留下 `llama-server` 子进程。进程开始关闭后同样会禁止再执行 `start_command`。
+- llama.cpp 模型同样从 `model_profiles[模型名].estimated_vram_gb` 读取显存估算。显存不足时，fake-ollama 可以停止空闲超过 60 秒、且由自己启动或配置了 `stop_command` 的其他 llama.cpp 模型 target；llama.cpp 没有通用的单模型卸载 API，所以回收单位就是该模型对应的 target 进程。释放后会重新读取 `nvidia-smi`，不会用 `estimated_vram_gb` 累加值当作真实可用显存。
 
 #### Copilot 走 upstream 调用 Ollama 模型
 
@@ -257,7 +269,7 @@ llama.cpp server 自带 OpenAI 兼容接口，fake-ollama 会把它聚合到 ext
 - 同机部署：`upstreams[*].base_url = "http://127.0.0.1:<external_port>"`
 - 跨机器部署：`upstreams[*].base_url = "http://<ollama-host>:<external_port>"`
 - `upstreams[*].auth_token` 填目标 fake_ollama 的 `external_access_tokens` 之一
-- 目标 fake_ollama 的 `ollama_targets[*].models` 或 `llama_cpp_targets[*].models` 包含这些模型
+- 目标 fake_ollama 的 `ollama_targets[*].models` 或 `llama_cpp_targets[*].model` 包含这些模型
 
 这样请求路径仍然是 upstream 语义：Copilot → internal `/api/chat` → upstream `/v1/messages` → 目标机器 Ollama / llama.cpp。不要为了图片能力把 internal `/api/chat` 直接改成本机 target，否则跨机器部署会失去这一层转发边界。
 
@@ -279,6 +291,11 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
     "thinking_mode": "enabled",
     "thinking_budget_tokens": 1024,
     "show_thinking": true
+  },
+  "llama3.1": {
+    "capabilities": ["completion", "tools"],
+    "context_length": 131072,
+    "estimated_vram_gb": 6.0
   }
 }
 ```
@@ -290,13 +307,14 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 | `capabilities` | `["completion","tools","vision"]` | 子集自这三者；**至少要有 `completion`**，否则 Copilot 会过滤掉 |
 | `context_length` | `200000` | 总上下文 token 上限。服务端会做拦截（输入估算 + `max_tokens` 超过 → 400） |
 | `max_output_tokens` | `null` | 可选；同时是 `max_tokens` 的硬上限 |
+| `estimated_vram_gb` | `null` | 可选；本地 Ollama / llama.cpp 模型加载后预计占用的 GPU 显存（GB），用于启动前预检和空闲模型回收 |
 | `thinking_mode` | `auto` | `auto` / `enabled` / `disabled`，控制是否注入 `thinking` 字段（仅 reasoning 模型有效） |
 | `thinking_budget_tokens` | `1024` | `enabled` 时的预算（DeepSeek 会忽略） |
 | `show_thinking` | `true` | 是否把上游 thinking 透传给客户端：用 `<think>...</think>` 包裹接到正文前面，并在 Ollama 响应里附 `message.thinking`、OpenAI 流式增量里附 `reasoning_content` |
 
 > token 估算用 `字符数 / 3` 的保守启发式（中英都偏高估），目的是宁可早拦也不漏拦——它**不**保证与上游计费完全一致。如需关闭拦截设 `enforce_context_limit: false`。
 
-> Web 编辑器里 `upstreams[*].models`、`ollama_targets[*].models`、`llama_cpp_targets[*].models` 与添加 `model_profiles` 时的 key 输入框都带 **HTML5 datalist 自动补全**。候选来自当前配置里的模型名、已探测到的模型名，以及已有 `model_profiles` key。
+> Web 编辑器里 `upstreams[*].models`、`ollama_targets[*].models`、`llama_cpp_targets[*].model` 与添加 `model_profiles` 时的 key 输入框都带 **HTML5 datalist 自动补全**。候选来自当前配置里的模型名、已探测到的模型名，以及已有 `model_profiles` key。
 
 ### 环境变量
 
@@ -319,7 +337,7 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 只要在 `config.json` 里配上 `ollama_targets` 或 `llama_cpp_targets`（见上），并填了至少一个 `external_access_tokens`，反向代理 `POST /v1/messages`、`POST /v1/messages/count_tokens` 与 external 端口的 `POST /v1/chat/completions` 就开门工作：
 
 - `model` 命中某个 `ollama_targets[*].models` → 转换为 Ollama `/api/chat`，再把响应翻译回 Anthropic 的 `message_*` SSE / 非流式 JSON。
-- `model` 命中某个 `llama_cpp_targets[*].models` → 调用 llama.cpp `/v1/chat/completions`；Anthropic 入口会做格式转换，OpenAI 入口则基本直通。
+- `model` 命中某个 `llama_cpp_targets[*].model` → 调用 llama.cpp `/v1/chat/completions`；Anthropic 入口会做格式转换，OpenAI 入口则基本直通。
 - `model` 命中某个 upstream 的 `expose_external` 列表 → 透传到该 Anthropic 上游（相当于一个本机鉴权转发壳）。
 - 其他情况 → 404 `model '...' is not exposed externally`。
 
@@ -349,9 +367,9 @@ claude
 - 左侧复选框 = **是否包含该字段**；取消勾选会从保存的 JSON 里移除，让它回退到默认值。
 - 右侧是输入控件（按字段类型自适应：文本 / 数字 / 复选框 / 多行列表 / key-value 表 / 嵌套对象列表 / **从兄弟字段拉取的复选框列表**）。
 - `upstreams`、`ollama_targets`、`llama_cpp_targets`、`model_profiles` 是可重复组，自带 +add / Remove。
-- **Detect models**：upstream / Ollama / llama.cpp 卡片右上角点一下，自动从 `/v1/models` 或 `/api/tags` 拉模型列表，弹窗里勾选后合并或替换 `models` 字段。
-- **expose_external**：upstream、Ollama target、llama.cpp target 卡片里都支持。点 "Refresh from models" 拉出当前 `models` 的复选框列表，勾选哪些模型对外暴露；不勾选该字段（默认）= 全部暴露（保持旧行为），勾上后留空 = 全部隐藏（仅本机内部可用）。
-- **model_profiles 添加**：key 输入框带浏览器原生 datalist 自动补全，候选从 `upstreams` / `ollama_targets` / `llama_cpp_targets` 的 `models` 收集。
+- **Detect models**：upstream / Ollama 卡片会把探测结果合并或替换 `models` 字段；llama.cpp 卡片会把选择结果写入单个 `model` 字段。多个 llama.cpp 模型请拆成多个 target。
+- **expose_external**：upstream、Ollama target 用模型列表筛选；llama.cpp target 用单个布尔开关，并可继承 `llama_cpp_defaults.expose_external`。
+- **model_profiles 添加**：key 输入框带浏览器原生 datalist 自动补全，候选从 `upstreams` / `ollama_targets` 的 `models` 和 `llama_cpp_targets` 的 `model` 收集。
 - **external_access_tokens**：每行带 Show / Generate 按钮；列表底部还有"+ generate token"直接追加随机 token。
 - 顶部三个按钮：
   - **Save & Reload**：用 `Settings` 校验 → 写回磁盘 → 原子替换 `app.state.settings`，并重建上游连接池（旧连接异步关闭，正在进行的请求不受影响）。
@@ -421,6 +439,7 @@ curl -X POST http://127.0.0.1:21435/v1/chat/completions `
 - **/v1/messages 返回 401**：`external_access_tokens` 为空（且 `external_port` 已设置 → 启动时已 WARN），或请求头里的 token 不在池里。检查 `x-api-key` / `Authorization: Bearer` 是否带对了。
 - **/v1/messages 在 internal 端口返回 404**：你启用了 `external_port`，反向代理已经只在 external 端口可达。请改连 external 端口。
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`（默认）。
+- **503 / `Insufficient GPU VRAM`**：某个本地 Ollama / llama.cpp 模型在 `model_profiles` 里配了 `estimated_vram_gb`，但 `nvidia-smi` 汇总的当前可用显存不足；fake-ollama 会尝试释放空闲 60 秒以上的可回收模型，并在释放后重新读取真实 free VRAM，仍不够才返回 503。Anthropic `/v1/messages` 会返回 `type=error`、`error.type=overloaded_error` 和英文 message；OpenAI/Ollama 入口会返回同样的英文错误文本。降低该模型的 `estimated_vram_gb`、等待旧模型空闲、配置有效的 `stop_command`，或手动释放显存后重试。
 - **400 thinking content must be passed back**（DeepSeek）：模型在某轮启用了 thinking，但下一轮历史里没把 `thinking` 块带回。fake-ollama 已做了缓存回查 + 当 profile 是 `auto + show_thinking=false` 时主动注入 `thinking: {type:"disabled"}` 绕过；如果你确实想要 thinking，把对应 profile 设为 `"thinking_mode": "enabled"`。
 - **503 `No available accounts: this group only allows Claude Code clients`**：上游（claude-relay-service 等）侧的账号池限制，要求请求来自 Claude Code 客户端且池里有可用账号。这种限制无法通过改请求体绕过，需在上游后台调整该 API Key 的客户端限制 / 账户池。
 

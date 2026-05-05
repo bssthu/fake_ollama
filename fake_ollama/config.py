@@ -18,10 +18,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import shlex
+import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlparse
 
 import logging
 
@@ -47,6 +50,20 @@ LEGACY_UPSTREAM_NAME = "default"
 def _model_base(name: str) -> str:
     """Return the Ollama-style tagless model name."""
     return name.split(":", 1)[0] if ":" in name else name
+
+
+def _shell_quote(value: str) -> str:
+    """Quote ``value`` for the platform's default shell.
+
+    ``create_subprocess_shell`` uses ``cmd.exe`` on Windows, which does not
+    treat single quotes as quoting characters — so ``shlex.quote`` (which
+    emits ``'...'``) silently breaks every path that contains a backslash
+    or space. ``subprocess.list2cmdline`` produces the right ``"..."``
+    form on Windows. On POSIX we keep ``shlex.quote``.
+    """
+    if os.name == "nt":
+        return subprocess.list2cmdline([value])
+    return shlex.quote(value)
 
 
 def _find_configured_model(display_name: str, models: Iterable[str]) -> Optional[str]:
@@ -86,6 +103,7 @@ class ModelProfile:
     thinking_mode: str = "auto"
     thinking_budget_tokens: int = DEFAULT_THINKING_BUDGET_TOKENS
     show_thinking: bool = True
+    estimated_vram_gb: Optional[float] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelProfile":
@@ -99,6 +117,15 @@ class ModelProfile:
             thinking = "auto"
         budget = data.get("thinking_budget_tokens") or data.get("thinking_budget") or DEFAULT_THINKING_BUDGET_TOKENS
         show = data.get("show_thinking")
+        raw_vram = data.get("estimated_vram_gb")
+        estimated_vram_gb = None
+        if raw_vram not in (None, ""):
+            try:
+                parsed_vram = float(raw_vram)
+                if parsed_vram > 0:
+                    estimated_vram_gb = parsed_vram
+            except (TypeError, ValueError):
+                estimated_vram_gb = None
         return cls(
             capabilities=[str(c) for c in caps],
             context_length=int(ctx),
@@ -106,6 +133,7 @@ class ModelProfile:
             thinking_mode=thinking,
             thinking_budget_tokens=int(budget),
             show_thinking=True if show is None else bool(show),
+            estimated_vram_gb=estimated_vram_gb,
         )
 
 
@@ -248,38 +276,24 @@ class OllamaTarget(BaseModel):
         return _find_configured_model(configured, self.expose_external) is not None
 
 
-class LlamaCppTarget(BaseModel):
-    """A llama.cpp server exposed through fake-ollama's reverse proxy.
+class LlamaCppDefaults(BaseModel):
+    """Defaults inherited by each llama.cpp target unless overridden."""
 
-    llama.cpp server speaks OpenAI-compatible ``/v1/chat/completions`` and
-    ``/v1/models``. fake-ollama aggregates these targets on the same external
-    ``/v1/*`` surface as ``ollama_targets`` and can optionally manage the
-    server process lifecycle with a configured start command and idle timeout.
-    """
-
-    name: str
-    base_url: str = "http://127.0.0.1:8080"
-    auth_token: str = ""
-    models: List[str] = Field(default_factory=list)
-    model_map: Dict[str, str] = Field(default_factory=dict)
-    expose_external: Optional[List[str]] = None
-
-    # Optional lifecycle management. If ``auto_start`` is true and the health
-    # check fails, fake-ollama runs ``start_command`` before forwarding the
-    # request. ``idle_timeout_seconds`` stops only processes started by this
-    # fake-ollama instance unless ``stop_command`` is configured.
+    expose_external: Optional[bool] = None
     auto_start: bool = False
-    start_command: Optional[str] = None
-    stop_command: Optional[str] = None
     idle_timeout_seconds: Optional[float] = None
     startup_timeout_seconds: float = 120.0
     health_path: str = "/health"
     cwd: Optional[str] = None
-
-    @field_validator("base_url")
-    @classmethod
-    def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+    # Defaults for synthesised start commands. Targets that leave
+    # ``start_command`` empty have one built from these (plus their own
+    # model_path / mmproj_path / port etc.).
+    binary_path: Optional[str] = None
+    runtime_root: Optional[str] = None
+    gpu_layers: Optional[int] = None
+    ctx_size: Optional[int] = None
+    parallel: Optional[int] = None
+    extra_args: Optional[str] = None
 
     @field_validator("health_path")
     @classmethod
@@ -288,18 +302,312 @@ class LlamaCppTarget(BaseModel):
             return "/health"
         return v if v.startswith("/") else "/" + v
 
+
+class LlamaCppTarget(BaseModel):
+    """One llama.cpp server process exposed through fake-ollama's reverse proxy.
+
+    llama.cpp server speaks OpenAI-compatible ``/v1/chat/completions`` and
+    ``/v1/models``. A llama.cpp server process loads one model, so each target
+    represents exactly one display model with its own port and lifecycle
+    commands. Configure additional models as additional ``llama_cpp_targets``.
+    """
+
+    name: str = ""
+    base_url: str = "http://127.0.0.1:8080"
+    auth_token: str = ""
+    model: str = ""
+    model_alias: Optional[str] = None
+    expose_external: Optional[bool] = None
+
+    # Optional lifecycle management. If ``auto_start`` is true and the health
+    # check fails, fake-ollama runs ``start_command`` before forwarding the
+    # request. ``idle_timeout_seconds`` stops only processes started by this
+    # fake-ollama instance unless ``stop_command`` is configured.
+    auto_start: Optional[bool] = None
+    start_command: Optional[str] = None
+    stop_command: Optional[str] = None
+    idle_timeout_seconds: Optional[float] = None
+    startup_timeout_seconds: Optional[float] = None
+    health_path: Optional[str] = None
+    cwd: Optional[str] = None
+
+    # Synthesised start_command parameters. Used only when ``start_command``
+    # is not set: fake-ollama assembles a llama-server invocation from these
+    # fields plus ``base_url`` (for host/port).
+    binary_path: Optional[str] = None
+    runtime_root: Optional[str] = None
+    model_path: Optional[str] = None
+    mmproj_path: Optional[str] = None
+    gpu_layers: Optional[int] = None
+    ctx_size: Optional[int] = None
+    parallel: Optional[int] = None
+    extra_args: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_single_model_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        legacy_models = out.pop("models", None)
+        if not out.get("model") and legacy_models is not None:
+            if isinstance(legacy_models, list) and len(legacy_models) == 1:
+                out["model"] = legacy_models[0]
+            else:
+                raise ValueError(
+                    "Each llama_cpp_target must declare exactly one model. Replace "
+                    "legacy `models` lists with a single `model` string and "
+                    "configure one target per llama.cpp process."
+                )
+
+        legacy_map = out.pop("model_map", None)
+        if not out.get("model_alias") and isinstance(legacy_map, dict):
+            model = str(out.get("model") or "")
+            base = _model_base(model) if model else ""
+            for key in (model, base):
+                if key and key in legacy_map:
+                    out["model_alias"] = legacy_map[key]
+                    break
+            else:
+                values = [v for v in legacy_map.values() if v]
+                if len(values) == 1:
+                    out["model_alias"] = values[0]
+
+        legacy_expose = out.get("expose_external")
+        if isinstance(legacy_expose, list):
+            model = str(out.get("model") or "")
+            out["expose_external"] = bool(
+                model and _find_configured_model(model, legacy_expose) is not None
+            )
+        return out
+
+    @field_validator("base_url")
+    @classmethod
+    def _strip_trailing_slash(cls, v: str) -> str:
+        return v.rstrip("/")
+
+    @field_validator("health_path")
+    @classmethod
+    def _normalise_health_path(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not v:
+            return "/health"
+        return v if v.startswith("/") else "/" + v
+
+    @model_validator(mode="after")
+    def _validate_single_model_process(self) -> "LlamaCppTarget":
+        if not self.model:
+            raise ValueError(
+                "Each llama_cpp_target must declare a non-empty `model` because "
+                "each llama.cpp server process loads one model. Configure a "
+                "separate llama_cpp_targets entry with its own base_url, "
+                "start_command, stop_command, and port for each model."
+            )
+        if not self.name:
+            object.__setattr__(self, "name", self.model)
+        return self
+
+    @property
+    def models(self) -> List[str]:
+        return [self.model] if self.model else []
+
+    def with_defaults(self, defaults: LlamaCppDefaults) -> "LlamaCppTarget":
+        return self.model_copy(
+            update={
+                "expose_external": (
+                    self.expose_external
+                    if self.expose_external is not None
+                    else defaults.expose_external
+                ),
+                "auto_start": (
+                    self.auto_start
+                    if self.auto_start is not None
+                    else defaults.auto_start
+                ),
+                "idle_timeout_seconds": (
+                    self.idle_timeout_seconds
+                    if self.idle_timeout_seconds is not None
+                    else defaults.idle_timeout_seconds
+                ),
+                "startup_timeout_seconds": (
+                    self.startup_timeout_seconds
+                    if self.startup_timeout_seconds is not None
+                    else defaults.startup_timeout_seconds
+                ),
+                "health_path": self.health_path or defaults.health_path,
+                "cwd": self.cwd if self.cwd is not None else defaults.cwd,
+                "binary_path": (
+                    self.binary_path
+                    if self.binary_path is not None
+                    else defaults.binary_path
+                ),
+                "runtime_root": (
+                    self.runtime_root
+                    if self.runtime_root is not None
+                    else defaults.runtime_root
+                ),
+                "gpu_layers": (
+                    self.gpu_layers
+                    if self.gpu_layers is not None
+                    else defaults.gpu_layers
+                ),
+                "ctx_size": (
+                    self.ctx_size
+                    if self.ctx_size is not None
+                    else defaults.ctx_size
+                ),
+                "parallel": (
+                    self.parallel
+                    if self.parallel is not None
+                    else defaults.parallel
+                ),
+                "extra_args": (
+                    self.extra_args
+                    if self.extra_args is not None
+                    else defaults.extra_args
+                ),
+            }
+        )
+
+    def synthesize_start_command(self) -> Optional[str]:
+        """Return ``start_command`` if set, otherwise build one from fields.
+
+        Returns ``None`` only when no ``start_command`` is configured *and*
+        ``model_path`` is empty (in which case fake-ollama cannot launch the
+        server itself and falls back to the legacy "bring your own process"
+        behaviour).
+        """
+        if self.start_command:
+            return self.start_command
+        argv = self.synthesize_start_argv()
+        if argv is None:
+            return None
+        # Use platform-appropriate quoting: shlex.quote (POSIX single quotes)
+        # would break on Windows because cmd.exe does not strip single
+        # quotes and would refuse to launch the executable.
+        return " ".join(_shell_quote(a) for a in argv)
+
+    def synthesize_start_argv(self) -> Optional[List[str]]:
+        """Return argv for launching ``llama-server`` directly (exec, no shell).
+
+        Returns ``None`` if a user-provided ``start_command`` is set (we
+        cannot safely split an arbitrary shell string into argv) or if no
+        ``model_path`` is configured.
+
+        Preferring exec over shell is important on Windows: ``cmd.exe /c``
+        wraps the actual server in a launcher process whose lifecycle is
+        decoupled from the child. When fake-ollama later wants to free
+        VRAM by killing the server, the wrapper may already have exited
+        (returncode set), leaving the real ``llama-server.exe`` orphaned
+        and unkillable via the captured PID.
+        """
+        if self.start_command:
+            return None
+        if not self.model_path:
+            return None
+        parsed = urlparse(self.base_url or "")
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 8080
+        binary = self._resolve_binary(self.binary_path)
+        argv: List[str] = [
+            binary,
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--model",
+            self.model_path,
+        ]
+        if self.mmproj_path:
+            argv += ["--mmproj", self.mmproj_path]
+        if self.gpu_layers is not None:
+            argv += ["-ngl", str(self.gpu_layers)]
+        if self.ctx_size:
+            argv += ["--ctx-size", str(self.ctx_size)]
+        if self.parallel:
+            argv += ["--parallel", str(self.parallel)]
+        if self.model_alias:
+            argv += ["--alias", self.model_alias]
+        if self.auth_token:
+            argv += ["--api-key", self.auth_token]
+        if self.extra_args:
+            extra = self.extra_args.strip()
+            if extra:
+                argv += shlex.split(extra, posix=(os.name != "nt"))
+        return argv
+
+    def effective_env(
+        self, base_env: Optional[Dict[str, str]] = None
+    ) -> Optional[Dict[str, str]]:
+        """Return env dict for launching this target, or ``None`` if no
+        adjustments are needed (caller will inherit os.environ).
+
+        The CUDA-build llama.cpp release ships with a separate
+        ``cudart-llama-bin-win-cuda-XX.X-x64`` folder containing
+        ``cudart64_*.dll`` etc. Without that directory on PATH, llama-server
+        fails to load CUDA and silently falls back to CPU (no VRAM growth).
+        Mirrors the original PowerShell launcher's
+        ``$env:PATH = \"$binRoot;$runtimeRoot;\" + $env:PATH``.
+        """
+        if not self.runtime_root and not self.binary_path:
+            return None
+        env = dict(base_env if base_env is not None else os.environ)
+        sep = os.pathsep
+        prepend: list[str] = []
+        binary = self._resolve_binary(self.binary_path)
+        if binary:
+            try:
+                bin_dir = str(Path(binary).resolve().parent)
+                if bin_dir and Path(bin_dir).is_dir():
+                    prepend.append(bin_dir)
+            except (OSError, ValueError):
+                pass
+        if self.runtime_root:
+            try:
+                rt = str(Path(self.runtime_root).resolve())
+                if Path(rt).is_dir():
+                    prepend.append(rt)
+            except (OSError, ValueError):
+                prepend.append(self.runtime_root)
+        if not prepend:
+            return None
+        existing = env.get("PATH", "")
+        env["PATH"] = sep.join(prepend + ([existing] if existing else []))
+        return env
+
+    @staticmethod
+    def _resolve_binary(binary_path: Optional[str]) -> str:
+        """Resolve ``binary_path`` to an actual executable.
+
+        Users sometimes paste the extracted llama.cpp release folder (e.g.
+        ``C:\\...\\llama-b8994-bin-win-cuda-13.1-x64``) instead of the
+        ``llama-server[.exe]`` inside it. A bare directory passed as a shell
+        command silently fails on Windows (``cmd.exe`` reports it as
+        "is not recognized") and the caller would then wait the full
+        ``startup_timeout_seconds`` with no useful diagnostic.
+        """
+        if not binary_path:
+            return "llama-server"
+        try:
+            p = Path(binary_path)
+        except (OSError, ValueError):
+            return binary_path
+        if p.is_dir():
+            for name in ("llama-server.exe", "llama-server"):
+                candidate = p / name
+                if candidate.exists():
+                    return str(candidate)
+        return binary_path
+
     def matching_model(self, display_name: str) -> Optional[str]:
-        return _find_configured_model(display_name, self.models)
+        return _find_configured_model(display_name, [self.model])
 
     def resolve_model(self, display_name: str) -> str:
         configured = self.matching_model(display_name)
-        for key in (display_name, configured, _model_base(display_name)):
-            if key and key in self.model_map:
-                return self.model_map[key]
+        if configured and self.model_alias:
+            return self.model_alias
         if configured:
-            base = _model_base(configured)
-            if base in self.model_map:
-                return self.model_map[base]
             return configured
         return display_name
 
@@ -312,7 +620,7 @@ class LlamaCppTarget(BaseModel):
             return False
         if self.expose_external is None:
             return True
-        return _find_configured_model(configured, self.expose_external) is not None
+        return bool(self.expose_external)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +658,7 @@ class Settings(BaseModel):
     enforce_context_limit: bool = True
     upstreams: List[Upstream] = Field(default_factory=list)
     ollama_targets: List[OllamaTarget] = Field(default_factory=list)
+    llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
     llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
     model_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
@@ -376,6 +685,9 @@ class Settings(BaseModel):
         llama_target_names = [t.name for t in self.llama_cpp_targets]
         if len(set(llama_target_names)) != len(llama_target_names):
             raise ValueError(f"Duplicate llama_cpp_target names: {llama_target_names}")
+        llama_models = [t.model for t in self.llama_cpp_targets]
+        if len(set(llama_models)) != len(llama_models):
+            raise ValueError(f"Duplicate llama_cpp_target models: {llama_models}")
         enabled_ports = {"internal": self.port}
         if self.external_port is not None:
             enabled_ports["external"] = self.external_port
@@ -421,11 +733,18 @@ class Settings(BaseModel):
     def reverse_proxy_models(self) -> List[str]:
         """Local target model names visible on /v1/* (subject to expose_external)."""
         seen: Dict[str, None] = {}
-        for t in [*self.ollama_targets, *self.llama_cpp_targets]:
+        for t in self.ollama_targets:
             allowed = t.models if t.expose_external is None else [
                 m for m in t.models if m in set(t.expose_external)
             ]
             for m in allowed:
+                if m not in seen:
+                    seen[m] = None
+        for raw_t in self.llama_cpp_targets:
+            t = self.effective_llama_cpp_target(raw_t)
+            if t.expose_external is False:
+                continue
+            for m in t.models:
                 if m not in seen:
                     seen[m] = None
         return list(seen.keys())
@@ -459,7 +778,8 @@ class Settings(BaseModel):
         for t in self.ollama_targets:
             if t.exposes(display_name):
                 return True
-        for t in self.llama_cpp_targets:
+        for raw_t in self.llama_cpp_targets:
+            t = self.effective_llama_cpp_target(raw_t)
             if t.exposes(display_name):
                 return True
         for up in self.upstreams:
@@ -535,6 +855,9 @@ class Settings(BaseModel):
             if t.serves(display_name):
                 return t
         return None
+
+    def effective_llama_cpp_target(self, target: LlamaCppTarget) -> LlamaCppTarget:
+        return target.with_defaults(self.llama_cpp_defaults)
 
     def profile_for(self, display_name: str) -> ModelProfile:
         raw = self.model_profiles.get(display_name)

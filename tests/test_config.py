@@ -240,6 +240,7 @@ def test_tagless_request_only_matches_latest_tag():
                 "health_path": "api/version",
             }
         ],
+        model_profiles={"qwen3.6-27b:q2_k_p": {"estimated_vram_gb": 10.5}},
     )
 
     assert s.upstream_name_for("qwen3.6-27b:q2_k_p") == "quantized"
@@ -250,6 +251,7 @@ def test_tagless_request_only_matches_latest_tag():
     assert target.auto_start is True
     assert target.start_command == "ollama serve"
     assert target.health_path == "/api/version"
+    assert s.profile_for("qwen3.6-27b:q2_k_p").estimated_vram_gb == 10.5
 
 
 def test_llama_cpp_target_routing_and_profile():
@@ -264,26 +266,129 @@ def test_llama_cpp_target_routing_and_profile():
         ],
         llama_cpp_targets=[
             {
-                "name": "qwen36",
                 "base_url": "http://127.0.0.1:21436/",
-                "models": ["qwen3.6:latest"],
-                "model_map": {"qwen3.6": "qwen3.6-alias"},
+                "model": "qwen3.6:latest",
+                "model_alias": "qwen3.6-alias",
                 "auto_start": True,
                 "start_command": "run-qwen36",
                 "idle_timeout_seconds": 1800,
                 "health_path": "health",
             }
         ],
-        model_profiles={"qwen3.6:latest": {"context_length": 262144}},
+        model_profiles={
+            "qwen3.6:latest": {"context_length": 262144, "estimated_vram_gb": 18}
+        },
     )
 
     target = s.llama_cpp_target_for("qwen3.6")
     assert target is not None
+    assert target.name == "qwen3.6:latest"
     assert target.base_url == "http://127.0.0.1:21436"
     assert target.health_path == "/health"
     assert target.resolve_model("qwen3.6") == "qwen3.6-alias"
     assert s.reverse_proxy_models == ["qwen3.6:latest"]
     assert s.profile_for("qwen3.6").context_length == 262144
+    assert s.profile_for("qwen3.6").estimated_vram_gb == 18
+
+
+def test_llama_cpp_defaults_are_inherited_and_overridden():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u1",
+                "base_url": "https://first.example.com",
+                "auth_token": "tok",
+                "models": ["fallback"],
+            }
+        ],
+        llama_cpp_defaults={
+            "expose_external": False,
+            "auto_start": True,
+            "idle_timeout_seconds": 1800,
+            "startup_timeout_seconds": 600,
+            "health_path": "ready",
+            "cwd": "I:\\Projects\\llama.cpp",
+        },
+        llama_cpp_targets=[
+            {
+                "model": "hidden-qwen",
+                "base_url": "http://127.0.0.1:21436",
+                "start_command": "run-hidden",
+            },
+            {
+                "model": "visible-qwen",
+                "base_url": "http://127.0.0.1:21437",
+                "expose_external": True,
+                "auto_start": False,
+                "health_path": "healthz",
+            },
+        ],
+    )
+
+    hidden = s.effective_llama_cpp_target(s.llama_cpp_targets[0])
+    visible = s.effective_llama_cpp_target(s.llama_cpp_targets[1])
+    assert hidden.name == "hidden-qwen"
+    assert hidden.expose_external is False
+    assert hidden.auto_start is True
+    assert hidden.idle_timeout_seconds == 1800
+    assert hidden.startup_timeout_seconds == 600
+    assert hidden.health_path == "/ready"
+    assert hidden.cwd == "I:\\Projects\\llama.cpp"
+    assert visible.expose_external is True
+    assert visible.auto_start is False
+    assert visible.health_path == "/healthz"
+    assert s.reverse_proxy_models == ["visible-qwen"]
+    assert s.is_externally_exposed("hidden-qwen") is False
+    assert s.is_externally_exposed("visible-qwen") is True
+
+
+def test_llama_cpp_target_accepts_legacy_single_model_fields():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u1",
+                "base_url": "https://first.example.com",
+                "auth_token": "tok",
+                "models": ["fallback"],
+            }
+        ],
+        llama_cpp_targets=[
+            {
+                "base_url": "http://127.0.0.1:21436",
+                "models": ["qwen3.6"],
+                "model_map": {"qwen3.6": "qwen3.6-alias"},
+                "expose_external": ["qwen3.6"],
+            }
+        ],
+    )
+
+    target = s.llama_cpp_targets[0]
+    assert target.name == "qwen3.6"
+    assert target.model == "qwen3.6"
+    assert target.model_alias == "qwen3.6-alias"
+    assert target.expose_external is True
+
+
+def test_llama_cpp_target_requires_one_model_per_process():
+    with pytest.raises(ValueError, match="exactly one model"):
+        Settings(
+            upstreams=[
+                {
+                    "name": "u1",
+                    "base_url": "https://first.example.com",
+                    "auth_token": "tok",
+                    "models": ["fallback"],
+                }
+            ],
+            llama_cpp_targets=[
+                {
+                    "name": "shared-process",
+                    "base_url": "http://127.0.0.1:21436",
+                    "models": ["qwen3.6", "qwen3.6-coder"],
+                    "start_command": "run-shared",
+                }
+            ],
+        )
 
 
 def test_routes_request_to_correct_upstream(monkeypatch, tmp_path):

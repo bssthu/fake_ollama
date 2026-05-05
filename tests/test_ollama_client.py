@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -10,6 +11,7 @@ import pytest
 
 from fake_ollama.ollama_client import OllamaClient
 from fake_ollama.llama_cpp_client import LlamaCppClient
+from fake_ollama.vram import LocalTargetResourceError, VramCoordinator
 
 
 class _FakeProcess:
@@ -37,8 +39,12 @@ async def test_ollama_client_auto_starts_before_chat(monkeypatch: pytest.MonkeyP
         return _FakeProcess()
 
     monkeypatch.setattr(
-        "fake_ollama.ollama_client.asyncio.create_subprocess_shell",
+        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
         fake_create_subprocess_shell,
+    )
+    monkeypatch.setattr(
+        "fake_ollama.ollama_client.terminate_process_tree",
+        lambda process, *, timeout=10.0: _async_true(),
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -85,7 +91,7 @@ async def test_ollama_client_does_not_start_when_disabled(monkeypatch: pytest.Mo
         return _FakeProcess()
 
     monkeypatch.setattr(
-        "fake_ollama.ollama_client.asyncio.create_subprocess_shell",
+        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
         fake_create_subprocess_shell,
     )
 
@@ -118,7 +124,7 @@ async def test_ollama_client_does_not_auto_start_during_shutdown(monkeypatch: py
         return _FakeProcess()
 
     monkeypatch.setattr(
-        "fake_ollama.ollama_client.asyncio.create_subprocess_shell",
+        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
         fake_create_subprocess_shell,
     )
 
@@ -152,7 +158,7 @@ async def test_llama_cpp_client_does_not_auto_start_during_shutdown(monkeypatch:
         return _FakeProcess()
 
     monkeypatch.setattr(
-        "fake_ollama.llama_cpp_client.asyncio.create_subprocess_shell",
+        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
         fake_create_subprocess_shell,
     )
 
@@ -175,3 +181,216 @@ async def test_llama_cpp_client_does_not_auto_start_during_shutdown(monkeypatch:
         await client.aclose()
 
     assert commands == []
+
+
+async def _async_true() -> bool:
+    return True
+
+
+async def _async_false() -> bool:
+    return False
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_client_stops_owned_process_tree(monkeypatch: pytest.MonkeyPatch):
+    stopped: list[_FakeProcess] = []
+
+    async def fake_terminate_process_tree(process: _FakeProcess, *, timeout: float = 10.0) -> bool:
+        stopped.append(process)
+        process.returncode = 0
+        return True
+
+    monkeypatch.setattr(
+        "fake_ollama.llama_cpp_client.terminate_process_tree",
+        fake_terminate_process_tree,
+    )
+    client = LlamaCppClient("http://127.0.0.1:21436")
+    fake_process = _FakeProcess()
+    client._process = fake_process
+    client._started_by_us = True
+    client._mark_vram_reserved("qwen", 20)
+
+    try:
+        stopped_ok = await client.stop_if_owned()
+    finally:
+        await client.aclose()
+
+    assert stopped_ok is True
+    assert stopped == [fake_process]
+    assert client.has_vram_reservation("qwen") is False
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_client_keeps_vram_reservation_when_process_tree_stop_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "fake_ollama.llama_cpp_client.terminate_process_tree",
+        lambda process, *, timeout=10.0: _async_false(),
+    )
+    client = LlamaCppClient("http://127.0.0.1:21436")
+    client._process = _FakeProcess()
+    client._started_by_us = True
+    client._mark_vram_reserved("qwen", 20)
+
+    try:
+        stopped_ok = await client.stop_if_owned()
+    finally:
+        client._started_by_us = False
+        await client.aclose()
+
+    assert stopped_ok is False
+    assert client.has_vram_reservation("qwen") is True
+
+
+@pytest.mark.asyncio
+async def test_ollama_client_unloads_idle_model_before_loading_new_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    free_vram_values = iter([1024.0, 3072.0])
+
+    async def free_vram_mib() -> float:
+        return next(free_vram_values, 3072.0)
+
+    monkeypatch.setattr(
+        "fake_ollama.vram._POST_RELEASE_REFRESH_DELAYS_SECONDS", (0.0,)
+    )
+
+    coordinator = VramCoordinator(provider=free_vram_mib)
+    unloaded: list[str] = []
+
+    def old_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/generate":
+            unloaded.append(json.loads(request.content)["model"])
+            return httpx.Response(200, json={"done": True, "done_reason": "unload"})
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.0.0-test"})
+        raise AssertionError(f"unexpected old path: {request.url.path}")
+
+    def new_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.0.0-test"})
+        if request.url.path == "/api/chat":
+            return httpx.Response(
+                200,
+                json={
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": True,
+                },
+            )
+        raise AssertionError(f"unexpected new path: {request.url.path}")
+
+    old_client = OllamaClient(
+        "http://old.local",
+        target_name="old",
+        vram_coordinator=coordinator,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(old_handler)),
+    )
+    new_client = OllamaClient(
+        "http://new.local",
+        target_name="new",
+        vram_coordinator=coordinator,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(new_handler)),
+    )
+    old_client._mark_vram_reserved("old-model:latest", 2)
+    old_client._loaded_models["old-model:latest"].last_used_monotonic = (
+        time.monotonic() - 61.0
+    )
+
+    try:
+        resp = await new_client.chat(
+            {"model": "new-model", "messages": []}, estimated_vram_gb=2
+        )
+    finally:
+        await new_client.aclose()
+        await old_client.aclose()
+
+    assert resp["message"]["content"] == "ok"
+    assert unloaded == ["old-model:latest"]
+    assert old_client.has_vram_reservation("old-model:latest") is False
+    assert new_client.has_vram_reservation("new-model") is True
+
+
+@pytest.mark.asyncio
+async def test_ollama_client_rechecks_vram_after_release_before_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def free_vram_mib() -> float:
+        return 1024.0
+
+    monkeypatch.setattr(
+        "fake_ollama.vram._POST_RELEASE_REFRESH_DELAYS_SECONDS", (0.0,)
+    )
+    coordinator = VramCoordinator(provider=free_vram_mib)
+    chat_called = False
+
+    def old_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/generate":
+            return httpx.Response(200, json={"done": True, "done_reason": "unload"})
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.0.0-test"})
+        raise AssertionError(f"unexpected old path: {request.url.path}")
+
+    def new_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chat_called
+        if request.url.path == "/api/chat":
+            chat_called = True
+        return httpx.Response(200, json={"version": "0.0.0-test"})
+
+    old_client = OllamaClient(
+        "http://old.local",
+        target_name="old",
+        vram_coordinator=coordinator,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(old_handler)),
+    )
+    new_client = OllamaClient(
+        "http://new.local",
+        target_name="new",
+        vram_coordinator=coordinator,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(new_handler)),
+    )
+    old_client._mark_vram_reserved("old-model", 2)
+    old_client._loaded_models["old-model"].last_used_monotonic = time.monotonic() - 61.0
+
+    try:
+        with pytest.raises(LocalTargetResourceError, match="rechecked current free VRAM"):
+            await new_client.chat(
+                {"model": "new-model", "messages": []}, estimated_vram_gb=2
+            )
+    finally:
+        await new_client.aclose()
+        await old_client.aclose()
+
+    assert chat_called is False
+
+
+@pytest.mark.asyncio
+async def test_ollama_client_reports_insufficient_vram_before_request():
+    async def free_vram_mib() -> float:
+        return 512.0
+
+    coordinator = VramCoordinator(provider=free_vram_mib)
+    chat_called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chat_called
+        if request.url.path == "/api/chat":
+            chat_called = True
+        return httpx.Response(200, json={"version": "0.0.0-test"})
+
+    client = OllamaClient(
+        "http://new.local",
+        target_name="new",
+        vram_coordinator=coordinator,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        with pytest.raises(LocalTargetResourceError, match="Insufficient GPU VRAM"):
+            await client.chat(
+                {"model": "new-model", "messages": []}, estimated_vram_gb=4
+            )
+    finally:
+        await client.aclose()
+
+    assert chat_called is False

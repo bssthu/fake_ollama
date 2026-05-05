@@ -16,6 +16,7 @@ from fake_ollama.config import (
     load_settings,
 )
 from fake_ollama.server import create_app
+from fake_ollama.vram import LocalTargetResourceError
 
 
 # ---------------------------------------------------------------------------
@@ -33,13 +34,20 @@ class _FakeOllamaClient:
         self.stream_lines = stream_lines or []
         self.last_chat_payload: Optional[Dict[str, Any]] = None
         self.last_stream_payload: Optional[Dict[str, Any]] = None
+        self.last_estimated_vram_gb: Optional[float] = None
 
-    async def chat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def chat(
+        self, payload: Dict[str, Any], *, estimated_vram_gb: Optional[float] = None
+    ) -> Dict[str, Any]:
         self.last_chat_payload = payload
+        self.last_estimated_vram_gb = estimated_vram_gb
         return self.chat_response
 
-    def stream_chat(self, payload: Dict[str, Any]) -> AsyncIterator[bytes]:
+    def stream_chat(
+        self, payload: Dict[str, Any], *, estimated_vram_gb: Optional[float] = None
+    ) -> AsyncIterator[bytes]:
         self.last_stream_payload = payload
+        self.last_estimated_vram_gb = estimated_vram_gb
         lines = self.stream_lines
 
         async def gen() -> AsyncIterator[bytes]:
@@ -64,13 +72,20 @@ class _FakeLlamaCppClient:
         self.stream_chunks = stream_chunks or []
         self.last_chat_payload: Optional[Dict[str, Any]] = None
         self.last_stream_payload: Optional[Dict[str, Any]] = None
+        self.last_estimated_vram_gb: Optional[float] = None
 
-    async def chat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def chat(
+        self, payload: Dict[str, Any], *, estimated_vram_gb: Optional[float] = None
+    ) -> Dict[str, Any]:
         self.last_chat_payload = payload
+        self.last_estimated_vram_gb = estimated_vram_gb
         return self.chat_response
 
-    async def stream_chat(self, payload: Dict[str, Any]) -> AsyncIterator[str]:
+    async def stream_chat(
+        self, payload: Dict[str, Any], *, estimated_vram_gb: Optional[float] = None
+    ) -> AsyncIterator[str]:
         self.last_stream_payload = payload
+        self.last_estimated_vram_gb = estimated_vram_gb
         for chunk in self.stream_chunks:
             yield "data: " + json.dumps(chunk)
         yield "data: [DONE]"
@@ -181,6 +196,33 @@ def test_reverse_non_stream_text(reverse_settings):
     assert sent["options"]["num_predict"] == 100
 
 
+def test_reverse_target_passes_per_model_estimated_vram(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["model_profiles"] = {"llama3.1": {"estimated_vram_gb": 6.5}}
+    settings = Settings(**data)
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+        }
+    )
+    client = _build_client(settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_estimated_vram_gb == 6.5
+
+
 def test_reverse_count_tokens_estimates_for_ollama_target(reverse_settings):
     client = _build_client(reverse_settings)
     payload = {
@@ -211,6 +253,40 @@ def test_reverse_count_tokens_estimates_for_ollama_target(reverse_settings):
     assert resp.status_code == 200
     assert resp.json() == {
         "input_tokens": estimate_tokens_from_anthropic_payload(payload)
+    }
+
+
+def test_reverse_messages_returns_anthropic_error_for_insufficient_vram(reverse_settings):
+    class FailingOllamaClient(_FakeOllamaClient):
+        async def chat(
+            self,
+            payload: Dict[str, Any],
+            *,
+            estimated_vram_gb: Optional[float] = None,
+        ) -> Dict[str, Any]:
+            raise LocalTargetResourceError(
+                "Insufficient GPU VRAM to start local model 'llama3.1'."
+            )
+
+    client = _build_client(reverse_settings, fake_ollama=FailingOllamaClient())
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "type": "error",
+        "error": {
+            "type": "overloaded_error",
+            "message": "Insufficient GPU VRAM to start local model 'llama3.1'.",
+        },
     }
 
 
@@ -494,8 +570,8 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
         {
             "name": "qwen36",
             "base_url": "http://127.0.0.1:21436",
-            "models": ["qwen3.6"],
-            "model_map": {"qwen3.6": "qwen3.6-alias"},
+            "model": "qwen3.6",
+            "model_alias": "qwen3.6-alias",
         }
     ]
     data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
@@ -546,7 +622,7 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
 def test_reverse_forwards_base64_image_to_llama_cpp(reverse_settings):
     data = reverse_settings.model_dump()
     data["llama_cpp_targets"] = [
-        {"name": "qwen36", "models": ["qwen3.6"], "base_url": "http://x.test"}
+        {"name": "qwen36", "model": "qwen3.6", "base_url": "http://x.test"}
     ]
     settings = Settings(**data)
     fake = _FakeLlamaCppClient(
@@ -608,8 +684,8 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
         {
             "name": "qwen36",
             "base_url": "http://127.0.0.1:21436",
-            "models": ["qwen3.6"],
-            "model_map": {"qwen3.6": "qwen3.6-alias"},
+            "model": "qwen3.6",
+            "model_alias": "qwen3.6-alias",
         }
     ]
     settings = Settings(**data)
@@ -647,7 +723,7 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
 def test_reverse_streaming_routes_to_llama_cpp_target(reverse_settings):
     data = reverse_settings.model_dump()
     data["llama_cpp_targets"] = [
-        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "models": ["qwen3.6"]}
+        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
     ]
     data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
     settings = Settings(**data)
@@ -702,7 +778,7 @@ def test_reverse_streaming_routes_to_llama_cpp_target(reverse_settings):
 def test_v1_models_includes_llama_cpp_targets_when_authed(reverse_settings):
     data = reverse_settings.model_dump()
     data["llama_cpp_targets"] = [
-        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "models": ["qwen3.6"]}
+        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
     ]
     settings = Settings(**data)
     client = _build_client(settings, fake_llama_cpp=_FakeLlamaCppClient())

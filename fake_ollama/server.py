@@ -29,6 +29,7 @@ from .converters import (
 )
 from .llama_cpp_client import LlamaCppClient
 from .ollama_client import OllamaClient
+from .vram import LocalTargetResourceError, VramCoordinator
 from .reverse_converters import (
     anthropic_to_ollama_chat as anthropic_to_ollama_chat_payload,
     anthropic_to_openai_chat as anthropic_to_openai_chat_payload,
@@ -56,6 +57,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.ollama_clients = {}
         if not getattr(app.state, "llama_cpp_clients", None):
             app.state.llama_cpp_clients = {}
+        if not getattr(app.state, "vram_coordinator", None):
+            app.state.vram_coordinator = VramCoordinator()
         for up in app.state.settings.upstreams:
             if up.name in app.state.clients:
                 continue
@@ -80,9 +83,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 startup_timeout_seconds=tgt.startup_timeout_seconds,
                 health_path=tgt.health_path,
                 cwd=tgt.cwd,
+                target_name=tgt.name,
+                vram_coordinator=app.state.vram_coordinator,
             )
             owned_target_names.append(tgt.name)
-        for tgt in app.state.settings.llama_cpp_targets:
+        for raw_tgt in app.state.settings.llama_cpp_targets:
+            tgt = app.state.settings.effective_llama_cpp_target(raw_tgt)
             if tgt.name in app.state.llama_cpp_clients:
                 continue
             app.state.llama_cpp_clients[tgt.name] = LlamaCppClient(
@@ -92,11 +98,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 trust_env=app.state.settings.use_system_proxy,
                 auto_start=tgt.auto_start,
                 start_command=tgt.start_command,
+                start_argv=tgt.synthesize_start_argv(),
                 stop_command=tgt.stop_command,
                 idle_timeout_seconds=tgt.idle_timeout_seconds,
                 startup_timeout_seconds=tgt.startup_timeout_seconds,
                 health_path=tgt.health_path,
                 cwd=tgt.cwd,
+                launch_env=tgt.effective_env(),
+                target_name=tgt.name,
+                vram_coordinator=app.state.vram_coordinator,
             )
             owned_llama_cpp_names.append(tgt.name)
         _sync_local_target_idle_monitor(app)
@@ -127,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.state.shutdown_requested = False
+    app.state.vram_coordinator = VramCoordinator()
     app.state.ensure_local_target_idle_monitor = _sync_local_target_idle_monitor
     _install_port_router(app)
     _register_routes(app)
@@ -134,10 +145,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 def request_shutdown(app: FastAPI) -> None:
-    """Mark the app as shutting down and disable local target auto-starts."""
+    """Mark the app as shutting down and disable local target auto-starts.
+
+    Also schedules ``stop_if_owned`` for every owned local target client so
+    in-flight requests against a still-loading llama.cpp / ollama child get
+    aborted (taskkill /T /F on Windows). Without this the upstream HTTP
+    connection from fake-ollama to the local server stays open until the
+    huge model finishes loading, which prevents uvicorn from exiting after
+    CTRL+C ("Waiting for connections to close").
+    """
     if getattr(app.state, "shutdown_requested", False):
         return
     app.state.shutdown_requested = True
+    owned_clients: list[Any] = []
     for client_group in (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
@@ -146,6 +166,34 @@ def request_shutdown(app: FastAPI) -> None:
             begin_shutdown = getattr(client, "begin_shutdown", None)
             if callable(begin_shutdown):
                 begin_shutdown()
+            if getattr(client, "stop_if_owned", None) is not None:
+                owned_clients.append(client)
+
+    if not owned_clients:
+        return
+
+    async def _stop_all() -> None:
+        for client in owned_clients:
+            try:
+                await client.stop_if_owned()
+            except Exception:
+                logger.exception(
+                    "failed to stop owned local target during shutdown"
+                )
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        loop.create_task(_stop_all())
+    else:
+        # No running loop (e.g. uvicorn already finished serving). Run the
+        # cleanup synchronously so the caller still kills the children.
+        try:
+            asyncio.run(_stop_all())
+        except RuntimeError:
+            pass
 
 
 def _client_for(app: FastAPI, settings: Settings, model_name: str) -> AnthropicClient:
@@ -561,9 +609,26 @@ def _read_error_text(exc: httpx.HTTPError) -> str:
 
 
 def _upstream_error_status(exc: httpx.HTTPError) -> int:
+    if isinstance(exc, LocalTargetResourceError):
+        return exc.status_code
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return 502
+
+
+def _anthropic_error_response(exc: httpx.HTTPError) -> JSONResponse:
+    error_type = (
+        exc.error_type
+        if isinstance(exc, LocalTargetResourceError)
+        else "upstream_error"
+    )
+    return JSONResponse(
+        status_code=_upstream_error_status(exc),
+        content={
+            "type": "error",
+            "error": {"type": error_type, "message": _read_error_text(exc)},
+        },
+    )
 
 
 def _log_upstream_error(
@@ -922,7 +987,10 @@ async def _handle_openai_chat(request: Request) -> Any:
         )
         if not stream:
             try:
-                resp = await oc.chat(ollama_payload)
+                resp = await oc.chat(
+                    ollama_payload,
+                    estimated_vram_gb=profile.estimated_vram_gb,
+                )
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, ollama_payload)
                 return _upstream_error(exc)
@@ -942,7 +1010,10 @@ async def _handle_openai_chat(request: Request) -> Any:
                 openai_model, show_thinking=profile.show_thinking
             )
             try:
-                lines = oc.stream_chat(ollama_payload)
+                lines = oc.stream_chat(
+                    ollama_payload,
+                    estimated_vram_gb=profile.estimated_vram_gb,
+                )
                 async for event_type, data in ollama_stream_to_anthropic_events(
                     lines, anthropic_model=openai_model
                 ):
@@ -988,9 +1059,13 @@ async def _handle_openai_chat(request: Request) -> Any:
         _apply_llama_cpp_thinking_config(
             settings, openai_model, payload, llama_payload
         )
+        estimated_vram_gb = profile.estimated_vram_gb
         if not stream:
             try:
-                resp = await lc.chat(llama_payload)
+                resp = await lc.chat(
+                    llama_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                )
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, llama_payload)
                 return _upstream_error(exc)
@@ -1001,7 +1076,10 @@ async def _handle_openai_chat(request: Request) -> Any:
 
         async def body_llama_openai() -> AsyncIterator[bytes]:
             try:
-                async for line in lc.stream_chat(llama_payload):
+                async for line in lc.stream_chat(
+                    llama_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                ):
                     if line.startswith("data:"):
                         yield (line + "\n\n").encode("utf-8")
                     else:
@@ -1207,29 +1285,41 @@ async def _handle_anthropic_messages(request: Request) -> Any:
             default_max_tokens=settings.default_max_tokens,
         )
         _apply_ollama_thinking_config(settings, anth_model, payload, ollama_payload)
+        estimated_vram_gb = settings.profile_for(anth_model).estimated_vram_gb
         if not stream:
             try:
-                resp = await oc.chat(ollama_payload)
+                resp = await oc.chat(
+                    ollama_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                )
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, ollama_payload)
-                return _upstream_error(exc)
+                return _anthropic_error_response(exc)
             return JSONResponse(
                 ollama_chat_to_anthropic_response(resp, anthropic_model=anth_model)
             )
 
         async def body() -> AsyncIterator[bytes]:
             try:
-                lines = oc.stream_chat(ollama_payload)
+                lines = oc.stream_chat(
+                    ollama_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                )
                 async for chunk in ollama_stream_to_anthropic_sse(
                     lines, anthropic_model=anth_model
                 ):
                     yield chunk
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, ollama_payload)
+                error_type = (
+                    exc.error_type
+                    if isinstance(exc, LocalTargetResourceError)
+                    else "upstream_error"
+                )
                 err = {
                     "type": "error",
                     "error": {
-                        "type": "upstream_error",
+                        "type": error_type,
                         "message": _read_error_text(exc),
                     },
                 }
@@ -1265,12 +1355,16 @@ async def _handle_anthropic_messages(request: Request) -> Any:
         )
         _apply_llama_cpp_thinking_config(settings, anth_model, payload, llama_payload)
         profile = settings.profile_for(anth_model)
+        estimated_vram_gb = profile.estimated_vram_gb
         if not stream:
             try:
-                resp = await lc.chat(llama_payload)
+                resp = await lc.chat(
+                    llama_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                )
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, llama_payload)
-                return _upstream_error(exc)
+                return _anthropic_error_response(exc)
             return JSONResponse(
                 openai_chat_to_anthropic_response(
                     resp,
@@ -1281,7 +1375,10 @@ async def _handle_anthropic_messages(request: Request) -> Any:
 
         async def body_llama_anthropic() -> AsyncIterator[bytes]:
             try:
-                lines = lc.stream_chat(llama_payload)
+                lines = lc.stream_chat(
+                    llama_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                )
                 async for chunk in openai_stream_to_anthropic_sse(
                     lines,
                     anthropic_model=anth_model,
@@ -1290,10 +1387,15 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                     yield chunk
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, llama_payload)
+                error_type = (
+                    exc.error_type
+                    if isinstance(exc, LocalTargetResourceError)
+                    else "upstream_error"
+                )
                 err = {
                     "type": "error",
                     "error": {
-                        "type": "upstream_error",
+                        "type": error_type,
                         "message": _read_error_text(exc),
                     },
                 }

@@ -43,7 +43,7 @@ from .ollama_client import OllamaClient
 #
 # Field types understood by the front-end:
 #   string, int, float, bool, string_list, string_map,
-#   object_list, object_map
+#   object, object_list, object_map
 #
 # - ``required`` fields cannot be omitted (no delete checkbox).
 # - ``secret`` fields render as <input type=password>.
@@ -96,34 +96,76 @@ OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 LLAMA_CPP_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
-    {"key": "name", "type": "string", "default": "", "required": True,
-     "description": "唯一名字"},
+    {"key": "name", "type": "string", "default": "",
+     "description": "可选：target 标识；不填时自动使用 model。用于内部 client 字典、日志和去重，不是全局配置"},
     {"key": "base_url", "type": "string", "default": "http://127.0.0.1:8080",
-     "description": "llama.cpp server URL，例如 http://127.0.0.1:21436"},
+      "description": "该模型专属 llama.cpp server URL，例如 http://127.0.0.1:21436。每个模型应使用独立端口"},
     {"key": "auth_token", "type": "string", "default": "", "secret": True,
      "description": "可选：llama.cpp --api-key；fake-ollama 调用该 target 时会带上 Bearer / x-api-key"},
-    {"key": "models", "type": "string_list", "default": [],
+    {"key": "model", "type": "string", "default": "", "required": True,
      "autocomplete": "model_names",
-     "description": "【Reverse / OpenAI 兼容入口】该 llama.cpp target 可服务的模型显示名（一行一个），用于 /v1/messages 与 external 端口的 /v1/chat/completions"},
-    {"key": "expose_external", "type": "string_list_subset_of",
-     "default": None, "subset_of": "models",
-     "description": "【External 反向代理】从 models 里选出允许出现在 /v1/models 与 /v1/messages 的子集。不勾该字段 = 全部暴露到外部（默认）；勾上后留空 = 全部隐藏；勾上后选部分 = 只暴露选中的"},
-    {"key": "model_map", "type": "string_map", "default": {},
-     "description": "可选：显示名 → llama.cpp --alias / OpenAI model ID"},
-    {"key": "auto_start", "type": "bool", "default": False,
-     "description": "请求到来且 health 检查失败时，是否执行 start_command 启动 llama.cpp"},
+      "description": "【Reverse / OpenAI 兼容入口】该 llama.cpp target 可服务的唯一模型显示名；一个 target = 一个模型进程"},
+    {"key": "model_alias", "type": "string", "default": None,
+     "description": "可选：发送给 llama.cpp 的真实 OpenAI model / --alias。不填则使用 model"},
+    {"key": "expose_external", "type": "bool", "default": None,
+     "description": "可选覆盖全局 llama_cpp_defaults.expose_external；勾选字段后，true=对 external 暴露，false=隐藏。不勾选则继承全局默认"},
+    {"key": "auto_start", "type": "bool", "default": None,
+     "description": "可选覆盖全局 llama_cpp_defaults.auto_start；请求到来且 health 检查失败时，是否执行 start_command 启动 llama.cpp"},
     {"key": "start_command", "type": "string", "default": None,
-     "description": "可选：启动 llama.cpp server 的命令；长驻进程会由 fake-ollama 持有"},
+      "description": "可选：启动该模型专属 llama.cpp server 的命令；长驻进程会由 fake-ollama 持有。如果留空，会用下面的 binary_path / model_path 等字段自动拼装命令"},
     {"key": "stop_command", "type": "string", "default": None,
      "description": "可选：停止命令。未配置时，仅会回收 fake-ollama 自己启动的进程"},
+    {"key": "binary_path", "type": "string", "default": None,
+     "description": "可选：llama-server 可执行文件路径（包含路径或仅命令名）。仅在没填 start_command 时用于自动拼装；不填则继承 llama_cpp_defaults.binary_path 或回退到 'llama-server'"},
+    {"key": "runtime_root", "type": "string", "default": None,
+     "description": "可选：CUDA runtime 目录（含 cudart64_*.dll），启动时会与 binary 所在目录一起 prepend 到 PATH。Windows 下 llama.cpp CUDA release 的 cudart-llama-bin-win-cuda-XX.X-x64 文件夹"},
+    {"key": "model_path", "type": "string", "default": None,
+     "description": "可选：传给 --model 的 GGUF 路径；填了它且 start_command 留空时，fake-ollama 会自动拼装启动命令"},
+    {"key": "mmproj_path", "type": "string", "default": None,
+     "description": "可选：多模态 mmproj 文件路径（--mmproj），仅自动拼装时使用"},
+    {"key": "gpu_layers", "type": "int", "default": None,
+     "description": "可选：传给 -ngl 的层数（999 = 全部上 GPU）。仅自动拼装时使用；不填继承 llama_cpp_defaults.gpu_layers"},
+    {"key": "ctx_size", "type": "int", "default": None,
+     "description": "可选：传给 --ctx-size 的上下文长度。仅自动拼装时使用；不填继承 llama_cpp_defaults.ctx_size"},
+    {"key": "parallel", "type": "int", "default": None,
+     "description": "可选：传给 --parallel 的并发槽数。仅自动拼装时使用；不填继承 llama_cpp_defaults.parallel"},
+    {"key": "extra_args", "type": "string", "default": None,
+     "description": "可选：额外原样追加到自动拼装命令末尾的参数串（例如 --jinja --slots）"},
     {"key": "idle_timeout_seconds", "type": "float", "default": None,
-     "description": "可选：空闲超过该秒数后停止 llama.cpp。留空表示不做 idle 回收"},
-    {"key": "startup_timeout_seconds", "type": "float", "default": 120.0,
-     "description": "auto_start 后等待 health 变为可用的最长秒数"},
-    {"key": "health_path", "type": "string", "default": "/health",
-     "description": "健康检查路径；llama.cpp server 默认为 /health"},
+     "description": "可选覆盖全局 llama_cpp_defaults.idle_timeout_seconds；空闲超过该秒数后停止 llama.cpp"},
+    {"key": "startup_timeout_seconds", "type": "float", "default": None,
+     "description": "可选覆盖全局 llama_cpp_defaults.startup_timeout_seconds；auto_start 后等待 health 变为可用的最长秒数"},
+    {"key": "health_path", "type": "string", "default": None,
+     "description": "可选覆盖全局 llama_cpp_defaults.health_path；健康检查路径"},
     {"key": "cwd", "type": "string", "default": None,
-     "description": "可选：执行 start_command / stop_command 时的工作目录"},
+     "description": "可选覆盖全局 llama_cpp_defaults.cwd；执行 start_command / stop_command 时的工作目录"},
+]
+
+LLAMA_CPP_DEFAULTS_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "expose_external", "type": "bool", "default": None,
+     "description": "默认是否把 llama.cpp 模型暴露到 external /v1/models 与 /v1/messages。不填 = 暴露（兼容旧行为）；target 可覆盖"},
+    {"key": "auto_start", "type": "bool", "default": False,
+     "description": "默认是否在 health 检查失败时执行 target.start_command；target 可覆盖"},
+    {"key": "idle_timeout_seconds", "type": "float", "default": None,
+     "description": "默认空闲回收秒数；target 可覆盖。留空表示不做 idle 回收"},
+    {"key": "startup_timeout_seconds", "type": "float", "default": 120.0,
+     "description": "默认启动等待 health 变为可用的最长秒数；target 可覆盖"},
+    {"key": "health_path", "type": "string", "default": "/health",
+     "description": "默认健康检查路径；target 可覆盖"},
+    {"key": "cwd", "type": "string", "default": None,
+     "description": "默认执行 start_command / stop_command 时的工作目录；target 可覆盖"},
+    {"key": "binary_path", "type": "string", "default": None,
+     "description": "默认 llama-server 可执行文件路径；target 留空 binary_path 时会沿用此字段，再回退到 'llama-server'"},
+    {"key": "runtime_root", "type": "string", "default": None,
+     "description": "默认 CUDA runtime 目录（含 cudart64_*.dll）；target 留空 runtime_root 时沿用此字段。启动时会和 binary 所在目录一起 prepend 到 PATH"},
+    {"key": "gpu_layers", "type": "int", "default": None,
+     "description": "默认 -ngl 层数；自动拼装命令时使用，target 可覆盖"},
+    {"key": "ctx_size", "type": "int", "default": None,
+     "description": "默认 --ctx-size；自动拼装命令时使用，target 可覆盖"},
+    {"key": "parallel", "type": "int", "default": None,
+     "description": "默认 --parallel 并发槽数；自动拼装命令时使用，target 可覆盖"},
+    {"key": "extra_args", "type": "string", "default": None,
+     "description": "默认追加到自动拼装命令末尾的参数串；target 可覆盖"},
 ]
 
 MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
@@ -134,6 +176,8 @@ MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "总上下文 token 上限（输入 + 输出）"},
     {"key": "max_output_tokens", "type": "int", "default": None,
      "description": "可选：覆盖默认 num_predict；同时是 max_tokens 的上限"},
+    {"key": "estimated_vram_gb", "type": "float", "default": None,
+     "description": "可选：该模型加载后预计占用的 GPU 显存（GB）。仅本地 Ollama / llama.cpp 反向代理会使用，用于启动前预检和空闲模型回收"},
     {"key": "thinking_mode", "type": "string", "default": "auto",
      "description": "auto / enabled / disabled；控制是否注入 thinking 字段"},
     {"key": "thinking_budget_tokens", "type": "int", "default": 1024,
@@ -167,10 +211,13 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
    "detect_models": "ollama",
    "description": "本机或远端 Ollama 服务；用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions"},
+  {"key": "llama_cpp_defaults", "type": "object", "default": {}, "group": "reverse_llamacpp",
+   "item_schema": LLAMA_CPP_DEFAULTS_SCHEMA,
+   "description": "llama.cpp targets 的全局默认值；每个 target 勾选同名字段后可覆盖"},
   {"key": "llama_cpp_targets", "type": "object_list", "default": [], "group": "reverse_llamacpp",
    "item_schema": LLAMA_CPP_TARGET_ITEM_SCHEMA,
    "detect_models": "llama_cpp",
-   "description": "llama.cpp server（OpenAI 兼容）；用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions；可选接管启动与 idle 回收"},
+    "description": "llama.cpp server（OpenAI 兼容）；一个 target 对应一个模型、一个进程、一个端口和一组启停命令；用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions"},
 
   {"key": "default_max_tokens", "type": "int", "default": 4096, "group": "shared_runtime",
    "description": "缺省的 max_tokens / num_predict；正向与反向转换都会用到"},
@@ -199,7 +246,7 @@ GROUP_LABELS: List[Dict[str, str]] = [
   {"key": "forward_upstreams", "label": "Remote Upstreams", "hint": "当前为 Anthropic 兼容远端上游；由它们驱动本机 Ollama 兼容入口", "section": "forward", "section_label": "Forward Proxy", "section_hint": "远端 Anthropic API -> 本机 Ollama 兼容入口"},
   {"key": "reverse_listener", "label": "External API", "hint": "对外暴露的 Anthropic / OpenAI 兼容端口与访问 token", "section": "reverse", "section_label": "Reverse Proxy", "section_hint": "本机模型服务 -> 对外 Anthropic / OpenAI 兼容 API"},
   {"key": "reverse_ollama", "label": "Ollama Targets", "hint": "反向代理到本机或远端 Ollama 服务", "section": "reverse", "section_label": "Reverse Proxy", "section_hint": "本机模型服务 -> 对外 Anthropic / OpenAI 兼容 API"},
-  {"key": "reverse_llamacpp", "label": "llama.cpp Targets", "hint": "反向代理到 llama.cpp OpenAI 兼容服务，可选生命周期接管", "section": "reverse", "section_label": "Reverse Proxy", "section_hint": "本机模型服务 -> 对外 Anthropic / OpenAI 兼容 API"},
+  {"key": "reverse_llamacpp", "label": "llama.cpp Targets", "hint": "每个模型一个 llama.cpp 进程、端口和启停脚本", "section": "reverse", "section_label": "Reverse Proxy", "section_hint": "本机模型服务 -> 对外 Anthropic / OpenAI 兼容 API"},
   {"key": "shared_runtime", "label": "Shared Runtime", "hint": "跨正向 / 反向共用的缺省参数与出站网络设置", "section": "shared", "section_label": "Shared Settings", "section_hint": "两条代理链路都会用到的公共配置"},
   {"key": "profiles", "label": "Model Profiles", "hint": "跨正向 / 反向共用的模型能力、上下文与 thinking 策略", "section": "shared", "section_label": "Shared Settings", "section_hint": "两条代理链路都会用到的公共配置"},
   {"key": "admin", "label": "Admin UI", "hint": "配置页面自身的开关与监听地址（无内置鉴权）", "section": "admin", "section_label": "Admin UI", "section_hint": "仅影响 /admin 配置页面本身"},
@@ -386,6 +433,11 @@ function makeScalar(field, value) {
     return {
       node: wrap,
       read: () => input.checked,
+      get: () => input.checked,
+      set: (v) => {
+        input.checked = !!v;
+        input.dispatchEvent(new Event('change'));
+      },
     };
   }
   if (field.type === 'int' || field.type === 'float') {
@@ -425,6 +477,8 @@ function makeScalar(field, value) {
     return {
       node: row,
       read() { return input.value; },
+      get() { return input.value; },
+      set(v) { input.value = v == null ? '' : String(v); },
     };
   }
   return {
@@ -434,6 +488,8 @@ function makeScalar(field, value) {
       if (field.type === 'float') return input.value === '' ? null : parseFloat(input.value);
       return input.value;
     },
+    get() { return input.value; },
+    set(v) { input.value = v == null ? '' : String(v); },
   };
 }
 
@@ -666,6 +722,16 @@ function makeObjectGroup(itemSchema, value) {
   };
 }
 
+function makeObject(field, value) {
+  const wrap = el('div', {class: 'group'});
+  const renderer = makeObjectGroup(field.item_schema, value || {});
+  wrap.append(renderer.node);
+  return {
+    node: wrap,
+    read: () => renderer.read(),
+  };
+}
+
 function makeObjectList(field, value) {
   const wrap = el('div', {class: 'group'});
   const items = [];
@@ -698,16 +764,22 @@ function makeObjectList(field, value) {
           for (const n of candidates) if (n) PROBED_MODEL_NAMES.add(n);
           refreshModelDatalist();
           setStatus('detected ' + candidates.length + ' models, choose...', 'ok');
-          const modelsR = renderer.getRenderer('models');
-          const existing = modelsR && modelsR.get ? modelsR.get() : [];
+          const modelKey = field.detect_models === 'llama_cpp' ? 'model' : 'models';
+          const modelsR = renderer.getRenderer(modelKey);
+          const current = modelsR && modelsR.get ? modelsR.get() : [];
+          const existing = Array.isArray(current) ? current : (current ? [current] : []);
           const result = await pickModelsDialog({
             title: 'Detected models from ' + baseUrl,
             candidates,
             existing,
           });
           if (result == null) { setStatus('detect: cancelled'); return; }
-          if (modelsR && modelsR.set) modelsR.set(result);
-          setStatus('models updated (' + result.length + ' total)', 'ok');
+          if (modelsR && modelsR.set) {
+            if (field.detect_models === 'llama_cpp') modelsR.set(result[0] || '');
+            else modelsR.set(result);
+          }
+          setStatus(field.detect_models === 'llama_cpp'
+            ? 'model updated' : 'models updated (' + result.length + ' total)', 'ok');
         } catch (e) {
           setStatus('detect failed: ' + e.message, 'err');
         } finally {
@@ -857,6 +929,7 @@ function collectKnownModelNames() {
     if (!Array.isArray(arr)) return;
     for (const item of arr) {
       if (item && Array.isArray(item.models)) for (const n of item.models) if (n) out.add(n);
+      if (item && item.model) out.add(item.model);
     }
   }
   for (const {field, r} of topRenderers) {
@@ -896,6 +969,8 @@ function renderField(field, value, ctx) {
       inner = makeStringListSubsetOf(field, present ? value : field.default, ctx); break;
     case 'string_map':
       inner = makeStringMap(field, present ? value : field.default); break;
+    case 'object':
+      inner = makeObject(field, present ? value : field.default); break;
     case 'object_list':
       inner = makeObjectList(field, present ? value : field.default); break;
     case 'object_map':
@@ -920,7 +995,7 @@ function renderField(field, value, ctx) {
   const defaultStr = (field.default === undefined || field.default === null)
     ? 'null'
     : (typeof field.default === 'object' ? JSON.stringify(field.default) : String(field.default));
-  const showDefault = field.type !== 'object_list' && field.type !== 'object_map';
+  const showDefault = field.type !== 'object' && field.type !== 'object_list' && field.type !== 'object_map';
   const desc = el('div', {class: 'desc'},
     field.description || '',
     showDefault ? ` (default: ${defaultStr})` : '',
@@ -1132,6 +1207,37 @@ load();
 def _settings_to_dict(s: Settings) -> Dict[str, Any]:
     data = s.model_dump()
     data.pop("config_path", None)
+    defaults = data.get("llama_cpp_defaults")
+    if isinstance(defaults, dict):
+        for key in list(defaults.keys()):
+            if defaults[key] is None:
+                defaults.pop(key)
+    for target in data.get("llama_cpp_targets", []):
+        if not isinstance(target, dict):
+            continue
+        for key in [
+            "model_alias",
+            "expose_external",
+            "auto_start",
+            "start_command",
+            "stop_command",
+            "idle_timeout_seconds",
+            "startup_timeout_seconds",
+            "health_path",
+            "cwd",
+            "binary_path",
+            "runtime_root",
+            "model_path",
+            "mmproj_path",
+            "gpu_layers",
+            "ctx_size",
+            "parallel",
+            "extra_args",
+        ]:
+            if target.get(key) is None:
+                target.pop(key, None)
+        if target.get("name") == target.get("model"):
+            target.pop("name", None)
     data["_path"] = s.config_path or ""
     return data
 
@@ -1147,6 +1253,7 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     old_clients: Dict[str, AnthropicClient] = dict(getattr(app.state, "clients", {}))
     old_ollama: Dict[str, OllamaClient] = dict(getattr(app.state, "ollama_clients", {}))
     old_llama_cpp: Dict[str, LlamaCppClient] = dict(getattr(app.state, "llama_cpp_clients", {}))
+    vram_coordinator = getattr(app.state, "vram_coordinator", None)
 
     new_clients: Dict[str, AnthropicClient] = {}
     for up in new_settings.upstreams:
@@ -1162,21 +1269,6 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             tgt.base_url,
             timeout=new_settings.timeout_seconds,
             trust_env=new_settings.use_system_proxy,
-          auto_start=tgt.auto_start,
-          start_command=tgt.start_command,
-          stop_command=tgt.stop_command,
-          idle_timeout_seconds=tgt.idle_timeout_seconds,
-          startup_timeout_seconds=tgt.startup_timeout_seconds,
-          health_path=tgt.health_path,
-          cwd=tgt.cwd,
-        )
-    new_llama_cpp: Dict[str, LlamaCppClient] = {}
-    for tgt in new_settings.llama_cpp_targets:
-        new_llama_cpp[tgt.name] = LlamaCppClient(
-            tgt.base_url,
-            auth_token=tgt.auth_token,
-            timeout=new_settings.timeout_seconds,
-            trust_env=new_settings.use_system_proxy,
             auto_start=tgt.auto_start,
             start_command=tgt.start_command,
             stop_command=tgt.stop_command,
@@ -1184,6 +1276,28 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             startup_timeout_seconds=tgt.startup_timeout_seconds,
             health_path=tgt.health_path,
             cwd=tgt.cwd,
+            target_name=tgt.name,
+            vram_coordinator=vram_coordinator,
+        )
+    new_llama_cpp: Dict[str, LlamaCppClient] = {}
+    for raw_tgt in new_settings.llama_cpp_targets:
+        tgt = new_settings.effective_llama_cpp_target(raw_tgt)
+        new_llama_cpp[tgt.name] = LlamaCppClient(
+            tgt.base_url,
+            auth_token=tgt.auth_token,
+            timeout=new_settings.timeout_seconds,
+            trust_env=new_settings.use_system_proxy,
+            auto_start=tgt.auto_start,
+            start_command=tgt.start_command,
+            start_argv=tgt.synthesize_start_argv(),
+            stop_command=tgt.stop_command,
+            idle_timeout_seconds=tgt.idle_timeout_seconds,
+            startup_timeout_seconds=tgt.startup_timeout_seconds,
+            health_path=tgt.health_path,
+            cwd=tgt.cwd,
+            launch_env=tgt.effective_env(),
+            target_name=tgt.name,
+            vram_coordinator=vram_coordinator,
         )
 
     app.state.settings = new_settings
