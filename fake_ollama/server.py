@@ -683,17 +683,18 @@ def _enforce_limits(
     ``FAKE_OLLAMA_ENFORCE_CONTEXT_LIMIT`` is enabled.
     """
     profile = settings.profile_for(ollama_model)
-    # Prefer per-model max_output_tokens default when client didn't pin one.
+    # Treat profile.max_output_tokens as both a floor and a cap. Many BYOK
+    # clients (notably VS Code Copilot Chat) send a small ``max_tokens``
+    # default that easily produces ``finish_reason=length`` on long file
+    # edits; downstream the client then refuses the whole reply with
+    # "Response too long". Lifting to the per-model output ceiling lets the
+    # upstream actually finish.
     if profile.max_output_tokens:
         cur = int(upstream_payload.get("max_tokens") or 0)
-        if cur <= 0 or cur == settings.default_max_tokens:
+        if cur <= 0 or cur < profile.max_output_tokens:
             upstream_payload["max_tokens"] = profile.max_output_tokens
-    # Cap any over-large request to model's max_output_tokens.
-    if profile.max_output_tokens:
-        upstream_payload["max_tokens"] = min(
-            int(upstream_payload.get("max_tokens") or profile.max_output_tokens),
-            profile.max_output_tokens,
-        )
+        else:
+            upstream_payload["max_tokens"] = min(cur, profile.max_output_tokens)
 
     if not settings.enforce_context_limit:
         return
@@ -775,6 +776,35 @@ def _apply_ollama_thinking_config(
         ollama_payload["think"] = False
     elif profile.thinking_mode == "enabled":
         ollama_payload["think"] = True
+
+
+def _apply_reverse_output_limits(
+    settings: Settings,
+    display_model: str,
+    ollama_payload: Dict[str, Any],
+) -> None:
+    """Lift ``options.num_predict`` to the per-profile ``max_output_tokens``.
+
+    Some upstream clients (notably VS Code Copilot Chat's BYOK provider) send
+    a small ``max_tokens`` that easily truncates long file edits. When the
+    upstream returns ``done_reason="length"`` Copilot rejects the whole
+    response with "Response too long" (see Copilot extension.js: it bails on
+    ``finishReason === "length"``). To let users opt in to a higher floor per
+    model, when ``profile.max_output_tokens`` is configured and is greater
+    than what the converter wrote into ``num_predict``, we raise it.
+
+    This mirrors the floor half of ``_enforce_limits`` but is intentionally
+    floor-only on the reverse path: we never lower a client-requested cap.
+    """
+    profile = settings.profile_for(display_model)
+    if not profile.max_output_tokens:
+        return
+    options = ollama_payload.setdefault("options", {})
+    if not isinstance(options, dict):
+        return
+    cur = int(options.get("num_predict") or 0)
+    if cur < int(profile.max_output_tokens):
+        options["num_predict"] = int(profile.max_output_tokens)
 
 
 def _apply_llama_cpp_thinking_config(
@@ -985,6 +1015,7 @@ async def _handle_openai_chat(request: Request) -> Any:
         _apply_ollama_thinking_config(
             settings, openai_model, anthropic_payload, ollama_payload
         )
+        _apply_reverse_output_limits(settings, openai_model, ollama_payload)
         if not stream:
             try:
                 resp = await oc.chat(
@@ -1285,6 +1316,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
             default_max_tokens=settings.default_max_tokens,
         )
         _apply_ollama_thinking_config(settings, anth_model, payload, ollama_payload)
+        _apply_reverse_output_limits(settings, anth_model, ollama_payload)
         estimated_vram_gb = settings.profile_for(anth_model).estimated_vram_gb
         if not stream:
             try:
