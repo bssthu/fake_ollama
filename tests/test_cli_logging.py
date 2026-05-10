@@ -25,3 +25,15 @@ def test_cli_logging_writes_default_style_log_file(tmp_path):
     assert "file log smoke" in completed.stderr
     assert log_file.exists()
     assert "INFO fake_ollama: file log smoke" in log_file.read_text(encoding="utf-8")
+
+
+def test_cli_help_mentions_separate_request_data_log():
+    completed = subprocess.run(
+        [sys.executable, "-m", "fake_ollama", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--request-data-log-file" in completed.stdout
+    assert "--no-request-data-log" in completed.stdout

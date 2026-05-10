@@ -79,7 +79,8 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 说明：
 - `python -m fake_ollama` 和 `.\.venv\Scripts\python.exe -m fake_ollama` 调的是同一个入口；前者依赖当前 shell 里的 `python` 已指向 `.venv`，后者直接指定虚拟环境解释器，更适合未激活环境、计划任务或服务脚本。
 - 未执行 `pip install -e .` 时，请在项目根目录启动；这样源码包、`./config.json`、`./.env` 和默认日志路径都能按预期解析。
-- 默认日志写到当前工作目录下的 `logs/fake_ollama.log`，同时输出到控制台。可用 `--log-file I:\path\fake_ollama.log` 指定固定日志路径，或用 `--no-log-file` 只保留控制台日志。
+- 默认运行日志写到当前工作目录下的 `logs/fake_ollama.log`，同时输出到控制台。可用 `--log-file I:\path\fake_ollama.log` 指定固定日志路径，或用 `--no-log-file` 只保留控制台日志。
+- 默认请求数据日志单独写到 `logs/fake_ollama.requests.jsonl`，不会混进运行日志；可用 `--request-data-log-file I:\path\requests.jsonl` 指定路径，或用 `--no-request-data-log` 关闭。
 
 启动后：
 - Ollama 客户端连 `http://127.0.0.1:21434`
@@ -434,9 +435,33 @@ curl -X POST http://127.0.0.1:21435/v1/chat/completions `
   -d '{"model":"qwen3.6-27b-hauhau-q2kp","stream":false,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
+## 请求数据日志
+
+`logs/fake_ollama.log` 只放运行状态、生命周期、access 摘要等普通日志。完整请求/响应数据默认写到独立 JSONL 文件 `logs/fake_ollama.requests.jsonl`，方便定位 agent 工作到一半中断时到底断在 agent、fake_ollama、上游 API，还是本地 Ollama / llama.cpp。
+
+每一行是一条 JSON 事件，核心字段：
+
+- `request_id`：同一次入口请求共享同一个 id；入口 HTTP、转换后的后端请求、后端响应 chunk、返回给 agent 的 chunk 都能串起来。
+- `event`：常见值包括 `http_request_start`、`http_request_body`、`backend_request`、`backend_response_body`、`http_response_body`、`http_request_end`、`backend_error`。
+- `body`：完整请求体 / 响应体 / 流式 chunk。文本按 UTF-8 记录，非文本按 base64 记录。
+- `headers`：会记录请求头，但 `Authorization`、`x-api-key`、cookie 等敏感头只保留 sha256 指纹，不写明文 token。
+
+默认只记录服务 API（`/api/*`、`/v1/*`），不记录 `/admin/*`，避免把配置页里的密钥写进数据日志。这个文件会包含 prompt、工具调用参数、模型输出和图片 base64，排查完请按敏感日志处理；默认按 100MB * 10 个文件轮转。
+
+常用启动参数：
+
+```powershell
+# 指定固定的数据日志路径
+python -m fake_ollama --request-data-log-file I:\Projects\fake_ollama\logs\agent-debug.jsonl
+
+# 只保留运行日志，不记录完整请求/响应数据
+python -m fake_ollama --no-request-data-log
+```
+
 ## 安全提示
 
 - `.env` / `config.json` 已加入 `.gitignore`，请勿提交真实 token。
+- `logs/fake_ollama.requests.jsonl*` 会包含完整 prompt、工具参数、模型输出和可能的图片 base64。即使 token 头已脱敏，也应按敏感数据处理，不要直接发给第三方。
 - **internal listener 默认仅绑 `127.0.0.1`**；要局域网共享请显式 `--host 0.0.0.0` 并自行做访问控制。
 - **external listener** 默认也是 `127.0.0.1`。要对外暴露反向代理：要么 `external_host: "0.0.0.0"`，要么保持 `127.0.0.1` + 用 Nginx/Caddy 反代（更推荐，可以加 TLS）。
 - **`/admin` Web UI 没有任何鉴权**。它默认只挂在独立 admin listener 上，并默认绑定 `127.0.0.1`。如果你把 `admin_host` 改成 `0.0.0.0` 或设置 `admin_port: null`，必须自行加一层带认证的反向代理（nginx/Caddy basic auth 等），或直接 `"admin_enabled": false`。
@@ -447,7 +472,8 @@ curl -X POST http://127.0.0.1:21435/v1/chat/completions `
 - **/v1/messages 返回 404 `model '...' is not exposed externally`**：该模型来自 upstream、Ollama target 或 llama.cpp target，但其所属节点的 `expose_external` 没把它列进去。在 admin UI 里勾选，或干脆删掉 `expose_external` 字段恢复"全部暴露"。
 - **/v1/messages 返回 401**：`external_access_tokens` 为空（且 `external_port` 已设置 → 启动时已 WARN），或请求头里的 token 不在池里。检查 `x-api-key` / `Authorization: Bearer` 是否带对了。
 - **/v1/messages 在 internal 端口返回 404**：你启用了 `external_port`，反向代理已经只在 external 端口可达。请改连 external 端口。
-- **启动后找不到日志文件**：默认日志路径是相对当前工作目录的 `logs/fake_ollama.log`。确认是在项目根目录启动，或显式传 `--log-file I:\Projects\fake_ollama\logs\fake_ollama.log`；如果传了 `--no-log-file`，则只会输出到控制台。
+- **启动后找不到日志文件**：默认路径都相对当前工作目录：运行日志是 `logs/fake_ollama.log`，请求数据日志是 `logs/fake_ollama.requests.jsonl`。确认是在项目根目录启动，或显式传 `--log-file I:\Projects\fake_ollama\logs\fake_ollama.log` 和 `--request-data-log-file I:\Projects\fake_ollama\logs\fake_ollama.requests.jsonl`；如果传了 `--no-log-file` / `--no-request-data-log`，对应文件不会写。
+- **agent 工作到一半中断，想复盘链路**：打开 `logs/fake_ollama.requests.jsonl`，按最后一次请求的 `request_id` 过滤。若 `backend_response_body` 已经有完整模型输出但 `http_response_body` 不完整，重点看 fake_ollama 转换/回传；若后端 chunk 停在中途并出现 `backend_error`，重点看本地模型或上游；若 `http_request_error` 是 `CancelledError`，通常是调用方连接先断开。
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`（默认）。
 - **503 / `Insufficient GPU VRAM`**：某个本地 Ollama / llama.cpp 模型在 `model_profiles` 里配了 `estimated_vram_gb`，但 `nvidia-smi` 汇总的当前可用显存不足；fake-ollama 会尝试释放空闲 60 秒以上的可回收模型，并在释放后重新读取真实 free VRAM，仍不够才返回 503。Anthropic `/v1/messages` 会返回 `type=error`、`error.type=overloaded_error` 和英文 message；OpenAI/Ollama 入口会返回同样的英文错误文本。降低该模型的 `estimated_vram_gb`、等待旧模型空闲、配置有效的 `stop_command`，或手动释放显存后重试。
 - **400 thinking content must be passed back**（DeepSeek）：模型在某轮启用了 thinking，但下一轮历史里没把 `thinking` 块带回。fake-ollama 已做了缓存回查 + 当 profile 是 `auto + show_thinking=false` 时主动注入 `thinking: {type:"disabled"}` 绕过；如果你确实想要 thinking，把对应 profile 设为 `"thinking_mode": "enabled"`。

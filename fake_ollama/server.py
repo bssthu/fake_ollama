@@ -29,6 +29,7 @@ from .converters import (
 )
 from .llama_cpp_client import LlamaCppClient
 from .ollama_client import OllamaClient
+from .request_data_log import RequestDataLogMiddleware
 from .vram import LocalTargetResourceError, VramCoordinator
 from .reverse_converters import (
     anthropic_to_ollama_chat as anthropic_to_ollama_chat_payload,
@@ -140,6 +141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.vram_coordinator = VramCoordinator()
     app.state.ensure_local_target_idle_monitor = _sync_local_target_idle_monitor
     _install_port_router(app)
+    app.add_middleware(RequestDataLogMiddleware)
     _register_routes(app)
     return app
 

@@ -20,6 +20,14 @@ from .process_utils import (
     create_managed_subprocess_shell,
     terminate_process_tree,
 )
+from .request_data_log import (
+    body_from_bytes,
+    body_from_json,
+    body_from_text,
+    headers_from_mapping,
+    log_data_event,
+    request_data_logging_enabled,
+)
 from .vram import VramCoordinator, VramReleaseCandidate
 
 logger = logging.getLogger("fake_ollama")
@@ -282,14 +290,66 @@ class LlamaCppClient:
             self._active += 1
             try:
                 try:
+                    url = f"{self._base}/v1/chat/completions"
+                    headers = self._headers()
+                    if request_data_logging_enabled():
+                        log_data_event(
+                            "backend_request",
+                            backend="llama.cpp",
+                            target_id=self.target_id,
+                            operation="chat",
+                            method="POST",
+                            url=url,
+                            headers=headers_from_mapping(headers),
+                            body=body_from_json(body),
+                        )
                     resp = await self._client.post(
-                        f"{self._base}/v1/chat/completions",
+                        url,
                         json=body,
-                        headers=self._headers(),
+                        headers=headers,
                     )
                     await resp.aread()
+                    if request_data_logging_enabled():
+                        log_data_event(
+                            "backend_response_start",
+                            backend="llama.cpp",
+                            target_id=self.target_id,
+                            operation="chat",
+                            method="POST",
+                            url=url,
+                            status=resp.status_code,
+                            headers=headers_from_mapping(dict(resp.headers)),
+                        )
+                        log_data_event(
+                            "backend_response_body",
+                            backend="llama.cpp",
+                            target_id=self.target_id,
+                            operation="chat",
+                            method="POST",
+                            url=url,
+                            body=body_from_bytes(resp.content),
+                        )
+                        log_data_event(
+                            "backend_response_end",
+                            backend="llama.cpp",
+                            target_id=self.target_id,
+                            operation="chat",
+                            method="POST",
+                            url=url,
+                            status=resp.status_code,
+                            response_bytes=len(resp.content),
+                        )
                     resp.raise_for_status()
-                except BaseException:
+                except BaseException as exc:
+                    log_data_event(
+                        "backend_error",
+                        backend="llama.cpp",
+                        target_id=self.target_id,
+                        operation="chat",
+                        method="POST",
+                        url=f"{self._base}/v1/chat/completions",
+                        error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
+                    )
                     self._discard_vram_pending(model)
                     raise
                 self._mark_vram_reserved(model, estimated_vram_gb)
@@ -320,21 +380,116 @@ class LlamaCppClient:
             marked = False
             try:
                 try:
+                    url = f"{self._base}/v1/chat/completions"
+                    headers = self._headers(stream=True)
+                    if request_data_logging_enabled():
+                        log_data_event(
+                            "backend_request",
+                            backend="llama.cpp",
+                            target_id=self.target_id,
+                            operation="stream_chat",
+                            method="POST",
+                            url=url,
+                            headers=headers_from_mapping(headers),
+                            body=body_from_json(body),
+                        )
+                    response_started = False
+                    response_bytes = 0
+                    outcome = "complete"
+                    error: Optional[str] = None
                     async with self._client.stream(
                         "POST",
-                        f"{self._base}/v1/chat/completions",
+                        url,
                         json=body,
-                        headers=self._headers(stream=True),
+                        headers=headers,
                     ) as resp:
+                        response_started = True
+                        log_data_event(
+                            "backend_response_start",
+                            backend="llama.cpp",
+                            target_id=self.target_id,
+                            operation="stream_chat",
+                            method="POST",
+                            url=url,
+                            status=resp.status_code,
+                            headers=headers_from_mapping(dict(resp.headers)),
+                        )
                         if resp.status_code >= 400:
-                            await resp.aread()
+                            error_body = await resp.aread()
+                            response_bytes += len(error_body)
+                            log_data_event(
+                                "backend_response_body",
+                                backend="llama.cpp",
+                                target_id=self.target_id,
+                                operation="stream_chat",
+                                method="POST",
+                                url=url,
+                                body=body_from_bytes(error_body),
+                            )
+                            log_data_event(
+                                "backend_response_end",
+                                backend="llama.cpp",
+                                target_id=self.target_id,
+                                operation="stream_chat",
+                                method="POST",
+                                url=url,
+                                status=resp.status_code,
+                                outcome="exception",
+                                response_bytes=response_bytes,
+                                error=f"http status {resp.status_code}",
+                            )
                             resp.raise_for_status()
                         self._mark_vram_reserved(model, estimated_vram_gb)
                         marked = True
-                        async for raw_line in resp.aiter_lines():
-                            if raw_line:
-                                yield raw_line
-                except BaseException:
+                        try:
+                            async for raw_line in resp.aiter_lines():
+                                if raw_line:
+                                    response_bytes += len(raw_line.encode("utf-8"))
+                                    log_data_event(
+                                        "backend_response_body",
+                                        backend="llama.cpp",
+                                        target_id=self.target_id,
+                                        operation="stream_chat",
+                                        method="POST",
+                                        url=url,
+                                        body=body_from_text(raw_line),
+                                    )
+                                    yield raw_line
+                        except BaseException as exc:
+                            outcome = (
+                                "cancelled"
+                                if exc.__class__.__name__ == "CancelledError"
+                                else "exception"
+                            )
+                            error = (
+                                f"{exc.__class__.__module__}."
+                                f"{exc.__class__.__name__}: {exc}"
+                            )
+                            raise
+                        finally:
+                            if response_started:
+                                log_data_event(
+                                    "backend_response_end",
+                                    backend="llama.cpp",
+                                    target_id=self.target_id,
+                                    operation="stream_chat",
+                                    method="POST",
+                                    url=url,
+                                    status=resp.status_code,
+                                    outcome=outcome,
+                                    response_bytes=response_bytes,
+                                    error=error,
+                                )
+                except BaseException as exc:
+                    log_data_event(
+                        "backend_error",
+                        backend="llama.cpp",
+                        target_id=self.target_id,
+                        operation="stream_chat",
+                        method="POST",
+                        url=f"{self._base}/v1/chat/completions",
+                        error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
+                    )
                     if not marked:
                         self._discard_vram_pending(model)
                     raise

@@ -7,6 +7,15 @@ from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 import httpx
 
+from .request_data_log import (
+    body_from_bytes,
+    body_from_json,
+    body_from_text,
+    headers_from_mapping,
+    log_data_event,
+    request_data_logging_enabled,
+)
+
 
 class AnthropicClient:
     def __init__(
@@ -61,7 +70,29 @@ class AnthropicClient:
 
     async def messages(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}/v1/messages"
-        resp = await self._client.post(url, json=payload, headers=self._headers())
+        headers = self._headers()
+        if request_data_logging_enabled():
+            log_data_event(
+                "backend_request",
+                backend="anthropic",
+                operation="messages",
+                method="POST",
+                url=url,
+                headers=headers_from_mapping(headers),
+                body=body_from_json(payload),
+            )
+        try:
+            resp = await self._client.post(url, json=payload, headers=headers)
+        except BaseException as exc:
+            log_data_event(
+                "backend_error",
+                backend="anthropic",
+                operation="messages",
+                method="POST",
+                url=url,
+                error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
+            )
+            raise
         if resp.status_code >= 400:
             # Make sure the body is read so callers can include it in error
             # responses / logs.
@@ -69,6 +100,42 @@ class AnthropicClient:
                 await resp.aread()
             except Exception:
                 pass
+        if request_data_logging_enabled():
+            log_data_event(
+                "backend_response_start",
+                backend="anthropic",
+                operation="messages",
+                method="POST",
+                url=url,
+                status=resp.status_code,
+                headers=headers_from_mapping(dict(resp.headers)),
+            )
+            log_data_event(
+                "backend_response_body",
+                backend="anthropic",
+                operation="messages",
+                method="POST",
+                url=url,
+                body=body_from_bytes(resp.content),
+            )
+            log_data_event(
+                "backend_response_end",
+                backend="anthropic",
+                operation="messages",
+                method="POST",
+                url=url,
+                status=resp.status_code,
+                response_bytes=len(resp.content),
+            )
+        if resp.status_code >= 400:
+            log_data_event(
+                "backend_error",
+                backend="anthropic",
+                operation="messages",
+                method="POST",
+                url=url,
+                error=f"http status {resp.status_code}",
+            )
             resp.raise_for_status()
         return resp.json()
 
@@ -79,17 +146,78 @@ class AnthropicClient:
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}/v1/messages/count_tokens"
-        resp = await self._client.post(
-            url,
-            json=payload,
-            headers=self._headers(),
-            params=params,
-        )
+        headers = self._headers()
+        if request_data_logging_enabled():
+            log_data_event(
+                "backend_request",
+                backend="anthropic",
+                operation="count_tokens",
+                method="POST",
+                url=url,
+                params=params or {},
+                headers=headers_from_mapping(headers),
+                body=body_from_json(payload),
+            )
+        try:
+            resp = await self._client.post(
+                url,
+                json=payload,
+                headers=headers,
+                params=params,
+            )
+        except BaseException as exc:
+            log_data_event(
+                "backend_error",
+                backend="anthropic",
+                operation="count_tokens",
+                method="POST",
+                url=url,
+                params=params or {},
+                error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
+            )
+            raise
         if resp.status_code >= 400:
             try:
                 await resp.aread()
             except Exception:
                 pass
+        if request_data_logging_enabled():
+            log_data_event(
+                "backend_response_start",
+                backend="anthropic",
+                operation="count_tokens",
+                method="POST",
+                url=url,
+                status=resp.status_code,
+                headers=headers_from_mapping(dict(resp.headers)),
+            )
+            log_data_event(
+                "backend_response_body",
+                backend="anthropic",
+                operation="count_tokens",
+                method="POST",
+                url=url,
+                body=body_from_bytes(resp.content),
+            )
+            log_data_event(
+                "backend_response_end",
+                backend="anthropic",
+                operation="count_tokens",
+                method="POST",
+                url=url,
+                status=resp.status_code,
+                response_bytes=len(resp.content),
+            )
+        if resp.status_code >= 400:
+            log_data_event(
+                "backend_error",
+                backend="anthropic",
+                operation="count_tokens",
+                method="POST",
+                url=url,
+                params=params or {},
+                error=f"http status {resp.status_code}",
+            )
             resp.raise_for_status()
         return resp.json()
 
@@ -99,37 +227,111 @@ class AnthropicClient:
         """Yield (event_type, json_data) tuples from the upstream SSE stream."""
         url = f"{self.base_url}/v1/messages"
         headers = {**self._headers(), "accept": "text/event-stream"}
-        async with self._client.stream(
-            "POST", url, json=payload, headers=headers
-        ) as resp:
-            if resp.status_code >= 400:
-                # In streaming mode the body has not been consumed yet; we
-                # MUST aread() before raise_for_status() or `exc.response.text`
-                # will be empty (httpx ResponseNotRead).
-                try:
-                    await resp.aread()
-                except Exception:
-                    pass
-                resp.raise_for_status()
-            event_name: Optional[str] = None
-            async for raw_line in resp.aiter_lines():
-                if raw_line is None:
-                    continue
-                line = raw_line.rstrip("\r")
-                if line == "":
-                    event_name = None
-                    continue
-                if line.startswith(":"):
-                    continue
-                if line.startswith("event:"):
-                    event_name = line[len("event:") :].strip()
-                    continue
-                if line.startswith("data:"):
-                    data_str = line[len("data:") :].strip()
-                    if not data_str:
-                        continue
+        if request_data_logging_enabled():
+            log_data_event(
+                "backend_request",
+                backend="anthropic",
+                operation="stream_messages",
+                method="POST",
+                url=url,
+                headers=headers_from_mapping(headers),
+                body=body_from_json(payload),
+            )
+        response_started = False
+        status_code: Optional[int] = None
+        response_bytes = 0
+        outcome = "complete"
+        error: Optional[str] = None
+        try:
+            async with self._client.stream(
+                "POST", url, json=payload, headers=headers
+            ) as resp:
+                response_started = True
+                status_code = resp.status_code
+                log_data_event(
+                    "backend_response_start",
+                    backend="anthropic",
+                    operation="stream_messages",
+                    method="POST",
+                    url=url,
+                    status=resp.status_code,
+                    headers=headers_from_mapping(dict(resp.headers)),
+                )
+                if resp.status_code >= 400:
+                    # In streaming mode the body has not been consumed yet; we
+                    # MUST aread() before raise_for_status() or `exc.response.text`
+                    # will be empty (httpx ResponseNotRead).
                     try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
+                        error_body = await resp.aread()
+                    except Exception:
+                        error_body = b""
+                    response_bytes += len(error_body)
+                    log_data_event(
+                        "backend_response_body",
+                        backend="anthropic",
+                        operation="stream_messages",
+                        method="POST",
+                        url=url,
+                        body=body_from_bytes(error_body),
+                    )
+                    resp.raise_for_status()
+                event_name: Optional[str] = None
+                async for raw_line in resp.aiter_lines():
+                    if raw_line is None:
                         continue
-                    yield (event_name or data.get("type", "message"), data)
+                    response_bytes += len(raw_line.encode("utf-8"))
+                    log_data_event(
+                        "backend_response_body",
+                        backend="anthropic",
+                        operation="stream_messages",
+                        method="POST",
+                        url=url,
+                        body=body_from_text(raw_line),
+                    )
+                    line = raw_line.rstrip("\r")
+                    if line == "":
+                        event_name = None
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line[len("event:") :].strip()
+                        continue
+                    if line.startswith("data:"):
+                        data_str = line[len("data:") :].strip()
+                        if not data_str:
+                            continue
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        yield (event_name or data.get("type", "message"), data)
+        except BaseException as exc:
+            outcome = (
+                "cancelled"
+                if exc.__class__.__name__ == "CancelledError"
+                else "exception"
+            )
+            error = f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}"
+            log_data_event(
+                "backend_error",
+                backend="anthropic",
+                operation="stream_messages",
+                method="POST",
+                url=url,
+                error=error,
+            )
+            raise
+        finally:
+            if response_started:
+                log_data_event(
+                    "backend_response_end",
+                    backend="anthropic",
+                    operation="stream_messages",
+                    method="POST",
+                    url=url,
+                    status=status_code,
+                    outcome=outcome,
+                    response_bytes=response_bytes,
+                    error=error,
+                )

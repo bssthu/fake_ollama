@@ -15,6 +15,10 @@ import uvicorn
 from dotenv import load_dotenv
 
 from .config import load_settings
+from .request_data_log import (
+    DEFAULT_REQUEST_DATA_LOG_FILE,
+    configure_request_data_logging,
+)
 from .server import create_app, request_shutdown
 
 logger = logging.getLogger("fake_ollama")
@@ -84,15 +88,40 @@ def main() -> None:
         action="store_true",
         help="disable file logging and only log to stderr",
     )
+    parser.add_argument(
+        "--request-data-log-file",
+        default=str(DEFAULT_REQUEST_DATA_LOG_FILE),
+        help=(
+            "write full request/response data JSONL to this file "
+            "(default: logs/fake_ollama.requests.jsonl)"
+        ),
+    )
+    parser.add_argument(
+        "--no-request-data-log",
+        action="store_true",
+        help="disable the separate full request/response data JSONL log",
+    )
     args = parser.parse_args()
 
     log_file = None if args.no_log_file else args.log_file
     _configure_logging(args.log_level, log_file=log_file)
+    request_data_log_file = (
+        None if args.no_request_data_log else args.request_data_log_file
+    )
+    configure_request_data_logging(request_data_log_file)
 
     settings = load_settings(config_path=args.config)
     logger.info(
         "logging initialised%s",
         f"; file={Path(log_file)}" if log_file else "; file=disabled",
+    )
+    logger.info(
+        "request data logging initialised%s",
+        (
+            f"; file={Path(request_data_log_file)}"
+            if request_data_log_file
+            else "; file=disabled"
+        ),
     )
 
     updates = {}
