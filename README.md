@@ -64,13 +64,22 @@ Copy-Item config.json.example config.json
 Copy-Item .env.example .env
 # 编辑 config.json 填上游；token 推荐放 .env
 
-# 3. 启动
+# 3. 启动（已激活 .venv 时）
 python -m fake_ollama
+# 未激活 .venv 时，显式使用虚拟环境里的 Python
+.\.venv\Scripts\python.exe -m fake_ollama
+# 如果已经 pip install -e .，也可以用 console script
+fake-ollama
 # 可选：覆盖 internal listener 的 host/port
 python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
 # 可选：覆盖 admin listener
 python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port 21433
 ```
+
+说明：
+- `python -m fake_ollama` 和 `.\.venv\Scripts\python.exe -m fake_ollama` 调的是同一个入口；前者依赖当前 shell 里的 `python` 已指向 `.venv`，后者直接指定虚拟环境解释器，更适合未激活环境、计划任务或服务脚本。
+- 未执行 `pip install -e .` 时，请在项目根目录启动；这样源码包、`./config.json`、`./.env` 和默认日志路径都能按预期解析。
+- 默认日志写到当前工作目录下的 `logs/fake_ollama.log`，同时输出到控制台。可用 `--log-file I:\path\fake_ollama.log` 指定固定日志路径，或用 `--no-log-file` 只保留控制台日志。
 
 启动后：
 - Ollama 客户端连 `http://127.0.0.1:21434`
@@ -438,6 +447,7 @@ curl -X POST http://127.0.0.1:21435/v1/chat/completions `
 - **/v1/messages 返回 404 `model '...' is not exposed externally`**：该模型来自 upstream、Ollama target 或 llama.cpp target，但其所属节点的 `expose_external` 没把它列进去。在 admin UI 里勾选，或干脆删掉 `expose_external` 字段恢复"全部暴露"。
 - **/v1/messages 返回 401**：`external_access_tokens` 为空（且 `external_port` 已设置 → 启动时已 WARN），或请求头里的 token 不在池里。检查 `x-api-key` / `Authorization: Bearer` 是否带对了。
 - **/v1/messages 在 internal 端口返回 404**：你启用了 `external_port`，反向代理已经只在 external 端口可达。请改连 external 端口。
+- **启动后找不到日志文件**：默认日志路径是相对当前工作目录的 `logs/fake_ollama.log`。确认是在项目根目录启动，或显式传 `--log-file I:\Projects\fake_ollama\logs\fake_ollama.log`；如果传了 `--no-log-file`，则只会输出到控制台。
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`（默认）。
 - **503 / `Insufficient GPU VRAM`**：某个本地 Ollama / llama.cpp 模型在 `model_profiles` 里配了 `estimated_vram_gb`，但 `nvidia-smi` 汇总的当前可用显存不足；fake-ollama 会尝试释放空闲 60 秒以上的可回收模型，并在释放后重新读取真实 free VRAM，仍不够才返回 503。Anthropic `/v1/messages` 会返回 `type=error`、`error.type=overloaded_error` 和英文 message；OpenAI/Ollama 入口会返回同样的英文错误文本。降低该模型的 `estimated_vram_gb`、等待旧模型空闲、配置有效的 `stop_command`，或手动释放显存后重试。
 - **400 thinking content must be passed back**（DeepSeek）：模型在某轮启用了 thinking，但下一轮历史里没把 `thinking` 块带回。fake-ollama 已做了缓存回查 + 当 profile 是 `auto + show_thinking=false` 时主动注入 `thinking: {type:"disabled"}` 绕过；如果你确实想要 thinking，把对应 profile 设为 `"thinking_mode": "enabled"`。

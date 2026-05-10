@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from types import FrameType
-from typing import Callable
+from typing import Callable, Optional
 
 import uvicorn
 from dotenv import load_dotenv
@@ -15,6 +18,8 @@ from .config import load_settings
 from .server import create_app, request_shutdown
 
 logger = logging.getLogger("fake_ollama")
+DEFAULT_LOG_FILE = Path("logs") / "fake_ollama.log"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
 class _ShutdownAwareServer(uvicorn.Server):
@@ -25,6 +30,32 @@ class _ShutdownAwareServer(uvicorn.Server):
     def handle_exit(self, sig: int, frame: FrameType | None) -> None:
         self._on_shutdown_requested()
         super().handle_exit(sig, frame)
+
+
+def _configure_logging(level_name: str, *, log_file: Optional[str]) -> None:
+    level = getattr(logging, level_name.upper(), None)
+    if not isinstance(level, int):
+        level = logging.INFO
+
+    formatter = logging.Formatter(LOG_FORMAT)
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+
+    if log_file:
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(
+                path,
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+        )
+
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
+    logging.basicConfig(level=level, handlers=handlers, force=True)
 
 
 def main() -> None:
@@ -43,14 +74,27 @@ def main() -> None:
     parser.add_argument("--admin-host", default=None, help="admin bind host (default from config)")
     parser.add_argument("--admin-port", type=int, default=None, help="admin bind port (default from config)")
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--log-file",
+        default=str(DEFAULT_LOG_FILE),
+        help="write application logs to this file (default: logs/fake_ollama.log)",
+    )
+    parser.add_argument(
+        "--no-log-file",
+        action="store_true",
+        help="disable file logging and only log to stderr",
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=args.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    log_file = None if args.no_log_file else args.log_file
+    _configure_logging(args.log_level, log_file=log_file)
 
     settings = load_settings(config_path=args.config)
+    logger.info(
+        "logging initialised%s",
+        f"; file={Path(log_file)}" if log_file else "; file=disabled",
+    )
+
     updates = {}
     if args.host is not None:
         updates["host"] = args.host
@@ -76,6 +120,7 @@ def main() -> None:
         host=host,
         port=port,
         log_level=args.log_level,
+        log_config=None,
         access_log=False,
     )
 
@@ -88,6 +133,7 @@ def main() -> None:
             host=ext_host,
             port=ext_port,
             log_level=args.log_level,
+            log_config=None,
             access_log=False,
         )
         configs.append(("external", ext_host, ext_port, external_cfg))
@@ -97,6 +143,7 @@ def main() -> None:
             host=settings.admin_host,
             port=int(settings.admin_port),  # type: ignore[arg-type]
             log_level=args.log_level,
+            log_config=None,
             access_log=False,
         )
         configs.append(("admin", settings.admin_host, int(settings.admin_port), admin_cfg))

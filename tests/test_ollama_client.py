@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -181,6 +182,92 @@ async def test_llama_cpp_client_does_not_auto_start_during_shutdown(monkeypatch:
         await client.aclose()
 
     assert commands == []
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_idle_stop_ignores_request_waiting_for_startup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = {"started": False, "chat_called": False}
+    health_gate = asyncio.Event()
+    stopped: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(argv, **kwargs):
+        state["started"] = True
+        return _FakeProcess()
+
+    async def fake_terminate_process_tree(
+        process: _FakeProcess, *, timeout: float = 10.0
+    ) -> bool:
+        stopped.append(process)
+        process.returncode = 0
+        return True
+
+    monkeypatch.setattr(
+        "fake_ollama.llama_cpp_client.create_managed_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(
+        "fake_ollama.llama_cpp_client.terminate_process_tree",
+        fake_terminate_process_tree,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            if not state["started"]:
+                raise httpx.ConnectError("daemon down", request=request)
+            await health_gate.wait()
+            return httpx.Response(200)
+        if request.url.path == "/v1/chat/completions":
+            state["chat_called"] = True
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "ok"}}
+                    ]
+                },
+            )
+        raise AssertionError(f"unexpected path: {request.url.path}")
+
+    client = LlamaCppClient(
+        "http://127.0.0.1:21436",
+        auto_start=True,
+        start_argv=["llama-server", "--model", "qwen.gguf"],
+        idle_timeout_seconds=1.0,
+        startup_timeout_seconds=5.0,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    client._last_used = time.monotonic() - 60.0
+
+    task = asyncio.create_task(client.chat({"model": "qwen", "messages": []}))
+    try:
+        for _ in range(100):
+            if state["started"]:
+                break
+            await asyncio.sleep(0.01)
+        assert state["started"] is True
+
+        await client.stop_if_idle()
+        assert stopped == []
+        assert not task.done()
+
+        health_gate.set()
+        resp = await task
+        assert resp["choices"][0]["message"]["content"] == "ok"
+    finally:
+        if not health_gate.is_set():
+            health_gate.set()
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        client._started_by_us = False
+        await client.aclose()
+
+    assert state["chat_called"] is True
 
 
 async def _async_true() -> bool:

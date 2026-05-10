@@ -68,6 +68,7 @@ class OllamaClient:
         self._started_by_us = False
         self._start_lock = asyncio.Lock()
         self._active = 0
+        self._request_refs = 0
         self._last_used = time.monotonic()
         self._loaded_models: dict[str, _LoadedModel] = {}
         self._shutdown_requested = False
@@ -88,6 +89,13 @@ class OllamaClient:
 
     def has_vram_reservation(self, model: str) -> bool:
         return bool(model and model in self._loaded_models)
+
+    def _begin_request_lifecycle(self) -> None:
+        self._request_refs += 1
+
+    def _end_request_lifecycle(self) -> None:
+        self._request_refs -= 1
+        self._last_used = time.monotonic()
 
     def vram_release_candidates(
         self, *, now: float, idle_seconds: float
@@ -212,26 +220,29 @@ class OllamaClient:
         body = dict(payload)
         body["stream"] = False
         model = str(body.get("model") or "")
-        await self._ensure_vram(model, estimated_vram_gb)
+        self._begin_request_lifecycle()
         try:
-            await self._ensure_ready()
-        except BaseException:
-            self._discard_vram_pending(model)
-            raise
-        self._active += 1
-        try:
+            await self._ensure_vram(model, estimated_vram_gb)
             try:
-                resp = await self._client.post(f"{self._base}/api/chat", json=body)
-                await resp.aread()
-                resp.raise_for_status()
+                await self._ensure_ready()
             except BaseException:
                 self._discard_vram_pending(model)
                 raise
-            self._mark_vram_reserved(model, estimated_vram_gb)
-            return resp.json()
+            self._active += 1
+            try:
+                try:
+                    resp = await self._client.post(f"{self._base}/api/chat", json=body)
+                    await resp.aread()
+                    resp.raise_for_status()
+                except BaseException:
+                    self._discard_vram_pending(model)
+                    raise
+                self._mark_vram_reserved(model, estimated_vram_gb)
+                return resp.json()
+            finally:
+                self._active -= 1
         finally:
-            self._active -= 1
-            self._last_used = time.monotonic()
+            self._end_request_lifecycle()
 
     async def stream_chat(
         self,
@@ -243,45 +254,54 @@ class OllamaClient:
         body = dict(payload)
         body["stream"] = True
         model = str(body.get("model") or "")
-        await self._ensure_vram(model, estimated_vram_gb)
+        self._begin_request_lifecycle()
         try:
-            await self._ensure_ready()
-        except BaseException:
-            self._discard_vram_pending(model)
-            raise
-        self._active += 1
-        marked = False
-        try:
+            await self._ensure_vram(model, estimated_vram_gb)
             try:
-                async with self._client.stream(
-                    "POST", f"{self._base}/api/chat", json=body
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err_body = await resp.aread()
-                        resp.raise_for_status()  # raises HTTPStatusError with body
-                        # Should be unreachable, but keep the error_body in scope so
-                        # type-checkers see it as used.
-                        _ = err_body
-                    self._mark_vram_reserved(model, estimated_vram_gb)
-                    marked = True
-                    async for raw_line in resp.aiter_lines():
-                        if raw_line:
-                            yield raw_line.encode("utf-8")
+                await self._ensure_ready()
             except BaseException:
-                if not marked:
-                    self._discard_vram_pending(model)
+                self._discard_vram_pending(model)
                 raise
+            self._active += 1
+            marked = False
+            try:
+                try:
+                    async with self._client.stream(
+                        "POST", f"{self._base}/api/chat", json=body
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            err_body = await resp.aread()
+                            resp.raise_for_status()  # raises HTTPStatusError with body
+                            # Should be unreachable, but keep the error_body in scope so
+                            # type-checkers see it as used.
+                            _ = err_body
+                        self._mark_vram_reserved(model, estimated_vram_gb)
+                        marked = True
+                        async for raw_line in resp.aiter_lines():
+                            if raw_line:
+                                yield raw_line.encode("utf-8")
+                except BaseException:
+                    if not marked:
+                        self._discard_vram_pending(model)
+                    raise
+            finally:
+                self._active -= 1
         finally:
-            self._active -= 1
-            self._last_used = time.monotonic()
+            self._end_request_lifecycle()
 
     async def stop_if_idle(self) -> None:
-        if not self._idle_timeout or self._active:
+        if not self._idle_timeout or self._active or self._request_refs:
             return
-        if time.monotonic() - self._last_used < self._idle_timeout:
+        idle_for = time.monotonic() - self._last_used
+        if idle_for < self._idle_timeout:
             return
         if not (self._started_by_us or self._stop_command):
             return
+        logger.info(
+            "stopping idle Ollama target %s after %.1fs idle",
+            self.target_id,
+            idle_for,
+        )
         await self.stop_if_owned()
 
     async def release_for_vram(self) -> bool:
