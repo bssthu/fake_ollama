@@ -14,6 +14,7 @@ Scope (MVP):
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
@@ -440,6 +441,79 @@ def _new_msg_id() -> str:
     return f"msg_{uuid.uuid4().hex[:24]}"
 
 
+_TAGGED_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL
+)
+_TAGGED_FUNCTION_RE = re.compile(
+    r"<function=([^\s>]+)>\s*(.*?)\s*</function>", re.IGNORECASE | re.DOTALL
+)
+_TAGGED_PARAMETER_RE = re.compile(
+    r"<parameter=([^\s>]+)>\s*(.*?)\s*</parameter>", re.IGNORECASE | re.DOTALL
+)
+
+
+def _tagged_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
+    """Recover Qwen-style XML-ish tool calls that appear in reasoning text."""
+    if "<tool_call" not in text.lower():
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for match in _TAGGED_TOOL_CALL_RE.finditer(text):
+        body = match.group(1).strip()
+        call = _tagged_tool_call_from_json(body, len(out))
+        if call is None:
+            call = _tagged_tool_call_from_xmlish(body, len(out))
+        if call is not None:
+            out.append(call)
+    return out
+
+
+def _tagged_tool_call_from_json(body: str, index: int) -> Optional[Dict[str, Any]]:
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    fn = parsed.get("function") if isinstance(parsed.get("function"), dict) else {}
+    name = parsed.get("name") or fn.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+
+    args = parsed.get("arguments", fn.get("arguments", parsed.get("input", {})))
+    return {
+        "id": parsed.get("id") or f"call_{index}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(_parse_openai_arguments(args), ensure_ascii=False),
+        },
+    }
+
+
+def _tagged_tool_call_from_xmlish(body: str, index: int) -> Optional[Dict[str, Any]]:
+    match = _TAGGED_FUNCTION_RE.search(body)
+    if not match:
+        return None
+    name = match.group(1).strip()
+    args = {
+        p.group(1).strip(): p.group(2).strip()
+        for p in _TAGGED_PARAMETER_RE.finditer(match.group(2))
+        if p.group(1).strip()
+    }
+    if not name:
+        return None
+    return {
+        "id": f"call_{index}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(args, ensure_ascii=False),
+        },
+    }
+
+
 def ollama_chat_to_anthropic(
     response: Dict[str, Any],
     *,
@@ -526,12 +600,13 @@ def openai_chat_to_anthropic(
     msg = choice.get("message") or {}
     text = msg.get("content") or ""
     thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    tool_calls = msg.get("tool_calls") or _tagged_tool_calls_from_text(thinking)
     blocks: List[Dict[str, Any]] = []
-    if thinking and show_thinking:
+    if thinking and show_thinking and not tool_calls:
         blocks.append({"type": "thinking", "thinking": thinking})
     if text:
         blocks.append({"type": "text", "text": text})
-    for i, tc in enumerate(msg.get("tool_calls") or []):
+    for i, tc in enumerate(tool_calls):
         fn = (tc.get("function") if isinstance(tc, dict) else None) or {}
         blocks.append(
             {
@@ -545,15 +620,16 @@ def openai_chat_to_anthropic(
     usage = response.get("usage") or {}
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("completion_tokens") or 0)
+    stop_reason = _OPENAI_FINISH_TO_STOP.get(choice.get("finish_reason"), "end_turn")
+    if tool_calls:
+        stop_reason = "tool_use"
     return {
         "id": response.get("id") or _new_msg_id(),
         "type": "message",
         "role": "assistant",
         "model": anthropic_model,
         "content": blocks,
-        "stop_reason": _OPENAI_FINISH_TO_STOP.get(
-            choice.get("finish_reason"), "end_turn"
-        ),
+        "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
             "input_tokens": prompt_tokens,
@@ -630,6 +706,7 @@ async def openai_stream_to_anthropic_events(
     stop_reason = "end_turn"
     input_tokens = 0
     output_tokens = 0
+    hidden_reasoning_parts: List[str] = []
 
     async for raw in lines:
         line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
@@ -661,9 +738,14 @@ async def openai_stream_to_anthropic_events(
             stop_reason = _OPENAI_FINISH_TO_STOP.get(finish, "end_turn")
 
         reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+        if reasoning and not show_thinking:
+            hidden_reasoning_parts.append(reasoning)
         if reasoning and show_thinking:
             if text_open:
-                yield ("content_block_stop", {"type": "content_block_stop", "index": text_index})
+                yield (
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": text_index},
+                )
                 text_open = False
             if not thinking_open:
                 thinking_index = next_index
@@ -730,9 +812,23 @@ async def openai_stream_to_anthropic_events(
                 acc["arguments"] += fn["arguments"]
 
     if thinking_open:
-        yield ("content_block_stop", {"type": "content_block_stop", "index": thinking_index})
+        yield (
+            "content_block_stop",
+            {"type": "content_block_stop", "index": thinking_index},
+        )
     if text_open:
         yield ("content_block_stop", {"type": "content_block_stop", "index": text_index})
+
+    if not pending_tools and hidden_reasoning_parts:
+        for i, tc in enumerate(
+            _tagged_tool_calls_from_text("".join(hidden_reasoning_parts))
+        ):
+            fn = (tc.get("function") if isinstance(tc, dict) else None) or {}
+            pending_tools[i] = {
+                "id": tc.get("id") or f"call_{i}",
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", ""),
+            }
 
     for idx in sorted(pending_tools):
         tool = pending_tools[idx]
@@ -764,6 +860,9 @@ async def openai_stream_to_anthropic_events(
             },
         )
         yield ("content_block_stop", {"type": "content_block_stop", "index": block_index})
+
+    if pending_tools:
+        stop_reason = "tool_use"
 
     yield (
         "message_delta",

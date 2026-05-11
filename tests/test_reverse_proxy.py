@@ -619,6 +619,70 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
     assert sent["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+def test_reverse_non_stream_salvages_reasoning_tool_call_from_llama_cpp(
+    reverse_settings,
+):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
+    ]
+    data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
+    settings = Settings(**data)
+    fake = _FakeLlamaCppClient(
+        chat_response={
+            "id": "chatcmpl_local",
+            "object": "chat.completion",
+            "model": "qwen3.6",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": (
+                            "<tool_call>\n"
+                            "<function=Bash>\n"
+                            "<parameter=command>\n"
+                            "echo 1\n"
+                            "</parameter>\n"
+                            "<parameter=description>\n"
+                            "Run first step\n"
+                            "</parameter>\n"
+                            "</function>\n"
+                            "</tool_call>"
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
+        }
+    )
+    client = _build_client(settings, fake_llama_cpp=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.6",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["stop_reason"] == "tool_use"
+    assert body["content"] == [
+        {
+            "type": "tool_use",
+            "id": "call_0",
+            "name": "Bash",
+            "input": {"command": "echo 1", "description": "Run first step"},
+        }
+    ]
+
+
 def test_reverse_forwards_base64_image_to_llama_cpp(reverse_settings):
     data = reverse_settings.model_dump()
     data["llama_cpp_targets"] = [
@@ -773,6 +837,113 @@ def test_reverse_streaming_routes_to_llama_cpp_target(reverse_settings):
     assert '"text": "hel"' in raw
     assert '"text": "lo"' in raw
     assert '"stop_reason": "end_turn"' in raw
+
+
+def test_reverse_streaming_salvages_reasoning_tool_call_from_llama_cpp(
+    reverse_settings,
+):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
+    ]
+    data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
+    settings = Settings(**data)
+    fake = _FakeLlamaCppClient(
+        stream_chunks=[
+            {
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "reasoning_content": "<tool_call>\n<function=Bash>"
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "reasoning_content": (
+                                "\n<parameter=command>\necho 1\n</parameter>"
+                            )
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "reasoning_content": (
+                                "\n<parameter=description>\nRun first step\n"
+                                "</parameter>\n</function>\n</tool_call>"
+                            )
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+            },
+        ]
+    )
+    client = _build_client(settings, fake_llama_cpp=fake)
+    with client:
+        with client.stream(
+            "POST",
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.6",
+                "stream": True,
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            raw = b"".join(resp.iter_bytes()).decode("utf-8")
+
+    events = []
+    for part in raw.split("\n\n"):
+        data_line = next(
+            (line for line in part.splitlines() if line.startswith("data: ")), None
+        )
+        if data_line:
+            events.append(json.loads(data_line[len("data: "):]))
+
+    tool_start = next(
+        e
+        for e in events
+        if e["type"] == "content_block_start"
+        and e["content_block"]["type"] == "tool_use"
+    )
+    tool_delta = next(
+        e
+        for e in events
+        if e["type"] == "content_block_delta"
+        and e["delta"]["type"] == "input_json_delta"
+    )
+    message_delta = next(e for e in events if e["type"] == "message_delta")
+
+    assert "thinking_delta" not in raw
+    assert tool_start["content_block"]["name"] == "Bash"
+    assert json.loads(tool_delta["delta"]["partial_json"]) == {
+        "command": "echo 1",
+        "description": "Run first step",
+    }
+    assert message_delta["delta"]["stop_reason"] == "tool_use"
 
 
 def test_v1_models_includes_llama_cpp_targets_when_authed(reverse_settings):
