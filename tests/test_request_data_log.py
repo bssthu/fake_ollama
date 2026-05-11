@@ -8,6 +8,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from fake_ollama.anthropic_client import AnthropicClient
+from fake_ollama.llama_cpp_client import LlamaCppClient
 from fake_ollama.request_data_log import configure_request_data_logging
 from fake_ollama.server import create_app
 
@@ -82,3 +83,38 @@ def test_request_data_log_records_http_and_backend_payloads(settings, tmp_path):
         record for record in records if record["event"] == "http_response_body"
     )
     assert "pong" in response_body["body"]["text"]
+
+
+async def test_request_data_log_treats_close_after_done_as_complete(tmp_path):
+    log_file = tmp_path / "fake_ollama.requests.jsonl"
+    configure_request_data_logging(str(log_file))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200)
+        assert request.url.path == "/v1/chat/completions"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: [DONE]\n\n",
+        )
+
+    client = LlamaCppClient(
+        "http://llama.test",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        stream = client.stream_chat({"model": "m", "messages": []})
+        assert await anext(stream) == "data: [DONE]"
+        await stream.aclose()
+    finally:
+        await client.aclose()
+        configure_request_data_logging(None)
+
+    records = _records(log_file)
+    assert not any(record["event"] == "backend_error" for record in records)
+    response_end = next(
+        record for record in records if record["event"] == "backend_response_end"
+    )
+    assert response_end["outcome"] == "complete"
+    assert response_end["error"] is None

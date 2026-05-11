@@ -397,6 +397,7 @@ class LlamaCppClient:
                     response_bytes = 0
                     outcome = "complete"
                     error: Optional[str] = None
+                    stream_done = False
                     async with self._client.stream(
                         "POST",
                         url,
@@ -445,6 +446,8 @@ class LlamaCppClient:
                             async for raw_line in resp.aiter_lines():
                                 if raw_line:
                                     response_bytes += len(raw_line.encode("utf-8"))
+                                    if raw_line.strip() == "data: [DONE]":
+                                        stream_done = True
                                     log_data_event(
                                         "backend_response_body",
                                         backend="llama.cpp",
@@ -456,15 +459,19 @@ class LlamaCppClient:
                                     )
                                     yield raw_line
                         except BaseException as exc:
-                            outcome = (
-                                "cancelled"
-                                if exc.__class__.__name__ == "CancelledError"
-                                else "exception"
-                            )
-                            error = (
-                                f"{exc.__class__.__module__}."
-                                f"{exc.__class__.__name__}: {exc}"
-                            )
+                            if exc.__class__.__name__ == "GeneratorExit":
+                                outcome = "complete" if stream_done else "closed"
+                                error = None if stream_done else "consumer closed stream"
+                            else:
+                                outcome = (
+                                    "cancelled"
+                                    if exc.__class__.__name__ == "CancelledError"
+                                    else "exception"
+                                )
+                                error = (
+                                    f"{exc.__class__.__module__}."
+                                    f"{exc.__class__.__name__}: {exc}"
+                                )
                             raise
                         finally:
                             if response_started:
@@ -481,15 +488,16 @@ class LlamaCppClient:
                                     error=error,
                                 )
                 except BaseException as exc:
-                    log_data_event(
-                        "backend_error",
-                        backend="llama.cpp",
-                        target_id=self.target_id,
-                        operation="stream_chat",
-                        method="POST",
-                        url=f"{self._base}/v1/chat/completions",
-                        error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
-                    )
+                    if exc.__class__.__name__ != "GeneratorExit":
+                        log_data_event(
+                            "backend_error",
+                            backend="llama.cpp",
+                            target_id=self.target_id,
+                            operation="stream_chat",
+                            method="POST",
+                            url=f"{self._base}/v1/chat/completions",
+                            error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
+                        )
                     if not marked:
                         self._discard_vram_pending(model)
                     raise

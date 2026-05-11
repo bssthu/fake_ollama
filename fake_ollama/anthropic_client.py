@@ -242,6 +242,7 @@ class AnthropicClient:
         response_bytes = 0
         outcome = "complete"
         error: Optional[str] = None
+        stream_done = False
         try:
             async with self._client.stream(
                 "POST", url, json=payload, headers=headers
@@ -305,22 +306,29 @@ class AnthropicClient:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
-                        yield (event_name or data.get("type", "message"), data)
+                        parsed_event = event_name or data.get("type", "message")
+                        if parsed_event == "message_stop" or data.get("type") == "message_stop":
+                            stream_done = True
+                        yield (parsed_event, data)
         except BaseException as exc:
-            outcome = (
-                "cancelled"
-                if exc.__class__.__name__ == "CancelledError"
-                else "exception"
-            )
-            error = f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}"
-            log_data_event(
-                "backend_error",
-                backend="anthropic",
-                operation="stream_messages",
-                method="POST",
-                url=url,
-                error=error,
-            )
+            if exc.__class__.__name__ == "GeneratorExit":
+                outcome = "complete" if stream_done else "closed"
+                error = None if stream_done else "consumer closed stream"
+            else:
+                outcome = (
+                    "cancelled"
+                    if exc.__class__.__name__ == "CancelledError"
+                    else "exception"
+                )
+                error = f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}"
+                log_data_event(
+                    "backend_error",
+                    backend="anthropic",
+                    operation="stream_messages",
+                    method="POST",
+                    url=url,
+                    error=error,
+                )
             raise
         finally:
             if response_started:
