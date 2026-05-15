@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .vram import VramCoordinator
@@ -109,6 +109,10 @@ def _collect_model_snapshots(app: FastAPI) -> list[dict[str, object]]:
                 snapshots.append(snap)
     snapshots.sort(key=lambda item: str(item.get("key") or ""))
     return snapshots
+
+
+def _dashboard_model_reclaim_enabled(settings: Any) -> bool:
+    return bool(getattr(settings, "dashboard_model_reclaim_enabled", False))
 
 
 def _dashboard_retention_seconds(settings: Any) -> float:
@@ -355,6 +359,11 @@ class DashboardState:
             "limits": {
                 "vram_low_free_threshold_mib": settings.vram_low_free_threshold_mib,
             },
+            "permissions": {
+                "dashboard_model_reclaim_enabled": _dashboard_model_reclaim_enabled(
+                    settings
+                ),
+            },
             "samples": samples,
             "current_models": _collect_model_snapshots(app),
         }
@@ -400,6 +409,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
   --panel: #ffffff;
   --accent: #0f766e;
   --warn: #b45309;
+  --danger: #b91c1c;
 }
 * { box-sizing: border-box; }
 body {
@@ -447,6 +457,22 @@ button.active {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+button.icon {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  font-weight: 700;
+  line-height: 1;
+}
+button.icon.danger {
+  border-color: #fecaca;
+  color: var(--danger);
 }
 .status {
   font-size: 13px;
@@ -545,6 +571,9 @@ td.model {
   white-space: normal;
   overflow-wrap: anywhere;
 }
+td.action {
+  text-align: center;
+}
 .empty {
   padding: 20px 6px;
   color: var(--muted);
@@ -604,6 +633,10 @@ const hiddenModels = new Set();
 const colors = ['#0f766e', '#2563eb', '#b45309', '#9333ea', '#dc2626', '#0891b2', '#4d7c0f', '#be185d', '#475569', '#ea580c'];
 
 function $(id) { return document.getElementById(id); }
+function escapeHtml(value) {
+  const escapes = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
+  return String(value ?? '').replace(/[&<>"']/g, ch => escapes[ch]);
+}
 function fmtGiB(mib) {
   if (mib === null || mib === undefined || Number.isNaN(Number(mib))) return '-';
   return (Number(mib) / 1024).toFixed(2) + ' GiB';
@@ -742,7 +775,7 @@ function renderLegend(models) {
   models.forEach((m, i) => {
     const b = document.createElement('button');
     b.className = hiddenModels.has(m.key) ? 'hidden' : '';
-    b.innerHTML = `<span class="swatch" style="background:${colorFor(i)}"></span>${m.model}`;
+    b.innerHTML = `<span class="swatch" style="background:${colorFor(i)}"></span>${escapeHtml(m.model)}`;
     b.title = modelLabel(m);
     b.onclick = () => {
       if (hiddenModels.has(m.key)) hiddenModels.delete(m.key);
@@ -758,19 +791,57 @@ function renderTable(models) {
     $('modelTable').innerHTML = '<div class="empty">No loaded local models</div>';
     return;
   }
-  const rows = models.map(m => `<tr>
-    <td class="model">${m.model}</td>
-    <td>${m.backend}</td>
-    <td>${m.target_id}</td>
-    <td>${fmtGiB(m.estimated_vram_mib)}</td>
-    <td>${m.active_requests || 0}</td>
-    <td>${fmtAge(m.idle_seconds)}</td>
-    <td>${m.reclaimable ? 'yes' : 'no'}</td>
-  </tr>`).join('');
+  const reclaimAllowed = Boolean(latest && latest.permissions && latest.permissions.dashboard_model_reclaim_enabled);
+  const rows = models.map(m => {
+    const canReclaim = reclaimAllowed && Boolean(m.reclaimable);
+    const title = !reclaimAllowed
+      ? 'Dashboard model reclaim is disabled in settings'
+      : (m.reclaimable ? 'Close and reclaim this model' : 'Model is not eligible for reclaim yet');
+    const disabled = canReclaim ? '' : ' disabled';
+    return `<tr>
+      <td class="model">${escapeHtml(m.model)}</td>
+      <td>${escapeHtml(m.backend)}</td>
+      <td>${escapeHtml(m.target_id)}</td>
+      <td>${fmtGiB(m.estimated_vram_mib)}</td>
+      <td>${m.active_requests || 0}</td>
+      <td>${fmtAge(m.idle_seconds)}</td>
+      <td>${m.reclaimable ? 'yes' : 'no'}</td>
+      <td class="action"><button type="button" class="icon danger" data-reclaim-key="${escapeHtml(m.key)}" title="${escapeHtml(title)}"${disabled}>X</button></td>
+    </tr>`;
+  }).join('');
   $('modelTable').innerHTML = `<table>
-    <thead><tr><th>Model</th><th>Backend</th><th>Target</th><th>Est. VRAM</th><th>Active</th><th>Idle</th><th>Reclaimable</th></tr></thead>
+    <thead><tr><th>Model</th><th>Backend</th><th>Target</th><th>Est. VRAM</th><th>Active</th><th>Idle</th><th>Reclaimable</th><th>Action</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+  for (const btn of $('modelTable').querySelectorAll('button[data-reclaim-key]')) {
+    btn.addEventListener('click', () => reclaimModel(btn.getAttribute('data-reclaim-key') || ''));
+  }
+}
+
+async function reclaimModel(key) {
+  if (!key) return;
+  const current = (latest && latest.current_models) || [];
+  const model = current.find(m => m.key === key);
+  const label = model ? modelLabel(model) : key;
+  if (!window.confirm(`Close and reclaim ${label}?`)) return;
+  $('status').textContent = `reclaiming ${label}...`;
+  try {
+    const resp = await fetch('/dashboard/reclaim-model', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({key}),
+    });
+    const text = await resp.text();
+    let payload = {};
+    try { payload = text ? JSON.parse(text) : {}; } catch (_) {}
+    if (!resp.ok) {
+      throw new Error(payload.detail || payload.reason || payload.error || text || resp.statusText);
+    }
+    $('status').textContent = `reclaim requested for ${label}`;
+    await loadData();
+  } catch (err) {
+    $('status').textContent = 'reclaim failed: ' + err.message;
+  }
 }
 
 function render() {
@@ -853,3 +924,49 @@ def register_dashboard_routes(app: FastAPI) -> None:
         return JSONResponse(
             await state.data(request.app, range_seconds=range_seconds)
         )
+
+    @app.post("/dashboard/reclaim-model", include_in_schema=False)
+    async def dashboard_reclaim_model(request: Request) -> JSONResponse:
+        settings = request.app.state.settings
+        if not _dashboard_model_reclaim_enabled(settings):
+            raise HTTPException(
+                status_code=403,
+                detail="dashboard model reclaim is disabled in settings",
+            )
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+        key = str(payload.get("key") or "")
+        if not key:
+            raise HTTPException(status_code=400, detail="missing model key")
+
+        snapshot = next(
+            (
+                item
+                for item in _collect_model_snapshots(request.app)
+                if item.get("key") == key
+            ),
+            None,
+        )
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="model is not currently loaded")
+
+        target_id = str(snapshot.get("target_id") or "")
+        model = str(snapshot.get("model") or "")
+        if not target_id or not model:
+            raise HTTPException(status_code=400, detail="invalid model snapshot")
+
+        coordinator: VramCoordinator | None = getattr(
+            request.app.state, "vram_coordinator", None
+        )
+        if coordinator is None:
+            raise HTTPException(status_code=503, detail="VRAM coordinator unavailable")
+
+        result = await coordinator.reclaim_model(target_id=target_id, model=model)
+        status_code = 200 if result.get("released") else 409
+        return JSONResponse(result, status_code=status_code)

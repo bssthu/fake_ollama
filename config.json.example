@@ -112,6 +112,7 @@
   "dashboard_sample_interval_seconds": 10.0,
   "dashboard_retention_seconds": 604800.0,
   "dashboard_data_path": "logs/dashboard_history.json",
+  "dashboard_model_reclaim_enabled": false,
   "vram_low_free_reclaim_enabled": true,
   "vram_low_free_threshold_mib": 200.0,
 

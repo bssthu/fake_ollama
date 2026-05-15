@@ -206,6 +206,83 @@ async def test_reclaim_if_below_does_not_release_active_participants():
 
 
 @pytest.mark.asyncio
+async def test_reclaim_model_releases_matching_idle_candidate():
+    coord = VramCoordinator(provider=_free_provider(100.0))
+
+    class _IdleParticipant:
+        target_id = "target"
+        active_requests = 0
+
+        def __init__(self) -> None:
+            self.released = False
+            self.last_used = time.monotonic() - 120.0
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return model == "old"
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            if now - self.last_used < idle_seconds:
+                return []
+            return [
+                VramReleaseCandidate(
+                    owner_id=self.target_id,
+                    model="old",
+                    estimated_vram_gb=1.0,
+                    last_used_monotonic=self.last_used,
+                    release=self.release,
+                )
+            ]
+
+        async def release(self) -> bool:
+            self.released = True
+            return True
+
+    participant = _IdleParticipant()
+    coord.register(participant)
+
+    result = await coord.reclaim_model(
+        target_id="target", model="old", idle_seconds=60.0
+    )
+
+    assert participant.released is True
+    assert result == {
+        "target_id": "target",
+        "model": "old",
+        "estimated_vram_gb": 1.0,
+        "released": True,
+        "reason": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reclaim_model_requires_idle_eligible_candidate():
+    coord = VramCoordinator(provider=_free_provider(100.0))
+
+    class _BusyParticipant:
+        target_id = "target"
+        active_requests = 1
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return model == "old"
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            raise AssertionError("active participant should be skipped")
+
+    coord.register(_BusyParticipant())
+
+    result = await coord.reclaim_model(
+        target_id="target", model="old", idle_seconds=60.0
+    )
+
+    assert result == {
+        "target_id": "target",
+        "model": "old",
+        "released": False,
+        "reason": "not_eligible",
+    }
+
+
+@pytest.mark.asyncio
 async def test_total_capacity_allows_best_effort_reclaim_when_estimates_are_short():
     free_mib = {"mib": 512.0}
     coord = VramCoordinator(

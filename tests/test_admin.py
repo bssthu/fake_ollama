@@ -81,6 +81,7 @@ def test_admin_schema(admin_settings):
         "dashboard_host",
         "dashboard_port",
         "dashboard_data_path",
+        "dashboard_model_reclaim_enabled",
     } <= keys
     upstreams = next(f for f in fields if f["key"] == "upstreams")
     assert upstreams["required"] is True
@@ -157,14 +158,15 @@ def test_admin_schema(admin_settings):
     field_order = [f["key"] for f in fields]
     assert field_order[:4] == ["host", "port", "advertised_version", "upstreams"]
     assert field_order[4:7] == ["external_host", "external_port", "external_access_tokens"]
-    assert field_order[-12] == "model_profiles"
-    assert field_order[-11:-3] == [
+    assert field_order[-13] == "model_profiles"
+    assert field_order[-12:-3] == [
         "dashboard_enabled",
         "dashboard_host",
         "dashboard_port",
         "dashboard_sample_interval_seconds",
         "dashboard_retention_seconds",
         "dashboard_data_path",
+        "dashboard_model_reclaim_enabled",
         "vram_low_free_reclaim_enabled",
         "vram_low_free_threshold_mib",
     ]

@@ -660,6 +660,7 @@ class Settings(BaseModel):
     dashboard_sample_interval_seconds: float = 10.0
     dashboard_retention_seconds: float = 7 * 24 * 60 * 60
     dashboard_data_path: Optional[str] = "logs/dashboard_history.json"
+    dashboard_model_reclaim_enabled: bool = False
 
     # Low-VRAM safety monitor. Every dashboard_sample_interval_seconds it
     # checks nvidia-smi; if free VRAM is below the threshold, it asks the
@@ -939,6 +940,10 @@ _ENV_SCALARS: Dict[str, tuple] = {
     ),
     "FAKE_OLLAMA_DASHBOARD_RETENTION_SECONDS": ("dashboard_retention_seconds", float),
     "FAKE_OLLAMA_DASHBOARD_DATA_PATH": ("dashboard_data_path", str),
+    "FAKE_OLLAMA_DASHBOARD_MODEL_RECLAIM_ENABLED": (
+        "dashboard_model_reclaim_enabled",
+        _parse_bool,
+    ),
     "FAKE_OLLAMA_VRAM_LOW_FREE_RECLAIM_ENABLED": (
         "vram_low_free_reclaim_enabled",
         _parse_bool,

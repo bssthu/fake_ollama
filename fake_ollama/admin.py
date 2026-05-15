@@ -245,6 +245,8 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "description": "Dashboard history retention in seconds."},
   {"key": "dashboard_data_path", "type": "string", "default": "logs/dashboard_history.json", "group": "dashboard",
    "description": "JSON file used to persist dashboard history. Leave empty to disable file persistence."},
+  {"key": "dashboard_model_reclaim_enabled", "type": "bool", "default": False, "group": "dashboard",
+   "description": "Allow the dashboard Current Models table to request release of eligible idle local models."},
   {"key": "vram_low_free_reclaim_enabled", "type": "bool", "default": True, "group": "dashboard",
    "description": "Enable periodic low-free-VRAM checks that release eligible idle local models."},
   {"key": "vram_low_free_threshold_mib", "type": "float", "default": 200.0, "group": "dashboard",

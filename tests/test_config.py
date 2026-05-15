@@ -119,6 +119,7 @@ def test_admin_listener_defaults_and_legacy_null_mode():
     assert s.dashboard_host == "127.0.0.1"
     assert s.dashboard_port == 21432
     assert s.dashboard_data_path == "logs/dashboard_history.json"
+    assert s.dashboard_model_reclaim_enabled is False
     assert s.dashboard_listener_enabled is True
 
     legacy = Settings(

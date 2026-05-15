@@ -403,6 +403,54 @@ class VramCoordinator:
                 "checked": True,
             }
 
+    async def reclaim_model(
+        self,
+        *,
+        target_id: str,
+        model: str,
+        idle_seconds: float = VRAM_IDLE_RECLAIM_SECONDS,
+    ) -> dict[str, object]:
+        """Release one eligible idle local model by target/model identity."""
+        async with self._lock:
+            for candidate in self._eligible_candidates(
+                "", idle_seconds=idle_seconds, include_same_model=True
+            ):
+                if candidate.owner_id != target_id or candidate.model != model:
+                    continue
+
+                released = await candidate.release()
+                if released:
+                    self._pending.pop((candidate.owner_id, candidate.model), None)
+                    logger.info(
+                        "dashboard requested release of idle local model %s on %s; estimated VRAM %.2f GiB",
+                        candidate.model,
+                        candidate.owner_id,
+                        candidate.estimated_vram_gb,
+                    )
+                    reason = None
+                else:
+                    logger.warning(
+                        "dashboard failed to release idle local model %s on %s",
+                        candidate.model,
+                        candidate.owner_id,
+                    )
+                    reason = "release_failed"
+
+                return {
+                    "target_id": candidate.owner_id,
+                    "model": candidate.model,
+                    "estimated_vram_gb": candidate.estimated_vram_gb,
+                    "released": released,
+                    "reason": reason,
+                }
+
+            return {
+                "target_id": target_id,
+                "model": model,
+                "released": False,
+                "reason": "not_eligible",
+            }
+
     # -- Internals -----------------------------------------------------
 
     def _record_pending(
