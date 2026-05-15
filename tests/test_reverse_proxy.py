@@ -404,6 +404,80 @@ def test_reverse_target_disables_ollama_thinking_from_profile(reverse_settings):
     assert fake.last_chat_payload["think"] is False
 
 
+def test_reverse_target_profile_disabled_overrides_client_thinking_enabled(
+    reverse_settings,
+):
+    data = reverse_settings.model_dump()
+    data["model_profiles"] = {
+        "llama3.1": {
+            "capabilities": ["completion", "tools"],
+            "thinking_mode": "disabled",
+            "show_thinking": True,
+        }
+    }
+    settings = Settings(**data)
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    client = _build_client(settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 100,
+                "thinking": {"type": "enabled", "budget_tokens": 99},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["think"] is False
+
+
+def test_reverse_target_profile_enabled_overrides_client_thinking_disabled(
+    reverse_settings,
+):
+    data = reverse_settings.model_dump()
+    data["model_profiles"] = {
+        "llama3.1": {
+            "capabilities": ["completion", "tools"],
+            "thinking_mode": "enabled",
+            "show_thinking": True,
+        }
+    }
+    settings = Settings(**data)
+    fake = _FakeOllamaClient(
+        chat_response={
+            "model": "llama3.1:8b",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    client = _build_client(settings, fake_ollama=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "llama3.1",
+                "max_tokens": 100,
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["think"] is True
+
+
 def test_openai_target_disables_ollama_thinking_from_profile(reverse_settings):
     data = reverse_settings.model_dump()
     data["model_profiles"] = {
@@ -617,6 +691,92 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
     assert sent["messages"] == [{"role": "user", "content": "hello"}]
     assert sent["max_tokens"] == 100
     assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_reverse_llama_cpp_profile_disabled_overrides_client_thinking_enabled(
+    reverse_settings,
+):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
+    ]
+    data["model_profiles"] = {
+        "qwen3.6": {
+            "capabilities": ["completion", "tools"],
+            "thinking_mode": "disabled",
+            "show_thinking": False,
+        }
+    }
+    settings = Settings(**data)
+    fake = _FakeLlamaCppClient(
+        chat_response={
+            "id": "chatcmpl_local",
+            "object": "chat.completion",
+            "model": "qwen3.6",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
+        }
+    )
+    client = _build_client(settings, fake_llama_cpp=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.6",
+                "max_tokens": 100,
+                "thinking": {"type": "enabled", "budget_tokens": 99},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_reverse_llama_cpp_auto_honors_client_thinking_enabled(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["llama_cpp_targets"] = [
+        {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
+    ]
+    data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
+    settings = Settings(**data)
+    fake = _FakeLlamaCppClient(
+        chat_response={
+            "id": "chatcmpl_local",
+            "object": "chat.completion",
+            "model": "qwen3.6",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
+        }
+    )
+    client = _build_client(settings, fake_llama_cpp=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen3.6",
+                "max_tokens": 100,
+                "thinking": {"type": "enabled", "budget_tokens": 99},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert fake.last_chat_payload["chat_template_kwargs"] == {"enable_thinking": True}
 
 
 def test_reverse_non_stream_salvages_reasoning_tool_call_from_llama_cpp(

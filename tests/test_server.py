@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fake_ollama.config import Settings
-from fake_ollama.server import create_app, request_shutdown
+from fake_ollama.server import _apply_thinking_config, create_app, request_shutdown
 
 
 def _build_sse(events: List[Dict[str, Any]]) -> bytes:
@@ -853,6 +853,33 @@ def test_thinking_mode_disabled_injects_disabled(monkeypatch):
         )
     assert resp.status_code == 200
     assert captured["body"]["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_profile_enabled_overrides_request_disabled(monkeypatch):
+    settings = _thinking_settings(monkeypatch, mode="enabled")
+    payload = {"thinking": {"type": "disabled"}}
+
+    _apply_thinking_config(settings, "deepseek-v4-pro", payload)
+
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 512}
+
+
+def test_thinking_profile_disabled_overrides_request_enabled(monkeypatch):
+    settings = _thinking_settings(monkeypatch, mode="disabled")
+    payload = {"thinking": {"type": "enabled", "budget_tokens": 999}}
+
+    _apply_thinking_config(settings, "deepseek-v4-pro", payload)
+
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_auto_preserves_request_field(monkeypatch):
+    settings = _thinking_settings(monkeypatch, mode="auto", show=False)
+    payload = {"thinking": {"type": "enabled", "budget_tokens": 999}}
+
+    _apply_thinking_config(settings, "deepseek-v4-pro", payload)
+
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 999}
 
 
 def test_thinking_auto_with_show_thinking_false_disables_upstream(monkeypatch):

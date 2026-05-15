@@ -769,17 +769,11 @@ def _apply_thinking_config(
 ) -> None:
     """Inject the per-model `thinking` directive into the upstream payload.
 
-    Honours the client's explicit ``thinking`` field if already present so
-    the user can override per-request. Acts when the profile mode is
-    ``enabled`` or ``disabled``. For ``auto`` we also force ``disabled`` if
-    the profile sets ``show_thinking=False`` -- the user clearly does not
-    want reasoning, and otherwise upstreams that auto-enter thinking mode
-    (DeepSeek-V3.2+) will demand the prior-turn thinking blocks be echoed
-    back, which we cannot reconstruct after a restart for messages we
-    never saw.
+    Explicit profile modes are authoritative. Client-provided ``thinking``
+    is only honoured when the profile mode is ``auto``. For ``auto`` we also
+    force ``disabled`` if the profile sets ``show_thinking=False`` and the
+    client did not make an explicit request.
     """
-    if "thinking" in upstream_payload:
-        return
     profile = settings.profile_for(ollama_model)
     mode = profile.thinking_mode
     if mode == "enabled":
@@ -789,7 +783,9 @@ def _apply_thinking_config(
         }
     elif mode == "disabled":
         upstream_payload["thinking"] = {"type": "disabled"}
-    elif mode == "auto" and not profile.show_thinking:
+    elif "thinking" in upstream_payload:
+        return
+    elif not profile.show_thinking:
         upstream_payload["thinking"] = {"type": "disabled"}
 
 
@@ -806,6 +802,14 @@ def _apply_ollama_thinking_config(
     ``think: false`` so clients do not see an apparently empty response when
     their output budget is consumed by hidden reasoning.
     """
+    profile = settings.profile_for(display_model)
+    if profile.thinking_mode == "disabled":
+        ollama_payload["think"] = False
+        return
+    if profile.thinking_mode == "enabled":
+        ollama_payload["think"] = True
+        return
+
     if "think" in ollama_payload:
         return
 
@@ -819,11 +823,8 @@ def _apply_ollama_thinking_config(
             ollama_payload["think"] = True
             return
 
-    profile = settings.profile_for(display_model)
-    if profile.thinking_mode == "disabled" or not profile.show_thinking:
+    if not profile.show_thinking:
         ollama_payload["think"] = False
-    elif profile.thinking_mode == "enabled":
-        ollama_payload["think"] = True
 
 
 def _apply_reverse_output_limits(
@@ -869,24 +870,25 @@ def _apply_llama_cpp_thinking_config(
     spend their entire budget on hidden reasoning when a profile disables it.
     """
     existing = openai_payload.get("chat_template_kwargs")
-    if isinstance(existing, dict) and "enable_thinking" in existing:
-        return
+    profile = settings.profile_for(display_model)
 
     enabled: bool | None = None
-    requested = source_payload.get("thinking")
-    if isinstance(requested, dict):
-        req_type = str(requested.get("type") or "").lower()
-        if req_type == "disabled":
+    if profile.thinking_mode == "disabled":
+        enabled = False
+    elif profile.thinking_mode == "enabled":
+        enabled = True
+    else:
+        if isinstance(existing, dict) and "enable_thinking" in existing:
+            return
+        requested = source_payload.get("thinking")
+        if isinstance(requested, dict):
+            req_type = str(requested.get("type") or "").lower()
+            if req_type == "disabled":
+                enabled = False
+            elif req_type == "enabled":
+                enabled = True
+        if enabled is None and not profile.show_thinking:
             enabled = False
-        elif req_type == "enabled":
-            enabled = True
-
-    if enabled is None:
-        profile = settings.profile_for(display_model)
-        if profile.thinking_mode == "disabled" or not profile.show_thinking:
-            enabled = False
-        elif profile.thinking_mode == "enabled":
-            enabled = True
 
     if enabled is None:
         return
