@@ -23,7 +23,7 @@ from .request_data_log import (
     log_data_event,
     request_data_logging_enabled,
 )
-from .vram import VramCoordinator, VramReleaseCandidate
+from .vram import VRAM_IDLE_RECLAIM_SECONDS, VramCoordinator, VramReleaseCandidate
 
 
 logger = logging.getLogger("fake_ollama")
@@ -57,6 +57,7 @@ class OllamaClient:
     ) -> None:
         self._base = base_url.rstrip("/")
         self._timeout = timeout
+        self._trust_env = trust_env
         self._auto_start = auto_start
         self._start_command = start_command
         self._stop_command = stop_command
@@ -108,7 +109,7 @@ class OllamaClient:
     def vram_release_candidates(
         self, *, now: float, idle_seconds: float
     ) -> list[VramReleaseCandidate]:
-        if self._active:
+        if self._active or self._request_refs:
             return []
         candidates: list[VramReleaseCandidate] = []
         for model, loaded in self._loaded_models.items():
@@ -124,6 +125,34 @@ class OllamaClient:
                 )
             )
         return candidates
+
+    def loaded_model_snapshots(
+        self,
+        *,
+        now: Optional[float] = None,
+        idle_reclaim_seconds: float = VRAM_IDLE_RECLAIM_SECONDS,
+    ) -> list[dict[str, object]]:
+        now = time.monotonic() if now is None else now
+        in_flight = bool(self._active or self._request_refs)
+        out: list[dict[str, object]] = []
+        for model, loaded in sorted(self._loaded_models.items()):
+            idle_seconds = max(0.0, now - loaded.last_used_monotonic)
+            out.append(
+                {
+                    "backend": "ollama",
+                    "target_id": self.target_id,
+                    "model": model,
+                    "estimated_vram_gb": loaded.estimated_vram_gb,
+                    "estimated_vram_mib": loaded.estimated_vram_gb * 1024.0,
+                    "active_requests": self._active,
+                    "request_refs": self._request_refs,
+                    "idle_seconds": idle_seconds,
+                    "reclaimable": (
+                        not in_flight and idle_seconds >= idle_reclaim_seconds
+                    ),
+                }
+            )
+        return out
 
     def begin_shutdown(self) -> None:
         self._shutdown_requested = True
@@ -157,6 +186,13 @@ class OllamaClient:
         )
         if self._vram_coordinator is not None:
             self._vram_coordinator.confirm_loaded(self.target_id, model)
+
+    def _touch_vram_reservation(self, model: Optional[str]) -> None:
+        if not model:
+            return
+        loaded = self._loaded_models.get(model)
+        if loaded is not None:
+            loaded.last_used_monotonic = time.monotonic()
 
     def _discard_vram_pending(self, model: Optional[str]) -> None:
         if not model or self._vram_coordinator is None:
@@ -300,6 +336,7 @@ class OllamaClient:
             finally:
                 self._active -= 1
         finally:
+            self._touch_vram_reservation(model)
             self._end_request_lifecycle()
 
     async def stream_chat(
@@ -447,6 +484,7 @@ class OllamaClient:
             finally:
                 self._active -= 1
         finally:
+            self._touch_vram_reservation(model)
             self._end_request_lifecycle()
 
     async def stop_if_idle(self) -> None:
@@ -474,7 +512,7 @@ class OllamaClient:
         return False
 
     async def _release_model_for_vram(self, model: str) -> bool:
-        if self._active:
+        if self._active or self._request_refs:
             return False
         if await self._unload_model(model):
             self._loaded_models.pop(model, None)

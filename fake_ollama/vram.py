@@ -177,6 +177,17 @@ class VramCoordinator:
     def unregister(self, participant: VramParticipant) -> None:
         self._participants.pop(participant.target_id, None)
 
+    async def free_vram_mib(self) -> Optional[float]:
+        return await self._provider()
+
+    async def total_vram_mib(self) -> Optional[float]:
+        if self._cached_total_mib is not None:
+            return self._cached_total_mib
+        total = await self._total_provider()
+        if total is not None:
+            self._cached_total_mib = total
+        return total
+
     # -- Pending reservation API ---------------------------------------
 
     def has_pending(self, target_id: str, model: str) -> bool:
@@ -303,6 +314,80 @@ class VramCoordinator:
                 attempted_release_mib=attempted_release_mib,
             )
 
+    async def reclaim_if_below(
+        self,
+        *,
+        threshold_mib: float,
+        idle_seconds: float = VRAM_IDLE_RECLAIM_SECONDS,
+    ) -> dict[str, object]:
+        """Release eligible idle local models when free VRAM is critically low."""
+        threshold_mib = max(0.0, float(threshold_mib))
+        async with self._lock:
+            available_mib = await self._provider()
+            if available_mib is None:
+                return {
+                    "available_mib": None,
+                    "threshold_mib": threshold_mib,
+                    "released": [],
+                    "checked": False,
+                }
+            if available_mib >= threshold_mib:
+                return {
+                    "available_mib": available_mib,
+                    "threshold_mib": threshold_mib,
+                    "released": [],
+                    "checked": True,
+                }
+
+            candidates = self._eligible_candidates(
+                "", idle_seconds=idle_seconds, include_same_model=True
+            )
+            released_models: list[dict[str, object]] = []
+            current_mib = available_mib
+            for candidate in candidates:
+                released = await candidate.release()
+                if released:
+                    self._pending.pop((candidate.owner_id, candidate.model), None)
+                    released_models.append(
+                        {
+                            "owner_id": candidate.owner_id,
+                            "model": candidate.model,
+                            "estimated_vram_gb": candidate.estimated_vram_gb,
+                        }
+                    )
+                    logger.info(
+                        "low free GPU VRAM (%s below threshold %s); requested release of idle local model %s on %s",
+                        _fmt_gib(current_mib),
+                        _fmt_gib(threshold_mib),
+                        candidate.model,
+                        candidate.owner_id,
+                    )
+                    refreshed = await self._wait_for_raw_available_after_release(
+                        threshold_mib
+                    )
+                    if refreshed is not None:
+                        current_mib = refreshed
+                    if current_mib >= threshold_mib:
+                        break
+                else:
+                    logger.warning(
+                        "failed to release idle local model %s on %s during low-VRAM check",
+                        candidate.model,
+                        candidate.owner_id,
+                    )
+                    refreshed = await self._provider()
+                    if refreshed is not None:
+                        current_mib = refreshed
+                    if current_mib >= threshold_mib:
+                        break
+
+            return {
+                "available_mib": current_mib,
+                "threshold_mib": threshold_mib,
+                "released": released_models,
+                "checked": True,
+            }
+
     # -- Internals -----------------------------------------------------
 
     def _record_pending(
@@ -353,16 +438,37 @@ class VramCoordinator:
                 return current_mib
         return latest_mib
 
-    def _eligible_candidates(self, requested_model: str) -> list[VramReleaseCandidate]:
+    async def _wait_for_raw_available_after_release(
+        self, threshold_mib: float
+    ) -> Optional[float]:
+        latest_mib: Optional[float] = None
+        for delay_seconds in _POST_RELEASE_REFRESH_DELAYS_SECONDS:
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
+            current_mib = await self._provider()
+            if current_mib is None:
+                continue
+            latest_mib = current_mib
+            if current_mib >= threshold_mib:
+                return current_mib
+        return latest_mib
+
+    def _eligible_candidates(
+        self,
+        requested_model: str,
+        *,
+        idle_seconds: float = VRAM_IDLE_RECLAIM_SECONDS,
+        include_same_model: bool = False,
+    ) -> list[VramReleaseCandidate]:
         now = time.monotonic()
         candidates: list[VramReleaseCandidate] = []
         for participant in self._participants.values():
             if participant.active_requests:
                 continue
             for candidate in participant.vram_release_candidates(
-                now=now, idle_seconds=VRAM_IDLE_RECLAIM_SECONDS
+                now=now, idle_seconds=idle_seconds
             ):
-                if candidate.model == requested_model:
+                if not include_same_model and candidate.model == requested_model:
                     continue
                 candidates.append(candidate)
         candidates.sort(

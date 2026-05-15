@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator, Dict, List
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 from . import __version__
 from .anthropic_client import AnthropicClient
@@ -31,6 +31,7 @@ from .llama_cpp_client import LlamaCppClient
 from .ollama_client import OllamaClient
 from .request_data_log import RequestDataLogMiddleware
 from .vram import LocalTargetResourceError, VramCoordinator
+from .dashboard import DashboardState, run_runtime_monitor
 from .reverse_converters import (
     anthropic_to_ollama_chat as anthropic_to_ollama_chat_payload,
     anthropic_to_openai_chat as anthropic_to_openai_chat_payload,
@@ -60,6 +61,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.llama_cpp_clients = {}
         if not getattr(app.state, "vram_coordinator", None):
             app.state.vram_coordinator = VramCoordinator()
+        if not getattr(app.state, "dashboard_state", None):
+            app.state.dashboard_state = DashboardState()
         for up in app.state.settings.upstreams:
             if up.name in app.state.clients:
                 continue
@@ -111,9 +114,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             owned_llama_cpp_names.append(tgt.name)
         _sync_local_target_idle_monitor(app)
+        _sync_runtime_monitor(app)
         try:
             yield
         finally:
+            runtime_monitor = getattr(app.state, "runtime_monitor", None)
+            if runtime_monitor is not None:
+                runtime_monitor.cancel()
+                try:
+                    await runtime_monitor
+                except asyncio.CancelledError:
+                    pass
+                app.state.runtime_monitor = None
             idle_monitor = getattr(app.state, "local_target_idle_monitor", None)
             if idle_monitor is not None:
                 idle_monitor.cancel()
@@ -139,7 +151,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.shutdown_requested = False
     app.state.vram_coordinator = VramCoordinator()
+    app.state.dashboard_state = DashboardState()
     app.state.ensure_local_target_idle_monitor = _sync_local_target_idle_monitor
+    app.state.ensure_runtime_monitor = _sync_runtime_monitor
     _install_port_router(app)
     app.add_middleware(RequestDataLogMiddleware)
     _register_routes(app)
@@ -257,6 +271,20 @@ def _sync_local_target_idle_monitor(app: FastAPI) -> None:
         app.state.local_target_idle_monitor = None
 
 
+def _sync_runtime_monitor(app: FastAPI) -> None:
+    settings: Settings = app.state.settings
+    needs_monitor = (
+        settings.dashboard_listener_enabled or settings.vram_low_free_reclaim_enabled
+    )
+    task = getattr(app.state, "runtime_monitor", None)
+    task_running = task is not None and not task.done()
+    if needs_monitor and not task_running:
+        app.state.runtime_monitor = asyncio.create_task(run_runtime_monitor(app))
+    elif not needs_monitor and task_running:
+        task.cancel()
+        app.state.runtime_monitor = None
+
+
 def _bearer_or_api_key(request: Request) -> str:
     """Extract a token from ``x-api-key`` or ``Authorization: Bearer ...``."""
     tok = request.headers.get("x-api-key") or ""
@@ -270,6 +298,8 @@ def _bearer_or_api_key(request: Request) -> str:
 
 # Path prefixes that are only served by the admin listener when admin_port is set.
 _ADMIN_ONLY_PATH_PREFIXES = ("/admin",)
+# Path prefixes that are only served by the dashboard listener.
+_DASHBOARD_ONLY_PATH_PREFIXES = ("/dashboard",)
 # Path prefixes that are only served by the external reverse-proxy listener.
 _EXTERNAL_ONLY_PATH_PREFIXES = ("/v1/messages", "/v1/models")
 # Paths available on both listeners. The handler may still choose different
@@ -291,6 +321,8 @@ def _listener_name(request: Request) -> str:
     local_port = _local_port(request)
     if settings.admin_listener_enabled and local_port == settings.admin_port:
         return "admin"
+    if settings.dashboard_listener_enabled and local_port == settings.dashboard_port:
+        return "dashboard"
     if settings.external_listener_enabled and local_port == settings.external_port:
         return "external"
     if local_port in (None, settings.port):
@@ -301,6 +333,8 @@ def _listener_name(request: Request) -> str:
 def _request_surface(path: str) -> str:
     if _has_path_prefix(path, _ADMIN_ONLY_PATH_PREFIXES):
         return "admin"
+    if _has_path_prefix(path, _DASHBOARD_ONLY_PATH_PREFIXES):
+        return "dashboard"
     if path == "/v1/messages/count_tokens" or path.startswith("/v1/messages/count_tokens/"):
         return "anthropic-count-tokens"
     if _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES):
@@ -403,6 +437,16 @@ def _install_port_router(app: FastAPI) -> None:
                 if admin and not admin_only:
                     return _finish(JSONResponse({"detail": "not found"}, status_code=404))
                 if (not admin) and admin_only:
+                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+
+            dashboard_only = _has_path_prefix(path, _DASHBOARD_ONLY_PATH_PREFIXES)
+            if settings.dashboard_listener_enabled:
+                dashboard = local_port == settings.dashboard_port
+                if dashboard and path == "/":
+                    return _finish(RedirectResponse("/dashboard/"))
+                if dashboard and not dashboard_only:
+                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+                if (not dashboard) and dashboard_only:
                     return _finish(JSONResponse({"detail": "not found"}, status_code=404))
 
             if not settings.external_listener_enabled:
@@ -599,6 +643,8 @@ def _register_routes(app: FastAPI) -> None:
 
     from . import admin as _admin
     _admin.register_admin_routes(app)
+    from . import dashboard as _dashboard
+    _dashboard.register_dashboard_routes(app)
 
 
 def _read_error_text(exc: httpx.HTTPError) -> str:

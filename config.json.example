@@ -106,6 +106,15 @@
     }
   },
 
+  "dashboard_enabled": true,
+  "dashboard_host": "127.0.0.1",
+  "dashboard_port": 21432,
+  "dashboard_sample_interval_seconds": 10.0,
+  "dashboard_retention_seconds": 604800.0,
+  "dashboard_data_path": "logs/dashboard_history.json",
+  "vram_low_free_reclaim_enabled": true,
+  "vram_low_free_threshold_mib": 200.0,
+
   "admin_enabled": true,
   "admin_host": "127.0.0.1",
   "admin_port": 21433

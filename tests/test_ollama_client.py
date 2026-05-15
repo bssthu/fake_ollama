@@ -31,6 +31,87 @@ class _FakeProcess:
 
 
 @pytest.mark.asyncio
+async def test_ollama_stream_counts_output_as_recent_vram_activity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    clock = {"now": 100.0}
+    monkeypatch.setattr(
+        "fake_ollama.ollama_client.time.monotonic", lambda: clock["now"]
+    )
+
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"message":{"role":"assistant","content":"a"},"done":false}\n'
+            clock["now"] = 250.0
+            yield b'{"done":true}\n'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.0.0-test"})
+        if request.url.path == "/api/chat":
+            return httpx.Response(200, stream=_Stream())
+        raise AssertionError(f"unexpected path: {request.url.path}")
+
+    client = OllamaClient(
+        "http://127.0.0.1:11434",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        chunks = [
+            line
+            async for line in client.stream_chat(
+                {"model": "m", "messages": []}, estimated_vram_gb=1.0
+            )
+        ]
+        assert chunks
+        assert client._loaded_models["m"].last_used_monotonic == 250.0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_stream_counts_output_as_recent_vram_activity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    clock = {"now": 100.0}
+    monkeypatch.setattr(
+        "fake_ollama.llama_cpp_client.time.monotonic", lambda: clock["now"]
+    )
+
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+            clock["now"] = 250.0
+            yield b"data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200)
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, stream=_Stream())
+        raise AssertionError(f"unexpected path: {request.url.path}")
+
+    client = LlamaCppClient(
+        "http://127.0.0.1:21436",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        chunks = [
+            line
+            async for line in client.stream_chat(
+                {"model": "m", "messages": []}, estimated_vram_gb=1.0
+            )
+        ]
+        assert chunks
+        assert client._loaded_model is not None
+        assert client._loaded_model.last_used_monotonic == 250.0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_ollama_client_auto_starts_before_chat(monkeypatch: pytest.MonkeyPatch):
     state: dict[str, Any] = {"started": False, "commands": []}
 

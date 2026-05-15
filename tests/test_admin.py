@@ -77,6 +77,10 @@ def test_admin_schema(admin_settings):
         "llama_cpp_defaults",
         "llama_cpp_targets",
         "model_profiles",
+        "dashboard_enabled",
+        "dashboard_host",
+        "dashboard_port",
+        "dashboard_data_path",
     } <= keys
     upstreams = next(f for f in fields if f["key"] == "upstreams")
     assert upstreams["required"] is True
@@ -142,17 +146,28 @@ def test_admin_schema(admin_settings):
         "reverse_llamacpp",
         "shared_runtime",
         "profiles",
+        "dashboard",
         "admin",
     ]
     section_order = []
     for group in schema["groups"]:
         if group["section"] not in section_order:
             section_order.append(group["section"])
-    assert section_order == ["forward", "reverse", "shared", "admin"]
+    assert section_order == ["forward", "reverse", "shared", "dashboard", "admin"]
     field_order = [f["key"] for f in fields]
     assert field_order[:4] == ["host", "port", "advertised_version", "upstreams"]
     assert field_order[4:7] == ["external_host", "external_port", "external_access_tokens"]
-    assert field_order[-4] == "model_profiles"
+    assert field_order[-12] == "model_profiles"
+    assert field_order[-11:-3] == [
+        "dashboard_enabled",
+        "dashboard_host",
+        "dashboard_port",
+        "dashboard_sample_interval_seconds",
+        "dashboard_retention_seconds",
+        "dashboard_data_path",
+        "vram_low_free_reclaim_enabled",
+        "vram_low_free_threshold_mib",
+    ]
     assert field_order[-3:] == ["admin_enabled", "admin_host", "admin_port"]
     group_keys = set(group_order)
     for f in fields:
@@ -216,6 +231,55 @@ def test_admin_put_invalid_returns_400(admin_settings):
     assert resp.status_code == 400
 
 
+def test_admin_hot_reload_reuses_unchanged_local_clients(tmp_path: Path):
+    cfg_path = tmp_path / "config.json"
+    settings = Settings(
+        config_path=str(cfg_path),
+        upstreams=[
+            {
+                "name": "u",
+                "base_url": "http://upstream.test",
+                "auth_token": "tok",
+                "models": ["remote"],
+            }
+        ],
+        ollama_targets=[
+            {
+                "name": "local",
+                "base_url": "http://127.0.0.1:11434",
+                "models": ["local-ollama"],
+            }
+        ],
+        llama_cpp_targets=[
+            {
+                "name": "qwen",
+                "base_url": "http://127.0.0.1:21436",
+                "model": "qwen",
+                "start_command": "run-qwen",
+            }
+        ],
+    )
+    app = create_app(settings)
+    client = TestClient(app, base_url="http://testserver:21433")
+
+    with client:
+        old_ollama = app.state.ollama_clients["local"]
+        old_llama = app.state.llama_cpp_clients["qwen"]
+        coord = app.state.vram_coordinator
+        assert coord._participants[old_ollama.target_id] is old_ollama
+        assert coord._participants[old_llama.target_id] is old_llama
+
+        new_cfg = settings.model_dump()
+        new_cfg["upstreams"][0]["models"] = ["remote", "remote-2"]
+        resp = client.put("/admin/config", json=new_cfg)
+
+        assert resp.status_code == 200, resp.text
+        assert app.state.ollama_clients["local"] is old_ollama
+        assert app.state.llama_cpp_clients["qwen"] is old_llama
+        assert coord._participants[old_ollama.target_id] is old_ollama
+        assert coord._participants[old_llama.target_id] is old_llama
+
+
 def test_admin_disabled_returns_404(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     cfg_path = tmp_path / "c.json"
     cfg_path.write_text(
@@ -250,6 +314,19 @@ def test_admin_routes_are_only_on_admin_port(admin_settings):
     with TestClient(app, base_url="http://testserver:21433") as admin:
         assert admin.get("/admin/").status_code == 200
         assert admin.get("/api/version").status_code == 404
+
+
+def test_dashboard_routes_are_only_on_dashboard_port(admin_settings):
+    app = create_app(admin_settings)
+    with TestClient(app, base_url="http://testserver:21434") as internal:
+        assert internal.get("/dashboard/").status_code == 404
+        assert internal.get("/api/version").status_code == 200
+    with TestClient(app, base_url="http://testserver:21433") as admin:
+        assert admin.get("/dashboard/").status_code == 404
+    with TestClient(app, base_url="http://testserver:21432") as dashboard:
+        assert dashboard.get("/dashboard/").status_code == 200
+        assert dashboard.get("/", follow_redirects=False).status_code in (307, 308)
+        assert dashboard.get("/api/version").status_code == 404
 
 
 def test_admin_probe_models_ollama(admin_settings, monkeypatch: pytest.MonkeyPatch):

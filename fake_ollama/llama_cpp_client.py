@@ -28,7 +28,7 @@ from .request_data_log import (
     log_data_event,
     request_data_logging_enabled,
 )
-from .vram import VramCoordinator, VramReleaseCandidate
+from .vram import VRAM_IDLE_RECLAIM_SECONDS, VramCoordinator, VramReleaseCandidate
 
 logger = logging.getLogger("fake_ollama")
 
@@ -64,6 +64,7 @@ class LlamaCppClient:
         self._base = base_url.rstrip("/")
         self._auth_token = auth_token
         self._timeout = timeout
+        self._trust_env = trust_env
         self._auto_start = auto_start
         # Prefer argv (exec) over a shell string when both are provided:
         # exec captures the actual server PID instead of a cmd.exe wrapper,
@@ -116,7 +117,7 @@ class LlamaCppClient:
     def vram_release_candidates(
         self, *, now: float, idle_seconds: float
     ) -> list[VramReleaseCandidate]:
-        if self._active or self._loaded_model is None:
+        if self._active or self._request_refs or self._loaded_model is None:
             return []
         if now - self._loaded_model.last_used_monotonic < idle_seconds:
             return []
@@ -131,6 +132,35 @@ class LlamaCppClient:
                 last_used_monotonic=loaded.last_used_monotonic,
                 release=self._release_server_for_vram,
             )
+        ]
+
+    def loaded_model_snapshots(
+        self,
+        *,
+        now: Optional[float] = None,
+        idle_reclaim_seconds: float = VRAM_IDLE_RECLAIM_SECONDS,
+    ) -> list[dict[str, object]]:
+        if self._loaded_model is None:
+            return []
+        now = time.monotonic() if now is None else now
+        loaded = self._loaded_model
+        idle_seconds = max(0.0, now - loaded.last_used_monotonic)
+        in_flight = bool(self._active or self._request_refs)
+        can_stop = bool(self._started_by_us or self._stop_command)
+        return [
+            {
+                "backend": "llama.cpp",
+                "target_id": self.target_id,
+                "model": loaded.model,
+                "estimated_vram_gb": loaded.estimated_vram_gb,
+                "estimated_vram_mib": loaded.estimated_vram_gb * 1024.0,
+                "active_requests": self._active,
+                "request_refs": self._request_refs,
+                "idle_seconds": idle_seconds,
+                "reclaimable": (
+                    can_stop and not in_flight and idle_seconds >= idle_reclaim_seconds
+                ),
+            }
         ]
 
     def begin_shutdown(self) -> None:
@@ -175,6 +205,12 @@ class LlamaCppClient:
         )
         if self._vram_coordinator is not None:
             self._vram_coordinator.confirm_loaded(self.target_id, model)
+
+    def _touch_vram_reservation(self, model: Optional[str]) -> None:
+        if not model or self._loaded_model is None:
+            return
+        if self._loaded_model.model == model:
+            self._loaded_model.last_used_monotonic = time.monotonic()
 
     def _discard_vram_pending(self, model: Optional[str]) -> None:
         if not model or self._vram_coordinator is None:
@@ -357,6 +393,7 @@ class LlamaCppClient:
             finally:
                 self._active -= 1
         finally:
+            self._touch_vram_reservation(model)
             self._end_request_lifecycle()
 
     async def stream_chat(
@@ -504,6 +541,7 @@ class LlamaCppClient:
             finally:
                 self._active -= 1
         finally:
+            self._touch_vram_reservation(model)
             self._end_request_lifecycle()
 
     async def stop_if_idle(self) -> None:
@@ -525,7 +563,7 @@ class LlamaCppClient:
         return await self._release_server_for_vram()
 
     async def _release_server_for_vram(self) -> bool:
-        if self._active:
+        if self._active or self._request_refs:
             return False
         if not (self._started_by_us or self._stop_command):
             return False

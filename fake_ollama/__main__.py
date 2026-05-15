@@ -77,6 +77,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=None, help="internal bind port (default from config)")
     parser.add_argument("--admin-host", default=None, help="admin bind host (default from config)")
     parser.add_argument("--admin-port", type=int, default=None, help="admin bind port (default from config)")
+    parser.add_argument("--dashboard-host", default=None, help="dashboard bind host (default from config)")
+    parser.add_argument("--dashboard-port", type=int, default=None, help="dashboard bind port (default from config)")
     parser.add_argument("--log-level", default="info")
     parser.add_argument(
         "--log-file",
@@ -133,6 +135,10 @@ def main() -> None:
         updates["admin_host"] = args.admin_host
     if args.admin_port is not None:
         updates["admin_port"] = args.admin_port
+    if args.dashboard_host is not None:
+        updates["dashboard_host"] = args.dashboard_host
+    if args.dashboard_port is not None:
+        updates["dashboard_port"] = args.dashboard_port
     if updates:
         data = settings.model_dump()
         data.update(updates)
@@ -176,6 +182,23 @@ def main() -> None:
             access_log=False,
         )
         configs.append(("admin", settings.admin_host, int(settings.admin_port), admin_cfg))
+    if settings.dashboard_listener_enabled:
+        dashboard_cfg = uvicorn.Config(
+            app,
+            host=settings.dashboard_host,
+            port=int(settings.dashboard_port),  # type: ignore[arg-type]
+            log_level=args.log_level,
+            log_config=None,
+            access_log=False,
+        )
+        configs.append(
+            (
+                "dashboard",
+                settings.dashboard_host,
+                int(settings.dashboard_port),  # type: ignore[arg-type]
+                dashboard_cfg,
+            )
+        )
 
     logger.info(
         "fake-ollama listening on %s",

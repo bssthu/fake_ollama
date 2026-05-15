@@ -651,6 +651,22 @@ class Settings(BaseModel):
     admin_host: str = "127.0.0.1"
     admin_port: Optional[int] = 21433
 
+    # ---- Dashboard listener (/dashboard/* only) ------------------------
+    # Runtime metrics are exposed on their own localhost listener so the
+    # unauthenticated dashboard does not share the admin or API ports.
+    dashboard_enabled: bool = True
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: Optional[int] = 21432
+    dashboard_sample_interval_seconds: float = 10.0
+    dashboard_retention_seconds: float = 7 * 24 * 60 * 60
+    dashboard_data_path: Optional[str] = "logs/dashboard_history.json"
+
+    # Low-VRAM safety monitor. Every dashboard_sample_interval_seconds it
+    # checks nvidia-smi; if free VRAM is below the threshold, it asks the
+    # coordinator to release eligible idle local models.
+    vram_low_free_reclaim_enabled: bool = True
+    vram_low_free_threshold_mib: float = 200.0
+
     advertised_version: str = "0.6.4"
     default_max_tokens: int = 4096
     timeout_seconds: float = 300.0
@@ -693,12 +709,14 @@ class Settings(BaseModel):
             enabled_ports["external"] = self.external_port
         if self.admin_enabled and self.admin_port is not None:
             enabled_ports["admin"] = self.admin_port
+        if self.dashboard_enabled and self.dashboard_port is not None:
+            enabled_ports["dashboard"] = self.dashboard_port
         seen_ports: Dict[int, str] = {}
         for label, port in enabled_ports.items():
             if port in seen_ports:
                 raise ValueError(
                     f"{label}_port={port} conflicts with {seen_ports[port]}_port; "
-                    "internal, external, and admin listeners must use distinct ports"
+                    "internal, external, admin, and dashboard listeners must use distinct ports"
                 )
             seen_ports[port] = label
         # Normalize tokens: drop blanks and dedupe.
@@ -728,6 +746,10 @@ class Settings(BaseModel):
     @property
     def admin_listener_enabled(self) -> bool:
         return self.admin_enabled and self.admin_port is not None
+
+    @property
+    def dashboard_listener_enabled(self) -> bool:
+        return self.dashboard_enabled and self.dashboard_port is not None
 
     @property
     def reverse_proxy_models(self) -> List[str]:
@@ -908,6 +930,23 @@ _ENV_SCALARS: Dict[str, tuple] = {
     "FAKE_OLLAMA_PORT": ("port", int),
     "FAKE_OLLAMA_ADMIN_HOST": ("admin_host", str),
     "FAKE_OLLAMA_ADMIN_PORT": ("admin_port", int),
+    "FAKE_OLLAMA_DASHBOARD_ENABLED": ("dashboard_enabled", _parse_bool),
+    "FAKE_OLLAMA_DASHBOARD_HOST": ("dashboard_host", str),
+    "FAKE_OLLAMA_DASHBOARD_PORT": ("dashboard_port", int),
+    "FAKE_OLLAMA_DASHBOARD_SAMPLE_INTERVAL_SECONDS": (
+        "dashboard_sample_interval_seconds",
+        float,
+    ),
+    "FAKE_OLLAMA_DASHBOARD_RETENTION_SECONDS": ("dashboard_retention_seconds", float),
+    "FAKE_OLLAMA_DASHBOARD_DATA_PATH": ("dashboard_data_path", str),
+    "FAKE_OLLAMA_VRAM_LOW_FREE_RECLAIM_ENABLED": (
+        "vram_low_free_reclaim_enabled",
+        _parse_bool,
+    ),
+    "FAKE_OLLAMA_VRAM_LOW_FREE_THRESHOLD_MIB": (
+        "vram_low_free_threshold_mib",
+        float,
+    ),
     "FAKE_OLLAMA_EXTERNAL_HOST": ("external_host", str),
     "FAKE_OLLAMA_EXTERNAL_PORT": ("external_port", int),
     "FAKE_OLLAMA_ADVERTISED_VERSION": ("advertised_version", str),

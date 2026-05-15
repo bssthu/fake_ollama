@@ -49,3 +49,4 @@ config.json
 # Logs
 *.log
 logs/
+dashboard_history.json

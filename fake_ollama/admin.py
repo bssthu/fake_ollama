@@ -233,6 +233,23 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "key_autocomplete": "model_names",
    "description": "正向/反向共用的模型 capabilities / 上下文 / 思维链等设置；key 是模型显示名（输入时会提示已知模型名）"},
 
+  {"key": "dashboard_enabled", "type": "bool", "default": True, "group": "dashboard",
+   "description": "Enable the runtime dashboard mounted at /dashboard on its own listener."},
+  {"key": "dashboard_host", "type": "string", "default": "127.0.0.1", "group": "dashboard",
+   "description": "Dashboard listener bind address. Keep 127.0.0.1 unless fronted by a trusted proxy."},
+  {"key": "dashboard_port", "type": "int", "default": 21432, "group": "dashboard",
+   "description": "Dashboard listener port. It must be distinct from internal, external, and admin ports."},
+  {"key": "dashboard_sample_interval_seconds", "type": "float", "default": 10.0, "group": "dashboard",
+   "description": "Runtime metric sampling interval in seconds."},
+  {"key": "dashboard_retention_seconds", "type": "float", "default": 604800.0, "group": "dashboard",
+   "description": "Dashboard history retention in seconds."},
+  {"key": "dashboard_data_path", "type": "string", "default": "logs/dashboard_history.json", "group": "dashboard",
+   "description": "JSON file used to persist dashboard history. Leave empty to disable file persistence."},
+  {"key": "vram_low_free_reclaim_enabled", "type": "bool", "default": True, "group": "dashboard",
+   "description": "Enable periodic low-free-VRAM checks that release eligible idle local models."},
+  {"key": "vram_low_free_threshold_mib", "type": "float", "default": 200.0, "group": "dashboard",
+   "description": "When free GPU VRAM falls below this MiB threshold, eligible idle models may be released."},
+
   {"key": "admin_enabled", "type": "bool", "default": True, "group": "admin",
    "description": "是否启用本 /admin 编辑器（关闭后需手动改 config.json）"},
   {"key": "admin_host", "type": "string", "default": "127.0.0.1", "group": "admin",
@@ -249,6 +266,7 @@ GROUP_LABELS: List[Dict[str, str]] = [
   {"key": "reverse_llamacpp", "label": "llama.cpp Targets", "hint": "每个模型一个 llama.cpp 进程、端口和启停脚本", "section": "reverse", "section_label": "Reverse Proxy", "section_hint": "本机模型服务 -> 对外 Anthropic / OpenAI 兼容 API"},
   {"key": "shared_runtime", "label": "Shared Runtime", "hint": "跨正向 / 反向共用的缺省参数与出站网络设置", "section": "shared", "section_label": "Shared Settings", "section_hint": "两条代理链路都会用到的公共配置"},
   {"key": "profiles", "label": "Model Profiles", "hint": "跨正向 / 反向共用的模型能力、上下文与 thinking 策略", "section": "shared", "section_label": "Shared Settings", "section_hint": "两条代理链路都会用到的公共配置"},
+  {"key": "dashboard", "label": "Dashboard", "hint": "Runtime graphs and the low-VRAM safety monitor", "section": "dashboard", "section_label": "Dashboard", "section_hint": "Memory, VRAM, and loaded local model telemetry"},
   {"key": "admin", "label": "Admin UI", "hint": "配置页面自身的开关与监听地址（无内置鉴权）", "section": "admin", "section_label": "Admin UI", "section_hint": "仅影响 /admin 配置页面本身"},
 ]
 
@@ -1248,6 +1266,52 @@ def _resolve_save_path(s: Settings) -> Path:
     return Path("config.json")
 
 
+def _ollama_client_matches(
+    client: OllamaClient,
+    *,
+    settings: Settings,
+    target: Any,
+) -> bool:
+    return (
+        getattr(client, "_base", None) == target.base_url.rstrip("/")
+        and getattr(client, "_timeout", None) == settings.timeout_seconds
+        and getattr(client, "_trust_env", None) == settings.use_system_proxy
+        and getattr(client, "_auto_start", None) == target.auto_start
+        and getattr(client, "_start_command", None) == target.start_command
+        and getattr(client, "_stop_command", None) == target.stop_command
+        and getattr(client, "_idle_timeout", None) == target.idle_timeout_seconds
+        and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
+        and getattr(client, "_health_path", None) == target.health_path
+        and getattr(client, "_cwd", None) == target.cwd
+    )
+
+
+def _llama_cpp_client_matches(
+    client: LlamaCppClient,
+    *,
+    settings: Settings,
+    target: Any,
+) -> bool:
+    expected_argv = target.synthesize_start_argv()
+    return (
+        getattr(client, "_base", None) == target.base_url.rstrip("/")
+        and getattr(client, "_auth_token", None) == target.auth_token
+        and getattr(client, "_timeout", None) == settings.timeout_seconds
+        and getattr(client, "_trust_env", None) == settings.use_system_proxy
+        and getattr(client, "_auto_start", None) == target.auto_start
+        and getattr(client, "_start_command", None) == target.start_command
+        and getattr(client, "_start_argv", None) == (
+            list(expected_argv) if expected_argv is not None else None
+        )
+        and getattr(client, "_stop_command", None) == target.stop_command
+        and getattr(client, "_idle_timeout", None) == target.idle_timeout_seconds
+        and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
+        and getattr(client, "_health_path", None) == target.health_path
+        and getattr(client, "_cwd", None) == target.cwd
+        and getattr(client, "_launch_env", None) == target.effective_env()
+    )
+
+
 async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     """Atomically replace app.state.settings and rebuild client pools."""
     old_clients: Dict[str, AnthropicClient] = dict(getattr(app.state, "clients", {}))
@@ -1264,7 +1328,19 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             trust_env=new_settings.use_system_proxy,
         )
     new_ollama: Dict[str, OllamaClient] = {}
+    remaining_ollama = dict(old_ollama)
     for tgt in new_settings.ollama_targets:
+        existing = remaining_ollama.pop(tgt.name, None)
+        if existing is not None and _ollama_client_matches(
+            existing, settings=new_settings, target=tgt
+        ):
+            new_ollama[tgt.name] = existing
+            continue
+        if existing is not None:
+            try:
+                await existing.aclose()
+            except Exception:  # pragma: no cover
+                pass
         new_ollama[tgt.name] = OllamaClient(
             tgt.base_url,
             timeout=new_settings.timeout_seconds,
@@ -1280,8 +1356,20 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             vram_coordinator=vram_coordinator,
         )
     new_llama_cpp: Dict[str, LlamaCppClient] = {}
+    remaining_llama_cpp = dict(old_llama_cpp)
     for raw_tgt in new_settings.llama_cpp_targets:
         tgt = new_settings.effective_llama_cpp_target(raw_tgt)
+        existing = remaining_llama_cpp.pop(tgt.name, None)
+        if existing is not None and _llama_cpp_client_matches(
+            existing, settings=new_settings, target=tgt
+        ):
+            new_llama_cpp[tgt.name] = existing
+            continue
+        if existing is not None:
+            try:
+                await existing.aclose()
+            except Exception:  # pragma: no cover
+                pass
         new_llama_cpp[tgt.name] = LlamaCppClient(
             tgt.base_url,
             auth_token=tgt.auth_token,
@@ -1306,7 +1394,10 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     app.state.llama_cpp_clients = new_llama_cpp
     ensure_idle_monitor = getattr(app.state, "ensure_local_target_idle_monitor", None)
     if ensure_idle_monitor is not None:
-      ensure_idle_monitor(app)
+        ensure_idle_monitor(app)
+    ensure_runtime_monitor = getattr(app.state, "ensure_runtime_monitor", None)
+    if ensure_runtime_monitor is not None:
+        ensure_runtime_monitor(app)
 
     for c in old_clients.values():
         try:
@@ -1314,11 +1405,19 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
         except Exception:  # pragma: no cover
             pass
     for c in old_ollama.values():
+        if c in new_ollama.values():
+            continue
+        if c not in remaining_ollama.values():
+            continue
         try:
             await c.aclose()
         except Exception:  # pragma: no cover
             pass
     for c in old_llama_cpp.values():
+        if c in new_llama_cpp.values():
+            continue
+        if c not in remaining_llama_cpp.values():
+            continue
         try:
             await c.aclose()
         except Exception:  # pragma: no cover

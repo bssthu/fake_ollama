@@ -116,6 +116,10 @@ def test_admin_listener_defaults_and_legacy_null_mode():
     assert s.admin_host == "127.0.0.1"
     assert s.admin_port == 21433
     assert s.admin_listener_enabled is True
+    assert s.dashboard_host == "127.0.0.1"
+    assert s.dashboard_port == 21432
+    assert s.dashboard_data_path == "logs/dashboard_history.json"
+    assert s.dashboard_listener_enabled is True
 
     legacy = Settings(
         admin_port=None,
@@ -135,6 +139,19 @@ def test_listener_ports_must_be_distinct():
     with pytest.raises(ValueError, match="conflicts"):
         Settings(
             admin_port=21434,
+            upstreams=[
+                {
+                    "name": "u",
+                    "base_url": "http://upstream.test",
+                    "auth_token": "tk",
+                    "models": ["m"],
+                }
+            ],
+        )
+
+    with pytest.raises(ValueError, match="conflicts"):
+        Settings(
+            dashboard_port=21433,
             upstreams=[
                 {
                     "name": "u",

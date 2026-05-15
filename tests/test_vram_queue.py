@@ -38,6 +38,12 @@ def _free_provider(mib: float):
     return _f
 
 
+def _mutable_free_provider(state: dict[str, float]):
+    async def _f() -> Optional[float]:
+        return state["mib"]
+    return _f
+
+
 # -- pending bookkeeping --------------------------------------------------
 
 
@@ -122,6 +128,75 @@ async def test_confirm_loaded_then_grace_expiry_drops_pending(monkeypatch: pytes
     # second target should fit (assuming nvidia-smi reflects the load —
     # here our fake free_provider still reports 16 GiB).
     await coord.ensure_available(p2, model="other", estimated_vram_gb=10)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_if_below_releases_idle_candidates():
+    free_mib = {"mib": 100.0}
+    coord = VramCoordinator(provider=_mutable_free_provider(free_mib))
+
+    class _IdleParticipant:
+        target_id = "target"
+        active_requests = 0
+
+        def __init__(self) -> None:
+            self.released = False
+            self.last_used = time.monotonic() - 120.0
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return model == "old"
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            if now - self.last_used < idle_seconds:
+                return []
+            return [
+                VramReleaseCandidate(
+                    owner_id=self.target_id,
+                    model="old",
+                    estimated_vram_gb=1.0,
+                    last_used_monotonic=self.last_used,
+                    release=self.release,
+                )
+            ]
+
+        async def release(self) -> bool:
+            self.released = True
+            free_mib["mib"] = 512.0
+            return True
+
+    participant = _IdleParticipant()
+    coord.register(participant)
+
+    result = await coord.reclaim_if_below(threshold_mib=200.0, idle_seconds=60.0)
+
+    assert participant.released is True
+    assert result["available_mib"] == 512.0
+    assert result["released"] == [
+        {"owner_id": "target", "model": "old", "estimated_vram_gb": 1.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reclaim_if_below_does_not_release_active_participants():
+    free_mib = {"mib": 100.0}
+    coord = VramCoordinator(provider=_mutable_free_provider(free_mib))
+
+    class _ActiveParticipant:
+        target_id = "target"
+        active_requests = 1
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return model == "old"
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            raise AssertionError("active participant should be skipped")
+
+    coord.register(_ActiveParticipant())
+
+    result = await coord.reclaim_if_below(threshold_mib=200.0, idle_seconds=60.0)
+
+    assert result["available_mib"] == 100.0
+    assert result["released"] == []
 
 
 # -- per-client startup queueing -----------------------------------------
