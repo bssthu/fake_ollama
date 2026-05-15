@@ -244,12 +244,27 @@ class VramCoordinator:
                 _gb_to_mib(candidate.estimated_vram_gb) for candidate in candidates
             )
             if effective_free + total_reclaimable_mib < required_mib:
-                raise self._insufficient_error(
-                    requester,
-                    model=model,
-                    required_mib=required_mib,
-                    available_mib=effective_free,
-                    reclaimable_mib=total_reclaimable_mib,
+                total_mib = await self.total_vram_mib()
+                if (
+                    total_mib is None
+                    or total_mib < required_mib
+                    or not candidates
+                ):
+                    raise self._insufficient_error(
+                        requester,
+                        model=model,
+                        required_mib=required_mib,
+                        available_mib=effective_free,
+                        reclaimable_mib=total_reclaimable_mib,
+                    )
+                logger.info(
+                    "local model %s needs %s; current effective free plus estimated "
+                    "idle reclaim is only %s, but total GPU VRAM is %s, so trying "
+                    "best-effort idle model release before failing admission",
+                    model or requester.target_id,
+                    _fmt_gib(required_mib),
+                    _fmt_gib(effective_free + total_reclaimable_mib),
+                    _fmt_gib(total_mib),
                 )
 
             current_effective_free = effective_free

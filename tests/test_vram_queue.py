@@ -44,6 +44,12 @@ def _mutable_free_provider(state: dict[str, float]):
     return _f
 
 
+def _total_provider(mib: float):
+    async def _f() -> Optional[float]:
+        return mib
+    return _f
+
+
 # -- pending bookkeeping --------------------------------------------------
 
 
@@ -197,6 +203,103 @@ async def test_reclaim_if_below_does_not_release_active_participants():
 
     assert result["available_mib"] == 100.0
     assert result["released"] == []
+
+
+@pytest.mark.asyncio
+async def test_total_capacity_allows_best_effort_reclaim_when_estimates_are_short():
+    free_mib = {"mib": 512.0}
+    coord = VramCoordinator(
+        provider=_mutable_free_provider(free_mib),
+        total_provider=_total_provider(8 * 1024.0),
+    )
+    requester = _FakeParticipant("new")
+    coord.register(requester)
+
+    class _IdleParticipant:
+        target_id = "old"
+        active_requests = 0
+
+        def __init__(self) -> None:
+            self.released = False
+            self.last_used = time.monotonic() - 120.0
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return model == "old-model"
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            if now - self.last_used < idle_seconds:
+                return []
+            return [
+                VramReleaseCandidate(
+                    owner_id=self.target_id,
+                    model="old-model",
+                    estimated_vram_gb=1.0,
+                    last_used_monotonic=self.last_used,
+                    release=self.release,
+                )
+            ]
+
+        async def release(self) -> bool:
+            self.released = True
+            # The estimate was too low; the real nvidia-smi refresh now shows
+            # enough free VRAM for the new model.
+            free_mib["mib"] = 5 * 1024.0
+            return True
+
+    old = _IdleParticipant()
+    coord.register(old)
+
+    await coord.ensure_available(requester, model="new-model", estimated_vram_gb=4)
+
+    assert old.released is True
+    assert coord.has_pending("new", "new-model")
+
+
+@pytest.mark.asyncio
+async def test_best_effort_reclaim_is_skipped_when_total_capacity_is_too_small():
+    free_mib = {"mib": 512.0}
+    coord = VramCoordinator(
+        provider=_mutable_free_provider(free_mib),
+        total_provider=_total_provider(2 * 1024.0),
+    )
+    requester = _FakeParticipant("new")
+    coord.register(requester)
+
+    class _IdleParticipant:
+        target_id = "old"
+        active_requests = 0
+
+        def __init__(self) -> None:
+            self.released = False
+            self.last_used = time.monotonic() - 120.0
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return model == "old-model"
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            return [
+                VramReleaseCandidate(
+                    owner_id=self.target_id,
+                    model="old-model",
+                    estimated_vram_gb=1.0,
+                    last_used_monotonic=self.last_used,
+                    release=self.release,
+                )
+            ]
+
+        async def release(self) -> bool:
+            self.released = True
+            free_mib["mib"] = 5 * 1024.0
+            return True
+
+    old = _IdleParticipant()
+    coord.register(old)
+
+    with pytest.raises(LocalTargetResourceError, match="Insufficient GPU VRAM"):
+        await coord.ensure_available(requester, model="new-model", estimated_vram_gb=4)
+
+    assert old.released is False
+    assert not coord.has_pending("new", "new-model")
 
 
 # -- per-client startup queueing -----------------------------------------
