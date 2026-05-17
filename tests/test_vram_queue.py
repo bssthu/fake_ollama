@@ -666,7 +666,11 @@ def test_effective_env_prepends_runtime_root_and_binary_dir(tmp_path, monkeypatc
     runtime_dir = tmp_path / "cudart"
     runtime_dir.mkdir()
 
-    monkeypatch.setenv("PATH", "C:\\existing")
+    # Pick a sentinel PATH entry that doesn't itself contain os.pathsep
+    # (':' on POSIX, ';' on Windows), so PATH.split(os.pathsep) keeps it
+    # as a single component on every platform.
+    existing_entry = str(tmp_path / "existing")
+    monkeypatch.setenv("PATH", existing_entry)
     tgt = LlamaCppTarget(
         base_url="http://127.0.0.1:21500",
         model="qa",
@@ -681,8 +685,8 @@ def test_effective_env_prepends_runtime_root_and_binary_dir(tmp_path, monkeypatc
     # Both prepended, runtime_root or bin_dir before existing.
     assert str(bin_dir.resolve()) in parts
     assert str(runtime_dir.resolve()) in parts
-    assert parts.index(str(bin_dir.resolve())) < parts.index("C:\\existing")
-    assert parts.index(str(runtime_dir.resolve())) < parts.index("C:\\existing")
+    assert parts.index(str(bin_dir.resolve())) < parts.index(existing_entry)
+    assert parts.index(str(runtime_dir.resolve())) < parts.index(existing_entry)
 
 
 def test_effective_env_returns_none_without_runtime_or_binary():
