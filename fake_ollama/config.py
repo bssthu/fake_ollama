@@ -293,6 +293,11 @@ class LlamaCppDefaults(BaseModel):
     gpu_layers: Optional[int] = None
     ctx_size: Optional[int] = None
     parallel: Optional[int] = None
+    # KV cache quantisation (llama.cpp -ctk / -ctv). Default upstream is f16;
+    # common values are f16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl. Lowering
+    # these can cut KV-cache VRAM substantially at some quality cost.
+    cache_type_k: Optional[str] = None
+    cache_type_v: Optional[str] = None
     extra_args: Optional[str] = None
 
     @field_validator("health_path")
@@ -341,6 +346,10 @@ class LlamaCppTarget(BaseModel):
     gpu_layers: Optional[int] = None
     ctx_size: Optional[int] = None
     parallel: Optional[int] = None
+    # KV cache quantisation (llama.cpp -ctk / -ctv). See LlamaCppDefaults
+    # for the accepted values; unset = inherit defaults; defaults unset = f16.
+    cache_type_k: Optional[str] = None
+    cache_type_v: Optional[str] = None
     extra_args: Optional[str] = None
 
     @model_validator(mode="before")
@@ -462,6 +471,16 @@ class LlamaCppTarget(BaseModel):
                     if self.parallel is not None
                     else defaults.parallel
                 ),
+                "cache_type_k": (
+                    self.cache_type_k
+                    if self.cache_type_k is not None
+                    else defaults.cache_type_k
+                ),
+                "cache_type_v": (
+                    self.cache_type_v
+                    if self.cache_type_v is not None
+                    else defaults.cache_type_v
+                ),
                 "extra_args": (
                     self.extra_args
                     if self.extra_args is not None
@@ -527,6 +546,10 @@ class LlamaCppTarget(BaseModel):
             argv += ["--ctx-size", str(self.ctx_size)]
         if self.parallel:
             argv += ["--parallel", str(self.parallel)]
+        if self.cache_type_k:
+            argv += ["-ctk", str(self.cache_type_k)]
+        if self.cache_type_v:
+            argv += ["-ctv", str(self.cache_type_v)]
         if self.model_alias:
             argv += ["--alias", self.model_alias]
         if self.auth_token:

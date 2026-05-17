@@ -129,6 +129,10 @@ LLAMA_CPP_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选：传给 --ctx-size 的上下文长度。仅自动拼装时使用；不填继承 llama_cpp_defaults.ctx_size"},
     {"key": "parallel", "type": "int", "default": None,
      "description": "可选：传给 --parallel 的并发槽数。仅自动拼装时使用；不填继承 llama_cpp_defaults.parallel"},
+    {"key": "cache_type_k", "type": "string", "default": None,
+     "description": "可选：传给 -ctk 的 KV cache K 类型（如 f16/q8_0/q5_1/q5_0/q4_1/q4_0/iq4_nl）。默认 f16；自动拼装时使用，不填继承 llama_cpp_defaults.cache_type_k"},
+    {"key": "cache_type_v", "type": "string", "default": None,
+     "description": "可选：传给 -ctv 的 KV cache V 类型（同上）。默认 f16；自动拼装时使用，不填继承 llama_cpp_defaults.cache_type_v"},
     {"key": "extra_args", "type": "string", "default": None,
      "description": "可选：额外原样追加到自动拼装命令末尾的参数串（例如 --jinja --slots）"},
     {"key": "idle_timeout_seconds", "type": "float", "default": None,
@@ -164,6 +168,10 @@ LLAMA_CPP_DEFAULTS_SCHEMA: List[Dict[str, Any]] = [
      "description": "默认 --ctx-size；自动拼装命令时使用，target 可覆盖"},
     {"key": "parallel", "type": "int", "default": None,
      "description": "默认 --parallel 并发槽数；自动拼装命令时使用，target 可覆盖"},
+    {"key": "cache_type_k", "type": "string", "default": None,
+     "description": "默认 -ctk KV cache K 类型（f16/q8_0/q5_1/q5_0/q4_1/q4_0/iq4_nl 等）。留空 = llama.cpp 默认 f16；target 可覆盖"},
+    {"key": "cache_type_v", "type": "string", "default": None,
+     "description": "默认 -ctv KV cache V 类型（同上）。留空 = llama.cpp 默认 f16；target 可覆盖"},
     {"key": "extra_args", "type": "string", "default": None,
      "description": "默认追加到自动拼装命令末尾的参数串；target 可覆盖"},
 ]
@@ -197,6 +205,7 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "upstreams", "type": "object_list", "default": [], "group": "forward_upstreams",
    "required": True, "item_schema": UPSTREAM_ITEM_SCHEMA,
    "detect_models": "anthropic",
+   "nav_label_keys": ["name"],
    "description": "至少一个远端 Anthropic 兼容上游；用于把远端 API 伪装成本机 Ollama"},
 
   {"key": "external_host", "type": "string", "default": None, "group": "reverse_listener",
@@ -210,6 +219,7 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "ollama_targets", "type": "object_list", "default": [], "group": "reverse_ollama",
    "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
    "detect_models": "ollama",
+   "nav_label_keys": ["name"],
    "description": "本机或远端 Ollama 服务；用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions"},
   {"key": "llama_cpp_defaults", "type": "object", "default": {}, "group": "reverse_llamacpp",
    "item_schema": LLAMA_CPP_DEFAULTS_SCHEMA,
@@ -217,6 +227,7 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "llama_cpp_targets", "type": "object_list", "default": [], "group": "reverse_llamacpp",
    "item_schema": LLAMA_CPP_TARGET_ITEM_SCHEMA,
    "detect_models": "llama_cpp",
+   "nav_label_keys": ["name", "model"],
     "description": "llama.cpp server（OpenAI 兼容）；一个 target 对应一个模型、一个进程、一个端口和一组启停命令；用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions"},
 
   {"key": "default_max_tokens", "type": "int", "default": 4096, "group": "shared_runtime",
@@ -304,6 +315,15 @@ _INDEX_HTML = r"""<!doctype html>
  .sidenav a:hover { background: rgba(127,127,127,0.1); }
  .sidenav a.active { border-left-color: var(--accent); background: rgba(58,123,213,0.1); font-weight: 600; }
  .sidenav a small { display: block; font-size: 0.75rem; color: #888; font-weight: 400; margin-top: 0.1rem; }
+ .sidenav .subnav { display: flex; flex-direction: column; }
+ .sidenav .subnav a { padding: 0.22rem 0.6rem 0.22rem 2rem; font-size: 0.85rem; border-left: 3px solid transparent; color: #555; }
+ .sidenav .subnav a:hover { background: rgba(127,127,127,0.08); }
+ .sidenav .subnav a.active { border-left-color: var(--accent); background: rgba(58,123,213,0.07); color: inherit; font-weight: 600; }
+ .sidenav .subnav a .idx { display: inline-block; min-width: 1.6em; color: #888; font-family: ui-monospace, Consolas, monospace; font-size: 0.75rem; }
+ .sidenav .subnav .empty { padding: 0.2rem 0.6rem 0.2rem 2rem; font-size: 0.78rem; color: #888; font-style: italic; }
+ .sidenav .nav-filter { padding: 0.4rem 0.6rem 0.5rem; border-bottom: 1px solid var(--border); }
+ .sidenav .nav-filter input { width: 100%; box-sizing: border-box; padding: 0.25rem 0.4rem; font-size: 0.85rem; font-family: inherit; }
+ .sidenav .nav-empty { padding: 0.4rem 0.8rem; font-size: 0.8rem; color: #888; font-style: italic; }
  .section-super { margin: 0 0 0.9rem 0; padding: 0.65rem 0.8rem; border: 1px solid var(--border);
    border-radius: 6px; background: rgba(58,123,213,0.05); }
  .section-super .section-title { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;
@@ -313,6 +333,8 @@ _INDEX_HTML = r"""<!doctype html>
  section.group-section > h2 { margin: 0 0 0.2rem 0; font-size: 1.1rem; padding-bottom: 0.3rem; border-bottom: 2px solid var(--accent); }
  section.group-section > .group-hint { color: #888; font-size: 0.85rem; margin-bottom: 0.6rem; }
  .field { border: 1px solid var(--border); border-radius: 5px; padding: 0.5rem 0.7rem; margin-bottom: var(--gap); background: Canvas; }
+ .group .item { scroll-margin-top: 5.5rem; }
+ .group .item.nav-flash { box-shadow: 0 0 0 2px var(--accent); transition: box-shadow 1.2s ease-out; }
  .field > label { display: flex; align-items: baseline; gap: 0.4rem; font-weight: 600; }
  .field .desc { color: #888; font-size: 0.82rem; margin: 0.15rem 0 0.4rem 0; }
  .field input[type=text], .field input[type=password], .field input[type=number],
@@ -382,6 +404,7 @@ _INDEX_HTML = r"""<!doctype html>
 
 <div class="layout">
   <aside class="sidenav" id="sidenav">
+    <div class="nav-filter"><input type="search" id="navFilter" placeholder="过滤 sections / targets / models" autocomplete="off"></div>
     <h3>Sections</h3>
   </aside>
   <main class="content">
@@ -755,12 +778,16 @@ function makeObject(field, value) {
 function makeObjectList(field, value) {
   const wrap = el('div', {class: 'group'});
   const items = [];
+  const changeListeners = [];
+  let _idSeq = 0;
+  function fireChange() { for (const cb of changeListeners) { try { cb(); } catch (e) { console.error(e); } } }
   function addItem(initial) {
     const renderer = makeObjectGroup(field.item_schema, initial || {});
-    const entry = {renderer};
+    const entry = {id: ++_idSeq, renderer};
     const remove = el('button', {class: 'danger', type: 'button', onclick: () => {
       wrap.removeChild(itemBox);
       items.splice(items.indexOf(entry), 1);
+      fireChange();
     }}, 'Remove');
     const headerChildren = [];
     if (field.detect_models) {
@@ -814,8 +841,10 @@ function makeObjectList(field, value) {
       el('div', {class: 'row', style: 'justify-content: flex-end;'}, ...headerChildren),
       renderer.node,
     );
+    entry.itemBox = itemBox;
     items.push(entry);
     wrap.insertBefore(itemBox, addBtn);
+    fireChange();
   }
   const addBtn = el('button', {type: 'button', onclick: () => addItem({})},
                        '+ add ' + field.key.replace(/s$/, ''));
@@ -824,12 +853,17 @@ function makeObjectList(field, value) {
   return {
     node: wrap,
     read: () => items.map(i => i.renderer.read()),
+    _items: items,
+    _onChange: (cb) => changeListeners.push(cb),
   };
 }
 
 function makeObjectMap(field, value) {
   const wrap = el('div', {class: 'group'});
   const items = [];
+  const changeListeners = [];
+  let _idSeq = 0;
+  function fireChange() { for (const cb of changeListeners) { try { cb(); } catch (e) { console.error(e); } } }
   function addItem(key, initial) {
     const ki = el('input', {type: 'text', placeholder: 'model name'});
     if (field.key_autocomplete === 'model_names') {
@@ -838,15 +872,18 @@ function makeObjectMap(field, value) {
     }
     ki.value = key || '';
     const renderer = makeObjectGroup(field.item_schema, initial || {});
-    const entry = {ki, renderer};
+    const entry = {id: ++_idSeq, ki, renderer};
     const remove = el('button', {class: 'danger', type: 'button', onclick: () => {
       wrap.removeChild(itemBox);
       items.splice(items.indexOf(entry), 1);
+      fireChange();
     }}, 'Remove');
     const head = el('div', {class: 'map-key'}, el('strong', {}, 'key:'), ki, remove);
     const itemBox = el('div', {class: 'item'}, head, renderer.node);
+    entry.itemBox = itemBox;
     items.push(entry);
     wrap.insertBefore(itemBox, addBtn);
+    fireChange();
   }
   const addBtn = el('button', {type: 'button', onclick: () => {
     addItem('', {});
@@ -866,6 +903,8 @@ function makeObjectMap(field, value) {
       }
       return out;
     },
+    _items: items,
+    _onChange: (cb) => changeListeners.push(cb),
   };
 }
 
@@ -1040,6 +1079,9 @@ function renderField(field, value, ctx) {
     get: inner.get ? (...a) => inner.get(...a) : undefined,
     set: inner.set ? (...a) => { setPresent(true); return inner.set(...a); } : undefined,
     add: inner.add ? (...a) => { setPresent(true); return inner.add(...a); } : undefined,
+    // Pass through list/map internals so the sidebar sub-nav can hook them.
+    _items: inner._items,
+    _onChange: inner._onChange ? (cb) => inner._onChange(cb) : undefined,
   };
 }
 
@@ -1049,10 +1091,79 @@ let topRenderers = [];
 
 function slug(s) { return String(s).replace(/[^a-z0-9]+/gi, '-').toLowerCase(); }
 
+// Registered sub-nav builders, populated during renderForm. Each entry
+// rebuilds the nested <a> list under its parent section link.
+let subNavBuilders = [];
+
+function scrollToItemBox(itemBox) {
+  if (!itemBox) return;
+  itemBox.scrollIntoView({behavior: 'smooth', block: 'start'});
+  itemBox.classList.add('nav-flash');
+  setTimeout(() => itemBox.classList.remove('nav-flash'), 1200);
+}
+
+function attachSubNav({sectionId, parentLinkEl, field, renderer}) {
+  // Container is inserted immediately after the parent section link so the
+  // sub-nav visually nests under it in the sidebar.
+  const subWrap = el('div', {class: 'subnav'});
+  subWrap.dataset.parent = sectionId;
+  parentLinkEl.after(subWrap);
+  const isMap = field.type === 'object_map';
+  const labelKeys = (field.nav_label_keys && field.nav_label_keys.length)
+    ? field.nav_label_keys : ['name'];
+
+  function labelFor(entry, idx) {
+    if (isMap) {
+      const k = entry.ki ? (entry.ki.value || '').trim() : '';
+      return k || '(unnamed)';
+    }
+    for (const key of labelKeys) {
+      const sub = entry.renderer && entry.renderer.getRenderer
+        ? entry.renderer.getRenderer(key) : null;
+      const v = sub && sub.get ? sub.get() : (sub && sub.read ? sub.read() : '');
+      if (v && typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return '(unnamed #' + (idx + 1) + ')';
+  }
+
+  function rebuild() {
+    subWrap.innerHTML = '';
+    const items = renderer._items || [];
+    if (!items.length) {
+      subWrap.append(el('div', {class: 'empty'}, '(empty)'));
+      return;
+    }
+    items.forEach((entry, idx) => {
+      const itemId = sectionId + '-item-' + entry.id;
+      entry.itemBox.id = itemId;
+      const a = el('a', {href: '#' + itemId, onclick: (e) => {
+        e.preventDefault();
+        scrollToItemBox(entry.itemBox);
+        history.replaceState(null, '', '#' + itemId);
+      }},
+        el('span', {class: 'idx'}, String(idx + 1)),
+        labelFor(entry, idx),
+      );
+      a.dataset.itemTarget = itemId;
+      a.dataset.searchText = labelFor(entry, idx).toLowerCase();
+      subWrap.append(a);
+    });
+  }
+
+  renderer._onChange(rebuild);
+  rebuild();
+  return {rebuild};
+}
+
 function renderForm(config) {
   $form.innerHTML = '';
-  $sidenav.innerHTML = '<h3>Sections</h3>';
+  // Preserve the filter input + heading; drop only previously-built links.
+  const navFilterEl = $sidenav.querySelector('.nav-filter');
+  $sidenav.innerHTML = '';
+  if (navFilterEl) $sidenav.append(navFilterEl);
+  $sidenav.append(el('h3', {}, 'Sections'));
   topRenderers = [];
+  subNavBuilders = [];
 
   // Group fields by their declared group (preserving GROUPS order; unknown groups go last).
   const groupOrder = GROUPS.length
@@ -1092,9 +1203,12 @@ function renderForm(config) {
       el('h2', {}, meta.label || k),
     );
     if (meta.hint) section.append(el('div', {class: 'group-hint'}, meta.hint));
+    // Track top renderers in this section so sub-nav builders can hook them.
+    const sectionRenderers = [];
     for (const field of fields) {
       const r = renderField(field, config[field.key]);
       topRenderers.push({field, r});
+      sectionRenderers.push({field, r});
       section.append(r.node);
     }
     $form.append(section);
@@ -1109,21 +1223,43 @@ function renderForm(config) {
     );
     if (meta.hint) link.append(el('small', {}, meta.hint));
     link.dataset.target = sectionId;
+    link.dataset.searchText = ((meta.label || k) + ' ' + (meta.hint || '')).toLowerCase();
     $sidenav.append(link);
+
+    // Build sub-nav for any list/map fields whose internal renderer
+    // exposes items (object_list with nav_label_keys, or object_map).
+    for (const {field, r} of sectionRenderers) {
+      if (!r || !r._items) continue;
+      if (field.type !== 'object_list' && field.type !== 'object_map') continue;
+      if (field.type === 'object_list' && !(field.nav_label_keys && field.nav_label_keys.length)) continue;
+      const builder = attachSubNav({sectionId, parentLinkEl: link, field, renderer: r});
+      subNavBuilders.push(builder);
+    }
   }
 
-  // Active-section highlighting via IntersectionObserver.
+  // Hook input events to live-refresh sub-nav labels whenever any nav
+  // label field (the primary name input, or an object_map key input)
+  // changes. Cheap enough on a config form.
+  $form.addEventListener('input', (e) => {
+    const t = e.target;
+    if (!t || t.tagName !== 'INPUT') return;
+    for (const b of subNavBuilders) {
+      try { b.rebuild(); } catch (err) { console.error(err); }
+    }
+  });
+
+  // Active-section highlighting via IntersectionObserver. Highlights both
+  // the top-level section link and (if scrolled into a specific item) the
+  // matching sub-nav entry.
   if (window._navObserver) window._navObserver.disconnect();
+  if (window._navItemObserver) window._navItemObserver.disconnect();
   const links = $sidenav.querySelectorAll('a[data-target]');
-  const byId = {};
-  links.forEach(a => { byId[a.dataset.target] = a; });
   const visible = new Set();
   window._navObserver = new IntersectionObserver((entries) => {
     for (const e of entries) {
       if (e.isIntersecting) visible.add(e.target.id);
       else visible.delete(e.target.id);
     }
-    // Pick the first section in DOM order that is currently visible.
     let active = null;
     for (const {id} of sectionEls) if (visible.has(id)) { active = id; break; }
     if (!active && sectionEls.length) active = sectionEls[0].id;
@@ -1131,8 +1267,92 @@ function renderForm(config) {
   }, {rootMargin: '-30% 0px -55% 0px', threshold: 0});
   for (const {section} of sectionEls) window._navObserver.observe(section);
 
+  // Sub-nav item highlighting.
+  const itemVisible = new Set();
+  window._navItemObserver = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (e.isIntersecting) itemVisible.add(e.target.id);
+      else itemVisible.delete(e.target.id);
+    }
+    const itemLinks = $sidenav.querySelectorAll('a[data-item-target]');
+    itemLinks.forEach(a => a.classList.toggle('active', itemVisible.has(a.dataset.itemTarget)));
+  }, {rootMargin: '-30% 0px -55% 0px', threshold: 0});
+  // Observe currently-known item boxes; new ones get observed on rebuild.
+  function observeItemBoxes() {
+    for (const {field, r} of topRenderers) {
+      if (!r || !r._items) continue;
+      for (const entry of r._items) {
+        if (entry.itemBox && entry.itemBox.id) window._navItemObserver.observe(entry.itemBox);
+      }
+    }
+  }
+  observeItemBoxes();
+  // Re-observe after any list/map mutation.
+  for (const b of subNavBuilders) {
+    const orig = b.rebuild;
+    b.rebuild = function () { orig(); observeItemBoxes(); };
+  }
+
+  // Filter wiring.
+  const filterInput = document.getElementById('navFilter');
+  if (filterInput && !filterInput._wired) {
+    filterInput._wired = true;
+    filterInput.addEventListener('input', applyNavFilter);
+  }
+  applyNavFilter();
+
   // Populate the model-name autocomplete datalist now that all fields exist.
   refreshModelDatalist();
+}
+
+function applyNavFilter() {
+  const input = document.getElementById('navFilter');
+  const q = (input && input.value || '').trim().toLowerCase();
+  const sectionLinks = $sidenav.querySelectorAll('a[data-target]');
+  let anyVisible = false;
+  sectionLinks.forEach(a => {
+    const subWrap = a.nextElementSibling && a.nextElementSibling.classList &&
+      a.nextElementSibling.classList.contains('subnav') ? a.nextElementSibling : null;
+    let matchedSelf = !q || (a.dataset.searchText || '').includes(q);
+    let matchedItems = 0;
+    if (subWrap) {
+      const itemLinks = subWrap.querySelectorAll('a[data-item-target]');
+      itemLinks.forEach(il => {
+        const m = !q || (il.dataset.searchText || '').includes(q);
+        il.style.display = m ? '' : 'none';
+        if (m) matchedItems += 1;
+      });
+      // Hide "(empty)" placeholder when filtering.
+      const empty = subWrap.querySelector('.empty');
+      if (empty) empty.style.display = q ? 'none' : '';
+      subWrap.style.display = (matchedSelf || matchedItems) ? '' : 'none';
+    }
+    const showLink = matchedSelf || matchedItems > 0;
+    a.style.display = showLink ? '' : 'none';
+    if (showLink) anyVisible = true;
+  });
+  // Hide section headings whose links are all filtered out.
+  const headings = $sidenav.querySelectorAll('.nav-section');
+  headings.forEach(h => {
+    let n = h.nextElementSibling;
+    let visible = false;
+    while (n && !(n.classList && n.classList.contains('nav-section'))) {
+      if (n.tagName === 'A' && n.style.display !== 'none') { visible = true; break; }
+      n = n.nextElementSibling;
+    }
+    h.style.display = visible ? '' : 'none';
+  });
+  // Friendly empty-state.
+  let emptyMsg = $sidenav.querySelector('.nav-empty');
+  if (!anyVisible && q) {
+    if (!emptyMsg) {
+      emptyMsg = el('div', {class: 'nav-empty'}, 'No matches');
+      $sidenav.append(emptyMsg);
+    }
+    emptyMsg.style.display = '';
+  } else if (emptyMsg) {
+    emptyMsg.style.display = 'none';
+  }
 }
 
 function readForm() {
@@ -1252,6 +1472,8 @@ def _settings_to_dict(s: Settings) -> Dict[str, Any]:
             "gpu_layers",
             "ctx_size",
             "parallel",
+            "cache_type_k",
+            "cache_type_v",
             "extra_args",
         ]:
             if target.get(key) is None:
