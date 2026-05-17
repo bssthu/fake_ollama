@@ -129,6 +129,12 @@ LLAMA_CPP_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选：传给 --ctx-size 的上下文长度。仅自动拼装时使用；不填继承 llama_cpp_defaults.ctx_size"},
     {"key": "parallel", "type": "int", "default": None,
      "description": "可选：传给 --parallel 的并发槽数。仅自动拼装时使用；不填继承 llama_cpp_defaults.parallel"},
+    {"key": "batch_size", "type": "int", "default": None,
+     "description": "可选：传给 -b / --batch-size 的逻辑 batch（llama.cpp 默认 2048）。仅自动拼装时使用；不填继承 llama_cpp_defaults.batch_size"},
+    {"key": "ubatch_size", "type": "int", "default": None,
+     "description": "可选：传给 -ub / --ubatch-size 的物理 micro-batch（llama.cpp 默认 512）。仅自动拼装时使用；不填继承 llama_cpp_defaults.ubatch_size"},
+    {"key": "flash_attn", "type": "bool", "default": None,
+     "description": "可选：勾选后 true=启用 -fa / --flash-attn；false 与不勾选同义（不传 -fa）。不勾选继承 llama_cpp_defaults.flash_attn"},
     {"key": "cache_type_k", "type": "string", "default": None,
      "description": "可选：传给 -ctk 的 KV cache K 类型（如 f16/q8_0/q5_1/q5_0/q4_1/q4_0/iq4_nl）。默认 f16；自动拼装时使用，不填继承 llama_cpp_defaults.cache_type_k"},
     {"key": "cache_type_v", "type": "string", "default": None,
@@ -168,6 +174,12 @@ LLAMA_CPP_DEFAULTS_SCHEMA: List[Dict[str, Any]] = [
      "description": "默认 --ctx-size；自动拼装命令时使用，target 可覆盖"},
     {"key": "parallel", "type": "int", "default": None,
      "description": "默认 --parallel 并发槽数；自动拼装命令时使用，target 可覆盖"},
+    {"key": "batch_size", "type": "int", "default": None,
+     "description": "默认 -b / --batch-size 逻辑 batch（llama.cpp 默认 2048）；target 可覆盖。不勾选 = 不传该参数、由 llama.cpp 自己决定"},
+    {"key": "ubatch_size", "type": "int", "default": None,
+     "description": "默认 -ub / --ubatch-size 物理 micro-batch（llama.cpp 默认 512）；target 可覆盖。不勾选 = 不传该参数"},
+    {"key": "flash_attn", "type": "bool", "default": None,
+     "description": "默认是否启用 -fa / --flash-attn。不勾选 = 不传该参数；target 可覆盖"},
     {"key": "cache_type_k", "type": "string", "default": None,
      "description": "默认 -ctk KV cache K 类型（f16/q8_0/q5_1/q5_0/q4_1/q4_0/iq4_nl 等）。留空 = llama.cpp 默认 f16；target 可覆盖"},
     {"key": "cache_type_v", "type": "string", "default": None,
@@ -223,6 +235,7 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "description": "本机或远端 Ollama 服务；用于反向代理 POST /v1/messages 与 external 端口的 /v1/chat/completions"},
   {"key": "llama_cpp_defaults", "type": "object", "default": {}, "group": "reverse_llamacpp",
    "item_schema": LLAMA_CPP_DEFAULTS_SCHEMA,
+   "nav_label": "Defaults",
    "description": "llama.cpp targets 的全局默认值；每个 target 勾选同名字段后可覆盖"},
   {"key": "llama_cpp_targets", "type": "object_list", "default": [], "group": "reverse_llamacpp",
    "item_schema": LLAMA_CPP_TARGET_ITEM_SCHEMA,
@@ -1039,6 +1052,7 @@ function renderField(field, value, ctx) {
   }
 
   const fieldBox = el('div', {class: 'field'});
+  fieldBox.id = 'field-' + slug(field.key);
   const labelChildren = [];
   let presentBox = null;
   if (!field.required) {
@@ -1102,55 +1116,47 @@ function scrollToItemBox(itemBox) {
   setTimeout(() => itemBox.classList.remove('nav-flash'), 1200);
 }
 
-function attachSubNav({sectionId, parentLinkEl, field, renderer}) {
-  // Container is inserted immediately after the parent section link so the
-  // sub-nav visually nests under it in the sidebar.
+function attachSubNav({sectionId, parentLinkEl, sources, changeNotifiers}) {
+  // Single .subnav container per section, fed by multiple sources.
+  // Each source is a function returning [{itemBox, label, idx?, kind?}].
   const subWrap = el('div', {class: 'subnav'});
   subWrap.dataset.parent = sectionId;
   parentLinkEl.after(subWrap);
-  const isMap = field.type === 'object_map';
-  const labelKeys = (field.nav_label_keys && field.nav_label_keys.length)
-    ? field.nav_label_keys : ['name'];
-
-  function labelFor(entry, idx) {
-    if (isMap) {
-      const k = entry.ki ? (entry.ki.value || '').trim() : '';
-      return k || '(unnamed)';
-    }
-    for (const key of labelKeys) {
-      const sub = entry.renderer && entry.renderer.getRenderer
-        ? entry.renderer.getRenderer(key) : null;
-      const v = sub && sub.get ? sub.get() : (sub && sub.read ? sub.read() : '');
-      if (v && typeof v === 'string' && v.trim()) return v.trim();
-    }
-    return '(unnamed #' + (idx + 1) + ')';
-  }
+  let _anchorSeq = 0;
 
   function rebuild() {
     subWrap.innerHTML = '';
-    const items = renderer._items || [];
-    if (!items.length) {
-      subWrap.append(el('div', {class: 'empty'}, '(empty)'));
-      return;
+    let total = 0;
+    for (const src of sources) {
+      let entries;
+      try { entries = src() || []; } catch (e) { console.error(e); entries = []; }
+      for (const entry of entries) {
+        if (!entry || !entry.itemBox) continue;
+        if (!entry.itemBox.id) {
+          entry.itemBox.id = sectionId + '-anchor-' + (++_anchorSeq);
+        }
+        const itemId = entry.itemBox.id;
+        const label = entry.label || '(unnamed)';
+        const a = el('a', {href: '#' + itemId, onclick: (ev) => {
+          ev.preventDefault();
+          scrollToItemBox(entry.itemBox);
+          history.replaceState(null, '', '#' + itemId);
+        }});
+        if (entry.idx != null) a.append(el('span', {class: 'idx'}, String(entry.idx)));
+        a.append(label);
+        if (entry.kind === 'static') a.classList.add('static');
+        a.dataset.itemTarget = itemId;
+        a.dataset.searchText = label.toLowerCase();
+        subWrap.append(a);
+        total += 1;
+      }
     }
-    items.forEach((entry, idx) => {
-      const itemId = sectionId + '-item-' + entry.id;
-      entry.itemBox.id = itemId;
-      const a = el('a', {href: '#' + itemId, onclick: (e) => {
-        e.preventDefault();
-        scrollToItemBox(entry.itemBox);
-        history.replaceState(null, '', '#' + itemId);
-      }},
-        el('span', {class: 'idx'}, String(idx + 1)),
-        labelFor(entry, idx),
-      );
-      a.dataset.itemTarget = itemId;
-      a.dataset.searchText = labelFor(entry, idx).toLowerCase();
-      subWrap.append(a);
-    });
+    if (total === 0) subWrap.append(el('div', {class: 'empty'}, '(empty)'));
   }
 
-  renderer._onChange(rebuild);
+  for (const n of (changeNotifiers || [])) {
+    try { n(rebuild); } catch (e) { console.error(e); }
+  }
   rebuild();
   return {rebuild};
 }
@@ -1226,13 +1232,51 @@ function renderForm(config) {
     link.dataset.searchText = ((meta.label || k) + ' ' + (meta.hint || '')).toLowerCase();
     $sidenav.append(link);
 
-    // Build sub-nav for any list/map fields whose internal renderer
-    // exposes items (object_list with nav_label_keys, or object_map).
+    // Build sub-nav for this section. Multiple fields can contribute:
+    //   - object fields with `nav_label` get a single static anchor
+    //   - object_list fields with `nav_label_keys` expand into one
+    //     anchor per item, labelled by the first non-empty key value
+    //   - object_map fields expand into one anchor per map key
+    const sources = [];
+    const changeNotifiers = [];
     for (const {field, r} of sectionRenderers) {
-      if (!r || !r._items) continue;
-      if (field.type !== 'object_list' && field.type !== 'object_map') continue;
-      if (field.type === 'object_list' && !(field.nav_label_keys && field.nav_label_keys.length)) continue;
-      const builder = attachSubNav({sectionId, parentLinkEl: link, field, renderer: r});
+      if (!r) continue;
+      if (field.nav_label && r.node) {
+        const label = field.nav_label;
+        // r.node is the .field wrapper; it already has id="field-<key>".
+        sources.push(() => [{itemBox: r.node, label, kind: 'static'}]);
+        continue;
+      }
+      if (!r._items) continue;
+      if (field.type === 'object_map') {
+        sources.push(() => r._items.map((entry, idx) => ({
+          itemBox: entry.itemBox,
+          label: ((entry.ki && entry.ki.value) || '').trim() || '(unnamed #' + (idx + 1) + ')',
+          idx: idx + 1,
+        })));
+      } else if (field.type === 'object_list' && field.nav_label_keys && field.nav_label_keys.length) {
+        const labelKeys = field.nav_label_keys;
+        sources.push(() => r._items.map((entry, idx) => {
+          let label = '';
+          for (const key of labelKeys) {
+            const sub = entry.renderer && entry.renderer.getRenderer
+              ? entry.renderer.getRenderer(key) : null;
+            const v = sub && sub.get ? sub.get() : (sub && sub.read ? sub.read() : '');
+            if (v && typeof v === 'string' && v.trim()) { label = v.trim(); break; }
+          }
+          return {
+            itemBox: entry.itemBox,
+            label: label || '(unnamed #' + (idx + 1) + ')',
+            idx: idx + 1,
+          };
+        }));
+      } else {
+        continue;
+      }
+      if (r._onChange) changeNotifiers.push(r._onChange);
+    }
+    if (sources.length) {
+      const builder = attachSubNav({sectionId, parentLinkEl: link, sources, changeNotifiers});
       subNavBuilders.push(builder);
     }
   }
@@ -1472,6 +1516,9 @@ def _settings_to_dict(s: Settings) -> Dict[str, Any]:
             "gpu_layers",
             "ctx_size",
             "parallel",
+            "batch_size",
+            "ubatch_size",
+            "flash_attn",
             "cache_type_k",
             "cache_type_v",
             "extra_args",

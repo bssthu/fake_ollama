@@ -293,6 +293,12 @@ class LlamaCppDefaults(BaseModel):
     gpu_layers: Optional[int] = None
     ctx_size: Optional[int] = None
     parallel: Optional[int] = None
+    # Logical (-b) / physical (-ub) batch sizes. llama.cpp defaults are
+    # 2048 / 512; leave None to inherit llama.cpp's default.
+    batch_size: Optional[int] = None
+    ubatch_size: Optional[int] = None
+    # Enable FlashAttention (-fa). None / False = do not pass; True passes -fa.
+    flash_attn: Optional[bool] = None
     # KV cache quantisation (llama.cpp -ctk / -ctv). Default upstream is f16;
     # common values are f16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl. Lowering
     # these can cut KV-cache VRAM substantially at some quality cost.
@@ -346,8 +352,11 @@ class LlamaCppTarget(BaseModel):
     gpu_layers: Optional[int] = None
     ctx_size: Optional[int] = None
     parallel: Optional[int] = None
-    # KV cache quantisation (llama.cpp -ctk / -ctv). See LlamaCppDefaults
-    # for the accepted values; unset = inherit defaults; defaults unset = f16.
+    # See LlamaCppDefaults; unset on target = inherit defaults; defaults
+    # unset = llama.cpp defaults (2048 / 512 / off / f16).
+    batch_size: Optional[int] = None
+    ubatch_size: Optional[int] = None
+    flash_attn: Optional[bool] = None
     cache_type_k: Optional[str] = None
     cache_type_v: Optional[str] = None
     extra_args: Optional[str] = None
@@ -471,6 +480,21 @@ class LlamaCppTarget(BaseModel):
                     if self.parallel is not None
                     else defaults.parallel
                 ),
+                "batch_size": (
+                    self.batch_size
+                    if self.batch_size is not None
+                    else defaults.batch_size
+                ),
+                "ubatch_size": (
+                    self.ubatch_size
+                    if self.ubatch_size is not None
+                    else defaults.ubatch_size
+                ),
+                "flash_attn": (
+                    self.flash_attn
+                    if self.flash_attn is not None
+                    else defaults.flash_attn
+                ),
                 "cache_type_k": (
                     self.cache_type_k
                     if self.cache_type_k is not None
@@ -546,6 +570,12 @@ class LlamaCppTarget(BaseModel):
             argv += ["--ctx-size", str(self.ctx_size)]
         if self.parallel:
             argv += ["--parallel", str(self.parallel)]
+        if self.batch_size:
+            argv += ["-b", str(self.batch_size)]
+        if self.ubatch_size:
+            argv += ["-ub", str(self.ubatch_size)]
+        if self.flash_attn:
+            argv += ["-fa"]
         if self.cache_type_k:
             argv += ["-ctk", str(self.cache_type_k)]
         if self.cache_type_v:
