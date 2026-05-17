@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +20,7 @@ from .vram import VramCoordinator
 
 _LOG = logging.getLogger("fake_ollama")
 _DASHBOARD_DATA_VERSION = 1
+_DASHBOARD_REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4)
 
 
 def _memory_status_mib() -> tuple[Optional[float], Optional[float]]:
@@ -238,6 +240,7 @@ def _read_dashboard_samples(
 
 
 def _write_dashboard_samples(path: Path, samples: list[dict[str, Any]]) -> None:
+    tmp: Optional[Path] = None
     try:
         if not path.name:
             raise ValueError("dashboard_data_path must include a file name")
@@ -246,14 +249,33 @@ def _write_dashboard_samples(path: Path, samples: list[dict[str, Any]]) -> None:
             "version": _DASHBOARD_DATA_VERSION,
             "samples": samples,
         }
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
             encoding="utf-8",
-        )
-        tmp.replace(path)
+            delete=False,
+        ) as fp:
+            tmp = Path(fp.name)
+            fp.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        for delay in (*_DASHBOARD_REPLACE_RETRY_DELAYS, None):
+            try:
+                tmp.replace(path)
+                tmp = None
+                break
+            except OSError:
+                if delay is None:
+                    raise
+                time.sleep(delay)
     except (OSError, TypeError, ValueError) as exc:
         _LOG.warning("failed to write dashboard data file %s: %s", path, exc)
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 class DashboardState:

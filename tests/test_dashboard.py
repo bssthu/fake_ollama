@@ -12,7 +12,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fake_ollama.config import Settings
-from fake_ollama.dashboard import DashboardState, _DASHBOARD_HTML, register_dashboard_routes
+from fake_ollama.dashboard import (
+    DashboardState,
+    _DASHBOARD_HTML,
+    _write_dashboard_samples,
+    register_dashboard_routes,
+)
 
 
 def _settings(path: Path, *, retention_seconds: float = 3600.0) -> Settings:
@@ -129,6 +134,30 @@ def test_dashboard_relative_history_path_uses_config_dir(
     asyncio.run(DashboardState().sample(app))
 
     assert (tmp_path / "history.json").exists()
+
+
+def test_dashboard_write_retries_transient_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "dashboard-history.json"
+    original_replace = Path.replace
+    failures: list[str] = []
+
+    def flaky_replace(self: Path, target: Path) -> Path:
+        if target == path and not failures:
+            failures.append(self.name)
+            raise OSError(32, "file is in use")
+        return original_replace(self, target)
+
+    monkeypatch.setattr("fake_ollama.dashboard.time.sleep", lambda _: None)
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+
+    _write_dashboard_samples(path, [{"ts": 1234.0, "models": {}}])
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["samples"][0]["ts"] == 1234.0
+    assert failures
+    assert not list(tmp_path.glob(".dashboard-history.json.*.tmp"))
 
 
 def test_dashboard_state_ignores_corrupt_history_file(
