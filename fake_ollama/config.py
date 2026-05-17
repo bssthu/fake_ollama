@@ -297,7 +297,8 @@ class LlamaCppDefaults(BaseModel):
     # 2048 / 512; leave None to inherit llama.cpp's default.
     batch_size: Optional[int] = None
     ubatch_size: Optional[int] = None
-    # Enable FlashAttention (-fa). None / False = do not pass; True passes -fa.
+    # Enable FlashAttention. Current llama.cpp expects a value:
+    # -fa/--flash-attn [on|off|auto].
     flash_attn: Optional[bool] = None
     # KV cache quantisation (llama.cpp -ctk / -ctv). Default upstream is f16;
     # common values are f16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl. Lowering
@@ -575,7 +576,7 @@ class LlamaCppTarget(BaseModel):
         if self.ubatch_size:
             argv += ["-ub", str(self.ubatch_size)]
         if self.flash_attn:
-            argv += ["-fa"]
+            argv += ["-fa", "on"]
         if self.cache_type_k:
             argv += ["-ctk", str(self.cache_type_k)]
         if self.cache_type_v:

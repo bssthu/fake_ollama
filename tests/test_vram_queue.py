@@ -725,6 +725,21 @@ def test_synthesize_start_argv_returns_unquoted_argv():
     assert "-ngl" in argv and "99" in argv
 
 
+def test_synthesize_start_argv_passes_flash_attn_value():
+    from fake_ollama.config import LlamaCppTarget
+
+    tgt = LlamaCppTarget(
+        base_url="http://127.0.0.1:21500",
+        model="qa",
+        model_path="C:/m.gguf",
+        flash_attn=True,
+    )
+    argv = tgt.synthesize_start_argv()
+    assert argv is not None
+    idx = argv.index("-fa")
+    assert argv[idx + 1] == "on"
+
+
 def test_synthesize_start_argv_returns_none_when_user_shell_command_set():
     from fake_ollama.config import LlamaCppTarget
 
