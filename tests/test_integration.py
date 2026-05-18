@@ -1,7 +1,9 @@
 """Live integration test against the configured upstream.
 
-These tests are skipped automatically unless ``ANTHROPIC_BASE_URL`` and
-``ANTHROPIC_AUTH_TOKEN`` are set in the environment (or in ``.env``).
+These tests are skipped automatically unless ``FAKE_OLLAMA_TEST_BASE_URL``
+and ``FAKE_OLLAMA_TEST_AUTH_TOKEN`` are set in the environment (or in
+``.env``). The two variables are used only as a presence signal: the
+actual upstream and credentials come from the active ``config.json``.
 """
 
 from __future__ import annotations
@@ -22,7 +24,9 @@ def live_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     # or .env). They DO surface real regressions in the Anthropic <->
     # Ollama translation layer, so we intentionally do NOT hide them
     # behind an extra opt-in flag.
-    if not os.getenv("ANTHROPIC_BASE_URL") or not os.getenv("ANTHROPIC_AUTH_TOKEN"):
+    if not os.getenv("FAKE_OLLAMA_TEST_BASE_URL") or not os.getenv(
+        "FAKE_OLLAMA_TEST_AUTH_TOKEN"
+    ):
         pytest.skip("upstream credentials not configured")
     get_settings.cache_clear()
     settings = get_settings()

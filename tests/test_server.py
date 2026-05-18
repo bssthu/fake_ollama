@@ -26,14 +26,16 @@ def _make_client(settings, transport: httpx.MockTransport) -> TestClient:
     from fake_ollama.anthropic_client import AnthropicClient
 
     app = create_app(settings)
-    # Inject the mocked client BEFORE lifespan startup so it is preserved.
-    # All upstreams in the test settings share the same mock transport.
-    mock = AnthropicClient(
-        settings.upstream_url,
-        settings.anthropic_auth_token,
-        client=httpx.AsyncClient(transport=transport),
-    )
-    app.state.clients = {up.name: mock for up in settings.upstreams}
+    # Inject one mocked AnthropicClient per upstream BEFORE lifespan startup
+    # so all routes share the same MockTransport.
+    app.state.clients = {
+        up.name: AnthropicClient(
+            up.base_url,
+            up.auth_token,
+            client=httpx.AsyncClient(transport=transport),
+        )
+        for up in settings.upstreams
+    }
     return TestClient(app)
 
 
@@ -68,8 +70,8 @@ def test_tags_lists_models(settings):
     assert resp.status_code == 200
     body = resp.json()
     names = [m["name"] for m in body["models"]]
-    assert "claude-3-5-sonnet-20241022" in names
-    assert "llama-test" in names
+    assert "claude-3-5-sonnet-20241022@default" in names
+    assert "llama-test@default" in names
 
 
 def test_version_endpoint(settings):
@@ -90,6 +92,8 @@ def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
                 "models": ["claude-3-5-sonnet-20241022"],
             }
         ],
+        internal_exposed_models=["claude-3-5-sonnet-20241022@default"],
+        external_exposed_models=["claude-3-5-sonnet-20241022@default"],
         external_host="127.0.0.1",
         external_port=21435,
         external_access_tokens=["rev-tk-1"],
@@ -132,7 +136,7 @@ def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
 def test_show_advertises_capabilities(settings):
     client = _make_client(settings, httpx.MockTransport(lambda req: httpx.Response(404)))
     with client:
-        resp = client.post("/api/show", json={"model": "claude-3-5-sonnet-20241022"})
+        resp = client.post("/api/show", json={"model": "claude-3-5-sonnet-20241022@default"})
     assert resp.status_code == 200
     body = resp.json()
     # GitHub Copilot and other clients filter out models that don't advertise
@@ -155,7 +159,7 @@ def test_chat_non_streaming(settings):
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "text", "text": "pong"}],
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 3, "output_tokens": 1},
             },
@@ -166,7 +170,7 @@ def test_chat_non_streaming(settings):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": False,
             },
@@ -195,6 +199,7 @@ def test_chat_tagless_alias_uses_configured_tagged_model():
                 "models": ["qwen3.5-2b:latest"],
             }
         ],
+        internal_exposed_models=["qwen3.5-2b@tagged", "qwen3.5-2b:latest@tagged"],
     )
     captured: Dict[str, Any] = {}
 
@@ -218,7 +223,7 @@ def test_chat_tagless_alias_uses_configured_tagged_model():
         resp = client.post(
             "/api/chat",
             json={
-                "model": "qwen3.5-2b",
+                "model": "qwen3.5-2b@tagged",
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": False,
             },
@@ -269,7 +274,7 @@ def test_chat_streaming(settings):
             "POST",
             "/api/chat",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": True,
             },
@@ -304,7 +309,7 @@ def test_generate_non_streaming(settings):
         resp = client.post(
             "/api/generate",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "prompt": "say hi",
                 "stream": False,
             },
@@ -334,7 +339,7 @@ def test_openai_chat_completions_non_streaming(settings):
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "text", "text": "pong"}],
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 4, "output_tokens": 1},
             },
@@ -345,7 +350,7 @@ def test_openai_chat_completions_non_streaming(settings):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [
                     {"role": "system", "content": "be brief"},
                     {"role": "user", "content": "ping"},
@@ -385,7 +390,7 @@ def test_openai_chat_completions_streaming(settings):
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": True,
             },
@@ -419,7 +424,7 @@ def test_openai_chat_streaming_upstream_disconnect_yields_error_choice(settings)
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": True,
             },
@@ -452,7 +457,7 @@ def test_openai_chat_non_streaming_upstream_disconnect_returns_502(settings):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
             },
@@ -470,7 +475,7 @@ def test_openai_models_list(settings):
     body = resp.json()
     assert body["object"] == "list"
     ids = [m["id"] for m in body["data"]]
-    assert "claude-3-5-sonnet-20241022" in ids
+    assert "claude-3-5-sonnet-20241022@default" in ids
 
 
 def test_openai_chat_streams_tool_calls(settings):
@@ -497,7 +502,7 @@ def test_openai_chat_streams_tool_calls(settings):
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [{"role": "user", "content": "weather?"}],
                 "stream": True,
                 "tools": [
@@ -539,39 +544,39 @@ def test_openai_chat_streams_tool_calls(settings):
 # ---- Per-model profile / context guardrail -------------------------------
 
 
-def _profile_settings(monkeypatch):
-    """Helper: build Settings with a tiny custom profile."""
-    from fake_ollama.config import get_settings as _gs
-
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://upstream.test")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-token")
-    monkeypatch.setenv("FAKE_OLLAMA_MODELS", "tiny-model,big-model")
-    monkeypatch.setenv("FAKE_OLLAMA_DEFAULT_MAX_TOKENS", "64")
-    monkeypatch.setenv(
-        "FAKE_OLLAMA_MODEL_PROFILES",
-        json.dumps(
+def _profile_settings(monkeypatch=None):
+    """Build Settings with two tiny custom profiles."""
+    return Settings(
+        default_max_tokens=64,
+        upstreams=[
             {
-                "tiny-model": {
-                    "capabilities": ["completion"],
-                    "context_length": 256,
-                    "max_output_tokens": 32,
-                },
-                "big-model": {
-                    "capabilities": ["completion", "tools", "vision"],
-                    "context_length": 200000,
-                },
+                "name": "default",
+                "base_url": "http://upstream.test",
+                "auth_token": "test-token",
+                "models": ["tiny-model", "big-model"],
             }
-        ),
+        ],
+        internal_exposed_models=["tiny-model@default", "big-model@default"],
+        external_exposed_models=["tiny-model@default", "big-model@default"],
+        model_profiles={
+            "tiny-model": {
+                "capabilities": ["completion"],
+                "context_length": 256,
+                "max_output_tokens": 32,
+            },
+            "big-model": {
+                "capabilities": ["completion", "tools", "vision"],
+                "context_length": 200000,
+            },
+        },
     )
-    _gs.cache_clear()
-    return _gs()
 
 
 def test_show_uses_per_model_profile(monkeypatch):
     settings = _profile_settings(monkeypatch)
     client = _make_client(settings, httpx.MockTransport(lambda r: httpx.Response(404)))
     with client:
-        resp = client.post("/api/show", json={"model": "tiny-model"})
+        resp = client.post("/api/show", json={"model": "tiny-model@default"})
     body = resp.json()
     assert body["capabilities"] == ["completion"]
     assert body["context_length"] == 256
@@ -585,9 +590,9 @@ def test_tags_includes_profile_fields(monkeypatch):
     with client:
         resp = client.get("/api/tags")
     by_name = {m["name"]: m for m in resp.json()["models"]}
-    assert by_name["tiny-model"]["context_length"] == 256
-    assert by_name["tiny-model"]["capabilities"] == ["completion"]
-    assert "vision" in by_name["big-model"]["capabilities"]
+    assert by_name["tiny-model@default"]["context_length"] == 256
+    assert by_name["tiny-model@default"]["capabilities"] == ["completion"]
+    assert "vision" in by_name["big-model@default"]["capabilities"]
 
 
 def test_context_limit_enforced(monkeypatch):
@@ -602,7 +607,7 @@ def test_context_limit_enforced(monkeypatch):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "tiny-model",
+                "model": "tiny-model@default",
                 "messages": [{"role": "user", "content": big_prompt}],
                 "stream": False,
             },
@@ -613,10 +618,10 @@ def test_context_limit_enforced(monkeypatch):
 
 def test_context_limit_can_be_disabled(monkeypatch):
     settings = _profile_settings(monkeypatch)
-    monkeypatch.setenv("FAKE_OLLAMA_ENFORCE_CONTEXT_LIMIT", "false")
-    from fake_ollama.config import get_settings as _gs
-    _gs.cache_clear()
-    settings = _gs()
+    # Rebuild with enforcement off.
+    settings = Settings(
+        **{**settings.model_dump(), "enforce_context_limit": False}
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -634,7 +639,7 @@ def test_context_limit_can_be_disabled(monkeypatch):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "tiny-model",
+                "model": "tiny-model@default",
                 "messages": [{"role": "user", "content": big_prompt}],
                 "stream": False,
             },
@@ -653,7 +658,7 @@ def test_openai_chat_respects_context_limit(monkeypatch):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "tiny-model",
+                "model": "tiny-model@default",
                 "messages": [{"role": "user", "content": "y" * 4000}],
                 "stream": False,
             },
@@ -713,7 +718,7 @@ def test_ollama_image_media_type_detected(settings):
             resp = client.post(
                 "/api/chat",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-3-5-sonnet-20241022@default",
                     "messages": [{"role": "user", "content": "what?", "images": [b64]}],
                     "stream": False,
                 },
@@ -745,7 +750,7 @@ def test_openai_image_url_passthrough(settings):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "stream": False,
                 "messages": [
                     {
@@ -772,29 +777,30 @@ def test_openai_image_url_passthrough(settings):
 # ---- Thinking / reasoning ------------------------------------------------
 
 
-def _thinking_settings(monkeypatch, *, mode="enabled", show=True):
-    from fake_ollama.config import get_settings as _gs
-
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://upstream.test")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-token")
-    monkeypatch.setenv("FAKE_OLLAMA_MODELS", "deepseek-v4-pro")
-    monkeypatch.setenv("FAKE_OLLAMA_DEFAULT_MAX_TOKENS", "256")
-    monkeypatch.setenv(
-        "FAKE_OLLAMA_MODEL_PROFILES",
-        json.dumps(
+def _thinking_settings(monkeypatch=None, *, mode="enabled", show=True, enforce_context_limit=True):
+    return Settings(
+        default_max_tokens=256,
+        enforce_context_limit=enforce_context_limit,
+        upstreams=[
             {
-                "deepseek-v4-pro": {
-                    "capabilities": ["completion", "tools"],
-                    "context_length": 128000,
-                    "thinking": mode,
-                    "thinking_budget_tokens": 512,
-                    "show_thinking": show,
-                }
+                "name": "default",
+                "base_url": "http://upstream.test",
+                "auth_token": "test-token",
+                "models": ["deepseek-v4-pro"],
             }
-        ),
+        ],
+        internal_exposed_models=["deepseek-v4-pro@default"],
+        external_exposed_models=["deepseek-v4-pro@default"],
+        model_profiles={
+            "deepseek-v4-pro": {
+                "capabilities": ["completion", "tools"],
+                "context_length": 128000,
+                "thinking_mode": mode,
+                "thinking_budget_tokens": 512,
+                "show_thinking": show,
+            }
+        },
     )
-    _gs.cache_clear()
-    return _gs()
 
 
 def test_thinking_mode_enabled_injects_request_field(monkeypatch):
@@ -817,7 +823,7 @@ def test_thinking_mode_enabled_injects_request_field(monkeypatch):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-v4-pro@default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
             },
@@ -846,7 +852,7 @@ def test_thinking_mode_disabled_injects_disabled(monkeypatch):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-v4-pro@default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
             },
@@ -907,7 +913,7 @@ def test_thinking_auto_with_show_thinking_false_disables_upstream(monkeypatch):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-v4-pro@default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
             },
@@ -937,7 +943,7 @@ def test_thinking_in_non_stream_response_wrapped_for_ollama(monkeypatch):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-v4-pro@default",
                 "messages": [{"role": "user", "content": "compute"}],
                 "stream": False,
             },
@@ -969,7 +975,7 @@ def test_thinking_hidden_when_show_false(monkeypatch):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-v4-pro@default",
                 "messages": [{"role": "user", "content": "?"}],
                 "stream": False,
             },
@@ -1007,7 +1013,7 @@ def test_thinking_streamed_to_openai_with_reasoning_content(monkeypatch):
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-v4-pro@default",
                 "messages": [{"role": "user", "content": "?"}],
                 "stream": True,
             },
@@ -1055,7 +1061,7 @@ def test_thinking_streamed_to_ollama_wraps_in_think_tags(monkeypatch):
             "POST",
             "/api/chat",
             json={
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-v4-pro@default",
                 "messages": [{"role": "user", "content": "?"}],
                 "stream": True,
             },
@@ -1089,7 +1095,7 @@ def test_thinking_auto_does_not_inject(settings):
         resp = client.post(
             "/api/chat",
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
             },
@@ -1097,31 +1103,3 @@ def test_thinking_auto_does_not_inject(settings):
     assert resp.status_code == 200
     assert "thinking" not in captured["body"]
 
-
-def test_unknown_model_falls_back_to_passthrough(settings):
-    captured: Dict[str, Any] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "content": [{"type": "text", "text": "ok"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            },
-        )
-
-    client = _make_client(settings, httpx.MockTransport(handler))
-    with client:
-        resp = client.post(
-            "/api/chat",
-            json={
-                "model": "claude-custom:latest",
-                "messages": [{"role": "user", "content": "x"}],
-                "stream": False,
-            },
-        )
-    assert resp.status_code == 200
-    # ":latest" suffix should be stripped before passthrough
-    assert captured["body"]["model"] == "claude-custom"

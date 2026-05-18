@@ -1,11 +1,4 @@
-"""Tests for the unified ``Backend`` view layer in ``config.py``.
-
-The ``Backend`` view is a transitional façade that lets routing code
-treat ``upstreams`` / ``ollama_targets`` / ``llama_cpp_targets`` as a
-single protocol-tagged list. These tests pin the semantics so the
-upcoming ``server.py`` routing refactor and the OpenAI backend addition
-land against a stable contract.
-"""
+"""Tests for the unified ``Backend`` view layer in ``config.py``."""
 
 from __future__ import annotations
 
@@ -19,28 +12,6 @@ from fake_ollama.config import (
     Settings,
     Upstream,
 )
-
-
-def _make_settings(
-    *,
-    upstreams=None,
-    ollama_targets=None,
-    llama_cpp_targets=None,
-    llama_cpp_defaults=None,
-) -> Settings:
-    return Settings(
-        upstreams=upstreams or [
-            Upstream(
-                name="anthropic",
-                base_url="http://upstream.test",
-                auth_token="t",
-                models=["claude-3-5-sonnet"],
-            ),
-        ],
-        ollama_targets=ollama_targets or [],
-        llama_cpp_targets=llama_cpp_targets or [],
-        llama_cpp_defaults=llama_cpp_defaults or LlamaCppDefaults(),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -100,12 +71,19 @@ def test_backend_from_llama_cpp_target_is_always_local_openai() -> None:
         model="qwen3",
     )
     b = Backend.from_llama_cpp_target(tgt)
-    # name falls back to model when target.name is empty
     assert b.name == "qwen3"
     assert b.protocol == "openai"
     assert b.kind == "local"
     assert b.auth_token == "tok"
     assert b.models == ["qwen3"]
+
+
+def test_backend_serves_checks_membership() -> None:
+    b = Backend.from_anthropic_upstream(
+        Upstream(name="u", base_url="http://u", auth_token="x", models=["a", "b"])
+    )
+    assert b.serves("a") is True
+    assert b.serves("missing") is False
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +92,7 @@ def test_backend_from_llama_cpp_target_is_always_local_openai() -> None:
 
 
 def test_settings_backends_order_and_protocols() -> None:
-    settings = _make_settings(
+    settings = Settings(
         upstreams=[
             Upstream(name="u1", base_url="http://u1", auth_token="x", models=["m1"]),
         ],
@@ -126,7 +104,7 @@ def test_settings_backends_order_and_protocols() -> None:
         ],
     )
     protocols = [(b.name, b.protocol, b.kind) for b in settings.backends]
-    # Routing priority: ollama → llama.cpp → anthropic.
+    # Routing priority order: ollama → llama.cpp → anthropic.
     assert protocols == [
         ("o1", "ollama", "remote"),
         ("m3", "openai", "local"),
@@ -135,7 +113,7 @@ def test_settings_backends_order_and_protocols() -> None:
 
 
 def test_settings_backends_applies_llama_cpp_defaults() -> None:
-    settings = _make_settings(
+    settings = Settings(
         llama_cpp_defaults=LlamaCppDefaults(
             auto_start=True, idle_timeout_seconds=900.0
         ),
@@ -149,12 +127,30 @@ def test_settings_backends_applies_llama_cpp_defaults() -> None:
 
 
 # ---------------------------------------------------------------------------
-# backend_for routing
+# Composite-id lookup
 # ---------------------------------------------------------------------------
 
 
-def test_backend_for_prefers_ollama_target_over_upstream() -> None:
-    settings = _make_settings(
+def test_backend_by_name_finds_each_kind() -> None:
+    settings = Settings(
+        upstreams=[
+            Upstream(name="up", base_url="http://up", auth_token="x", models=["m"]),
+        ],
+        ollama_targets=[
+            OllamaTarget(name="ot", base_url="http://ot", models=["m"]),
+        ],
+        llama_cpp_targets=[
+            LlamaCppTarget(base_url="http://lc", model="lcm"),
+        ],
+    )
+    assert settings.backend_by_name("up").protocol == "anthropic"
+    assert settings.backend_by_name("ot").protocol == "ollama"
+    assert settings.backend_by_name("lcm").protocol == "openai"
+    assert settings.backend_by_name("nope") is None
+
+
+def test_backend_for_uses_composite_id_to_disambiguate_duplicate_model() -> None:
+    settings = Settings(
         upstreams=[
             Upstream(name="up", base_url="http://up", auth_token="x", models=["dup"]),
         ],
@@ -162,98 +158,73 @@ def test_backend_for_prefers_ollama_target_over_upstream() -> None:
             OllamaTarget(name="ot", base_url="http://ot", models=["dup"]),
         ],
     )
-    b = settings.backend_for("dup")
-    assert b is not None and b.protocol == "ollama" and b.name == "ot"
+    # Composite ids let callers pick exactly which backend serves the
+    # duplicate name — no implicit priority.
+    via_ollama = settings.backend_for("dup@ot")
+    via_upstream = settings.backend_for("dup@up")
+    assert via_ollama is not None and via_ollama.protocol == "ollama"
+    assert via_upstream is not None and via_upstream.protocol == "anthropic"
 
 
-def test_backend_for_prefers_llama_cpp_over_upstream() -> None:
-    settings = _make_settings(
+def test_backend_for_returns_none_for_unknown_target() -> None:
+    settings = Settings(
         upstreams=[
-            Upstream(name="up", base_url="http://up", auth_token="x", models=["dup"]),
-        ],
-        llama_cpp_targets=[
-            LlamaCppTarget(base_url="http://lc", model="dup"),
+            Upstream(name="up", base_url="http://up", auth_token="x", models=["m"]),
         ],
     )
-    b = settings.backend_for("dup")
-    assert b is not None and b.protocol == "openai" and b.kind == "local"
+    assert settings.backend_for("m@nope") is None
 
 
-def test_backend_for_falls_back_to_upstream_when_no_target_serves() -> None:
-    settings = _make_settings(
-        upstreams=[
-            Upstream(name="up", base_url="http://up", auth_token="x", models=["only"]),
-        ],
-        ollama_targets=[
-            OllamaTarget(name="ot", base_url="http://ot", models=["other"]),
-        ],
-    )
-    b = settings.backend_for("only")
-    assert b is not None and b.protocol == "anthropic" and b.name == "up"
-
-
-def test_backend_for_returns_none_when_no_one_serves() -> None:
-    settings = _make_settings(
+def test_backend_for_returns_none_when_target_does_not_serve_model() -> None:
+    settings = Settings(
         upstreams=[
             Upstream(name="up", base_url="http://up", auth_token="x", models=["a"]),
         ],
     )
-    assert settings.backend_for("not-served") is None
+    assert settings.backend_for("b@up") is None
+
+
+def test_backend_for_returns_none_on_bare_model() -> None:
+    settings = Settings(
+        upstreams=[
+            Upstream(name="up", base_url="http://up", auth_token="x", models=["m"]),
+        ],
+    )
+    # ``backend_for`` requires composite ids; bare names → None.
+    assert settings.backend_for("m") is None
 
 
 # ---------------------------------------------------------------------------
-# Surface-aware exposure
+# Surface-aware exposure (now driven by Settings.{internal,external}_exposed_models)
 # ---------------------------------------------------------------------------
 
 
-def test_backend_for_external_surface_skips_hidden_models() -> None:
-    settings = _make_settings(
+def test_backend_for_external_surface_skips_unexposed() -> None:
+    settings = Settings(
         upstreams=[
             Upstream(
                 name="up",
                 base_url="http://up",
                 auth_token="x",
                 models=["public", "private"],
-                expose_external=["public"],
             ),
         ],
+        internal_exposed_models=["public@up", "private@up"],
+        external_exposed_models=["public@up"],
     )
-    # Internal sees both; external only sees the whitelisted one.
-    assert settings.backend_for("private", surface="internal") is not None
-    assert settings.backend_for("private", surface="external") is None
-    assert settings.backend_for("public", surface="external") is not None
+    assert settings.backend_for("private@up", surface="internal") is not None
+    assert settings.backend_for("private@up", surface="external") is None
+    assert settings.backend_for("public@up", surface="external") is not None
 
 
-def test_backend_for_external_skips_hidden_llama_cpp() -> None:
-    settings = _make_settings(
-        llama_cpp_targets=[
-            LlamaCppTarget(base_url="http://lc", model="m", expose_external=False),
-        ],
-    )
-    assert settings.backend_for("m", surface="internal") is not None
-    assert settings.backend_for("m", surface="external") is None
-
-
-def test_backend_for_external_skips_hidden_ollama_target() -> None:
-    settings = _make_settings(
-        ollama_targets=[
-            OllamaTarget(
-                name="ot",
-                base_url="http://ot",
-                models=["pub", "priv"],
-                expose_external=["pub"],
-            ),
-        ],
-    )
-    assert settings.backend_for("priv", surface="internal") is not None
-    assert settings.backend_for("priv", surface="external") is None
-
-
-def test_backend_for_unknown_surface_raises() -> None:
-    settings = _make_settings(
+def test_backend_for_no_surface_ignores_exposure() -> None:
+    settings = Settings(
         upstreams=[
             Upstream(name="up", base_url="http://up", auth_token="x", models=["m"]),
         ],
+        # nothing exposed
+        internal_exposed_models=[],
+        external_exposed_models=[],
     )
-    with pytest.raises(ValueError):
-        settings.backend_for("m", surface="bogus")  # type: ignore[arg-type]
+    # Without ``surface`` the exposure check is skipped.
+    assert settings.backend_for("m@up") is not None

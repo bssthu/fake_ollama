@@ -155,14 +155,6 @@ class Upstream(BaseModel):
     # Display name -> upstream-side model id. Falls through to the display
     # name itself when not present.
     model_map: Dict[str, str] = Field(default_factory=dict)
-    # Subset of ``models`` that should be visible on the EXTERNAL
-    # reverse-proxy surface (/v1/models, /v1/messages passthrough).
-    # Semantics:
-    #   None  -> expose all entries in ``models`` (legacy / default).
-    #   []    -> expose nothing from this upstream externally.
-    #   [...] -> expose only the listed display names.
-    # ollama_targets are unaffected (they exist solely for external use).
-    expose_external: Optional[List[str]] = None
 
     @field_validator("base_url")
     @classmethod
@@ -191,14 +183,6 @@ class Upstream(BaseModel):
 
     def serves(self, display_name: str) -> bool:
         return self.matching_model(display_name) is not None
-
-    def exposes(self, display_name: str) -> bool:
-        configured = self.matching_model(display_name)
-        if not configured:
-            return False
-        if self.expose_external is None:
-            return True
-        return _find_configured_model(configured, self.expose_external) is not None
 
 
 class OpenAIUpstream(Upstream):
@@ -231,12 +215,6 @@ class OllamaTarget(BaseModel):
     models: List[str] = Field(default_factory=list)
     # Anthropic-side display name -> Ollama-side model id.
     model_map: Dict[str, str] = Field(default_factory=dict)
-    # Subset of ``models`` visible on the EXTERNAL reverse-proxy surface
-    # (/v1/models, /v1/messages). Same semantics as ``Upstream.expose_external``:
-    #   None  -> expose all (default; back-compat).
-    #   []    -> expose nothing externally (target becomes internal-only).
-    #   [...] -> expose only the listed display names.
-    expose_external: Optional[List[str]] = None
     # Optional daemon lifecycle management. Leave ``auto_start`` false when
     # Ollama is installed as a separately managed service / desktop app.
     auto_start: bool = False
@@ -279,19 +257,10 @@ class OllamaTarget(BaseModel):
     def serves(self, display_name: str) -> bool:
         return self.matching_model(display_name) is not None
 
-    def exposes(self, display_name: str) -> bool:
-        configured = self.matching_model(display_name)
-        if not configured:
-            return False
-        if self.expose_external is None:
-            return True
-        return _find_configured_model(configured, self.expose_external) is not None
-
 
 class LlamaCppDefaults(BaseModel):
     """Defaults inherited by each llama.cpp target unless overridden."""
 
-    expose_external: Optional[bool] = None
     auto_start: bool = False
     idle_timeout_seconds: Optional[float] = None
     startup_timeout_seconds: float = 120.0
@@ -341,7 +310,6 @@ class LlamaCppTarget(BaseModel):
     auth_token: str = ""
     model: str = ""
     model_alias: Optional[str] = None
-    expose_external: Optional[bool] = None
 
     # Optional lifecycle management. If ``auto_start`` is true and the health
     # check fails, fake-ollama runs ``start_command`` before forwarding the
@@ -403,13 +371,6 @@ class LlamaCppTarget(BaseModel):
                 values = [v for v in legacy_map.values() if v]
                 if len(values) == 1:
                     out["model_alias"] = values[0]
-
-        legacy_expose = out.get("expose_external")
-        if isinstance(legacy_expose, list):
-            model = str(out.get("model") or "")
-            out["expose_external"] = bool(
-                model and _find_configured_model(model, legacy_expose) is not None
-            )
         return out
 
     @field_validator("base_url")
@@ -446,11 +407,6 @@ class LlamaCppTarget(BaseModel):
     def with_defaults(self, defaults: LlamaCppDefaults) -> "LlamaCppTarget":
         return self.model_copy(
             update={
-                "expose_external": (
-                    self.expose_external
-                    if self.expose_external is not None
-                    else defaults.expose_external
-                ),
                 "auto_start": (
                     self.auto_start
                     if self.auto_start is not None
@@ -680,14 +636,6 @@ class LlamaCppTarget(BaseModel):
     def serves(self, display_name: str) -> bool:
         return self.matching_model(display_name) is not None
 
-    def exposes(self, display_name: str) -> bool:
-        configured = self.matching_model(display_name)
-        if not configured:
-            return False
-        if self.expose_external is None:
-            return True
-        return bool(self.expose_external)
-
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -744,6 +692,15 @@ class Settings(BaseModel):
     ollama_targets: List[OllamaTarget] = Field(default_factory=list)
     llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
     llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
+    # Per-interface exposed-model whitelists. Each entry is a composite
+    # ``model@target`` identifier; ``model`` here is the **display name**
+    # the target/upstream advertises (i.e. an entry from its ``models``
+    # list, not the wire-side id from ``model_map``). Default ``[]``
+    # means nothing is exposed on that interface; a fresh config must
+    # opt models in explicitly. ``None`` is reserved for "expose all"
+    # if you ever want it back; the admin UI normalises empty to ``[]``.
+    internal_exposed_models: List[str] = Field(default_factory=list)
+    external_exposed_models: List[str] = Field(default_factory=list)
     model_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
     # Web admin UI (mounted at /admin). Set to false to disable entirely.
@@ -754,32 +711,35 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "Settings":
-        if not self.upstreams and not self.openai_upstreams:
+        # All backend source names must be globally unique because they
+        # form the right-hand side of the composite ``model@target``
+        # identifier used by both /api/tags and routing. Allowing two
+        # sources to share a name would make composite identifiers
+        # ambiguous.
+        all_source_names: List[str] = []
+        for up in self.upstreams:
+            all_source_names.append(up.name)
+        for up in self.openai_upstreams:
+            all_source_names.append(up.name)
+        for t in self.ollama_targets:
+            all_source_names.append(t.name)
+        for t in self.llama_cpp_targets:
+            all_source_names.append(t.name or t.model)
+        dupes = sorted({n for n in all_source_names if all_source_names.count(n) > 1})
+        if dupes:
             raise ValueError(
-                "At least one upstream is required. Either set ANTHROPIC_BASE_URL "
-                "and ANTHROPIC_AUTH_TOKEN, or define an `upstreams` / "
-                "`openai_upstreams` array in config.json."
+                f"Duplicate source names across upstreams/openai_upstreams/"
+                f"ollama_targets/llama_cpp_targets: {dupes}. Source names "
+                f"are used as the target component of composite model IDs "
+                f"(model@target) and must be globally unique."
             )
-        names = [u.name for u in self.upstreams]
-        if len(set(names)) != len(names):
-            raise ValueError(f"Duplicate upstream names: {names}")
-        openai_names = [u.name for u in self.openai_upstreams]
-        if len(set(openai_names)) != len(openai_names):
-            raise ValueError(f"Duplicate openai_upstream names: {openai_names}")
-        cross = set(names) & set(openai_names)
-        if cross:
-            raise ValueError(
-                f"upstream and openai_upstream share names: {sorted(cross)}"
-            )
-        target_names = [t.name for t in self.ollama_targets]
-        if len(set(target_names)) != len(target_names):
-            raise ValueError(f"Duplicate ollama_target names: {target_names}")
-        llama_target_names = [t.name for t in self.llama_cpp_targets]
-        if len(set(llama_target_names)) != len(llama_target_names):
-            raise ValueError(f"Duplicate llama_cpp_target names: {llama_target_names}")
-        llama_models = [t.model for t in self.llama_cpp_targets]
-        if len(set(llama_models)) != len(llama_models):
-            raise ValueError(f"Duplicate llama_cpp_target models: {llama_models}")
+        # ``@`` is reserved as the composite-identifier separator.
+        for name in all_source_names:
+            if "@" in name:
+                raise ValueError(
+                    f"Source name {name!r} contains '@'; '@' is reserved "
+                    f"as the model/target separator in composite IDs."
+                )
         enabled_ports = {"internal": self.port}
         if self.external_port is not None:
             enabled_ports["external"] = self.external_port
@@ -827,73 +787,76 @@ class Settings(BaseModel):
     def dashboard_listener_enabled(self) -> bool:
         return self.dashboard_enabled and self.dashboard_port is not None
 
-    @property
-    def reverse_proxy_models(self) -> List[str]:
-        """Local target model names visible on /v1/* (subject to expose_external)."""
+    # -- Composite model identity ---------------------------------------
+    #
+    # Every model the user can talk to is identified globally by a
+    # composite ``model@target`` string, where ``model`` is the display
+    # name the source advertises and ``target`` is the source's ``name``.
+    # The composite form is the *only* form clients may send (bare model
+    # names are 400'd) and is what /api/tags / /v1/models expose. Inside
+    # routing we split composite -> (target_name, model) and look the
+    # backend up by target name directly.
+
+    COMPOSITE_SEP: str = "@"
+
+    @staticmethod
+    def compose_model_id(model: str, target: str) -> str:
+        return f"{model}@{target}"
+
+    @staticmethod
+    def split_composite(name: str) -> Optional[tuple[str, str]]:
+        """Split ``model@target`` into ``(model, target)``; ``None`` if not composite."""
+        if "@" not in name:
+            return None
+        model, _, target = name.rpartition("@")
+        if not model or not target:
+            return None
+        return model, target
+
+    def all_composite_ids(self) -> List[str]:
+        """Every ``model@target`` advertised by any configured source.
+
+        Order: ollama_targets → llama_cpp_targets → openai_upstreams →
+        anthropic upstreams; within each source the source's own model
+        order is preserved. Duplicates within one source are dropped.
+        """
+        out: List[str] = []
         seen: Dict[str, None] = {}
-        for t in self.ollama_targets:
-            allowed = t.models if t.expose_external is None else [
-                m for m in t.models if m in set(t.expose_external)
-            ]
-            for m in allowed:
-                if m not in seen:
-                    seen[m] = None
-        for raw_t in self.llama_cpp_targets:
-            t = self.effective_llama_cpp_target(raw_t)
-            if t.expose_external is False:
-                continue
-            for m in t.models:
-                if m not in seen:
-                    seen[m] = None
-        return list(seen.keys())
+        for backend in self.backends:
+            for model in backend.models:
+                cid = self.compose_model_id(model, backend.name)
+                if cid not in seen:
+                    seen[cid] = None
+                    out.append(cid)
+        return out
+
+    def exposed_composite_ids(self, surface: str) -> List[str]:
+        """Composite ids the given surface (``internal`` / ``external``) exposes.
+
+        Order matches ``all_composite_ids``; entries listed in the
+        per-surface whitelist but not actually backed by any source are
+        silently skipped.
+        """
+        if surface == "internal":
+            allowed = set(self.internal_exposed_models)
+        elif surface == "external":
+            allowed = set(self.external_exposed_models)
+        else:
+            raise ValueError(f"unknown surface: {surface!r}")
+        return [cid for cid in self.all_composite_ids() if cid in allowed]
+
+    def is_exposed(self, surface: str, composite_id: str) -> bool:
+        if surface == "internal":
+            return composite_id in self.internal_exposed_models
+        if surface == "external":
+            return composite_id in self.external_exposed_models
+        raise ValueError(f"unknown surface: {surface!r}")
 
     def is_valid_external_token(self, token: str) -> bool:
         """True iff ``token`` is in ``external_access_tokens``."""
         if not token:
             return False
         return token in self.external_access_tokens
-
-    @property
-    def externally_exposed_upstream_models(self) -> List[str]:
-        """Upstream model names visible on /v1/* (subject to expose_external)."""
-        seen: Dict[str, None] = {}
-        for up in self.upstreams:
-            allowed = up.models if up.expose_external is None else [
-                m for m in up.models if m in set(up.expose_external)
-            ]
-            for m in allowed:
-                if m not in seen:
-                    seen[m] = None
-        for up in self.openai_upstreams:
-            allowed = up.models if up.expose_external is None else [
-                m for m in up.models if m in set(up.expose_external)
-            ]
-            for m in allowed:
-                if m not in seen:
-                    seen[m] = None
-        return list(seen.keys())
-
-    def is_externally_exposed(self, display_name: str) -> bool:
-        """True iff a model is reachable on the /v1/* reverse-proxy surface.
-
-        Both ollama_targets and upstreams honour their own
-        ``expose_external`` whitelist (None = expose all, [] = none,
-        [...] = subset).
-        """
-        for t in self.ollama_targets:
-            if t.exposes(display_name):
-                return True
-        for raw_t in self.llama_cpp_targets:
-            t = self.effective_llama_cpp_target(raw_t)
-            if t.exposes(display_name):
-                return True
-        for up in self.upstreams:
-            if up.exposes(display_name):
-                return True
-        for up in self.openai_upstreams:
-            if up.exposes(display_name):
-                return True
-        return False
 
     @property
     def auth_required_for_v1(self) -> bool:
@@ -909,126 +872,51 @@ class Settings(BaseModel):
 
     @property
     def models(self) -> List[str]:
-        """Union of all upstream models, dedup, order preserved."""
-        seen: Dict[str, None] = {}
-        for up in self.upstreams:
-            for name in up.models:
-                if name not in seen:
-                    seen[name] = None
-        for up in self.openai_upstreams:
-            for name in up.models:
-                if name not in seen:
-                    seen[name] = None
-        return list(seen.keys())
-
-    @property
-    def upstream_url(self) -> str:
-        """First upstream's base_url. Kept for backwards compatibility."""
-        return self.upstreams[0].base_url if self.upstreams else ""
-
-    @property
-    def anthropic_auth_token(self) -> str:
-        """First upstream's token. Kept for backwards compatibility."""
-        return self.upstreams[0].auth_token if self.upstreams else ""
+        """All advertised composite model ids across every source."""
+        return self.all_composite_ids()
 
     # -- Routing helpers -------------------------------------------------
-
-    def upstream_for_model(self, display_name: str) -> Upstream:
-        """Return the upstream that should serve the given display name.
-
-        Falls back to the first upstream when no explicit match exists, so
-        unknown model names still get a sensible default route.
-        """
-        for up in self.upstreams:
-            if up.serves(display_name):
-                return up
-        return self.upstreams[0]
-
-    def upstream_name_for(self, display_name: str) -> str:
-        return self.upstream_for_model(display_name).name
-
-    def resolve_model(self, display_name: str) -> str:
-        return self.upstream_for_model(display_name).resolve_model(display_name)
-
-    # -- Reverse-proxy routing -------------------------------------------
-
-    def ollama_target_for(self, display_name: str):
-        """Return the OllamaTarget that should serve the given display name,
-        or ``None`` if no target serves it."""
-        for t in self.ollama_targets:
-            if t.serves(display_name):
-                return t
-        return None
-
-    def llama_cpp_target_for(self, display_name: str):
-        """Return the LlamaCppTarget that should serve the given display name,
-        or ``None`` if no target serves it."""
-        for t in self.llama_cpp_targets:
-            if t.serves(display_name):
-                return t
-        return None
-
-    def openai_upstream_for(self, display_name: str):
-        """Return the OpenAIUpstream that should serve the given display name,
-        or ``None`` if no remote OpenAI upstream serves it.
-
-        Routing precedence matches :pyattr:`backends` — local backends
-        (ollama_targets, llama_cpp_targets) win first; this helper only
-        finds matches among the configured ``openai_upstreams``.
-        """
-        for up in self.openai_upstreams:
-            if up.serves(display_name):
-                return up
-        return None
 
     def effective_llama_cpp_target(self, target: LlamaCppTarget) -> LlamaCppTarget:
         return target.with_defaults(self.llama_cpp_defaults)
 
-    def profile_for(self, display_name: str) -> ModelProfile:
-        raw = self.model_profiles.get(display_name)
-        if raw is None:
-            key = _find_configured_model(display_name, self.model_profiles.keys())
-            if key is not None:
-                raw = self.model_profiles.get(key)
-        if raw is None and ":" in display_name:
-            raw = self.model_profiles.get(_model_base(display_name))
-        if raw is None:
-            for up in self.upstreams:
-                configured = up.matching_model(display_name)
-                if configured and configured in self.model_profiles:
-                    raw = self.model_profiles[configured]
-                    break
-        if raw is None:
-            for target in self.ollama_targets:
-                configured = target.matching_model(display_name)
-                if configured and configured in self.model_profiles:
-                    raw = self.model_profiles[configured]
-                    break
-        if raw is None:
-            for target in self.llama_cpp_targets:
-                configured = target.matching_model(display_name)
-                if configured and configured in self.model_profiles:
-                    raw = self.model_profiles[configured]
-                    break
-        if raw is None:
-            return ModelProfile(
-                capabilities=list(DEFAULT_CAPABILITIES),
-                context_length=DEFAULT_CONTEXT_LENGTH,
-                max_output_tokens=None,
-            )
-        return ModelProfile.from_dict(raw)
+    def profile_for(self, composite_or_bare: str) -> ModelProfile:
+        """Look up a profile by composite ``model@target`` then fall back.
 
-    # -- Unified backends view (transitional) ----------------------------
-    #
-    # The on-disk config still has three separate lists
-    # (``upstreams`` / ``ollama_targets`` / ``llama_cpp_targets``) for
-    # backwards compatibility with the existing admin UI. Internally we
-    # expose a single ``backends`` list that tags each entry with a
-    # ``protocol`` (``anthropic`` / ``ollama`` / ``openai``) and a
-    # ``kind`` (``remote`` / ``local``). New code (routing in
-    # ``server.py``, future OpenAI upstream/target support) should drive
-    # off this unified view so adding a 4th backend type does not require
-    # another set of if/elif branches.
+        Lookup order:
+        1. Exact composite id (most specific).
+        2. Bare model name (generic default shared across all targets
+           that serve this model).
+        3. Tagless base of the bare model (Ollama-style; ``foo:latest``
+           falls back to ``foo``).
+
+        Returns the built-in defaults when nothing matches.
+        """
+        keys: List[str] = []
+        split = self.split_composite(composite_or_bare)
+        if split is not None:
+            model, _target = split
+            keys.append(composite_or_bare)
+            keys.append(model)
+            if ":" in model:
+                keys.append(_model_base(model))
+        else:
+            keys.append(composite_or_bare)
+            if ":" in composite_or_bare:
+                keys.append(_model_base(composite_or_bare))
+        for k in keys:
+            if k in self.model_profiles:
+                return ModelProfile.from_dict(self.model_profiles[k])
+            match = _find_configured_model(k, self.model_profiles.keys())
+            if match is not None:
+                return ModelProfile.from_dict(self.model_profiles[match])
+        return ModelProfile(
+            capabilities=list(DEFAULT_CAPABILITIES),
+            context_length=DEFAULT_CONTEXT_LENGTH,
+            max_output_tokens=None,
+        )
+
+    # -- Unified backends view -------------------------------------------
 
     @property
     def backends(self) -> List["Backend"]:
@@ -1055,30 +943,68 @@ class Settings(BaseModel):
             out.append(Backend.from_anthropic_upstream(up))
         return out
 
-    def backend_for(
-        self, display_name: str, *, surface: Optional[str] = None
-    ) -> Optional["Backend"]:
-        """Return the backend that should handle ``display_name`` on ``surface``.
-
-        Resolution order mirrors the historical behaviour of the three
-        legacy handlers:
-
-        1. ``ollama_targets`` — local Ollama-protocol backends serve first.
-        2. ``llama_cpp_targets`` — local OpenAI-protocol backends next.
-        3. ``upstreams`` — remote Anthropic-protocol fall-back.
-
-        When ``surface`` is provided (``"internal"`` or ``"external"``)
-        backends that do not expose ``display_name`` on that surface are
-        skipped, so a model hidden via ``expose_external`` is invisible
-        to the external listener.
-        """
+    def backend_by_name(self, target_name: str) -> Optional["Backend"]:
+        """Look up a backend by its source name (the right side of ``model@target``)."""
         for backend in self.backends:
-            if not backend.serves(display_name):
-                continue
-            if surface is not None and not backend.exposes_on(surface, display_name):
-                continue
-            return backend
+            if backend.name == target_name:
+                return backend
         return None
+
+    def resolve_request(
+        self, requested: str, *, surface: str
+    ) -> tuple["Backend", str]:
+        """Resolve a client-supplied model id on ``surface``.
+
+        ``requested`` must be a composite ``model@target`` string; bare
+        model names are rejected with ``ValueError`` carrying a
+        client-friendly message listing valid composite ids exposed on
+        the surface. The returned tuple is ``(backend, display_model)``
+        where ``display_model`` is the bare model name; callers feed it
+        through ``backend.resolve_model`` to get the wire-side id.
+        """
+        split = self.split_composite(requested)
+        if split is None:
+            exposed = self.exposed_composite_ids(surface)
+            raise ValueError(
+                f"model {requested!r} must be specified as 'model@target'; "
+                f"available on {surface}: {exposed}"
+            )
+        model, target_name = split
+        backend = self.backend_by_name(target_name)
+        if backend is None:
+            raise ValueError(
+                f"unknown target {target_name!r} in model id {requested!r}"
+            )
+        if not backend.serves(model):
+            raise ValueError(
+                f"target {target_name!r} does not serve model {model!r}"
+            )
+        composite_id = self.compose_model_id(model, target_name)
+        if not self.is_exposed(surface, composite_id):
+            raise ValueError(
+                f"model {composite_id!r} is not exposed on {surface}"
+            )
+        return backend, model
+
+    def backend_for(
+        self, composite_id: str, *, surface: Optional[str] = None
+    ) -> Optional["Backend"]:
+        """Return the backend that should handle ``composite_id`` on ``surface``.
+
+        ``composite_id`` is a ``model@target`` string. Returns ``None``
+        when the target is unknown, does not serve the named model, or
+        (when ``surface`` is given) is not exposed on that surface.
+        """
+        split = self.split_composite(composite_id)
+        if split is None:
+            return None
+        model, target_name = split
+        backend = self.backend_by_name(target_name)
+        if backend is None or not backend.serves(model):
+            return None
+        if surface is not None and not self.is_exposed(surface, composite_id):
+            return None
+        return backend
 
 
 # ---------------------------------------------------------------------------
@@ -1182,22 +1108,6 @@ class Backend:
     def resolve_model(self, display_name: str) -> str:
         return self.source.resolve_model(display_name)
 
-    def exposes_on(self, surface: str, display_name: str) -> bool:
-        """True iff ``display_name`` is visible on ``surface``.
-
-        ``surface`` is one of ``"internal"`` / ``"external"``.
-
-        * On ``internal`` every backend that ``serves(display_name)``
-          exposes it (the internal listener has no per-model gating).
-        * On ``external`` we honour the legacy ``expose_external``
-          whitelist semantics each source type already implements.
-        """
-        if surface == "internal":
-            return self.serves(display_name)
-        if surface == "external":
-            return bool(self.source.exposes(display_name))
-        raise ValueError(f"unknown surface: {surface!r}")
-
     # -- Lifecycle helpers ----------------------------------------------
 
     @property
@@ -1215,46 +1125,6 @@ class Backend:
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
-
-
-def _parse_bool(value: str) -> bool:
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
-_ENV_SCALARS: Dict[str, tuple] = {
-    "FAKE_OLLAMA_HOST": ("host", str),
-    "FAKE_OLLAMA_PORT": ("port", int),
-    "FAKE_OLLAMA_ADMIN_HOST": ("admin_host", str),
-    "FAKE_OLLAMA_ADMIN_PORT": ("admin_port", int),
-    "FAKE_OLLAMA_DASHBOARD_ENABLED": ("dashboard_enabled", _parse_bool),
-    "FAKE_OLLAMA_DASHBOARD_HOST": ("dashboard_host", str),
-    "FAKE_OLLAMA_DASHBOARD_PORT": ("dashboard_port", int),
-    "FAKE_OLLAMA_DASHBOARD_SAMPLE_INTERVAL_SECONDS": (
-        "dashboard_sample_interval_seconds",
-        float,
-    ),
-    "FAKE_OLLAMA_DASHBOARD_RETENTION_SECONDS": ("dashboard_retention_seconds", float),
-    "FAKE_OLLAMA_DASHBOARD_DATA_PATH": ("dashboard_data_path", str),
-    "FAKE_OLLAMA_DASHBOARD_MODEL_RECLAIM_ENABLED": (
-        "dashboard_model_reclaim_enabled",
-        _parse_bool,
-    ),
-    "FAKE_OLLAMA_VRAM_LOW_FREE_RECLAIM_ENABLED": (
-        "vram_low_free_reclaim_enabled",
-        _parse_bool,
-    ),
-    "FAKE_OLLAMA_VRAM_LOW_FREE_THRESHOLD_MIB": (
-        "vram_low_free_threshold_mib",
-        float,
-    ),
-    "FAKE_OLLAMA_EXTERNAL_HOST": ("external_host", str),
-    "FAKE_OLLAMA_EXTERNAL_PORT": ("external_port", int),
-    "FAKE_OLLAMA_ADVERTISED_VERSION": ("advertised_version", str),
-    "FAKE_OLLAMA_DEFAULT_MAX_TOKENS": ("default_max_tokens", int),
-    "FAKE_OLLAMA_TIMEOUT": ("timeout_seconds", float),
-    "FAKE_OLLAMA_USE_SYSTEM_PROXY": ("use_system_proxy", _parse_bool),
-    "FAKE_OLLAMA_ENFORCE_CONTEXT_LIMIT": ("enforce_context_limit", _parse_bool),
-}
 
 
 def _resolve_config_path(explicit: Optional[str | Path]) -> Optional[Path]:
@@ -1277,114 +1147,20 @@ def _read_json(path: Optional[Path]) -> Dict[str, Any]:
     return json.loads(raw)
 
 
-def _apply_env_overrides(data: Dict[str, Any]) -> Dict[str, Any]:
-    # Scalar overrides
-    for env_key, (field, caster) in _ENV_SCALARS.items():
-        if env_key in os.environ:
-            try:
-                data[field] = caster(os.environ[env_key])
-            except (TypeError, ValueError):
-                continue
-
-    # CSV-list override for external_access_tokens.
-    raw_tokens = os.getenv("FAKE_OLLAMA_EXTERNAL_ACCESS_TOKENS")
-    if raw_tokens is not None:
-        data["external_access_tokens"] = [
-            t.strip() for t in raw_tokens.split(",") if t.strip()
-        ]
-
-    # model_profiles via FAKE_OLLAMA_MODEL_PROFILES (JSON)
-    raw_profiles = os.getenv("FAKE_OLLAMA_MODEL_PROFILES")
-    if raw_profiles:
-        try:
-            data["model_profiles"] = json.loads(raw_profiles)
-        except json.JSONDecodeError:
-            pass
-
-    # Legacy single-upstream env vars. When set, they create or override the
-    # upstream named "default".
-    base_url = os.getenv("ANTHROPIC_BASE_URL")
-    auth = os.getenv("ANTHROPIC_AUTH_TOKEN")
-    if base_url and auth:
-        legacy_models_str = os.getenv("FAKE_OLLAMA_MODELS")
-        legacy_map_str = os.getenv("FAKE_OLLAMA_MODEL_MAP")
-        legacy_models = (
-            [m.strip() for m in legacy_models_str.split(",") if m.strip()]
-            if legacy_models_str
-            else []
-        )
-        legacy_map: Dict[str, str] = {}
-        if legacy_map_str:
-            try:
-                legacy_map = json.loads(legacy_map_str)
-            except json.JSONDecodeError:
-                legacy_map = {}
-        env_up = {
-            "name": LEGACY_UPSTREAM_NAME,
-            "base_url": base_url,
-            "auth_token": auth,
-            "models": legacy_models,
-            "model_map": legacy_map,
-        }
-        upstreams = list(data.get("upstreams") or [])
-        for i, up in enumerate(upstreams):
-            if up.get("name") == LEGACY_UPSTREAM_NAME:
-                merged = {**up, **env_up}
-                if not legacy_models and up.get("models"):
-                    merged["models"] = up["models"]
-                if not legacy_map and up.get("model_map"):
-                    merged["model_map"] = up["model_map"]
-                upstreams[i] = merged
-                break
-        else:
-            upstreams.insert(0, env_up)
-        data["upstreams"] = upstreams
-
-    return data
-
-
 def load_settings(config_path: Optional[str | Path] = None) -> Settings:
-    """Build a Settings object from JSON config + env vars."""
+    """Build a Settings object from JSON config.
+
+    All runtime knobs live in the config file (or are set via the admin
+    UI); the only environment variable consulted at load time is
+    ``FAKE_OLLAMA_CONFIG`` which selects the config-file path. Use
+    ``tests/conftest.py`` to inject test-only env if you need it.
+    """
     resolved = _resolve_config_path(config_path)
     data = _read_json(resolved)
-    data = _apply_env_overrides(data)
-    data = _migrate_legacy_target_tokens(data)
     settings = Settings(**data)
     if resolved is not None:
         settings = settings.model_copy(update={"config_path": str(resolved)})
     return settings
-
-
-def _migrate_legacy_target_tokens(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Hoist legacy per-target ``api_token`` into ``external_access_tokens``.
-
-    Older config.json files carried an ``api_token`` on each ollama_target.
-    The new model centralises the access-token list on the Settings; we keep
-    backward compat by lifting any non-empty per-target tokens into the
-    central list (deduped) and then dropping the legacy field so the
-    OllamaTarget validator does not warn about it.
-    """
-    targets = data.get("ollama_targets")
-    if not isinstance(targets, list):
-        return data
-    existing = list(data.get("external_access_tokens") or [])
-    seen = {t for t in existing if isinstance(t, str)}
-    migrated = False
-    for tgt in targets:
-        if not isinstance(tgt, dict):
-            continue
-        tok = tgt.pop("api_token", None)
-        if isinstance(tok, str) and tok and tok not in seen:
-            existing.append(tok)
-            seen.add(tok)
-            migrated = True
-    if migrated:
-        _LOG.warning(
-            "migrated legacy ollama_target.api_token into external_access_tokens; "
-            "please re-save config from the Web UI to make this permanent."
-        )
-        data["external_access_tokens"] = existing
-    return data
 
 
 @lru_cache(maxsize=1)

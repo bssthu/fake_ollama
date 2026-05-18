@@ -37,17 +37,19 @@ def test_request_data_log_records_http_and_backend_payloads(settings, tmp_path):
 
     try:
         app = create_app(settings)
-        mock = AnthropicClient(
-            settings.upstream_url,
-            settings.anthropic_auth_token,
-            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        )
-        app.state.clients = {up.name: mock for up in settings.upstreams}
+        transport = httpx.MockTransport(handler)
+        app.state.clients = {
+            up.name: AnthropicClient(
+                up.base_url, up.auth_token,
+                client=httpx.AsyncClient(transport=transport),
+            )
+            for up in settings.upstreams
+        }
         with TestClient(app) as client:
             resp = client.post(
                 "/api/chat",
                 json={
-                    "model": "claude-3-5-sonnet-20241022",
+                    "model": "claude-3-5-sonnet-20241022@default",
                     "messages": [{"role": "user", "content": "ping"}],
                     "stream": False,
                 },

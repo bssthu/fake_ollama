@@ -12,7 +12,6 @@ from types import FrameType
 from typing import Callable, Optional
 
 import uvicorn
-from dotenv import load_dotenv
 
 from .config import load_settings
 from .request_data_log import (
@@ -63,10 +62,6 @@ def _configure_logging(level_name: str, *, log_file: Optional[str]) -> None:
 
 
 def main() -> None:
-    # Load .env so ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / FAKE_OLLAMA_*
-    # variables are visible to the loader.
-    load_dotenv()
-
     parser = argparse.ArgumentParser(prog="fake-ollama")
     parser.add_argument(
         "--config",

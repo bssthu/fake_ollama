@@ -102,26 +102,62 @@ class _FakeLlamaCppClient:
 @pytest.fixture
 def reverse_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     """Settings with one upstream + one ollama_target serving 'llama3.1'."""
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://upstream.test")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tk")
-    monkeypatch.setenv("FAKE_OLLAMA_MODELS", "claude-3-5-sonnet-20241022")
-    s = load_settings()
-    # Inject an ollama target by constructing a new Settings instance.
-    data = s.model_dump()
-    data["external_access_tokens"] = ["rev-tk-1"]
-    data["ollama_targets"] = [
-        {
-            "name": "local",
-            "base_url": "http://127.0.0.1:11434",
-            "models": ["llama3.1"],
-            "model_map": {"llama3.1": "llama3.1:8b"},
-        }
-    ]
-    return Settings(**data)
+    return Settings(
+        upstreams=[
+            {
+                "name": "default",
+                "base_url": "http://upstream.test",
+                "auth_token": "tk",
+                "models": ["claude-3-5-sonnet-20241022"],
+            }
+        ],
+        ollama_targets=[
+            {
+                "name": "local",
+                "base_url": "http://127.0.0.1:11434",
+                "models": ["llama3.1"],
+                "model_map": {"llama3.1": "llama3.1:8b"},
+            }
+        ],
+        external_access_tokens=["rev-tk-1"],
+        internal_exposed_models=[
+            "claude-3-5-sonnet-20241022@default",
+            "llama3.1@local",
+        ],
+        external_exposed_models=[
+            "claude-3-5-sonnet-20241022@default",
+            "llama3.1@local",
+        ],
+    )
 
 
 # Header sent by all reverse-proxy tests below.
 _AUTH = {"x-api-key": "rev-tk-1"}
+
+
+def _expose_all(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Auto-populate internal/external_exposed_models for every backend's models.
+
+    Lets bulk-rewritten tests construct ``Settings(**_expose_all(data))``
+    without manually listing composite ids.
+    """
+    exposed: List[str] = []
+    for section in ("upstreams", "openai_upstreams", "ollama_targets"):
+        for src in data.get(section, []) or []:
+            name = src["name"]
+            for m in src.get("models", []) or []:
+                exposed.append(f"{m}@{name}")
+    for tgt in data.get("llama_cpp_targets", []) or []:
+        name = tgt["name"]
+        m = tgt.get("model")
+        if m:
+            exposed.append(f"{m}@{name}")
+    # Union with any caller-provided lists.
+    existing_int = set(data.get("internal_exposed_models") or [])
+    existing_ext = set(data.get("external_exposed_models") or [])
+    data["internal_exposed_models"] = sorted(existing_int | set(exposed))
+    data["external_exposed_models"] = sorted(existing_ext | set(exposed))
+    return data
 
 
 def _build_client(
@@ -146,12 +182,13 @@ def _build_client(
         else {}
     )
     if upstream_transport is not None:
-        mock = AnthropicClient(
-            settings.upstream_url,
-            settings.anthropic_auth_token,
-            client=httpx.AsyncClient(transport=upstream_transport),
-        )
-        app.state.clients = {up.name: mock for up in settings.upstreams}
+        app.state.clients = {
+            up.name: AnthropicClient(
+                up.base_url, up.auth_token,
+                client=httpx.AsyncClient(transport=upstream_transport),
+            )
+            for up in settings.upstreams
+        }
     return TestClient(app, base_url=base_url)
 
 
@@ -177,7 +214,7 @@ def test_reverse_non_stream_text(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -185,7 +222,7 @@ def test_reverse_non_stream_text(reverse_settings):
     assert resp.status_code == 200
     body = resp.json()
     assert body["role"] == "assistant"
-    assert body["model"] == "llama3.1"
+    assert body["model"] == "llama3.1@local"
     assert body["stop_reason"] == "end_turn"
     assert body["content"] == [{"type": "text", "text": "hi there"}]
     assert body["usage"] == {"input_tokens": 7, "output_tokens": 3}
@@ -199,7 +236,7 @@ def test_reverse_non_stream_text(reverse_settings):
 def test_reverse_target_passes_per_model_estimated_vram(reverse_settings):
     data = reverse_settings.model_dump()
     data["model_profiles"] = {"llama3.1": {"estimated_vram_gb": 6.5}}
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient(
         chat_response={
             "model": "llama3.1:8b",
@@ -213,7 +250,7 @@ def test_reverse_target_passes_per_model_estimated_vram(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -226,7 +263,7 @@ def test_reverse_target_passes_per_model_estimated_vram(reverse_settings):
 def test_reverse_count_tokens_estimates_for_ollama_target(reverse_settings):
     client = _build_client(reverse_settings)
     payload = {
-        "model": "llama3.1",
+        "model": "llama3.1@local",
         "messages": [
             {
                 "role": "user",
@@ -274,7 +311,7 @@ def test_reverse_messages_returns_anthropic_error_for_insufficient_vram(reverse_
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -309,7 +346,7 @@ def test_reverse_count_tokens_passthrough_to_upstream(reverse_settings):
             "/v1/messages/count_tokens?beta=true",
             headers=_AUTH,
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "max_tokens": 100,
                 "stream": True,
                 "messages": [{"role": "user", "content": "hello"}],
@@ -321,6 +358,8 @@ def test_reverse_count_tokens_passthrough_to_upstream(reverse_settings):
     assert captured["path"] == "/v1/messages/count_tokens"
     assert captured["query"] == "beta=true"
     assert captured["headers"]["x-api-key"] == "tk"
+    # The composite ``@default`` suffix is fake-ollama routing syntax
+    # and must be stripped before talking to a real Anthropic upstream.
     assert captured["body"] == {
         "model": "claude-3-5-sonnet-20241022",
         "messages": [{"role": "user", "content": "hello"}],
@@ -343,7 +382,7 @@ def test_reverse_forwards_base64_image_to_ollama(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 100,
                 "messages": [
                     {
@@ -379,7 +418,7 @@ def test_reverse_target_disables_ollama_thinking_from_profile(reverse_settings):
             "show_thinking": False,
         }
     }
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient(
         chat_response={
             "model": "llama3.1:8b",
@@ -394,7 +433,7 @@ def test_reverse_target_disables_ollama_thinking_from_profile(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -415,7 +454,7 @@ def test_reverse_target_profile_disabled_overrides_client_thinking_enabled(
             "show_thinking": True,
         }
     }
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient(
         chat_response={
             "model": "llama3.1:8b",
@@ -430,7 +469,7 @@ def test_reverse_target_profile_disabled_overrides_client_thinking_enabled(
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 100,
                 "thinking": {"type": "enabled", "budget_tokens": 99},
                 "messages": [{"role": "user", "content": "hello"}],
@@ -452,7 +491,7 @@ def test_reverse_target_profile_enabled_overrides_client_thinking_disabled(
             "show_thinking": True,
         }
     }
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient(
         chat_response={
             "model": "llama3.1:8b",
@@ -467,7 +506,7 @@ def test_reverse_target_profile_enabled_overrides_client_thinking_disabled(
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 100,
                 "thinking": {"type": "disabled"},
                 "messages": [{"role": "user", "content": "hello"}],
@@ -487,7 +526,7 @@ def test_openai_target_disables_ollama_thinking_from_profile(reverse_settings):
             "show_thinking": False,
         }
     }
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient(
         chat_response={
             "model": "llama3.1:8b",
@@ -501,7 +540,7 @@ def test_openai_target_disables_ollama_thinking_from_profile(reverse_settings):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": False,
             },
@@ -527,7 +566,7 @@ def test_openai_chat_non_stream_routes_to_ollama_target(reverse_settings):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "messages": [
                     {"role": "system", "content": "be brief"},
                     {"role": "user", "content": "hello"},
@@ -540,7 +579,7 @@ def test_openai_chat_non_stream_routes_to_ollama_target(reverse_settings):
     assert resp.status_code == 200
     body = resp.json()
     assert body["object"] == "chat.completion"
-    assert body["model"] == "llama3.1"
+    assert body["model"] == "llama3.1@local"
     assert body["choices"][0]["message"]["content"] == "hi from local"
     assert body["usage"] == {
         "prompt_tokens": 6,
@@ -571,7 +610,7 @@ def test_openai_chat_image_routes_to_ollama_target(reverse_settings):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "messages": [
                     {
                         "role": "user",
@@ -617,7 +656,7 @@ def test_openai_chat_stream_routes_to_ollama_target(reverse_settings):
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": True,
             },
@@ -649,7 +688,7 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
         }
     ]
     data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeLlamaCppClient(
         chat_response={
             "id": "chatcmpl_local",
@@ -675,7 +714,7 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.6",
+                "model": "qwen3.6@qwen36",
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -683,7 +722,7 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["model"] == "qwen3.6"
+    assert body["model"] == "qwen3.6@qwen36"
     assert body["content"] == [{"type": "text", "text": "hi from llama.cpp"}]
     assert body["usage"] == {"input_tokens": 8, "output_tokens": 4}
     sent = fake.last_chat_payload
@@ -707,7 +746,7 @@ def test_reverse_llama_cpp_profile_disabled_overrides_client_thinking_enabled(
             "show_thinking": False,
         }
     }
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeLlamaCppClient(
         chat_response={
             "id": "chatcmpl_local",
@@ -729,7 +768,7 @@ def test_reverse_llama_cpp_profile_disabled_overrides_client_thinking_enabled(
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.6",
+                "model": "qwen3.6@qwen36",
                 "max_tokens": 100,
                 "thinking": {"type": "enabled", "budget_tokens": 99},
                 "messages": [{"role": "user", "content": "hello"}],
@@ -746,7 +785,7 @@ def test_reverse_llama_cpp_auto_honors_client_thinking_enabled(reverse_settings)
         {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
     ]
     data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeLlamaCppClient(
         chat_response={
             "id": "chatcmpl_local",
@@ -768,7 +807,7 @@ def test_reverse_llama_cpp_auto_honors_client_thinking_enabled(reverse_settings)
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.6",
+                "model": "qwen3.6@qwen36",
                 "max_tokens": 100,
                 "thinking": {"type": "enabled", "budget_tokens": 99},
                 "messages": [{"role": "user", "content": "hello"}],
@@ -787,7 +826,7 @@ def test_reverse_non_stream_salvages_reasoning_tool_call_from_llama_cpp(
         {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
     ]
     data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeLlamaCppClient(
         chat_response={
             "id": "chatcmpl_local",
@@ -824,7 +863,7 @@ def test_reverse_non_stream_salvages_reasoning_tool_call_from_llama_cpp(
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.6",
+                "model": "qwen3.6@qwen36",
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -848,7 +887,7 @@ def test_reverse_forwards_base64_image_to_llama_cpp(reverse_settings):
     data["llama_cpp_targets"] = [
         {"name": "qwen36", "model": "qwen3.6", "base_url": "http://x.test"}
     ]
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeLlamaCppClient(
         chat_response={
             "choices": [
@@ -866,7 +905,7 @@ def test_reverse_forwards_base64_image_to_llama_cpp(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.6",
+                "model": "qwen3.6@qwen36",
                 "max_tokens": 100,
                 "messages": [
                     {
@@ -912,7 +951,7 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
             "model_alias": "qwen3.6-alias",
         }
     ]
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeLlamaCppClient(
         chat_response={
             "id": "chatcmpl_local",
@@ -932,14 +971,14 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "qwen3.6",
+                "model": "qwen3.6@qwen36",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": False,
             },
         )
 
     assert resp.status_code == 200
-    assert resp.json()["model"] == "qwen3.6"
+    assert resp.json()["model"] == "qwen3.6@qwen36"
     assert resp.json()["choices"][0]["message"]["content"] == "direct openai"
     assert fake.last_chat_payload["model"] == "qwen3.6-alias"
 
@@ -950,7 +989,7 @@ def test_reverse_streaming_routes_to_llama_cpp_target(reverse_settings):
         {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
     ]
     data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeLlamaCppClient(
         stream_chunks=[
             {
@@ -983,7 +1022,7 @@ def test_reverse_streaming_routes_to_llama_cpp_target(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.6",
+                "model": "qwen3.6@qwen36",
                 "stream": True,
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -1007,7 +1046,7 @@ def test_reverse_streaming_salvages_reasoning_tool_call_from_llama_cpp(
         {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
     ]
     data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeLlamaCppClient(
         stream_chunks=[
             {
@@ -1066,7 +1105,7 @@ def test_reverse_streaming_salvages_reasoning_tool_call_from_llama_cpp(
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.6",
+                "model": "qwen3.6@qwen36",
                 "stream": True,
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -1111,20 +1150,20 @@ def test_v1_models_includes_llama_cpp_targets_when_authed(reverse_settings):
     data["llama_cpp_targets"] = [
         {"name": "qwen36", "base_url": "http://127.0.0.1:21436", "model": "qwen3.6"}
     ]
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     client = _build_client(settings, fake_llama_cpp=_FakeLlamaCppClient())
     with client:
         r = client.get("/v1/models", headers=_AUTH)
     assert r.status_code == 200
     ids = [m["id"] for m in r.json()["data"]]
-    assert "qwen3.6" in ids
+    assert "qwen3.6@qwen36" in ids
 
 
 def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
     data = reverse_settings.model_dump()
     data["external_host"] = "127.0.0.1"
     data["external_port"] = 21435
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient()
     captured: Dict[str, Any] = {}
 
@@ -1137,7 +1176,7 @@ def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "text", "text": "from upstream"}],
-                "model": "llama3.1",
+                "model": "claude-3-5-sonnet-20241022",
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 2, "output_tokens": 2},
             },
@@ -1153,7 +1192,7 @@ def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "llama3.1",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": False,
             },
@@ -1161,7 +1200,7 @@ def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
 
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["message"]["content"] == "from upstream"
-    assert captured["body"]["model"] == "llama3.1"
+    assert captured["body"]["model"] == "claude-3-5-sonnet-20241022"
     assert fake.last_chat_payload is None
 
 
@@ -1169,7 +1208,7 @@ def test_openai_chat_external_port_routes_to_ollama_target(reverse_settings):
     data = reverse_settings.model_dump()
     data["external_host"] = "127.0.0.1"
     data["external_port"] = 21435
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient(
         chat_response={
             "model": "llama3.1:8b",
@@ -1193,7 +1232,7 @@ def test_openai_chat_external_port_routes_to_ollama_target(reverse_settings):
             "/v1/chat/completions",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": False,
             },
@@ -1206,11 +1245,12 @@ def test_openai_chat_external_port_routes_to_ollama_target(reverse_settings):
 
 def test_reverse_tagless_alias_routes_to_tagged_ollama_target(reverse_settings):
     data = reverse_settings.model_dump()
-    data["upstreams"][0]["expose_external"] = []
     data["ollama_targets"][0]["models"] = ["qwen3.5-2b:latest"]
     data["ollama_targets"][0]["model_map"] = {}
-    data["ollama_targets"][0]["expose_external"] = ["qwen3.5-2b:latest"]
-    settings = Settings(**data)
+    # Tagless alias: expose both forms so a bare request can be routed.
+    data["internal_exposed_models"] = ["qwen3.5-2b@local"]
+    data["external_exposed_models"] = ["qwen3.5-2b@local"]
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient(
         chat_response={
             "model": "qwen3.5-2b:latest",
@@ -1225,7 +1265,7 @@ def test_reverse_tagless_alias_routes_to_tagged_ollama_target(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.5-2b",
+                "model": "qwen3.5-2b@local",
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -1233,7 +1273,7 @@ def test_reverse_tagless_alias_routes_to_tagged_ollama_target(reverse_settings):
 
     assert resp.status_code == 200
     assert fake.last_chat_payload["model"] == "qwen3.5-2b:latest"
-    assert resp.json()["model"] == "qwen3.5-2b"
+    assert resp.json()["model"] == "qwen3.5-2b@local"
 
 
 def test_reverse_tagless_alias_does_not_route_to_non_latest_tag(reverse_settings):
@@ -1242,7 +1282,7 @@ def test_reverse_tagless_alias_does_not_route_to_non_latest_tag(reverse_settings
     data["ollama_targets"][0]["models"] = ["qwen3.6-27b:q2_k_p"]
     data["ollama_targets"][0]["model_map"] = {}
     data["ollama_targets"][0]["expose_external"] = ["qwen3.6-27b:q2_k_p"]
-    settings = Settings(**data)
+    settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient()
     client = _build_client(settings, fake_ollama=fake)
     with client:
@@ -1250,7 +1290,7 @@ def test_reverse_tagless_alias_does_not_route_to_non_latest_tag(reverse_settings
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "qwen3.6-27b",
+                "model": "qwen3.6-27b@local",
                 "max_tokens": 100,
                 "messages": [{"role": "user", "content": "hello"}],
             },
@@ -1289,7 +1329,7 @@ def test_reverse_non_stream_tool_use(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 64,
                 "tools": [
                     {
@@ -1338,7 +1378,7 @@ def test_reverse_streaming(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "stream": True,
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -1390,7 +1430,7 @@ def test_reverse_streaming_tool_use(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "stream": True,
                 "max_tokens": 20,
                 "messages": [{"role": "user", "content": "go"}],
@@ -1418,7 +1458,7 @@ def test_reverse_passthrough_when_no_target(reverse_settings):
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "text", "text": "from upstream"}],
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 1, "output_tokens": 2},
             },
@@ -1433,7 +1473,7 @@ def test_reverse_passthrough_when_no_target(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "hi"}],
             },
@@ -1471,7 +1511,7 @@ def test_reverse_tool_result_to_tool_role(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "llama3.1",
+                "model": "llama3.1@local",
                 "max_tokens": 10,
                 "messages": [
                     {"role": "user", "content": "weather?"},
@@ -1513,7 +1553,7 @@ def test_reverse_missing_token_returns_401(reverse_settings):
     )
     client = _build_client(reverse_settings, fake_ollama=fake)
     payload = {
-        "model": "llama3.1",
+        "model": "llama3.1@local",
         "max_tokens": 5,
         "messages": [{"role": "user", "content": "hi"}],
     }
@@ -1549,33 +1589,44 @@ def test_reverse_token_required_in_settings():
             }
         ],
         ollama_targets=[
-            {"name": "local", "models": ["llama3.1"], "api_token": "ignored"}
+            {
+                "name": "local",
+                "base_url": "http://127.0.0.1:11434",
+                "models": ["llama3.1"],
+                "api_token": "ignored",
+            }
         ],
+        internal_exposed_models=["m@u", "llama3.1@local"],
+        external_exposed_models=["m@u", "llama3.1@local"],
     )
     # Target is routable regardless of legacy api_token.
-    assert s.ollama_target_for("llama3.1") is not None
+    assert s.backend_for("llama3.1@local") is not None
     # No central tokens -> no auth required for /v1/* (legacy permissive mode).
     assert s.auth_required_for_v1 is False
     assert s.is_valid_external_token("ignored") is False
 
 
-def test_legacy_target_api_token_is_migrated(tmp_path, monkeypatch):
-    """Loading config.json with legacy per-target ``api_token`` hoists it."""
+def test_legacy_target_api_token_is_silently_dropped(tmp_path, monkeypatch):
+    """Loading config.json with legacy per-target ``api_token`` no longer
+    migrates it; auth tokens must be set centrally."""
     cfg = tmp_path / "config.json"
     cfg.write_text(
         json.dumps({
             "upstreams": [{"name": "u", "base_url": "http://x.test",
                            "auth_token": "t", "models": ["m"]}],
             "ollama_targets": [
-                {"name": "local", "models": ["llama3.1"], "api_token": "legacy-tk"}
+                {"name": "local", "base_url": "http://127.0.0.1:11434",
+                 "models": ["llama3.1"], "api_token": "legacy-tk"}
             ],
+            "internal_exposed_models": ["m@u", "llama3.1@local"],
+            "external_exposed_models": ["m@u", "llama3.1@local"],
         }),
         encoding="utf-8",
     )
     monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
     s = load_settings()
-    assert "legacy-tk" in s.external_access_tokens
-    assert s.is_valid_external_token("legacy-tk")
+    assert s.external_access_tokens == []
+    assert s.backend_for("llama3.1@local") is not None
 
 
 def test_v1_models_includes_reverse_targets_when_authed(reverse_settings):
@@ -1588,47 +1639,51 @@ def test_v1_models_includes_reverse_targets_when_authed(reverse_settings):
         r = client.get("/v1/models", headers=_AUTH)
         assert r.status_code == 200
         ids = [m["id"] for m in r.json()["data"]]
-        assert "llama3.1" in ids
-        assert "claude-3-5-sonnet-20241022" in ids
+        assert "llama3.1@local" in ids
+        assert "claude-3-5-sonnet-20241022@default" in ids
 
 
-def test_v1_models_open_when_no_tokens(monkeypatch):
-    """No external_access_tokens -> /v1/models requires no auth (legacy mode)."""
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://upstream.test")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tk")
-    monkeypatch.setenv("FAKE_OLLAMA_MODELS", "m1")
+def test_v1_models_open_when_no_tokens(tmp_path, monkeypatch):
+    """No external_access_tokens -> /v1/models requires no auth."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps({
+            "upstreams": [{"name": "u", "base_url": "http://upstream.test",
+                           "auth_token": "tk", "models": ["m1"]}],
+            "internal_exposed_models": ["m1@u"],
+            "external_exposed_models": ["m1@u"],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
     s = load_settings()
     client = _build_client(s, fake_ollama=_FakeOllamaClient())
     with client:
         r = client.get("/v1/models")
         assert r.status_code == 200
         ids = [m["id"] for m in r.json()["data"]]
-        assert "m1" in ids
+        assert "m1@u" in ids
 
 
 def test_expose_external_hides_upstream_models(reverse_settings):
-    """Setting expose_external=[] on an upstream hides its models from /v1/*."""
+    """Removing a composite id from external_exposed_models hides it from /v1/*."""
     data = reverse_settings.model_dump()
-    # Hide all upstream models from the external surface.
-    for up in data["upstreams"]:
-        up["expose_external"] = []
+    # Keep the upstream model in internal but hide it from external.
+    data["external_exposed_models"] = ["llama3.1@local"]
     s = Settings(**data)
     client = _build_client(s, fake_ollama=_FakeOllamaClient())
     with client:
         r = client.get("/v1/models", headers=_AUTH)
         assert r.status_code == 200
         ids = [m["id"] for m in r.json()["data"]]
-        # Reverse-proxy target still listed (always exposed).
-        assert "llama3.1" in ids
-        # Upstream model is hidden.
-        assert "claude-3-5-sonnet-20241022" not in ids
+        assert "llama3.1@local" in ids
+        assert "claude-3-5-sonnet-20241022@default" not in ids
 
 
 def test_expose_external_blocks_passthrough(reverse_settings):
     """A non-exposed upstream model gets 404 on /v1/messages passthrough."""
     data = reverse_settings.model_dump()
-    for up in data["upstreams"]:
-        up["expose_external"] = []
+    data["external_exposed_models"] = ["llama3.1@local"]
     s = Settings(**data)
 
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
@@ -1640,7 +1695,7 @@ def test_expose_external_blocks_passthrough(reverse_settings):
             "/v1/messages",
             headers=_AUTH,
             json={
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-3-5-sonnet-20241022@default",
                 "max_tokens": 10,
                 "messages": [{"role": "user", "content": "hi"}],
             },
@@ -1649,14 +1704,17 @@ def test_expose_external_blocks_passthrough(reverse_settings):
 
 
 def test_expose_external_explicit_subset(reverse_settings):
-    """Only display names in expose_external are visible."""
+    """Only composite ids in external_exposed_models are visible."""
     data = reverse_settings.model_dump()
     data["upstreams"][0]["models"] = ["public-m", "private-m"]
-    data["upstreams"][0]["expose_external"] = ["public-m"]
+    data["external_exposed_models"] = ["public-m@default"]
+    data["internal_exposed_models"] = [
+        "public-m@default", "private-m@default", "llama3.1@local",
+    ]
     s = Settings(**data)
     client = _build_client(s, fake_ollama=_FakeOllamaClient())
     with client:
         r = client.get("/v1/models", headers=_AUTH)
         ids = [m["id"] for m in r.json()["data"]]
-        assert "public-m" in ids
-        assert "private-m" not in ids
+        assert "public-m@default" in ids
+        assert "private-m@default" not in ids

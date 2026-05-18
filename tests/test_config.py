@@ -1,4 +1,4 @@
-"""Tests for the JSON-based config loader and multi-upstream routing."""
+"""Tests for the JSON-based config loader and composite-id routing."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fake_ollama.anthropic_client import AnthropicClient
-from fake_ollama.config import LEGACY_UPSTREAM_NAME, Settings, load_settings
+from fake_ollama.config import Settings, load_settings
 from fake_ollama.server import create_app
 
 
@@ -37,10 +37,6 @@ def test_loads_from_json_file(tmp_path, monkeypatch):
         },
     )
     monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("FAKE_OLLAMA_MODELS", raising=False)
-    monkeypatch.delenv("FAKE_OLLAMA_DEFAULT_MAX_TOKENS", raising=False)
 
     s = load_settings()
     assert s.host == "0.0.0.0"
@@ -49,57 +45,12 @@ def test_loads_from_json_file(tmp_path, monkeypatch):
     assert len(s.upstreams) == 1
     up = s.upstreams[0]
     assert up.name == "anthropic"
-    # base_url trailing slash gets stripped
+    # trailing slash stripped
     assert up.base_url == "https://api.example.com"
     assert up.auth_token == "json-token"
-    assert s.models == ["claude-x", "claude-y"]
-
-
-def test_env_vars_override_json(tmp_path, monkeypatch):
-    cfg = tmp_path / "config.json"
-    _write_config(
-        cfg,
-        {
-            "port": 31434,
-            "upstreams": [
-                {
-                    "name": LEGACY_UPSTREAM_NAME,
-                    "base_url": "https://json-only.example.com",
-                    "auth_token": "json-token",
-                    "models": ["json-model"],
-                }
-            ],
-        },
-    )
-    monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
-    monkeypatch.setenv("FAKE_OLLAMA_PORT", "41434")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://env-wins.example.com")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
-    monkeypatch.delenv("FAKE_OLLAMA_MODELS", raising=False)
-    monkeypatch.delenv("FAKE_OLLAMA_MODEL_MAP", raising=False)
-
-    s = load_settings()
-    assert s.port == 41434
-    # The "default" upstream should be merged: env wins for url + token, but
-    # models came from JSON because env didn't supply any.
-    default = s.upstreams[0]
-    assert default.name == LEGACY_UPSTREAM_NAME
-    assert default.base_url == "https://env-wins.example.com"
-    assert default.auth_token == "env-token"
-    assert default.models == ["json-model"]
-
-
-def test_legacy_env_only_creates_default_upstream(monkeypatch):
-    monkeypatch.setenv("FAKE_OLLAMA_CONFIG", "/no/such/path.json")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://legacy.example.com")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "legacy")
-    monkeypatch.setenv("FAKE_OLLAMA_MODELS", "claude-3-5-sonnet-20241022")
-
-    s = load_settings()
-    assert len(s.upstreams) == 1
-    assert s.upstreams[0].name == LEGACY_UPSTREAM_NAME
-    assert s.upstreams[0].base_url == "http://legacy.example.com"
-    assert s.upstreams[0].models == ["claude-3-5-sonnet-20241022"]
+    # Composite ids reflect (model, target)
+    assert s.all_composite_ids() == ["claude-x@anthropic", "claude-y@anthropic"]
+    assert s.models == ["claude-x@anthropic", "claude-y@anthropic"]
 
 
 def test_admin_listener_defaults_and_legacy_null_mode():
@@ -164,15 +115,51 @@ def test_listener_ports_must_be_distinct():
         )
 
 
-def test_no_upstream_raises(monkeypatch, tmp_path):
-    monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(tmp_path / "missing.json"))
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-    with pytest.raises(Exception):
-        load_settings()
+def test_empty_config_is_allowed():
+    # No upstreams / targets at all is now valid; the server simply has no
+    # exposed models.
+    s = Settings()
+    assert s.all_composite_ids() == []
+    assert s.exposed_composite_ids("internal") == []
+    assert s.exposed_composite_ids("external") == []
 
 
-def test_resolve_model_respects_per_upstream_map(monkeypatch, tmp_path):
+def test_source_names_must_be_unique_across_kinds():
+    with pytest.raises(ValueError, match="unique"):
+        Settings(
+            upstreams=[
+                {
+                    "name": "shared",
+                    "base_url": "https://a",
+                    "auth_token": "x",
+                    "models": ["m"],
+                }
+            ],
+            ollama_targets=[
+                {
+                    "name": "shared",
+                    "base_url": "http://127.0.0.1:11434",
+                    "models": ["n"],
+                }
+            ],
+        )
+
+
+def test_source_names_reject_at_sign():
+    with pytest.raises(ValueError, match="@"):
+        Settings(
+            upstreams=[
+                {
+                    "name": "weird@name",
+                    "base_url": "https://a",
+                    "auth_token": "x",
+                    "models": ["m"],
+                }
+            ]
+        )
+
+
+def test_resolve_request_routes_to_correct_upstream(monkeypatch, tmp_path):
     cfg = tmp_path / "config.json"
     _write_config(
         cfg,
@@ -192,22 +179,118 @@ def test_resolve_model_respects_per_upstream_map(monkeypatch, tmp_path):
                     "models": ["dpsk"],
                     "model_map": {"dpsk": "deepseek-v4-pro"},
                 },
-            ]
+            ],
+            "internal_exposed_models": ["sonnet@anthropic", "dpsk@deepseek"],
         },
     )
     monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-
     s = load_settings()
-    assert s.models == ["sonnet", "dpsk"]
-    assert s.upstream_name_for("sonnet") == "anthropic"
-    assert s.upstream_name_for("dpsk") == "deepseek"
-    assert s.resolve_model("sonnet") == "claude-3-5-sonnet-20241022"
-    assert s.resolve_model("dpsk") == "deepseek-v4-pro"
+    assert s.all_composite_ids() == ["sonnet@anthropic", "dpsk@deepseek"]
+
+    backend_a, real_a = s.resolve_request("sonnet@anthropic", surface="internal")
+    assert backend_a.name == "anthropic"
+    assert real_a == "sonnet"
+    assert backend_a.source.resolve_model(real_a) == "claude-3-5-sonnet-20241022"
+
+    backend_d, real_d = s.resolve_request("dpsk@deepseek", surface="internal")
+    assert backend_d.name == "deepseek"
+    assert real_d == "dpsk"
+    assert backend_d.source.resolve_model(real_d) == "deepseek-v4-pro"
 
 
-def test_tagless_request_matches_configured_tagged_model():
+def test_resolve_request_rejects_bare_model_with_helpful_error():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "anthropic",
+                "base_url": "https://a",
+                "auth_token": "x",
+                "models": ["sonnet"],
+            },
+            {
+                "name": "deepseek",
+                "base_url": "https://d",
+                "auth_token": "y",
+                "models": ["dpsk"],
+            },
+        ],
+        internal_exposed_models=["sonnet@anthropic", "dpsk@deepseek"],
+    )
+    with pytest.raises(ValueError) as exc:
+        s.resolve_request("sonnet", surface="internal")
+    msg = str(exc.value)
+    assert "model@target" in msg
+    assert "sonnet@anthropic" in msg
+
+
+def test_resolve_request_rejects_unknown_target():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u1",
+                "base_url": "https://a",
+                "auth_token": "x",
+                "models": ["m"],
+            }
+        ],
+        internal_exposed_models=["m@u1"],
+    )
+    with pytest.raises(ValueError, match="unknown target"):
+        s.resolve_request("m@u2", surface="internal")
+
+
+def test_resolve_request_rejects_model_not_served_by_target():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u1",
+                "base_url": "https://a",
+                "auth_token": "x",
+                "models": ["m1"],
+            }
+        ],
+        internal_exposed_models=["m1@u1"],
+    )
+    with pytest.raises(ValueError, match="does not serve"):
+        s.resolve_request("m2@u1", surface="internal")
+
+
+def test_resolve_request_rejects_unexposed_model():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u1",
+                "base_url": "https://a",
+                "auth_token": "x",
+                "models": ["m1"],
+            }
+        ],
+        internal_exposed_models=[],
+    )
+    with pytest.raises(ValueError, match="not exposed"):
+        s.resolve_request("m1@u1", surface="internal")
+
+
+def test_exposed_surfaces_are_independent():
+    s = Settings(
+        upstreams=[
+            {
+                "name": "u1",
+                "base_url": "https://a",
+                "auth_token": "x",
+                "models": ["m1", "m2"],
+            }
+        ],
+        internal_exposed_models=["m1@u1", "m2@u1"],
+        external_exposed_models=["m1@u1"],
+    )
+    assert s.exposed_composite_ids("internal") == ["m1@u1", "m2@u1"]
+    assert s.exposed_composite_ids("external") == ["m1@u1"]
+    assert s.is_exposed("external", "m1@u1") is True
+    assert s.is_exposed("external", "m2@u1") is False
+
+
+def test_tagless_model_match_via_latest_alias():
     s = Settings(
         upstreams=[
             {
@@ -217,6 +300,7 @@ def test_tagless_request_matches_configured_tagged_model():
                 "models": ["qwen3.5-2b:latest"],
             }
         ],
+        internal_exposed_models=["qwen3.5-2b:latest@tagged"],
         model_profiles={
             "qwen3.5-2b:latest": {
                 "capabilities": ["completion", "tools"],
@@ -224,64 +308,13 @@ def test_tagless_request_matches_configured_tagged_model():
             }
         },
     )
-
-    assert s.upstream_name_for("qwen3.5-2b") == "tagged"
-    assert s.resolve_model("qwen3.5-2b") == "qwen3.5-2b:latest"
-    assert s.resolve_model("qwen3.5-2b:latest") == "qwen3.5-2b:latest"
+    # resolve_request only accepts composite ids — bare names always 400 at
+    # the API boundary, but ``profile_for`` falls back to base name lookup.
     assert s.profile_for("qwen3.5-2b").context_length == 8192
 
 
-def test_tagless_request_only_matches_latest_tag():
+def test_llama_cpp_target_routing_via_composite_id():
     s = Settings(
-        upstreams=[
-            {
-                "name": "u1",
-                "base_url": "https://first.example.com",
-                "auth_token": "tok",
-                "models": ["fallback"],
-            },
-            {
-                "name": "quantized",
-                "base_url": "https://quantized.example.com",
-                "auth_token": "tok",
-                "models": ["qwen3.6-27b:q2_k_p"],
-            },
-        ],
-        ollama_targets=[
-            {
-                "name": "local",
-                "base_url": "http://127.0.0.1:11434",
-                "models": ["qwen3.6-27b:q2_k_p"],
-                "auto_start": True,
-                "start_command": "ollama serve",
-                "idle_timeout_seconds": 900,
-                "health_path": "api/version",
-            }
-        ],
-        model_profiles={"qwen3.6-27b:q2_k_p": {"estimated_vram_gb": 10.5}},
-    )
-
-    assert s.upstream_name_for("qwen3.6-27b:q2_k_p") == "quantized"
-    assert s.upstream_name_for("qwen3.6-27b") == "u1"
-    assert s.ollama_target_for("qwen3.6-27b:q2_k_p") is not None
-    assert s.ollama_target_for("qwen3.6-27b") is None
-    target = s.ollama_target_for("qwen3.6-27b:q2_k_p")
-    assert target.auto_start is True
-    assert target.start_command == "ollama serve"
-    assert target.health_path == "/api/version"
-    assert s.profile_for("qwen3.6-27b:q2_k_p").estimated_vram_gb == 10.5
-
-
-def test_llama_cpp_target_routing_and_profile():
-    s = Settings(
-        upstreams=[
-            {
-                "name": "u1",
-                "base_url": "https://first.example.com",
-                "auth_token": "tok",
-                "models": ["fallback"],
-            }
-        ],
         llama_cpp_targets=[
             {
                 "base_url": "http://127.0.0.1:21436/",
@@ -293,34 +326,24 @@ def test_llama_cpp_target_routing_and_profile():
                 "health_path": "health",
             }
         ],
+        internal_exposed_models=["qwen3.6:latest@qwen3.6:latest"],
         model_profiles={
             "qwen3.6:latest": {"context_length": 262144, "estimated_vram_gb": 18}
         },
     )
 
-    target = s.llama_cpp_target_for("qwen3.6")
-    assert target is not None
+    # llama_cpp target's source name defaults to its single model name
+    target = s.llama_cpp_targets[0]
     assert target.name == "qwen3.6:latest"
     assert target.base_url == "http://127.0.0.1:21436"
     assert target.health_path == "/health"
-    assert target.resolve_model("qwen3.6") == "qwen3.6-alias"
-    assert s.reverse_proxy_models == ["qwen3.6:latest"]
-    assert s.profile_for("qwen3.6").context_length == 262144
-    assert s.profile_for("qwen3.6").estimated_vram_gb == 18
+    assert target.resolve_model("qwen3.6:latest") == "qwen3.6-alias"
+    assert s.profile_for("qwen3.6:latest").context_length == 262144
 
 
 def test_llama_cpp_defaults_are_inherited_and_overridden():
     s = Settings(
-        upstreams=[
-            {
-                "name": "u1",
-                "base_url": "https://first.example.com",
-                "auth_token": "tok",
-                "models": ["fallback"],
-            }
-        ],
         llama_cpp_defaults={
-            "expose_external": False,
             "auto_start": True,
             "idle_timeout_seconds": 1800,
             "startup_timeout_seconds": 600,
@@ -336,7 +359,6 @@ def test_llama_cpp_defaults_are_inherited_and_overridden():
             {
                 "model": "visible-qwen",
                 "base_url": "http://127.0.0.1:21437",
-                "expose_external": True,
                 "auto_start": False,
                 "health_path": "healthz",
             },
@@ -346,58 +368,34 @@ def test_llama_cpp_defaults_are_inherited_and_overridden():
     hidden = s.effective_llama_cpp_target(s.llama_cpp_targets[0])
     visible = s.effective_llama_cpp_target(s.llama_cpp_targets[1])
     assert hidden.name == "hidden-qwen"
-    assert hidden.expose_external is False
     assert hidden.auto_start is True
     assert hidden.idle_timeout_seconds == 1800
     assert hidden.startup_timeout_seconds == 600
     assert hidden.health_path == "/ready"
     assert hidden.cwd == "I:\\Projects\\llama.cpp"
-    assert visible.expose_external is True
     assert visible.auto_start is False
     assert visible.health_path == "/healthz"
-    assert s.reverse_proxy_models == ["visible-qwen"]
-    assert s.is_externally_exposed("hidden-qwen") is False
-    assert s.is_externally_exposed("visible-qwen") is True
 
 
 def test_llama_cpp_target_accepts_legacy_single_model_fields():
     s = Settings(
-        upstreams=[
-            {
-                "name": "u1",
-                "base_url": "https://first.example.com",
-                "auth_token": "tok",
-                "models": ["fallback"],
-            }
-        ],
         llama_cpp_targets=[
             {
                 "base_url": "http://127.0.0.1:21436",
                 "models": ["qwen3.6"],
                 "model_map": {"qwen3.6": "qwen3.6-alias"},
-                "expose_external": ["qwen3.6"],
             }
         ],
     )
-
     target = s.llama_cpp_targets[0]
     assert target.name == "qwen3.6"
     assert target.model == "qwen3.6"
     assert target.model_alias == "qwen3.6-alias"
-    assert target.expose_external is True
 
 
 def test_llama_cpp_target_requires_one_model_per_process():
     with pytest.raises(ValueError, match="exactly one model"):
         Settings(
-            upstreams=[
-                {
-                    "name": "u1",
-                    "base_url": "https://first.example.com",
-                    "auth_token": "tok",
-                    "models": ["fallback"],
-                }
-            ],
             llama_cpp_targets=[
                 {
                     "name": "shared-process",
@@ -409,7 +407,7 @@ def test_llama_cpp_target_requires_one_model_per_process():
         )
 
 
-def test_routes_request_to_correct_upstream(monkeypatch, tmp_path):
+def test_routes_request_via_composite_id(monkeypatch, tmp_path):
     cfg = tmp_path / "config.json"
     _write_config(
         cfg,
@@ -429,12 +427,11 @@ def test_routes_request_to_correct_upstream(monkeypatch, tmp_path):
                     "models": ["dpsk"],
                     "model_map": {"dpsk": "deepseek-v4-pro"},
                 },
-            ]
+            ],
+            "internal_exposed_models": ["sonnet@anthropic", "dpsk@deepseek"],
         },
     )
     monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     s = load_settings()
 
     hits: dict[str, list[str]] = {"anthropic": [], "deepseek": []}
@@ -454,8 +451,6 @@ def test_routes_request_to_correct_upstream(monkeypatch, tmp_path):
         return _h
 
     app = create_app(s)
-    # Inject one mocked AnthropicClient per upstream, each pointed at its own
-    # MockTransport so we can verify routing.
     app.state.clients = {
         "anthropic": AnthropicClient(
             "https://anthropic.example.com",
@@ -470,13 +465,25 @@ def test_routes_request_to_correct_upstream(monkeypatch, tmp_path):
     }
 
     with TestClient(app) as tc:
-        r1 = tc.post("/api/chat", json={"model": "sonnet", "stream": False,
-                                        "messages": [{"role": "user", "content": "hi"}]})
-        r2 = tc.post("/api/chat", json={"model": "dpsk", "stream": False,
-                                        "messages": [{"role": "user", "content": "hi"}]})
+        r1 = tc.post(
+            "/api/chat",
+            json={
+                "model": "sonnet@anthropic",
+                "stream": False,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        r2 = tc.post(
+            "/api/chat",
+            json={
+                "model": "dpsk@deepseek",
+                "stream": False,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
 
-    assert r1.status_code == 200
-    assert r2.status_code == 200
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
     assert hits["anthropic"] == ["claude-3-5-sonnet-20241022"]
     assert hits["deepseek"] == ["deepseek-v4-pro"]
 
@@ -487,19 +494,38 @@ def test_tags_unions_models_across_upstreams(monkeypatch, tmp_path):
         cfg,
         {
             "upstreams": [
-                {"name": "u1", "base_url": "https://a", "auth_token": "x",
-                 "models": ["alpha", "beta"]},
-                {"name": "u2", "base_url": "https://b", "auth_token": "y",
-                 "models": ["beta", "gamma"]},
+                {
+                    "name": "u1",
+                    "base_url": "https://a",
+                    "auth_token": "x",
+                    "models": ["alpha", "beta"],
+                },
+                {
+                    "name": "u2",
+                    "base_url": "https://b",
+                    "auth_token": "y",
+                    "models": ["beta", "gamma"],
+                },
             ]
         },
     )
     monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     s = load_settings()
-    # dedupe, order preserved (first occurrence wins)
-    assert s.models == ["alpha", "beta", "gamma"]
-    # routing: 'beta' goes to u1 because it appears first
-    assert s.upstream_name_for("beta") == "u1"
-    assert s.upstream_name_for("gamma") == "u2"
+    # Each (model, target) becomes its own composite id; "beta" appears in
+    # both upstreams as distinct ids.
+    assert s.all_composite_ids() == [
+        "alpha@u1",
+        "beta@u1",
+        "beta@u2",
+        "gamma@u2",
+    ]
+    a_backend, a_real = s.resolve_request(
+        "alpha@u1", surface="internal"
+    ) if "alpha@u1" in s.exposed_composite_ids("internal") else (
+        s.backend_by_name("u1"),
+        "alpha",
+    )
+    # No exposure declared => bare exposure-aware routing rejects, but
+    # backend_for() bypasses exposure.
+    assert s.backend_for("alpha@u1").name == "u1"
+    assert s.backend_for("beta@u2").name == "u2"

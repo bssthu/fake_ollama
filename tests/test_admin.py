@@ -73,10 +73,13 @@ def test_admin_schema(admin_settings):
         "admin_host",
         "admin_port",
         "upstreams",
+        "openai_upstreams",
         "ollama_targets",
         "llama_cpp_defaults",
         "llama_cpp_targets",
         "model_profiles",
+        "internal_exposed_models",
+        "external_exposed_models",
         "dashboard_enabled",
         "dashboard_host",
         "dashboard_port",
@@ -84,26 +87,27 @@ def test_admin_schema(admin_settings):
         "dashboard_model_reclaim_enabled",
     } <= keys
     upstreams = next(f for f in fields if f["key"] == "upstreams")
-    # ``upstreams`` is no longer strictly required: an OpenAI-only
-    # config (``openai_upstreams``) is now a valid forward-proxy setup.
+    # ``upstreams`` is no longer strictly required.
     assert upstreams.get("required", False) is False
     assert upstreams["type"] == "object_list"
-    assert {f["key"] for f in upstreams["item_schema"]} >= {"name", "base_url"}
+    upstream_item_keys = {f["key"] for f in upstreams["item_schema"]}
+    assert {"name", "base_url", "auth_token", "models"} <= upstream_item_keys
+    # expose_external has been removed from every item schema.
+    assert "expose_external" not in upstream_item_keys
     upstream_models = next(f for f in upstreams["item_schema"] if f["key"] == "models")
     assert upstream_models["autocomplete"] == "model_names"
+
     openai_ups = next(f for f in fields if f["key"] == "openai_upstreams")
     assert openai_ups["type"] == "object_list"
     assert openai_ups["detect_models"] == "openai"
-    assert {f["key"] for f in openai_ups["item_schema"]} >= {
-        "name",
-        "base_url",
-        "auth_token",
-        "models",
-    }
-    # ollama_target items no longer carry per-target api_token.
+    openai_item_keys = {f["key"] for f in openai_ups["item_schema"]}
+    assert {"name", "base_url", "auth_token", "models"} <= openai_item_keys
+    assert "expose_external" not in openai_item_keys
+
     ollama = next(f for f in fields if f["key"] == "ollama_targets")
-    item_keys = {f["key"] for f in ollama["item_schema"]}
-    assert "api_token" not in item_keys
+    ollama_item_keys = {f["key"] for f in ollama["item_schema"]}
+    assert "api_token" not in ollama_item_keys
+    assert "expose_external" not in ollama_item_keys
     assert {
         "name",
         "base_url",
@@ -112,12 +116,14 @@ def test_admin_schema(admin_settings):
         "start_command",
         "idle_timeout_seconds",
         "health_path",
-    } <= item_keys
+    } <= ollama_item_keys
     ollama_models = next(f for f in ollama["item_schema"] if f["key"] == "models")
     assert ollama_models["autocomplete"] == "model_names"
+
     llama_cpp = next(f for f in fields if f["key"] == "llama_cpp_targets")
     assert llama_cpp["detect_models"] == "llama_cpp"
     llama_item_keys = {f["key"] for f in llama_cpp["item_schema"]}
+    assert "expose_external" not in llama_item_keys
     assert {
         "name",
         "base_url",
@@ -130,34 +136,47 @@ def test_admin_schema(admin_settings):
     } <= llama_item_keys
     llama_model = next(f for f in llama_cpp["item_schema"] if f["key"] == "model")
     assert llama_model["autocomplete"] == "model_names"
+
     llama_defaults = next(f for f in fields if f["key"] == "llama_cpp_defaults")
     assert llama_defaults["type"] == "object"
-    assert {f["key"] for f in llama_defaults["item_schema"]} >= {
-        "expose_external",
+    defaults_keys = {f["key"] for f in llama_defaults["item_schema"]}
+    assert "expose_external" not in defaults_keys
+    assert {
         "auto_start",
         "idle_timeout_seconds",
         "startup_timeout_seconds",
         "health_path",
         "cwd",
-    }
+    } <= defaults_keys
+
     profiles = next(f for f in fields if f["key"] == "model_profiles")
     profile_item_keys = {f["key"] for f in profiles["item_schema"]}
     assert "estimated_vram_gb" in profile_item_keys
-    # external_access_tokens lives at the Settings level with secret_each + generate_each.
+
+    internal_exposed = next(
+        f for f in fields if f["key"] == "internal_exposed_models"
+    )
+    assert internal_exposed["type"] == "string_list"
+    assert internal_exposed["group"] == "interface_internal"
+    external_exposed = next(
+        f for f in fields if f["key"] == "external_exposed_models"
+    )
+    assert external_exposed["type"] == "string_list"
+    assert external_exposed["group"] == "interface_external"
+
     ext = next(f for f in fields if f["key"] == "external_access_tokens")
     assert ext["type"] == "string_list"
     assert ext["secret_each"] is True
     assert ext["generate_each"] is True
-    # The config page is organized by proxy direction first, then shared/admin.
+
+    # Groups are reorganized along source-vs-interface lines.
     group_order = [g["key"] for g in schema["groups"]]
     assert group_order == [
-        "forward_listener",
-        "forward_upstreams",
-        "reverse_listener",
-        "reverse_ollama",
-        "reverse_llamacpp",
-        "shared_runtime",
-        "profiles",
+        "model_sources_remote",
+        "model_sources_local",
+        "interface_internal",
+        "interface_external",
+        "runtime",
         "dashboard",
         "admin",
     ]
@@ -165,24 +184,13 @@ def test_admin_schema(admin_settings):
     for group in schema["groups"]:
         if group["section"] not in section_order:
             section_order.append(group["section"])
-    assert section_order == ["forward", "reverse", "shared", "dashboard", "admin"]
-    field_order = [f["key"] for f in fields]
-    assert field_order[:4] == ["host", "port", "advertised_version", "upstreams"]
-    assert field_order[4] == "openai_upstreams"
-    assert field_order[5:8] == ["external_host", "external_port", "external_access_tokens"]
-    assert field_order[-13] == "model_profiles"
-    assert field_order[-12:-3] == [
-        "dashboard_enabled",
-        "dashboard_host",
-        "dashboard_port",
-        "dashboard_sample_interval_seconds",
-        "dashboard_retention_seconds",
-        "dashboard_data_path",
-        "dashboard_model_reclaim_enabled",
-        "vram_low_free_reclaim_enabled",
-        "vram_low_free_threshold_mib",
+    assert section_order == [
+        "model_sources",
+        "interfaces",
+        "runtime",
+        "dashboard",
+        "admin",
     ]
-    assert field_order[-3:] == ["admin_enabled", "admin_host", "admin_port"]
     group_keys = set(group_order)
     for f in fields:
         assert f["group"] in group_keys
@@ -240,8 +248,29 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
 def test_admin_put_invalid_returns_400(admin_settings):
     client = _admin_client(admin_settings)
     with client:
-        # Missing required upstreams -> Settings validator raises.
-        resp = client.put("/admin/config", json={"host": "127.0.0.1", "upstreams": []})
+        # Duplicate source names across kinds is now the main structural
+        # error the validator catches ("upstreams=[]" alone is valid).
+        resp = client.put(
+            "/admin/config",
+            json={
+                "host": "127.0.0.1",
+                "upstreams": [
+                    {
+                        "name": "dup",
+                        "base_url": "http://a.test",
+                        "auth_token": "t",
+                        "models": ["m"],
+                    }
+                ],
+                "ollama_targets": [
+                    {
+                        "name": "dup",
+                        "base_url": "http://127.0.0.1:11434",
+                        "models": ["n"],
+                    }
+                ],
+            },
+        )
     assert resp.status_code == 400
 
 

@@ -40,14 +40,15 @@
 
 ## 特性一览
 
-- **多上游路由**：把 Anthropic / DeepSeek / 自建网关合并到同一个 Ollama 端口
-- **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限
-- **每个模型可控外露**（`expose_external`，upstream / `ollama_targets` / `llama_cpp_targets` 都支持）：某些模型只想本机用、不想出现在反向代理 `/v1/models` 里？勾上即可
-- **本地 target 生命周期接管**：Ollama / llama.cpp 都可配置 health check、按需启动脚本、启动超时、空闲回收；不配置时就只转发到你单独启动的服务
-- **本地显存预检**：本地 Ollama / llama.cpp 模型可在 `model_profiles` 里填写 `estimated_vram_gb`；启动或加载前会用 `nvidia-smi` 评估可用显存，并尝试回收空闲本地模型
-- **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权 external 端口上的 `/v1/messages`、`/v1/messages/count_tokens`、`/v1/models` 与 `/v1/chat/completions`
+- **多上游路由**：把 Anthropic / OpenAI 兼容（DeepSeek / Together / Groq / 自建网关 / claude-relay-service…）合并到同一个 Ollama 端口
+- **复合模型标识 `model@target`**：每个模型的全局唯一 ID 由「模型名 + 来源 target 名」组成，相同名字但来源不同的模型不会再被混淆；客户端必须按 `model@target` 形式请求，裸名直接 400
+- **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限——key 支持 `model@target`（最优先）、裸 `model`、tagless base 三级回退
+- **按接口 / 按链路精细化暴露**：顶层两个白名单 `internal_exposed_models` / `external_exposed_models`，分别决定 `/api/*`（内部 Ollama 兼容入口）和 `/v1/*`（对外 Anthropic / OpenAI 兼容 API）允许哪些 `model@target` 可被列出、被请求
+- **本地 target 生命周期接管**：Ollama / llama.cpp 都可配置 health check、按需启动脚本、启动超时、空闲回收；不配置时只转发到你单独启动的服务
+- **本地显存预检**：本地模型可在 `model_profiles` 里填写 `estimated_vram_gb`；启动或加载前会用 `nvidia-smi` 评估可用显存，并尝试回收空闲本地模型
+- **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权所有 `/v1/*` 入口
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP），不再硬编码 `image/png`
-- **零依赖 Web 编辑器**：字段说明 / 默认值回退 / 上游 detect-models / models 与 model_profiles key 自动补全
+- **零依赖 Web 编辑器**：按「模型来源 / 对用户的接口 / 共享设置 / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
 - `pytest` + `httpx.MockTransport` 离线单测
 - **网络错误安全降级**：上游连接断开 / 超时等非 HTTP 错误统一返回 502 / 流式错误帧，不会抛出未处理异常
 
@@ -93,7 +94,8 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 
 1. 代码默认值
 2. `config.json`（路径优先级：`--config` > `$FAKE_OLLAMA_CONFIG` > `./config.json`）
-3. 环境变量 / `.env`（仅覆盖顶层标量；推荐只用来塞 token）
+
+运行期不再读任何「文本配置」环境变量（旧版的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `FAKE_OLLAMA_HOST` 等均已移除）。唯一会被读取的环境变量是 `FAKE_OLLAMA_CONFIG`，用于选中配置文件路径；`.env` 现在只服务于测试（见 [.env.example](./.env.example)）。
 
 完整示例见 [config.json.example](./config.json.example)；下面只列结构。
 
@@ -141,6 +143,21 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 | `llama_cpp_defaults` | object | `{}` | `llama_cpp_targets` 的全局默认值；target 同名字段可覆盖 |
 | `llama_cpp_targets` | array | `[]` | 反向代理的 llama.cpp server（OpenAI 兼容，见下） |
 
+#### 按接口暴露哪些模型
+
+上面四种 source（`upstreams` / `openai_upstreams` / `ollama_targets` / `llama_cpp_targets`）里的每个 `models` 项都会生成一个全局唯一的复合 ID `model@target`。这些复合 ID 是否对外可见 / 可请求由下面两个白名单控制（空列表代表该接口一个模型都不暴露）：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `internal_exposed_models` | string[] | `[]` | `/api/tags`、`/api/chat`、`/api/generate` 等 **内部 Ollama 兼容入口**允许看到 / 访问的 `model@target` ID |
+| `external_exposed_models` | string[] | `[]` | `/v1/models`、`/v1/messages`、external 端口上的 `/v1/chat/completions` 等 **对外 API 接口**允许的 `model@target` ID |
+
+- 复合 ID 必须使用某个 source 自身声明的显示名（`models` 里的原始名字），后面跟上 `@` 和该 source 的 `name`。source 名不能冲突，也不能包含 `@`。
+- 同一个模型被两个 source 同时提供（例如本机 Ollama + 远端 Anthropic 都上架了 `deepseek-chat`）时，你可以同时勾上 `deepseek-chat@local-ollama` 和 `deepseek-chat@deepseek`，客户端在下拉里会看到两项，可以明确选择走哪一路。
+- 客户端必须传复合 ID（例如 `"model": "deepseek-chat@deepseek"`）。裸名会被服务器 400，提示可用的复合 ID 列表。
+- `/api/tags` 与 `/v1/models` 列出的也是复合 ID；推荐客户端从它们学习可用型号。
+- 在 Admin UI 里，「接口 / Exposure」分组用复选框列出所有 source 产生的复合 ID，可以一键勾选。
+
 #### 共享设置
 
 | 字段 | 类型 | 默认 | 说明 |
@@ -149,7 +166,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 | `timeout_seconds` | float | `300` | 所有出站 HTTP 请求超时（上游与本地 target 都会用到） |
 | `use_system_proxy` | bool | `false` | 所有出站 HTTP 请求是否走系统代理（Clash/V2Ray 用户保持 false） |
 | `enforce_context_limit` | bool | `true` | 估算 token 超过 `context_length` 直接 400，避免误传巨 prompt |
-| `model_profiles` | object | `{}` | 正向 / 反向共用的每模型 capabilities / 上下文 / 思维链等设置 |
+| `model_profiles` | object | `{}` | 正向 / 反向共用的每模型 capabilities / 上下文 / 思维链等设置。key 可以写复合 `model@target`（最优先）、裾 `model`，或者 tagless base；三级回退 |
 
 #### Admin UI
 
@@ -174,12 +191,12 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 
 ```jsonc
 {
-  "name": "anthropic",                              // 唯一名字
+  "name": "anthropic",                              // 唯一名字；source 名不能含 @
   "base_url": "https://api.anthropic.com",           // 上游 base URL
-  "auth_token": "sk-ant-...",                        // 鉴权 token（也可走 ANTHROPIC_AUTH_TOKEN）
-  "models": ["claude-3-5-sonnet-20241022",           // 本机 Ollama 兼容入口可见、并路由到该 upstream 的显示名
-             "claude-3-5-haiku-20241022"],
-  "expose_external": ["claude-3-5-haiku-20241022"],  // 可选：哪些模型出现在反向代理 /v1/models
+  "auth_token": "sk-ant-...",                        // 鉴权 token
+  "models": ["claude-3-5-sonnet-20241022",           // 会产生复合 ID:
+             "claude-3-5-haiku-20241022"],           //   claude-3-5-sonnet-20241022@anthropic
+                                                     //   claude-3-5-haiku-20241022@anthropic
   "model_map": {                                     // 可选：显示名 → 上游真实模型 ID
     "claude-sonnet": "claude-3-5-sonnet-20241022"
   }
@@ -187,14 +204,9 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 ```
 
 路由规则：
-- `/api/tags`（正向 Ollama 端）：返回所有 upstream `models` 的并集（去重，保留首次出现位置）。**不**受 `expose_external` 限制——本机使用时全可见。
-- 一次正向请求按 `model` 字段查找：第一个 `models` 中包含该名字的 upstream 胜出；没匹配回退第一个 upstream。
-- `/v1/models`（反向 Anthropic 端）与 `/v1/messages` 透传：**只**返回 / 接受被 `expose_external` 允许的上游模型 + 被 `expose_external` 允许的本地 target 模型。
-
-`expose_external` 语义：
-- **不写该字段**（或为 `null`）：等同于"全部允许"，保持向后兼容。
-- upstream / `ollama_targets` 使用列表：空数组 `[]` 表示全部隐藏；显式列表表示仅列出的模型对外暴露。
-- `llama_cpp_targets` 因为每个 target 只有一个 `model`，所以使用布尔值：`true` 暴露，`false` 隐藏；target 不写则继承 `llama_cpp_defaults.expose_external`，全局也不写时按旧行为暴露。
+- `/api/tags`（正向 Ollama 端）：返回所有被 `internal_exposed_models` 勾选的复合 ID。
+- 一次请求按 `model` 字段查找：必须是复合 `model@target` 形式，路由直接读 `@target` 部分。裸名返回 400 并附带可用复合 ID 列表。
+- `/v1/models` 与 `/v1/messages` 同理，受 `external_exposed_models` 控制。上游请求实际发出时，`@target` 后缀会被剥掉，只发裸模型名给上游。
 
 模型名匹配按 Ollama 规则处理：`model` 与 `model:latest` 等价；省略 tag 只代表 `latest`，不会匹配其他显式 tag（例如 `model:q4_K_M` / `model:q2_k_p`）。
 
@@ -204,11 +216,10 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 
 ```jsonc
 {
-  "name": "deepseek",                          // 唯一名字，且不能与 upstreams[].name 冲突
+  "name": "deepseek",                          // 唯一名字，跨 source 都不能冲突，且不能含 @
   "base_url": "https://api.deepseek.com",       // 上游 base URL（会自动拼 /v1/chat/completions）
   "auth_token": "sk-...",                       // 同时以 Authorization: Bearer 与 x-api-key 发送
   "models": ["deepseek-chat", "deepseek-reasoner"],
-  "expose_external": ["deepseek-chat"],        // 可选：哪些模型出现在反向代理 /v1/models
   "model_map": {                                // 可选：显示名 → 上游真实模型 ID
     "deepseek-r1": "deepseek-reasoner"
   }
@@ -223,16 +234,15 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 | `POST /v1/messages`（Anthropic 兼容入口） | Anthropic → OpenAI；OpenAI → Anthropic | 流式同样回写 Anthropic SSE 事件 |
 | `POST /v1/chat/completions`（OpenAI 兼容入口） | 透传 | 仅按 `model_map` 改写请求 `model`，响应里再改写回显示名 |
 
-路由优先级与 `upstreams` 一致：本机 target（`ollama_targets` / `llama_cpp_targets`）优先，远端按 `models` 列表里第一个匹配胜出；外部 `/v1/*` 入口仍受 `expose_external` 与 `external_access_tokens` 限制。
+请求所携 `model` 必须是复合 `model@target` ID，路由直接看 `@target` 部分；是否允许这一 ID 走该接口受 `internal_exposed_models` / `external_exposed_models` 控制。external 端口仍需 `external_access_tokens` 鉴权。
 
 ### ollama_targets（反向：Anthropic → 本机 Ollama）
 
 ```jsonc
 {
-  "name": "local",                                  // 唯一名字
+  "name": "local",                                  // 唯一名字；source 名不能含 @
   "base_url": "http://127.0.0.1:11434",              // 本机 Ollama URL
-  "models": ["llama3.1", "qwen2.5-coder"],          // Anthropic 端可见的显示名
-  "expose_external": ["llama3.1"],                  // 可选：哪些模型对外暴露（同 upstream 语义）
+  "models": ["llama3.1", "qwen2.5-coder"],          // 生成复合 ID: llama3.1@local, qwen2.5-coder@local
   "model_map": { "llama3.1": "llama3.1:8b" },       // 可选：显示名 → Ollama tag
 
   "auto_start": false,                               // true 时 health 失败会执行 start_command
@@ -245,7 +255,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 }
 ```
 
-ollama_targets 默认全部对外暴露（不写 `expose_external`，保持向后兼容）；想做"本机才能用"的隔离就把 `expose_external` 勾上并留空，或只勾选允许暴露的子集。访问鉴权统一走顶层的 `external_access_tokens`，**不再有 per-target 的 `api_token` 字段**——旧版 `api_token` 在加载时会被自动 hoist 到 `external_access_tokens` 并打 WARN，存盘后清理。
+对外是否可见由顶层 `external_exposed_models` 控制（要在里面勾上例如 `llama3.1@local`）；对内同理由 `internal_exposed_models` 控制。访问鉴权统一走顶层的 `external_access_tokens`，**不再有 per-target 的 `api_token` 字段**——旧版 `api_token` 在加载时会被自动 hoist 到 `external_access_tokens` 并打 WARN，存盘后清理。
 
 Ollama target 有两种运行方式：
 - **单独运行模式**：`auto_start: false`（默认）。fake-ollama 只负责转发；Ollama Desktop / system service / 你自己的脚本负责 daemon 生命周期。
@@ -273,7 +283,6 @@ llama.cpp server 自带 OpenAI 兼容接口，fake-ollama 会把多个 server �
 ```jsonc
 {
   "llama_cpp_defaults": {
-    "expose_external": true,
     "auto_start": true,                           // health 失败时按需启动
     "idle_timeout_seconds": 1800,                 // 留空表示不做空闲回收
     "startup_timeout_seconds": 600,
@@ -356,17 +365,15 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 
 ### 环境变量
 
-`config.json` 的顶层标量都可被 `FAKE_OLLAMA_*` 覆盖（路径用 `FAKE_OLLAMA_CONFIG`），但**推荐只用 env 放敏感 token**：
+运行期只读一个环境变量：
 
-| 变量 | 等价 |
+| 变量 | 说明 |
 | --- | --- |
-| `FAKE_OLLAMA_CONFIG` | 同 `--config` |
-| `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` | 兼容旧版：自动建一个名为 `default` 的 upstream（如 JSON 已有同名 upstream，env 字段覆盖之） |
-| `FAKE_OLLAMA_HOST` / `_PORT` | 覆盖 internal listener |
-| `FAKE_OLLAMA_ADMIN_HOST` / `_ADMIN_PORT` | 覆盖 admin listener |
-| `FAKE_OLLAMA_EXTERNAL_HOST` / `_EXTERNAL_PORT` | 覆盖 external listener |
-| `FAKE_OLLAMA_EXTERNAL_ACCESS_TOKENS` | CSV 列表，覆盖 `external_access_tokens` |
-| `FAKE_OLLAMA_DEFAULT_MAX_TOKENS` / `_TIMEOUT` / `_USE_SYSTEM_PROXY` / `_ENFORCE_CONTEXT_LIMIT` / `_ADVERTISED_VERSION` | 同名标量覆盖；其中 `_ADVERTISED_VERSION` 只影响 Ollama 兼容 `/api/version` |
+| `FAKE_OLLAMA_CONFIG` | 同 `--config`，选中 `config.json` 路径。未设时使用 CWD 下的 `./config.json` |
+
+所有听口 host / port、token、模型白名单、上下文限制、超时、代理开关等都只能在 `config.json`（或 Admin UI）里配置。旧版的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `FAKE_OLLAMA_*` 文本变量都已移除，请迁移到 `upstreams[*].auth_token` 与顶层端口字段。
+
+`.env` 现在只服务于集成测试场景，可设 `FAKE_OLLAMA_TEST_BASE_URL` / `FAKE_OLLAMA_TEST_AUTH_TOKEN` 控制是否跳过依赖真实上游的 e2e 用例。
 
 ## 反向代理：把本地 Ollama / llama.cpp 当远端 API 用
 
@@ -374,10 +381,10 @@ key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客�
 
 只要在 `config.json` 里配上 `ollama_targets` 或 `llama_cpp_targets`（见上），并填了至少一个 `external_access_tokens`，反向代理 `POST /v1/messages`、`POST /v1/messages/count_tokens` 与 external 端口的 `POST /v1/chat/completions` 就开门工作：
 
-- `model` 命中某个 `ollama_targets[*].models` → 转换为 Ollama `/api/chat`，再把响应翻译回 Anthropic 的 `message_*` SSE / 非流式 JSON。
-- `model` 命中某个 `llama_cpp_targets[*].model` → 调用 llama.cpp `/v1/chat/completions`；Anthropic 入口会做格式转换，OpenAI 入口则基本直通。
-- `model` 命中某个 upstream 的 `expose_external` 列表 → 透传到该 Anthropic 上游（相当于一个本机鉴权转发壳）。
-- 其他情况 → 404 `model '...' is not exposed externally`。
+- `model` 命中某个 `ollama_targets[*].models` 且复合 ID 在 `external_exposed_models` 里 → 转换为 Ollama `/api/chat`，再把响应翻译回 Anthropic 的 `message_*` SSE / 非流式 JSON。
+- `model` 命中某个 `llama_cpp_targets[*].model` 且在白名单里 → 调用 llama.cpp `/v1/chat/completions`；Anthropic 入口会做格式转换，OpenAI 入口则基本直通。
+- `model` 命中某个 upstream 提供的复合 ID 且在白名单里 → 透传到该 Anthropic 上游（相当于一个本机鉴权转发壳）。
+- 其他情况 → 400 提示裸名 / 未知 `model@target`，或 404 `model '...@...' is not exposed on external surface`。
 
 `POST /v1/messages/count_tokens` 按 Anthropic 官方格式返回 `{"input_tokens": ...}`：命中本地 Ollama / llama.cpp target 时用本地估算，不会为了计数唤起模型；命中外露 upstream 时透传到上游的 count_tokens 接口，所以官方 Anthropic 端可以返回精确值。客户端附带的 `?beta=true` 会被接受；透传 upstream 时会保留这个 query。
 
@@ -406,8 +413,8 @@ claude
 - 右侧是输入控件（按字段类型自适应：文本 / 数字 / 复选框 / 多行列表 / key-value 表 / 嵌套对象列表 / **从兄弟字段拉取的复选框列表**）。
 - `upstreams`、`ollama_targets`、`llama_cpp_targets`、`model_profiles` 是可重复组，自带 +add / Remove。
 - **Detect models**：upstream / Ollama 卡片会把探测结果合并或替换 `models` 字段；llama.cpp 卡片会把选择结果写入单个 `model` 字段。多个 llama.cpp 模型请拆成多个 target。
-- **expose_external**：upstream、Ollama target 用模型列表筛选；llama.cpp target 用单个布尔开关，并可继承 `llama_cpp_defaults.expose_external`。
-- **model_profiles 添加**：key 输入框带浏览器原生 datalist 自动补全，候选从 `upstreams` / `ollama_targets` 的 `models` 和 `llama_cpp_targets` 的 `model` 收集。
+- **Exposure**：不再在每个 source 卡片里写 `expose_external`。「对用户的接口 / Exposure」分组里有两个复选框列表（`internal_exposed_models` / `external_exposed_models`），列出所有 source 产生的 `model@target` 复合 ID，供你分别勾选。
+- **model_profiles 添加**：key 输入框带浏览器原生 datalist 自动补全，key 可以是复合 `model@target`（最优先匹配）、裸 `model` 名，或 tagless base。
 - **external_access_tokens**：每行带 Show / Generate 按钮；列表底部还有"+ generate token"直接追加随机 token。
 - 顶部三个按钮：
   - **Save & Reload**：用 `Settings` 校验 → 写回磁盘 → 原子替换 `app.state.settings`，并重建上游连接池（旧连接异步关闭，正在进行的请求不受影响）。
@@ -429,12 +436,11 @@ settings.backends
 #    source:   底层的 Upstream / OllamaTarget / LlamaCppTarget 对象，
 #              需要协议专属字段（启停命令、llama.cpp 启动参数等）时用
 
-settings.backend_for("llama3.1")
-# -> 按路由优先级（ollama_targets → llama_cpp_targets → upstreams）
-#    挑出第一个 serves(model) 的 backend，找不到返回 None
+settings.backend_for("llama3.1@local")
+# -> 按复合 ID 直接查找 backend，找不到返回 None
 
-settings.backend_for("private-model", surface="external")
-# -> 额外按 expose_external 规则过滤；隐藏在外部的模型会被跳过
+settings.backend_for("private-model@anthropic", surface="external")
+# -> 额外按 external_exposed_models 过滤；未列出的复合 ID 会被跳过
 ```
 
 设计意图：
@@ -525,7 +531,8 @@ python -m fake_ollama --no-request-data-log
 
 ## 故障排查
 
-- **/v1/messages 返回 404 `model '...' is not exposed externally`**：该模型来自 upstream、Ollama target 或 llama.cpp target，但其所属节点的 `expose_external` 没把它列进去。在 admin UI 里勾选，或干脆删掉 `expose_external` 字段恢复"全部暴露"。
+- **/v1/messages 返回 404 `model '...@...' is not exposed on external surface`**：该复合 ID 不在顶层 `external_exposed_models` 里。去 admin UI 「对用户的接口 / Exposure」里勾选它。
+- **/v1/messages 返回 400 `model '...' must be qualified as 'model@target'`**：客户端传了裸名。改为传复合 ID，可以先请求 `/v1/models` 获取当前可用列表。
 - **/v1/messages 返回 401**：`external_access_tokens` 为空（且 `external_port` 已设置 → 启动时已 WARN），或请求头里的 token 不在池里。检查 `x-api-key` / `Authorization: Bearer` 是否带对了。
 - **/v1/messages 在 internal 端口返回 404**：你启用了 `external_port`，反向代理已经只在 external 端口可达。请改连 external 端口。
 - **启动后找不到日志文件**：默认路径都相对当前工作目录：运行日志是 `logs/fake_ollama.log`，请求数据日志是 `logs/fake_ollama.requests.jsonl`。确认是在项目根目录启动，或显式传 `--log-file I:\Projects\fake_ollama\logs\fake_ollama.log` 和 `--request-data-log-file I:\Projects\fake_ollama\logs\fake_ollama.requests.jsonl`；如果传了 `--no-log-file` / `--no-request-data-log`，对应文件不会写。

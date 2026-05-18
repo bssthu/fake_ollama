@@ -255,6 +255,126 @@ def _openai_client_for(app: FastAPI, upstream_name: str) -> OpenAIClient:
     return client
 
 
+def _surface_for(request: Request) -> str:
+    """Map a request URL (and listener) to its user-facing surface.
+
+    The two surfaces gate which composite ``model@target`` ids are
+    visible / callable:
+
+    * ``external`` — the Anthropic / OpenAI-compatible API exposed to
+      remote clients. Whitelisted via ``Settings.external_exposed_models``.
+    * ``internal`` — the Ollama-compatible surface for local clients.
+      Whitelisted via ``Settings.internal_exposed_models``.
+
+    Selection rules:
+
+    * ``/v1/messages*`` and ``/v1/models`` are external-only routes, so
+      they always count as ``external`` regardless of which listener
+      served them.
+    * ``/v1/chat/completions`` is shared between listeners. When a
+      dedicated external listener is configured we use the listener
+      port to disambiguate; otherwise it defaults to ``internal`` so
+      local clients can use the OpenAI-compatible endpoint without
+      acquiring an external access token.
+    * Everything else (``/api/*``, root, etc.) is ``internal``.
+    """
+    settings: Settings = request.app.state.settings
+    path = request.url.path
+    if _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES):
+        return "external"
+    if _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES):
+        if (
+            settings.external_listener_enabled
+            and _local_port(request) == settings.external_port
+        ):
+            return "external"
+        return "internal"
+    return "internal"
+
+
+def _dispatch(
+    request: Request, settings: Settings, requested_model: str
+) -> tuple["Backend", str]:  # type: ignore[name-defined]
+    """Resolve a client-requested composite ``model@target`` for ``request``.
+
+    * Performs the external-surface auth check (when applicable).
+    * Returns ``(backend, real_model)`` where ``real_model`` is the bare
+      model name the source advertises; callers further wrap it via
+      ``backend.source.resolve_model(real_model)`` to get the wire-side
+      id (handles ``model_map``).
+    * Raises ``HTTPException`` with 400/401/404 on bad input.
+    """
+    surface = _surface_for(request)
+    if surface == "external" and settings.auth_required_for_v1:
+        token = _bearer_or_api_key(request)
+        if not settings.is_valid_external_token(token):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+    try:
+        backend, model = settings.resolve_request(requested_model, surface=surface)
+    except ValueError as exc:
+        msg = str(exc)
+        if (
+            "is not exposed" in msg
+            or "unknown target" in msg
+            or "does not serve" in msg
+        ):
+            raise HTTPException(status_code=404, detail=msg) from exc
+        raise HTTPException(status_code=400, detail=msg) from exc
+    return backend, model
+
+
+def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-def]
+    """Return the protocol-appropriate client for ``backend``.
+
+    Knows about the four (protocol, kind) pairs:
+    * ``anthropic`` + ``remote`` → :class:`AnthropicClient`
+    * ``openai`` + ``remote`` → :class:`OpenAIClient`
+    * ``ollama`` + ``local`` → :class:`OllamaClient`
+    * ``openai`` + ``local`` → :class:`LlamaCppClient`
+    """
+    if backend.protocol == "anthropic":
+        client = app.state.clients.get(backend.name)
+        if client is None:
+            # Fall back to the first available client, mirroring the
+            # legacy ``_client_for`` behaviour used by some tests.
+            clients = app.state.clients
+            if clients:
+                return next(iter(clients.values()))
+            raise HTTPException(
+                status_code=503,
+                detail=f"anthropic upstream '{backend.name}' is not initialised",
+            )
+        return client
+    if backend.protocol == "openai" and backend.kind == "remote":
+        return _openai_client_for(app, backend.name)
+    if backend.protocol == "ollama":
+        client = app.state.ollama_clients.get(backend.name)
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"ollama_target '{backend.name}' is not initialised",
+            )
+        return client
+    if backend.protocol == "openai" and backend.kind == "local":
+        client = app.state.llama_cpp_clients.get(backend.name)
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"llama_cpp_target '{backend.name}' is not initialised",
+            )
+        return client
+    raise HTTPException(
+        status_code=500,
+        detail=f"no client wiring for backend {backend.name!r} ({backend.protocol}/{backend.kind})",
+    )
+
+
 async def _openai_upstream_messages(
     oc: OpenAIClient,
     anthropic_payload: Dict[str, Any],
@@ -563,11 +683,15 @@ def _register_routes(app: FastAPI) -> None:
         return {"version": settings.advertised_version}
 
     @app.get("/api/tags")
-    async def tags() -> Dict[str, Any]:
+    async def tags(request: Request) -> Dict[str, Any]:
         settings: Settings = app.state.settings
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         models = []
-        for name in settings.models:
+        # Surface-aware enumeration: /api/tags on the internal listener
+        # shows the internal whitelist; if mounted on the external port
+        # (unusual) it shows the external whitelist.
+        surface = _surface_for(request)
+        for name in settings.exposed_composite_ids(surface):
             profile = settings.profile_for(name)
             models.append(
                 {
@@ -672,12 +796,8 @@ def _register_routes(app: FastAPI) -> None:
 
         seen: Dict[str, None] = {}
         names: List[str] = []
-        # Only upstream models opted in via expose_external are listed here.
-        for n in settings.externally_exposed_upstream_models:
-            if n not in seen:
-                seen[n] = None
-                names.append(n)
-        for n in settings.reverse_proxy_models:
+        surface = _surface_for(request)
+        for n in settings.exposed_composite_ids(surface):
             if n not in seen:
                 seen[n] = None
                 names.append(n)
@@ -997,7 +1117,8 @@ def _count_tokens_payload(payload: Dict[str, Any], model: str) -> Dict[str, Any]
 async def _handle_ollama_via_openai_upstream(
     request: Request,
     payload: Dict[str, Any],
-    openai_up: Any,
+    backend: Any,
+    real_model: str,
     *,
     mode: str,
 ) -> Any:
@@ -1011,9 +1132,9 @@ async def _handle_ollama_via_openai_upstream(
     """
     app = request.app
     settings: Settings = app.state.settings
-    ollama_model = payload.get("model") or (settings.models[0] if settings.models else "")
-    upstream_model = openai_up.resolve_model(ollama_model)
-    oc = _openai_client_for(app, openai_up.name)
+    ollama_model = payload.get("model") or ""
+    upstream_model = backend.source.resolve_model(real_model)
+    oc = _backend_client(app, backend)
     profile = settings.profile_for(ollama_model)
 
     if mode == "chat":
@@ -1101,16 +1222,32 @@ async def _handle(request: Request, *, mode: str) -> Any:
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
 
-    ollama_model = payload.get("model") or (settings.models[0] if settings.models else "")
-    if not ollama_model:
+    requested = payload.get("model") or ""
+    if not requested:
         raise HTTPException(status_code=400, detail="missing 'model'")
-    openai_up = settings.openai_upstream_for(ollama_model)
-    if openai_up is not None:
+    backend, real_model = _dispatch(request, settings, requested)
+    # ``ollama_model`` is the composite id (e.g. ``llama3.1@my-target``)
+    # which we keep echoing back to the client in response payloads so
+    # they keep seeing the same identifier they sent us.
+    ollama_model = requested
+
+    if backend.protocol == "openai" and backend.kind == "remote":
         return await _handle_ollama_via_openai_upstream(
-            request, payload, openai_up, mode=mode
+            request, payload, backend, real_model, mode=mode
         )
-    upstream_model = settings.resolve_model(ollama_model)
-    client = _client_for(app, settings, ollama_model)
+    if backend.protocol != "anthropic":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"model {requested!r} resolves to {backend.protocol}/{backend.kind} "
+                f"backend; the Ollama /api/chat surface only forwards to "
+                f"anthropic upstreams or openai remote upstreams. Use "
+                f"/v1/chat/completions or /v1/messages instead."
+            ),
+        )
+
+    upstream_model = backend.source.resolve_model(real_model)
+    client = _backend_client(app, backend)
 
     if mode == "chat":
         upstream_payload = ollama_chat_to_anthropic(
@@ -1182,47 +1319,28 @@ async def _handle_openai_chat(request: Request) -> Any:
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
 
-    openai_model = payload.get("model") or (settings.models[0] if settings.models else "")
+    openai_model = payload.get("model") or ""
     if not openai_model:
         raise HTTPException(status_code=400, detail="missing 'model'")
+
+    backend, real_model = _dispatch(request, settings, openai_model)
     profile = settings.profile_for(openai_model)
 
-    external_request = _is_external_request(request)
-    if external_request and settings.auth_required_for_v1:
-        presented = _bearer_or_api_key(request)
-        if not settings.is_valid_external_token(presented):
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "missing or invalid api token (send via x-api-key "
-                    "or Authorization: Bearer header)"
-                ),
-            )
-
-    reverse_openai = external_request or not settings.external_listener_enabled
-    target = settings.ollama_target_for(openai_model) if reverse_openai else None
-    if external_request and target is not None and not target.exposes(openai_model):
-        target = None
-    llama_target = None
-    if reverse_openai and target is None:
-        llama_target = settings.llama_cpp_target_for(openai_model)
-        if (
-            external_request
-            and llama_target is not None
-            and not llama_target.exposes(openai_model)
-        ):
-            llama_target = None
-
-    if (
-        external_request
-        and target is None
-        and llama_target is None
-        and not settings.is_externally_exposed(openai_model)
-    ):
-        raise HTTPException(
-            status_code=404,
-            detail=f"model '{openai_model}' is not exposed externally",
-        )
+    # Map the resolved backend back onto the four legacy local variables
+    # the per-protocol branches below still reference. ``real_model`` is
+    # the bare model name the backend advertises (no ``@target``
+    # suffix); ``openai_model`` keeps the composite id so response
+    # payloads echo back what the client sent.
+    target = backend.source if (backend.protocol == "ollama") else None
+    llama_target = (
+        backend.source
+        if (backend.protocol == "openai" and backend.kind == "local")
+        else None
+    )
+    openai_up_backend = (
+        backend if (backend.protocol == "openai" and backend.kind == "remote") else None
+    )
+    anthropic_backend = backend if backend.protocol == "anthropic" else None
 
     if target is not None:
         oc: OllamaClient = app.state.ollama_clients.get(target.name)
@@ -1240,7 +1358,7 @@ async def _handle_openai_chat(request: Request) -> Any:
         anthropic_payload["stream"] = stream
         ollama_payload = anthropic_to_ollama_chat_payload(
             anthropic_payload,
-            target_model=target.resolve_model(openai_model),
+            target_model=target.resolve_model(real_model),
             default_max_tokens=settings.default_max_tokens,
         )
         _apply_ollama_thinking_config(
@@ -1315,7 +1433,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                 detail=f"llama_cpp_target '{llama_target.name}' is not initialised",
             )
         llama_payload = dict(payload)
-        llama_payload["model"] = llama_target.resolve_model(openai_model)
+        llama_payload["model"] = llama_target.resolve_model(real_model)
         stream = bool(payload.get("stream", False))
         llama_payload["stream"] = stream
         _apply_llama_cpp_thinking_config(
@@ -1370,16 +1488,10 @@ async def _handle_openai_chat(request: Request) -> Any:
 
         return StreamingResponse(body_llama_openai(), media_type="text/event-stream")
 
-    openai_up = settings.openai_upstream_for(openai_model)
-    if openai_up is not None:
-        if external_request and not openai_up.exposes(openai_model):
-            raise HTTPException(
-                status_code=404,
-                detail=f"model '{openai_model}' is not exposed externally",
-            )
-        oc_remote = _openai_client_for(app, openai_up.name)
+    if openai_up_backend is not None:
+        oc_remote = _backend_client(app, openai_up_backend)
         forward_payload = dict(payload)
-        forward_payload["model"] = openai_up.resolve_model(openai_model)
+        forward_payload["model"] = openai_up_backend.source.resolve_model(real_model)
         stream = bool(payload.get("stream", False))
         forward_payload["stream"] = stream
         # No thinking_config / _enforce_limits here: remote OpenAI gateways
@@ -1427,8 +1539,14 @@ async def _handle_openai_chat(request: Request) -> Any:
 
         return StreamingResponse(body_openai_upstream(), media_type="text/event-stream")
 
-    upstream_model = settings.resolve_model(openai_model)
-    client = _client_for(app, settings, openai_model)
+    # Fallback: anthropic backend
+    if anthropic_backend is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"unhandled backend {backend.name!r} ({backend.protocol}/{backend.kind})",
+        )
+    upstream_model = anthropic_backend.source.resolve_model(real_model)
+    client = _backend_client(app, anthropic_backend)
 
     upstream_payload = openai_chat_to_anthropic(
         payload,
@@ -1510,43 +1628,24 @@ async def _handle_anthropic_count_tokens(request: Request) -> Any:
     if not anth_model:
         raise HTTPException(status_code=400, detail="missing 'model'")
 
-    target = settings.ollama_target_for(anth_model)
-    llama_target = settings.llama_cpp_target_for(anth_model)
-    if target is not None or llama_target is not None:
-        presented = _bearer_or_api_key(request)
-        if not settings.is_valid_external_token(presented):
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "missing or invalid api token (send via x-api-key "
-                    "or Authorization: Bearer header)"
-                ),
-            )
+    backend, real_model = _dispatch(request, settings, anth_model)
+
+    # Only Anthropic upstreams expose a real ``/v1/messages/count_tokens``
+    # endpoint. For every other backend (Ollama daemons, llama.cpp
+    # servers, remote OpenAI-compatible upstreams) we return the
+    # project's conservative local estimate without spinning the model
+    # up or making a wire call.
+    if backend.protocol != "anthropic":
         return JSONResponse(
             {"input_tokens": estimate_tokens_from_anthropic_payload(payload)}
         )
 
-    if not settings.is_externally_exposed(anth_model):
-        raise HTTPException(
-            status_code=404,
-            detail=f"model '{anth_model}' is not exposed externally",
-        )
-    if settings.auth_required_for_v1:
-        presented = _bearer_or_api_key(request)
-        if not settings.is_valid_external_token(presented):
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "missing or invalid api token (send via x-api-key "
-                    "or Authorization: Bearer header)"
-                ),
-            )
-
+    # Anthropic upstream: forward to its count_tokens endpoint.
     upstream_payload = _count_tokens_payload(
         payload,
-        model=settings.resolve_model(anth_model),
+        model=backend.source.resolve_model(real_model),
     )
-    client = _client_for(app, settings, anth_model)
+    client = _backend_client(app, backend)
     try:
         data = await client.count_tokens(
             upstream_payload,
@@ -1580,18 +1679,19 @@ async def _handle_anthropic_messages(request: Request) -> Any:
         raise HTTPException(status_code=400, detail="missing 'model'")
     stream = bool(payload.get("stream", False))
 
-    target = settings.ollama_target_for(anth_model)
+    backend, real_model = _dispatch(request, settings, anth_model)
+    target = backend.source if backend.protocol == "ollama" else None
+    llama_target = (
+        backend.source
+        if (backend.protocol == "openai" and backend.kind == "local")
+        else None
+    )
+    openai_up_backend = (
+        backend if (backend.protocol == "openai" and backend.kind == "remote") else None
+    )
+    anthropic_backend = backend if backend.protocol == "anthropic" else None
+
     if target is not None:
-        # Authenticate against the centralised external_access_tokens list.
-        presented = _bearer_or_api_key(request)
-        if not settings.is_valid_external_token(presented):
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "missing or invalid api token (send via x-api-key "
-                    "or Authorization: Bearer header)"
-                ),
-            )
         oc: OllamaClient = app.state.ollama_clients.get(target.name)
         if oc is None:
             raise HTTPException(
@@ -1600,7 +1700,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
             )
         ollama_payload = anthropic_to_ollama_chat_payload(
             payload,
-            target_model=target.resolve_model(anth_model),
+            target_model=target.resolve_model(real_model),
             default_max_tokens=settings.default_max_tokens,
         )
         _apply_ollama_thinking_config(settings, anth_model, payload, ollama_payload)
@@ -1651,17 +1751,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
 
         return StreamingResponse(body(), media_type="text/event-stream")
 
-    llama_target = settings.llama_cpp_target_for(anth_model)
     if llama_target is not None:
-        presented = _bearer_or_api_key(request)
-        if not settings.is_valid_external_token(presented):
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "missing or invalid api token (send via x-api-key "
-                    "or Authorization: Bearer header)"
-                ),
-            )
         lc: LlamaCppClient = app.state.llama_cpp_clients.get(llama_target.name)
         if lc is None:
             raise HTTPException(
@@ -1670,7 +1760,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
             )
         llama_payload = anthropic_to_openai_chat_payload(
             payload,
-            target_model=llama_target.resolve_model(anth_model),
+            target_model=llama_target.resolve_model(real_model),
             default_max_tokens=settings.default_max_tokens,
         )
         _apply_llama_cpp_thinking_config(settings, anth_model, payload, llama_payload)
@@ -1727,26 +1817,9 @@ async def _handle_anthropic_messages(request: Request) -> Any:
 
         return StreamingResponse(body_llama_anthropic(), media_type="text/event-stream")
 
-    openai_up = settings.openai_upstream_for(anth_model)
-    if openai_up is not None:
-        # Reverse-proxy surface: refuse models hidden via expose_external.
-        if not openai_up.exposes(anth_model):
-            raise HTTPException(
-                status_code=404,
-                detail=f"model '{anth_model}' is not exposed externally",
-            )
-        if settings.auth_required_for_v1:
-            presented = _bearer_or_api_key(request)
-            if not settings.is_valid_external_token(presented):
-                raise HTTPException(
-                    status_code=401,
-                    detail=(
-                        "missing or invalid api token (send via x-api-key "
-                        "or Authorization: Bearer header)"
-                    ),
-                )
-        oc_remote = _openai_client_for(app, openai_up.name)
-        upstream_model = openai_up.resolve_model(anth_model)
+    if openai_up_backend is not None:
+        oc_remote = _backend_client(app, openai_up_backend)
+        upstream_model = openai_up_backend.source.resolve_model(real_model)
         profile = settings.profile_for(anth_model)
         if not stream:
             try:
@@ -1793,30 +1866,17 @@ async def _handle_anthropic_messages(request: Request) -> Any:
 
         return StreamingResponse(body_openai_anthropic(), media_type="text/event-stream")
 
-    # Pass-through to the matching upstream Anthropic server.
-    # Reverse-proxy surface: refuse models that are not opted in via
-    # ``Upstream.expose_external``. Also gate with the access-token list
-    # whenever auth is required (same rule as /v1/models).
-    if not settings.is_externally_exposed(anth_model):
+    # Fallback: Anthropic upstream pass-through.
+    if anthropic_backend is None:
         raise HTTPException(
-            status_code=404,
-            detail=f"model '{anth_model}' is not exposed externally",
+            status_code=500,
+            detail=f"unhandled backend {backend.name!r} ({backend.protocol}/{backend.kind})",
         )
-    if settings.auth_required_for_v1:
-        presented = _bearer_or_api_key(request)
-        if not settings.is_valid_external_token(presented):
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "missing or invalid api token (send via x-api-key "
-                    "or Authorization: Bearer header)"
-                ),
-            )
     upstream_payload = dict(payload)
-    upstream_model = settings.resolve_model(anth_model)
+    upstream_model = anthropic_backend.source.resolve_model(real_model)
     upstream_payload["model"] = upstream_model
     upstream_payload["stream"] = stream
-    client = _client_for(app, settings, anth_model)
+    client = _backend_client(app, anthropic_backend)
     if not stream:
         try:
             data = await client.messages(upstream_payload)

@@ -62,6 +62,16 @@ def _settings_with_openai(**overrides: Any) -> Settings:
         ollama_targets=[],
         llama_cpp_targets=[],
         llama_cpp_defaults=LlamaCppDefaults(),
+        internal_exposed_models=[
+            "claude-3-5-sonnet@anthropic",
+            "deepseek-chat@deepseek",
+            "deepseek-reasoner@deepseek",
+        ],
+        external_exposed_models=[
+            "claude-3-5-sonnet@anthropic",
+            "deepseek-chat@deepseek",
+            "deepseek-reasoner@deepseek",
+        ],
     )
     base.update(overrides)
     return Settings(**base)
@@ -95,7 +105,7 @@ def test_settings_backends_includes_openai_upstream() -> None:
 
 def test_backend_for_routes_to_openai_upstream() -> None:
     settings = _settings_with_openai()
-    b = settings.backend_for("deepseek-chat")
+    b = settings.backend_for("deepseek-chat@deepseek")
     assert b is not None
     assert b.protocol == "openai"
     assert b.kind == "remote"
@@ -112,8 +122,20 @@ def test_backend_for_prefers_local_over_openai_upstream() -> None:
                 auto_start=True,
             )
         ],
+        internal_exposed_models=[
+            "claude-3-5-sonnet@anthropic",
+            "deepseek-chat@deepseek",
+            "deepseek-reasoner@deepseek",
+            "deepseek-chat@local",
+        ],
+        external_exposed_models=[
+            "claude-3-5-sonnet@anthropic",
+            "deepseek-chat@deepseek",
+            "deepseek-reasoner@deepseek",
+            "deepseek-chat@local",
+        ],
     )
-    b = settings.backend_for("deepseek-chat")
+    b = settings.backend_for("deepseek-chat@local")
     assert b is not None
     assert b.protocol == "ollama"
     assert b.kind == "local"
@@ -152,25 +174,28 @@ def test_settings_allows_openai_only_config() -> None:
                 models=["gpt-4o"],
             )
         ],
+        external_exposed_models=["gpt-4o@o"],
     )
-    assert settings.openai_upstream_for("gpt-4o").name == "o"
-    assert settings.is_externally_exposed("gpt-4o") is True
+    backend = settings.backend_by_name("o")
+    assert backend is not None and backend.protocol == "openai"
+    assert settings.is_exposed("external", "gpt-4o@o") is True
 
 
 def test_settings_models_aggregates_openai_upstreams() -> None:
     settings = _settings_with_openai()
-    assert set(settings.models) == {
-        "claude-3-5-sonnet",
-        "deepseek-chat",
-        "deepseek-reasoner",
+    assert set(settings.all_composite_ids()) == {
+        "claude-3-5-sonnet@anthropic",
+        "deepseek-chat@deepseek",
+        "deepseek-reasoner@deepseek",
     }
 
 
 def test_openai_upstream_resolve_model_uses_model_map() -> None:
     settings = _settings_with_openai()
-    up = settings.openai_upstream_for("deepseek-reasoner")
-    assert up.resolve_model("deepseek-reasoner") == "deepseek-r1"
-    assert up.resolve_model("deepseek-chat") == "deepseek-chat"
+    up = settings.backend_by_name("deepseek")
+    assert up is not None
+    assert up.source.resolve_model("deepseek-reasoner") == "deepseek-r1"
+    assert up.source.resolve_model("deepseek-chat") == "deepseek-chat"
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +215,7 @@ def test_openai_client_chat_posts_to_v1_chat_completions_with_bearer() -> None:
             200,
             json={
                 "id": "cmpl-1",
-                "model": "deepseek-chat",
+                "model": "deepseek-chat@deepseek",
                 "choices": [
                     {
                         "index": 0,
@@ -315,7 +340,7 @@ def test_ollama_chat_routes_via_openai_upstream() -> None:
         resp = client.post(
             "/api/chat",
             json={
-                "model": "deepseek-chat",
+                "model": "deepseek-chat@deepseek",
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": False,
             },
@@ -338,15 +363,15 @@ def test_openai_chat_routes_via_openai_upstream_passthrough() -> None:
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "deepseek-reasoner",
+                "model": "deepseek-reasoner@deepseek",
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": False,
             },
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        # Display model name preserved in the response back to the client.
-        assert body["model"] == "deepseek-reasoner"
+        # Display model name preserved (composite id requested) in response.
+        assert body["model"] == "deepseek-reasoner@deepseek"
         # Upstream sees the resolved (mapped) model id.
         assert captured["chat_calls"][0]["model"] == "deepseek-r1"
 
@@ -359,7 +384,7 @@ def test_anthropic_messages_routes_via_openai_upstream() -> None:
         resp = client.post(
             "/v1/messages",
             json={
-                "model": "deepseek-chat",
+                "model": "deepseek-chat@deepseek",
                 "messages": [{"role": "user", "content": "ping"}],
                 "max_tokens": 64,
                 "stream": False,

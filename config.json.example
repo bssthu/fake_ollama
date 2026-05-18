@@ -1,7 +1,36 @@
 {
+  "_": "fake-ollama configuration. Every model the proxy can route to has a globally-unique composite id 'model@target', where 'target' is the name of the upstream / target entry below. Clients must request models by their composite id; bare model names are rejected with 400. The two exposed-models lists at the bottom decide which composite ids are visible on each user-facing surface.",
+
   "host": "127.0.0.1",
   "port": 21434,
   "advertised_version": "0.6.4",
+
+  "default_max_tokens": 4096,
+  "timeout_seconds": 300.0,
+  "use_system_proxy": false,
+  "enforce_context_limit": true,
+
+  "external_host": "127.0.0.1",
+  "external_port": 21435,
+  "external_access_tokens": [
+    "tk-replace-me-with-a-long-random-string"
+  ],
+
+  "admin_enabled": true,
+  "admin_host": "127.0.0.1",
+  "admin_port": 21433,
+
+  "dashboard_enabled": true,
+  "dashboard_host": "127.0.0.1",
+  "dashboard_port": 21432,
+  "dashboard_sample_interval_seconds": 10.0,
+  "dashboard_retention_seconds": 604800.0,
+  "dashboard_data_path": "logs/dashboard_history.json",
+  "dashboard_model_reclaim_enabled": false,
+  "vram_low_free_reclaim_enabled": true,
+  "vram_low_free_threshold_mib": 200.0,
+
+  "_model_sources": "==== Model sources (remote) ============================",
 
   "upstreams": [
     {
@@ -19,10 +48,7 @@
       "base_url": "https://api.deepseek.com/anthropic",
       "auth_token": "sk-deepseek-...",
       "models": ["deepseek-chat", "deepseek-reasoner"],
-      "model_map": {
-        "deepseek-chat": "deepseek-chat",
-        "deepseek-reasoner": "deepseek-reasoner"
-      }
+      "model_map": {}
     }
   ],
 
@@ -32,21 +58,15 @@
       "base_url": "https://api.deepseek.com",
       "auth_token": "sk-deepseek-...",
       "models": ["deepseek-chat", "deepseek-reasoner"],
-      "model_map": {
-        "deepseek-reasoner": "deepseek-reasoner"
-      }
+      "model_map": {}
     }
   ],
 
-  "external_host": "127.0.0.1",
-  "external_port": 21435,
-  "external_access_tokens": [
-    "tk-replace-me-with-a-long-random-string"
-  ],
+  "_model_sources_local": "==== Model sources (local) =============================",
 
   "ollama_targets": [
     {
-      "name": "local",
+      "name": "local-ollama",
       "base_url": "http://127.0.0.1:11434",
       "models": ["llama3.1", "qwen2.5-coder"],
       "model_map": {
@@ -63,29 +83,41 @@
   ],
 
   "llama_cpp_defaults": {
-    "expose_external": true,
     "auto_start": true,
     "idle_timeout_seconds": 1800,
     "startup_timeout_seconds": 600,
     "health_path": "/health",
-    "cwd": "I:\\Projects\\llama.cpp"
+    "cwd": "I:\\Projects\\llama.cpp",
+    "binary_path": null,
+    "runtime_root": null,
+    "gpu_layers": 99,
+    "ctx_size": null,
+    "parallel": 1,
+    "batch_size": null,
+    "ubatch_size": null,
+    "flash_attn": null,
+    "cache_type_k": null,
+    "cache_type_v": null,
+    "extra_args": null
   },
 
   "llama_cpp_targets": [
     {
+      "name": "qwen3.6-27b-hauhau-q2kp",
       "base_url": "http://127.0.0.1:21436",
       "auth_token": "",
       "model": "qwen3.6-27b-hauhau-q2kp",
       "model_alias": null,
-      "start_command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"I:\\Projects\\llama.cpp\\start_qwen36_server.ps1\" -ListenHost 127.0.0.1 -Port 21436",
-      "stop_command": null
+      "model_path": "I:\\Projects\\LLM_Models\\Qwen\\Qwen3.6-27B-Uncensored\\Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q2_K.gguf",
+      "mmproj_path": null,
+      "ctx_size": 60000,
+      "flash_attn": true,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0"
     }
   ],
 
-  "default_max_tokens": 4096,
-  "timeout_seconds": 300.0,
-  "use_system_proxy": false,
-  "enforce_context_limit": true,
+  "_profiles": "==== Model profiles ==================================== Keys are looked up most-specific first: 'model@target' overrides bare 'model', which overrides the tagless base (e.g. 'foo' for 'foo:latest').",
 
   "model_profiles": {
     "claude-3-5-sonnet-20241022": {
@@ -96,13 +128,20 @@
       "thinking_budget_tokens": 2048,
       "show_thinking": true
     },
-    "deepseek-reasoner": {
+    "deepseek-reasoner@deepseek": {
       "capabilities": ["completion", "tools"],
       "context_length": 65536,
       "max_output_tokens": 8192,
       "thinking_mode": "enabled",
       "thinking_budget_tokens": 4096,
       "show_thinking": true
+    },
+    "deepseek-reasoner@deepseek-openai": {
+      "capabilities": ["completion", "tools"],
+      "context_length": 65536,
+      "max_output_tokens": 8192,
+      "thinking_mode": "disabled",
+      "show_thinking": false
     },
     "llama3.1": {
       "capabilities": ["completion", "tools"],
@@ -111,24 +150,27 @@
     },
     "qwen3.6-27b-hauhau-q2kp": {
       "capabilities": ["completion", "tools"],
-      "context_length": 262144,
+      "context_length": 60000,
       "estimated_vram_gb": 18.0,
       "thinking_mode": "disabled",
       "show_thinking": false
     }
   },
 
-  "dashboard_enabled": true,
-  "dashboard_host": "127.0.0.1",
-  "dashboard_port": 21432,
-  "dashboard_sample_interval_seconds": 10.0,
-  "dashboard_retention_seconds": 604800.0,
-  "dashboard_data_path": "logs/dashboard_history.json",
-  "dashboard_model_reclaim_enabled": false,
-  "vram_low_free_reclaim_enabled": true,
-  "vram_low_free_threshold_mib": 200.0,
+  "_exposed": "==== Per-surface model whitelists ====================== Each entry is a composite 'model@target' id. Empty list = nothing exposed on that surface. 'internal' = /api/* (Ollama-compatible); 'external' = /v1/messages, /v1/models, and /v1/chat/completions on the external listener.",
 
-  "admin_enabled": true,
-  "admin_host": "127.0.0.1",
-  "admin_port": 21433
+  "internal_exposed_models": [
+    "claude-3-5-sonnet-20241022@anthropic",
+    "deepseek-chat@deepseek",
+    "deepseek-reasoner@deepseek",
+    "llama3.1@local-ollama",
+    "qwen2.5-coder@local-ollama",
+    "qwen3.6-27b-hauhau-q2kp@qwen3.6-27b-hauhau-q2kp"
+  ],
+
+  "external_exposed_models": [
+    "claude-3-5-sonnet-20241022@anthropic",
+    "deepseek-chat@deepseek",
+    "qwen3.6-27b-hauhau-q2kp@qwen3.6-27b-hauhau-q2kp"
+  ]
 }
