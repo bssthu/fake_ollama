@@ -29,6 +29,7 @@ from .converters import (
 )
 from .llama_cpp_client import LlamaCppClient
 from .ollama_client import OllamaClient
+from .openai_client import OpenAIClient
 from .request_data_log import RequestDataLogMiddleware
 from .vram import LocalTargetResourceError, VramCoordinator
 from .dashboard import DashboardState, run_runtime_monitor
@@ -53,12 +54,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         owned_names: list[str] = []
         owned_target_names: list[str] = []
         owned_llama_cpp_names: list[str] = []
+        owned_openai_names: list[str] = []
         if not getattr(app.state, "clients", None):
             app.state.clients = {}
         if not getattr(app.state, "ollama_clients", None):
             app.state.ollama_clients = {}
         if not getattr(app.state, "llama_cpp_clients", None):
             app.state.llama_cpp_clients = {}
+        if not getattr(app.state, "openai_clients", None):
+            app.state.openai_clients = {}
         if not getattr(app.state, "vram_coordinator", None):
             app.state.vram_coordinator = VramCoordinator()
         if not getattr(app.state, "dashboard_state", None):
@@ -73,6 +77,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 trust_env=app.state.settings.use_system_proxy,
             )
             owned_names.append(up.name)
+        for up in app.state.settings.openai_upstreams:
+            if up.name in app.state.openai_clients:
+                continue
+            app.state.openai_clients[up.name] = OpenAIClient(
+                up.base_url,
+                auth_token=up.auth_token,
+                timeout=app.state.settings.timeout_seconds,
+                trust_env=app.state.settings.use_system_proxy,
+                upstream_name=up.name,
+            )
+            owned_openai_names.append(up.name)
         for tgt in app.state.settings.ollama_targets:
             if tgt.name in app.state.ollama_clients:
                 continue
@@ -146,6 +161,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 lc = app.state.llama_cpp_clients.pop(name, None)
                 if lc is not None:
                     await lc.aclose()
+            for name in owned_openai_names:
+                oc2 = app.state.openai_clients.pop(name, None)
+                if oc2 is not None:
+                    await oc2.aclose()
 
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
     app.state.settings = settings
@@ -222,6 +241,65 @@ def _client_for(app: FastAPI, settings: Settings, model_name: str) -> AnthropicC
         # under any key working.
         return next(iter(clients.values()))
     return clients[name]
+
+
+def _openai_client_for(app: FastAPI, upstream_name: str) -> OpenAIClient:
+    """Resolve the configured :class:`OpenAIClient` for an upstream name."""
+    clients: Dict[str, OpenAIClient] = getattr(app.state, "openai_clients", {})
+    client = clients.get(upstream_name)
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"openai_upstream '{upstream_name}' is not initialised",
+        )
+    return client
+
+
+async def _openai_upstream_messages(
+    oc: OpenAIClient,
+    anthropic_payload: Dict[str, Any],
+    *,
+    anthropic_model: str,
+    target_model: str,
+    default_max_tokens: int,
+    show_thinking: bool,
+) -> Dict[str, Any]:
+    """Round-trip an Anthropic-shape payload through an OpenAI upstream."""
+    openai_payload = anthropic_to_openai_chat_payload(
+        anthropic_payload,
+        target_model=target_model,
+        default_max_tokens=default_max_tokens,
+    )
+    openai_resp = await oc.chat(openai_payload)
+    return openai_chat_to_anthropic_response(
+        openai_resp,
+        anthropic_model=anthropic_model,
+        show_thinking=show_thinking,
+    )
+
+
+async def _openai_upstream_stream_messages(
+    oc: OpenAIClient,
+    anthropic_payload: Dict[str, Any],
+    *,
+    anthropic_model: str,
+    target_model: str,
+    default_max_tokens: int,
+    show_thinking: bool,
+) -> AsyncIterator[tuple[str, Dict[str, Any]]]:
+    """Stream an Anthropic-shape request through an OpenAI upstream as events."""
+    from .reverse_converters import openai_stream_to_anthropic_events
+
+    openai_payload = anthropic_to_openai_chat_payload(
+        anthropic_payload,
+        target_model=target_model,
+        default_max_tokens=default_max_tokens,
+    )
+    lines = oc.stream_chat(openai_payload)
+    async for event_type, data in openai_stream_to_anthropic_events(
+        lines, anthropic_model=anthropic_model, show_thinking=show_thinking
+    ):
+        yield event_type, data
 
 
 async def _local_target_idle_monitor(app: FastAPI) -> None:
@@ -916,6 +994,104 @@ def _count_tokens_payload(payload: Dict[str, Any], model: str) -> Dict[str, Any]
     return out
 
 
+async def _handle_ollama_via_openai_upstream(
+    request: Request,
+    payload: Dict[str, Any],
+    openai_up: Any,
+    *,
+    mode: str,
+) -> Any:
+    """Ollama frontend (``/api/chat`` or ``/api/generate``) over an OpenAI upstream.
+
+    Pipeline: Ollama JSON -> Anthropic canonical -> OpenAI Chat
+    Completions -> Anthropic canonical -> Ollama JSON. The two
+    conversion steps re-use the existing forward/reverse converters so
+    new wire formats only need an Anthropic adapter pair to plug into
+    every existing surface.
+    """
+    app = request.app
+    settings: Settings = app.state.settings
+    ollama_model = payload.get("model") or (settings.models[0] if settings.models else "")
+    upstream_model = openai_up.resolve_model(ollama_model)
+    oc = _openai_client_for(app, openai_up.name)
+    profile = settings.profile_for(ollama_model)
+
+    if mode == "chat":
+        anthropic_payload = ollama_chat_to_anthropic(
+            payload,
+            upstream_model=ollama_model,
+            default_max_tokens=settings.default_max_tokens,
+        )
+    else:
+        anthropic_payload = ollama_generate_to_anthropic(
+            payload,
+            upstream_model=ollama_model,
+            default_max_tokens=settings.default_max_tokens,
+        )
+    stream = bool(payload.get("stream", True))
+    anthropic_payload["stream"] = stream
+    _apply_thinking_config(settings, ollama_model, anthropic_payload)
+    _enforce_limits(settings, ollama_model, anthropic_payload)
+
+    if not stream:
+        try:
+            anthropic_resp = await _openai_upstream_messages(
+                oc,
+                anthropic_payload,
+                anthropic_model=ollama_model,
+                target_model=upstream_model,
+                default_max_tokens=settings.default_max_tokens,
+                show_thinking=profile.show_thinking,
+            )
+        except httpx.HTTPError as exc:
+            _log_upstream_error(request, exc, anthropic_payload)
+            return _upstream_error(exc)
+        if mode == "chat":
+            return JSONResponse(
+                anthropic_to_ollama_chat(
+                    anthropic_resp,
+                    ollama_model=ollama_model,
+                    show_thinking=profile.show_thinking,
+                )
+            )
+        return JSONResponse(
+            anthropic_to_ollama_generate(
+                anthropic_resp,
+                ollama_model=ollama_model,
+                show_thinking=profile.show_thinking,
+            )
+        )
+
+    async def body() -> AsyncIterator[bytes]:
+        translator = AnthropicStreamTranslator(
+            ollama_model, mode=mode, show_thinking=profile.show_thinking
+        )
+        try:
+            async for event_type, data in _openai_upstream_stream_messages(
+                oc,
+                anthropic_payload,
+                anthropic_model=ollama_model,
+                target_model=upstream_model,
+                default_max_tokens=settings.default_max_tokens,
+                show_thinking=profile.show_thinking,
+            ):
+                for chunk in translator.feed_event(event_type, data):
+                    yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
+        except httpx.HTTPError as exc:
+            _log_upstream_error(request, exc, anthropic_payload)
+            err_chunk = {
+                "model": ollama_model,
+                "created_at": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+                "done": True,
+                "error": _read_error_text(exc),
+            }
+            yield (json.dumps(err_chunk, ensure_ascii=False) + "\n").encode("utf-8")
+
+    return StreamingResponse(body(), media_type="application/x-ndjson")
+
+
 async def _handle(request: Request, *, mode: str) -> Any:
     app = request.app
     settings: Settings = app.state.settings
@@ -928,6 +1104,11 @@ async def _handle(request: Request, *, mode: str) -> Any:
     ollama_model = payload.get("model") or (settings.models[0] if settings.models else "")
     if not ollama_model:
         raise HTTPException(status_code=400, detail="missing 'model'")
+    openai_up = settings.openai_upstream_for(ollama_model)
+    if openai_up is not None:
+        return await _handle_ollama_via_openai_upstream(
+            request, payload, openai_up, mode=mode
+        )
     upstream_model = settings.resolve_model(ollama_model)
     client = _client_for(app, settings, ollama_model)
 
@@ -1188,6 +1369,63 @@ async def _handle_openai_chat(request: Request) -> Any:
                 yield b"data: [DONE]\n\n"
 
         return StreamingResponse(body_llama_openai(), media_type="text/event-stream")
+
+    openai_up = settings.openai_upstream_for(openai_model)
+    if openai_up is not None:
+        if external_request and not openai_up.exposes(openai_model):
+            raise HTTPException(
+                status_code=404,
+                detail=f"model '{openai_model}' is not exposed externally",
+            )
+        oc_remote = _openai_client_for(app, openai_up.name)
+        forward_payload = dict(payload)
+        forward_payload["model"] = openai_up.resolve_model(openai_model)
+        stream = bool(payload.get("stream", False))
+        forward_payload["stream"] = stream
+        # No thinking_config / _enforce_limits here: remote OpenAI gateways
+        # are passthrough; the user already controls those knobs in the
+        # request they send us.
+        if not stream:
+            try:
+                resp = await oc_remote.chat(forward_payload)
+            except httpx.HTTPError as exc:
+                _log_upstream_error(request, exc, forward_payload)
+                return _upstream_error(exc)
+            if isinstance(resp, dict):
+                resp = dict(resp)
+                resp["model"] = openai_model
+            return JSONResponse(resp)
+
+        async def body_openai_upstream() -> AsyncIterator[bytes]:
+            try:
+                async for line in oc_remote.stream_chat(forward_payload):
+                    if line.startswith("data:"):
+                        yield (line + "\n\n").encode("utf-8")
+                    else:
+                        yield ("data: " + line + "\n\n").encode("utf-8")
+            except httpx.HTTPError as exc:
+                _log_upstream_error(request, exc, forward_payload)
+                err_frame = {
+                    "id": "chatcmpl-fake",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now(timezone.utc).timestamp()),
+                    "model": openai_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": f"[upstream error: {_read_error_text(exc)}]"
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                yield (
+                    "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
+                ).encode("utf-8")
+                yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(body_openai_upstream(), media_type="text/event-stream")
 
     upstream_model = settings.resolve_model(openai_model)
     client = _client_for(app, settings, openai_model)
@@ -1488,6 +1726,72 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                 ).encode("utf-8")
 
         return StreamingResponse(body_llama_anthropic(), media_type="text/event-stream")
+
+    openai_up = settings.openai_upstream_for(anth_model)
+    if openai_up is not None:
+        # Reverse-proxy surface: refuse models hidden via expose_external.
+        if not openai_up.exposes(anth_model):
+            raise HTTPException(
+                status_code=404,
+                detail=f"model '{anth_model}' is not exposed externally",
+            )
+        if settings.auth_required_for_v1:
+            presented = _bearer_or_api_key(request)
+            if not settings.is_valid_external_token(presented):
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "missing or invalid api token (send via x-api-key "
+                        "or Authorization: Bearer header)"
+                    ),
+                )
+        oc_remote = _openai_client_for(app, openai_up.name)
+        upstream_model = openai_up.resolve_model(anth_model)
+        profile = settings.profile_for(anth_model)
+        if not stream:
+            try:
+                anthropic_resp = await _openai_upstream_messages(
+                    oc_remote,
+                    payload,
+                    anthropic_model=anth_model,
+                    target_model=upstream_model,
+                    default_max_tokens=settings.default_max_tokens,
+                    show_thinking=profile.show_thinking,
+                )
+            except httpx.HTTPError as exc:
+                _log_upstream_error(request, exc, payload)
+                return _anthropic_error_response(exc)
+            return JSONResponse(anthropic_resp)
+
+        async def body_openai_anthropic() -> AsyncIterator[bytes]:
+            from .reverse_converters import _sse  # type: ignore
+
+            try:
+                async for event_type, data in _openai_upstream_stream_messages(
+                    oc_remote,
+                    payload,
+                    anthropic_model=anth_model,
+                    target_model=upstream_model,
+                    default_max_tokens=settings.default_max_tokens,
+                    show_thinking=profile.show_thinking,
+                ):
+                    yield _sse(event_type, data)
+            except httpx.HTTPError as exc:
+                _log_upstream_error(request, exc, payload)
+                err = {
+                    "type": "error",
+                    "error": {
+                        "type": "upstream_error",
+                        "message": _read_error_text(exc),
+                    },
+                }
+                yield (
+                    "event: error\ndata: "
+                    + json.dumps(err, ensure_ascii=False)
+                    + "\n\n"
+                ).encode("utf-8")
+
+        return StreamingResponse(body_openai_anthropic(), media_type="text/event-stream")
 
     # Pass-through to the matching upstream Anthropic server.
     # Reverse-proxy surface: refuse models that are not opted in via

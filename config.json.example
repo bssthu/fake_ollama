@@ -26,6 +26,18 @@
     }
   ],
 
+  "openai_upstreams": [
+    {
+      "name": "deepseek-openai",
+      "base_url": "https://api.deepseek.com",
+      "auth_token": "sk-deepseek-...",
+      "models": ["deepseek-chat", "deepseek-reasoner"],
+      "model_map": {
+        "deepseek-reasoner": "deepseek-reasoner"
+      }
+    }
+  ],
+
   "external_host": "127.0.0.1",
   "external_port": 21435,
   "external_access_tokens": [

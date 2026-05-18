@@ -84,11 +84,22 @@ def test_admin_schema(admin_settings):
         "dashboard_model_reclaim_enabled",
     } <= keys
     upstreams = next(f for f in fields if f["key"] == "upstreams")
-    assert upstreams["required"] is True
+    # ``upstreams`` is no longer strictly required: an OpenAI-only
+    # config (``openai_upstreams``) is now a valid forward-proxy setup.
+    assert upstreams.get("required", False) is False
     assert upstreams["type"] == "object_list"
     assert {f["key"] for f in upstreams["item_schema"]} >= {"name", "base_url"}
     upstream_models = next(f for f in upstreams["item_schema"] if f["key"] == "models")
     assert upstream_models["autocomplete"] == "model_names"
+    openai_ups = next(f for f in fields if f["key"] == "openai_upstreams")
+    assert openai_ups["type"] == "object_list"
+    assert openai_ups["detect_models"] == "openai"
+    assert {f["key"] for f in openai_ups["item_schema"]} >= {
+        "name",
+        "base_url",
+        "auth_token",
+        "models",
+    }
     # ollama_target items no longer carry per-target api_token.
     ollama = next(f for f in fields if f["key"] == "ollama_targets")
     item_keys = {f["key"] for f in ollama["item_schema"]}
@@ -157,7 +168,8 @@ def test_admin_schema(admin_settings):
     assert section_order == ["forward", "reverse", "shared", "dashboard", "admin"]
     field_order = [f["key"] for f in fields]
     assert field_order[:4] == ["host", "port", "advertised_version", "upstreams"]
-    assert field_order[4:7] == ["external_host", "external_port", "external_access_tokens"]
+    assert field_order[4] == "openai_upstreams"
+    assert field_order[5:8] == ["external_host", "external_port", "external_access_tokens"]
     assert field_order[-13] == "model_profiles"
     assert field_order[-12:-3] == [
         "dashboard_enabled",

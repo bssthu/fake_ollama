@@ -2,7 +2,7 @@
 
 一个轻量的协议适配层，主要做两件事：
 
-1. **正向**（Ollama 兼容入口 → Anthropic 上游）：把 **Anthropic Messages API** 兼容的上游（官方 / DeepSeek / 自建网关 / claude-relay-service）伪装成一台本机 **Ollama** 服务，让只支持 Ollama 协议的客户端（GitHub Copilot 自定义 provider、IDE 插件、桌面 AI 软件）无缝调用 Claude / DeepSeek 等模型。
+1. **正向**（Ollama / Anthropic / OpenAI 兼容入口 → 远端上游）：把 **Anthropic Messages API** 或 **OpenAI Chat Completions API** 兼容的上游（官方 / DeepSeek / Together / Groq / 自建网关 / claude-relay-service）伪装成一台本机 **Ollama** 服务，让只支持 Ollama 协议的客户端（GitHub Copilot 自定义 provider、IDE 插件、桌面 AI 软件）无缝调用 Claude / DeepSeek / GPT 等模型；同时三个前端入口都可用，按需自动翻译协议。
 2. **反向**（Anthropic / OpenAI 兼容入口 → 本机模型服务）：把本机的 **Ollama** 或 **llama.cpp server** 包装成 **Anthropic Messages API**（`POST /v1/messages`）和 OpenAI Chat Completions（`POST /v1/chat/completions`），让只支持远端 API 的客户端也能调用本地大模型。
 
 附带一个零依赖的 Web 配置编辑器（`/admin`），不必再手改 JSON。
@@ -120,7 +120,8 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `upstreams` | array | — | **必填**，至少一个 Anthropic 兼容上游（见下） |
+| `upstreams` | array | `[]` | Anthropic 兼容上游（见下）。和 `openai_upstreams` 至少配置一组 |
+| `openai_upstreams` | array | `[]` | OpenAI 兼容上游（OpenAI / DeepSeek / Together / Groq 等，见下）。和 `upstreams` 至少配置一组 |
 
 #### 反向代理：本机模型 -> 对外 API
 
@@ -196,6 +197,33 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 - `llama_cpp_targets` 因为每个 target 只有一个 `model`，所以使用布尔值：`true` 暴露，`false` 隐藏；target 不写则继承 `llama_cpp_defaults.expose_external`，全局也不写时按旧行为暴露。
 
 模型名匹配按 Ollama 规则处理：`model` 与 `model:latest` 等价；省略 tag 只代表 `latest`，不会匹配其他显式 tag（例如 `model:q4_K_M` / `model:q2_k_p`）。
+
+### openai_upstreams（正向：三种入口 → OpenAI 兼容上游）
+
+每项是一个独立的 OpenAI Chat Completions 兼容端点（OpenAI 官方 / DeepSeek / Together / Groq / SiliconFlow / 自建网关等）：
+
+```jsonc
+{
+  "name": "deepseek",                          // 唯一名字，且不能与 upstreams[].name 冲突
+  "base_url": "https://api.deepseek.com",       // 上游 base URL（会自动拼 /v1/chat/completions）
+  "auth_token": "sk-...",                       // 同时以 Authorization: Bearer 与 x-api-key 发送
+  "models": ["deepseek-chat", "deepseek-reasoner"],
+  "expose_external": ["deepseek-chat"],        // 可选：哪些模型出现在反向代理 /v1/models
+  "model_map": {                                // 可选：显示名 → 上游真实模型 ID
+    "deepseek-r1": "deepseek-reasoner"
+  }
+}
+```
+
+三个前端入口都能命中 `openai_upstreams`，并按需做协议翻译：
+
+| 入口 | 翻译方向 | 说明 |
+| --- | --- | --- |
+| `POST /api/chat`、`POST /api/generate`（Ollama 兼容入口） | Ollama → OpenAI；OpenAI → Ollama | 走 `Anthropic` 中间态，复用 thinking / 上下文限制等共享逻辑 |
+| `POST /v1/messages`（Anthropic 兼容入口） | Anthropic → OpenAI；OpenAI → Anthropic | 流式同样回写 Anthropic SSE 事件 |
+| `POST /v1/chat/completions`（OpenAI 兼容入口） | 透传 | 仅按 `model_map` 改写请求 `model`，响应里再改写回显示名 |
+
+路由优先级与 `upstreams` 一致：本机 target（`ollama_targets` / `llama_cpp_targets`）优先，远端按 `models` 列表里第一个匹配胜出；外部 `/v1/*` 入口仍受 `expose_external` 与 `external_access_tokens` 限制。
 
 ### ollama_targets（反向：Anthropic → 本机 Ollama）
 

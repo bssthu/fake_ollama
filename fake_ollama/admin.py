@@ -66,6 +66,23 @@ UPSTREAM_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选：显示名 → 上游真实模型 ID"},
 ]
 
+OPENAI_UPSTREAM_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "name", "type": "string", "default": "", "required": True,
+     "description": "唯一名字（routing key）；不可与 Anthropic upstreams 同名"},
+    {"key": "base_url", "type": "string", "default": "", "required": True,
+     "description": "OpenAI 兼容上游 base URL，例如 https://api.openai.com 或 https://api.deepseek.com"},
+    {"key": "auth_token", "type": "string", "default": "", "secret": True,
+     "description": "上游 API token；同时以 Authorization: Bearer 与 x-api-key 发出，兼容大多数网关"},
+    {"key": "models", "type": "string_list", "default": [],
+     "autocomplete": "model_names",
+     "description": "【Forward / Ollama 兼容入口】本机 /api/tags 可见、并路由到该 upstream 的模型显示名（一行一个）。Anthropic / Ollama / OpenAI 三个前端入口都会用此列表查找路由"},
+    {"key": "expose_external", "type": "string_list_subset_of",
+     "default": None, "subset_of": "models",
+     "description": "【External 反向代理】从 models 里选出允许出现在 /v1/models、/v1/messages 与 external /v1/chat/completions 的子集。语义同 Anthropic upstreams"},
+    {"key": "model_map", "type": "string_map", "default": {},
+     "description": "可选：显示名 → 上游真实模型 ID（如 gpt-4o → gpt-4o-2024-08-06）"},
+]
+
 OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "name", "type": "string", "default": "", "required": True,
      "description": "唯一名字"},
@@ -215,10 +232,16 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "description": "仅用于 Ollama 兼容入口的 GET /api/version 返回值，不影响 /v1/* 接口"},
 
   {"key": "upstreams", "type": "object_list", "default": [], "group": "forward_upstreams",
-   "required": True, "item_schema": UPSTREAM_ITEM_SCHEMA,
+   "item_schema": UPSTREAM_ITEM_SCHEMA,
    "detect_models": "anthropic",
    "nav_label_keys": ["name"],
-   "description": "至少一个远端 Anthropic 兼容上游；用于把远端 API 伪装成本机 Ollama"},
+   "description": "远端 Anthropic 兼容上游；用于把远端 API 伪装成本机 Ollama。和 openai_upstreams 至少配置一组"},
+
+  {"key": "openai_upstreams", "type": "object_list", "default": [], "group": "forward_upstreams",
+   "item_schema": OPENAI_UPSTREAM_ITEM_SCHEMA,
+   "detect_models": "openai",
+   "nav_label_keys": ["name"],
+   "description": "可选：OpenAI 兼容远端上游（OpenAI / DeepSeek / Together / Groq 等）。三个前端入口都可使用：Ollama /api/chat、Anthropic /v1/messages（自动转换）、OpenAI /v1/chat/completions（透传）"},
 
   {"key": "external_host", "type": "string", "default": None, "group": "reverse_listener",
    "description": "反向代理对外服务监听地址。填 127.0.0.1 仅本机（推荐 + Nginx）；填 0.0.0.0 直接对外。不填则不启用独立对外端口"},
@@ -1808,6 +1831,19 @@ def register_admin_routes(app: FastAPI) -> None:
                             for m in (data.get("models") or [])
                             if isinstance(m, dict) and (m.get("name") or m.get("model"))
                         ]
+                elif kind == "openai":
+                    headers = {}
+                    if token:
+                        headers["authorization"] = f"Bearer {token}"
+                        headers["x-api-key"] = token
+                    resp = await cli.get(base_url + "/v1/models", headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    names = [
+                        m.get("id")
+                        for m in (data.get("data") or [])
+                        if isinstance(m, dict) and m.get("id")
+                    ]
                 else:
                     raise HTTPException(
                         status_code=400, detail=f"unknown kind: {kind!r}"

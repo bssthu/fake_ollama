@@ -3,6 +3,17 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
+
+# These tests spawn ``sys.executable`` to import ``fake_ollama.__main__``,
+# whose top-level imports include ``uvicorn``. ``uvicorn`` is in
+# ``requirements.txt`` so a properly-set-up dev env will always have it
+# and this skip will be a no-op; the guard only triggers when pytest is
+# invoked from a stripped-down interpreter (e.g. bare system Python),
+# in which case the failure would be an environment issue rather than a
+# regression in the logging code under test.
+pytest.importorskip("uvicorn")
+
 
 def test_cli_logging_writes_default_style_log_file(tmp_path):
     log_file = tmp_path / "logs" / "fake_ollama.log"

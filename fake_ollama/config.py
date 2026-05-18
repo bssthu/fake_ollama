@@ -201,6 +201,18 @@ class Upstream(BaseModel):
         return _find_configured_model(configured, self.expose_external) is not None
 
 
+class OpenAIUpstream(Upstream):
+    """An OpenAI-compatible remote upstream (OpenAI, DeepSeek, Together, …).
+
+    The data shape and routing semantics are identical to
+    :class:`Upstream`; only the wire format spoken to the upstream
+    differs (POST ``/v1/chat/completions`` instead of ``/v1/messages``).
+    Keeping it as a distinct Pydantic class lets the admin UI / config
+    file declare which protocol an entry uses without resorting to a
+    free-form ``protocol`` field on the unified backend list.
+    """
+
+
 class OllamaTarget(BaseModel):
     """A local-side Ollama-compatible server we expose as Anthropic API.
 
@@ -728,6 +740,7 @@ class Settings(BaseModel):
     use_system_proxy: bool = False
     enforce_context_limit: bool = True
     upstreams: List[Upstream] = Field(default_factory=list)
+    openai_upstreams: List[OpenAIUpstream] = Field(default_factory=list)
     ollama_targets: List[OllamaTarget] = Field(default_factory=list)
     llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
     llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
@@ -741,15 +754,23 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "Settings":
-        if not self.upstreams:
+        if not self.upstreams and not self.openai_upstreams:
             raise ValueError(
                 "At least one upstream is required. Either set ANTHROPIC_BASE_URL "
-                "and ANTHROPIC_AUTH_TOKEN, or define an `upstreams` array in "
-                "config.json."
+                "and ANTHROPIC_AUTH_TOKEN, or define an `upstreams` / "
+                "`openai_upstreams` array in config.json."
             )
         names = [u.name for u in self.upstreams]
         if len(set(names)) != len(names):
             raise ValueError(f"Duplicate upstream names: {names}")
+        openai_names = [u.name for u in self.openai_upstreams]
+        if len(set(openai_names)) != len(openai_names):
+            raise ValueError(f"Duplicate openai_upstream names: {openai_names}")
+        cross = set(names) & set(openai_names)
+        if cross:
+            raise ValueError(
+                f"upstream and openai_upstream share names: {sorted(cross)}"
+            )
         target_names = [t.name for t in self.ollama_targets]
         if len(set(target_names)) != len(target_names):
             raise ValueError(f"Duplicate ollama_target names: {target_names}")
@@ -843,6 +864,13 @@ class Settings(BaseModel):
             for m in allowed:
                 if m not in seen:
                     seen[m] = None
+        for up in self.openai_upstreams:
+            allowed = up.models if up.expose_external is None else [
+                m for m in up.models if m in set(up.expose_external)
+            ]
+            for m in allowed:
+                if m not in seen:
+                    seen[m] = None
         return list(seen.keys())
 
     def is_externally_exposed(self, display_name: str) -> bool:
@@ -860,6 +888,9 @@ class Settings(BaseModel):
             if t.exposes(display_name):
                 return True
         for up in self.upstreams:
+            if up.exposes(display_name):
+                return True
+        for up in self.openai_upstreams:
             if up.exposes(display_name):
                 return True
         return False
@@ -881,6 +912,10 @@ class Settings(BaseModel):
         """Union of all upstream models, dedup, order preserved."""
         seen: Dict[str, None] = {}
         for up in self.upstreams:
+            for name in up.models:
+                if name not in seen:
+                    seen[name] = None
+        for up in self.openai_upstreams:
             for name in up.models:
                 if name not in seen:
                     seen[name] = None
@@ -931,6 +966,19 @@ class Settings(BaseModel):
         for t in self.llama_cpp_targets:
             if t.serves(display_name):
                 return t
+        return None
+
+    def openai_upstream_for(self, display_name: str):
+        """Return the OpenAIUpstream that should serve the given display name,
+        or ``None`` if no remote OpenAI upstream serves it.
+
+        Routing precedence matches :pyattr:`backends` — local backends
+        (ollama_targets, llama_cpp_targets) win first; this helper only
+        finds matches among the configured ``openai_upstreams``.
+        """
+        for up in self.openai_upstreams:
+            if up.serves(display_name):
+                return up
         return None
 
     def effective_llama_cpp_target(self, target: LlamaCppTarget) -> LlamaCppTarget:
@@ -1001,6 +1049,8 @@ class Settings(BaseModel):
             out.append(
                 Backend.from_llama_cpp_target(self.effective_llama_cpp_target(raw_t))
             )
+        for up in self.openai_upstreams:
+            out.append(Backend.from_openai_upstream(up))
         for up in self.upstreams:
             out.append(Backend.from_anthropic_upstream(up))
         return out
@@ -1077,6 +1127,18 @@ class Backend:
         return cls(
             name=up.name,
             protocol="anthropic",
+            kind="remote",
+            base_url=up.base_url,
+            auth_token=up.auth_token,
+            models=list(up.models),
+            source=up,
+        )
+
+    @classmethod
+    def from_openai_upstream(cls, up: "OpenAIUpstream") -> "Backend":
+        return cls(
+            name=up.name,
+            protocol="openai",
             kind="remote",
             base_url=up.base_url,
             auth_token=up.auth_token,
