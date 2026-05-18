@@ -970,6 +970,185 @@ class Settings(BaseModel):
             )
         return ModelProfile.from_dict(raw)
 
+    # -- Unified backends view (transitional) ----------------------------
+    #
+    # The on-disk config still has three separate lists
+    # (``upstreams`` / ``ollama_targets`` / ``llama_cpp_targets``) for
+    # backwards compatibility with the existing admin UI. Internally we
+    # expose a single ``backends`` list that tags each entry with a
+    # ``protocol`` (``anthropic`` / ``ollama`` / ``openai``) and a
+    # ``kind`` (``remote`` / ``local``). New code (routing in
+    # ``server.py``, future OpenAI upstream/target support) should drive
+    # off this unified view so adding a 4th backend type does not require
+    # another set of if/elif branches.
+
+    @property
+    def backends(self) -> List["Backend"]:
+        """Backends in routing priority order.
+
+        Local backends (Ollama, then llama.cpp) come before remote
+        Anthropic upstreams so the same display name on both a local
+        target and a remote upstream resolves to the local one. This
+        mirrors the precedence the legacy three-handler routing
+        already implemented via ``ollama_target_for`` /
+        ``llama_cpp_target_for`` being consulted before falling back to
+        ``upstreams``.
+        """
+        out: List[Backend] = []
+        for tgt in self.ollama_targets:
+            out.append(Backend.from_ollama_target(tgt))
+        for raw_t in self.llama_cpp_targets:
+            out.append(
+                Backend.from_llama_cpp_target(self.effective_llama_cpp_target(raw_t))
+            )
+        for up in self.upstreams:
+            out.append(Backend.from_anthropic_upstream(up))
+        return out
+
+    def backend_for(
+        self, display_name: str, *, surface: Optional[str] = None
+    ) -> Optional["Backend"]:
+        """Return the backend that should handle ``display_name`` on ``surface``.
+
+        Resolution order mirrors the historical behaviour of the three
+        legacy handlers:
+
+        1. ``ollama_targets`` — local Ollama-protocol backends serve first.
+        2. ``llama_cpp_targets`` — local OpenAI-protocol backends next.
+        3. ``upstreams`` — remote Anthropic-protocol fall-back.
+
+        When ``surface`` is provided (``"internal"`` or ``"external"``)
+        backends that do not expose ``display_name`` on that surface are
+        skipped, so a model hidden via ``expose_external`` is invisible
+        to the external listener.
+        """
+        for backend in self.backends:
+            if not backend.serves(display_name):
+                continue
+            if surface is not None and not backend.exposes_on(surface, display_name):
+                continue
+            return backend
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Unified backend view
+# ---------------------------------------------------------------------------
+
+
+_BackendSource = Any  # Upstream | OllamaTarget | LlamaCppTarget
+
+
+@dataclass(frozen=True)
+class Backend:
+    """A protocol-tagged view over one backend declaration.
+
+    ``Backend`` is intentionally a thin façade: routing code stays
+    independent of which legacy field (``upstreams`` / ``ollama_targets``
+    / ``llama_cpp_targets``) declared the backend, while still letting
+    callers reach into ``source`` for protocol-specific fields (lifecycle
+    commands, llama.cpp launch args, etc.).
+
+    Tags:
+
+    * ``protocol``: wire format spoken to this backend. ``anthropic`` for
+      Anthropic Messages API upstreams, ``ollama`` for the Ollama
+      ``/api/chat`` JSON format, ``openai`` for the OpenAI Chat
+      Completions format that llama.cpp server and (future) remote
+      OpenAI-compatible upstreams speak.
+    * ``kind``: ``remote`` for HTTP-only backends fake-ollama only proxies
+      to; ``local`` for backends fake-ollama may also own the process
+      lifecycle of (health check, auto-start, idle stop). ``auto_start``
+      on a ``remote`` backend is meaningless and ignored.
+    """
+
+    name: str
+    protocol: str  # "anthropic" | "ollama" | "openai"
+    kind: str  # "remote" | "local"
+    base_url: str
+    auth_token: str
+    models: List[str]
+    source: _BackendSource
+
+    # -- Constructors ----------------------------------------------------
+
+    @classmethod
+    def from_anthropic_upstream(cls, up: "Upstream") -> "Backend":
+        return cls(
+            name=up.name,
+            protocol="anthropic",
+            kind="remote",
+            base_url=up.base_url,
+            auth_token=up.auth_token,
+            models=list(up.models),
+            source=up,
+        )
+
+    @classmethod
+    def from_ollama_target(cls, tgt: "OllamaTarget") -> "Backend":
+        # Ollama targets are usually local (``http://127.0.0.1:11434``)
+        # but may point at a remote daemon; the practical differentiator
+        # is whether fake-ollama owns the lifecycle (``auto_start``).
+        kind = "local" if tgt.auto_start or tgt.stop_command else "remote"
+        return cls(
+            name=tgt.name,
+            protocol="ollama",
+            kind=kind,
+            base_url=tgt.base_url,
+            auth_token="",
+            models=list(tgt.models),
+            source=tgt,
+        )
+
+    @classmethod
+    def from_llama_cpp_target(cls, tgt: "LlamaCppTarget") -> "Backend":
+        return cls(
+            name=tgt.name or tgt.model,
+            protocol="openai",
+            kind="local",
+            base_url=tgt.base_url,
+            auth_token=tgt.auth_token,
+            models=list(tgt.models),
+            source=tgt,
+        )
+
+    # -- Routing helpers -------------------------------------------------
+
+    def serves(self, display_name: str) -> bool:
+        return self.source.serves(display_name)
+
+    def resolve_model(self, display_name: str) -> str:
+        return self.source.resolve_model(display_name)
+
+    def exposes_on(self, surface: str, display_name: str) -> bool:
+        """True iff ``display_name`` is visible on ``surface``.
+
+        ``surface`` is one of ``"internal"`` / ``"external"``.
+
+        * On ``internal`` every backend that ``serves(display_name)``
+          exposes it (the internal listener has no per-model gating).
+        * On ``external`` we honour the legacy ``expose_external``
+          whitelist semantics each source type already implements.
+        """
+        if surface == "internal":
+            return self.serves(display_name)
+        if surface == "external":
+            return bool(self.source.exposes(display_name))
+        raise ValueError(f"unknown surface: {surface!r}")
+
+    # -- Lifecycle helpers ----------------------------------------------
+
+    @property
+    def supports_lifecycle(self) -> bool:
+        """Whether ``auto_start`` / ``idle_timeout`` are meaningful here."""
+        return self.kind == "local"
+
+    @property
+    def auto_start(self) -> bool:
+        if not self.supports_lifecycle:
+            return False
+        return bool(getattr(self.source, "auto_start", False))
+
 
 # ---------------------------------------------------------------------------
 # Loader

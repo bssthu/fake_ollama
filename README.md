@@ -389,6 +389,34 @@ claude
 
 不需要这个 UI 的话设 `"admin_enabled": false`，相关路由不会注册。默认情况下 `/admin` 只挂在 admin listener 上，**不会被 internal 或 external 端口暴露**。只有显式设置 `"admin_port": null` 时才会回到旧的 internal 单端口模式。
 
+## 内部 backends 视图（重构准备）
+
+`config.json` 当前仍按历史形态分成 `upstreams` / `ollama_targets` / `llama_cpp_targets` 三个列表（admin UI 也按这个结构渲染），但在 `Settings` 之上现在统一暴露一个协议无关的 `backends` 视图，路由代码可以不再关心一个 backend 是从哪个列表来的：
+
+```python
+settings.backends
+# -> List[Backend]，每个元素带 (name, protocol, kind, base_url, models, source)
+#    protocol: "anthropic" | "ollama" | "openai"
+#    kind:     "remote" | "local"
+#    source:   底层的 Upstream / OllamaTarget / LlamaCppTarget 对象，
+#              需要协议专属字段（启停命令、llama.cpp 启动参数等）时用
+
+settings.backend_for("llama3.1")
+# -> 按路由优先级（ollama_targets → llama_cpp_targets → upstreams）
+#    挑出第一个 serves(model) 的 backend，找不到返回 None
+
+settings.backend_for("private-model", surface="external")
+# -> 额外按 expose_external 规则过滤；隐藏在外部的模型会被跳过
+```
+
+设计意图：
+
+- **`protocol`** 决定走哪套 wire format converter（Anthropic Messages、Ollama `/api/chat`、OpenAI Chat Completions）。
+- **`kind`** 决定是否参与生命周期管理：`local` 才会触发 health check / `auto_start` / VRAM 回收；远端 backend 上设 `auto_start` 没有意义、会被忽略。
+- 下一轮加 OpenAI 兼容端口时，新增的 `openai_upstreams` / `openai_targets` 会自动归并进同一份 `backends` 列表，server 路由不再需要新增一组 if/elif 分支。
+
+新增字段细节见 `tests/test_backends.py`。
+
 ## 视觉输入（图片）
 
 - `/api/chat`、`/api/generate`：消息里传 `images: ["<base64>", ...]`，服务端从 base64 magic bytes 嗅探 PNG / JPEG / GIF / WEBP 并设置正确的 `media_type`。
