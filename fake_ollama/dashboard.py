@@ -96,6 +96,13 @@ def _model_key(snapshot: dict[str, object]) -> str:
 
 def _collect_model_snapshots(app: FastAPI) -> list[dict[str, object]]:
     now = time.monotonic()
+    settings = getattr(app.state, "settings", None)
+    # The dashboard close button is a user-driven action and uses a much
+    # looser idle threshold than the automatic LRU-reclaim path. Falls
+    # back to 20s if the field is missing on older Settings instances.
+    idle_reclaim_seconds = float(
+        getattr(settings, "dashboard_reclaim_idle_seconds", 20.0) or 20.0
+    )
     snapshots: list[dict[str, object]] = []
     for clients in (
         getattr(app.state, "ollama_clients", {}),
@@ -105,7 +112,7 @@ def _collect_model_snapshots(app: FastAPI) -> list[dict[str, object]]:
             getter = getattr(client, "loaded_model_snapshots", None)
             if not callable(getter):
                 continue
-            for raw in getter(now=now):
+            for raw in getter(now=now, idle_reclaim_seconds=idle_reclaim_seconds):
                 snap = dict(raw)
                 snap["key"] = _model_key(snap)
                 snapshots.append(snap)

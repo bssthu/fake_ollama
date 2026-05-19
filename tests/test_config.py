@@ -392,3 +392,61 @@ def test_routes_request_via_composite_id_through_app(monkeypatch, tmp_path):
     assert r2.status_code == 200, r2.text
     assert hits["anthropic"] == ["sonnet"]
     assert hits["deepseek"] == ["dpsk"]
+
+# ---------------------------------------------------------------------------
+# model_profiles list-form + dashboard_reclaim_idle_seconds
+# ---------------------------------------------------------------------------
+
+
+def test_model_profiles_list_form_loads():
+    s = Settings(
+        model_profiles=[
+            {"model": "foo", "context_length": 1000},
+            {"model": "bar", "target": "openai-a", "thinking_mode": "disabled"},
+        ]
+    )
+    assert s.profile_for("foo").context_length == 1000
+    assert s.profile_for("bar@openai-a").thinking_mode == "disabled"
+
+
+def test_model_profiles_list_form_rejects_missing_model():
+    with pytest.raises(Exception):
+        Settings(model_profiles=[{"target": "x", "context_length": 1}])
+
+
+def test_model_profiles_list_form_rejects_duplicates():
+    with pytest.raises(Exception):
+        Settings(model_profiles=[
+            {"model": "a", "target": "t", "context_length": 1},
+            {"model": "a", "target": "t", "context_length": 2},
+        ])
+
+
+def test_model_profiles_dict_form_still_works():
+    s = Settings(model_profiles={"foo@bar": {"context_length": 42}})
+    assert s.profile_for("foo@bar").context_length == 42
+
+
+def test_model_profiles_dump_emits_list_form():
+    s = Settings(model_profiles={
+        "foo": {"context_length": 1},
+        "bar@baz": {"context_length": 2},
+    })
+    dumped = s.model_dump()["model_profiles"]
+    assert isinstance(dumped, list)
+    by_key = {(e["model"], e.get("target")): e for e in dumped}
+    assert by_key[("foo", None)]["context_length"] == 1
+    assert by_key[("bar", "baz")]["context_length"] == 2
+    # Roundtrip back through Settings produces the same internal state.
+    s2 = Settings(model_profiles=dumped)
+    assert s2.profile_for("foo").context_length == 1
+    assert s2.profile_for("bar@baz").context_length == 2
+
+
+def test_dashboard_reclaim_idle_seconds_default_is_20():
+    assert Settings().dashboard_reclaim_idle_seconds == 20.0
+
+
+def test_dashboard_reclaim_idle_seconds_configurable():
+    s = Settings(dashboard_reclaim_idle_seconds=5.0)
+    assert s.dashboard_reclaim_idle_seconds == 5.0

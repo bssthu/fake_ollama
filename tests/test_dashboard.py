@@ -59,7 +59,7 @@ class _SnapshotClient:
     def __init__(self, snapshot: dict[str, object]) -> None:
         self.snapshot = snapshot
 
-    def loaded_model_snapshots(self, *, now: float) -> list[dict[str, object]]:
+    def loaded_model_snapshots(self, *, now: float, idle_reclaim_seconds: float = 60.0) -> list[dict[str, object]]:
         return [dict(self.snapshot)]
 
 

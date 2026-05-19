@@ -321,7 +321,7 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 | `use_system_proxy` | bool | `false` | 出站是否走系统代理 |
 | `enforce_context_limit` | bool | `true` | 估算 token 超 `context_length` 直接 400 |
 | `advertised_version` | string | `0.6.4` | 仅用于 Ollama 接口的 `/api/version` |
-| `model_profiles` | object | `{}` | 每模型 capabilities / 上下文 / 思维链等。key 三级回退：`model@target` > 裸 `model` > tagless base |
+| `model_profiles` | list | `[]` | 每模型 capabilities / 上下文 / 思维链等。每项写 `model`（必填）+ 可选 `target`，两者拼起来作为最终 key：填 `target` 时为 `model@target` 仅覆盖该 target，不填则裸 `model` 适用于所有 target。查找时三级回退：`model@target` > 裸 `model` > tagless base。旧的 `{ "model@target": {...} }` dict 写法仍兼容 |
 
 ### Admin UI / Dashboard
 
@@ -336,6 +336,7 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 | `dashboard_retention_seconds` | float | `604800.0` | 历史保留窗口 |
 | `dashboard_data_path` | string | `logs/dashboard_history.json` | 历史落盘路径 |
 | `dashboard_model_reclaim_enabled` | bool | `true` | dashboard 是否显示模型回收 |
+| `dashboard_reclaim_idle_seconds` | float | `20.0` | dashboard 关闭按钮所需的最小空闲秒数。和自动 LRU 回收的 60s 阈值独立——用户手动判断更宽松 |
 | `vram_low_free_reclaim_enabled` | bool | `true` | 检测显存低水位时主动回收 |
 | `vram_low_free_threshold_mib` | float | `200.0` | 低水位阈值（MiB） |
 

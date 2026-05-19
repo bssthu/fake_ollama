@@ -200,6 +200,11 @@ LLAMA_CPP_DEFAULTS_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "model", "type": "string", "default": "", "required": True,
+     "autocomplete": "model_names",
+     "description": "模型名（裸名应用于所有 target；与 target 一起拼出最终 key 'model@target' 仅覆盖该 target）"},
+    {"key": "target", "type": "string", "default": "",
+     "description": "可选：source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets 中的某个 name）。留空 = 对该 model 名所有 target 生效"},
     {"key": "capabilities", "type": "string_list",
      "default": ["completion", "tools", "vision"],
      "description": "子集自 completion / tools / vision；至少包含 completion"},
@@ -299,10 +304,11 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "enforce_context_limit", "type": "bool", "default": True, "group": "runtime",
    "description": "在带 context_length 的请求上，估算输入+max_tokens 超限时直接 400"},
 
-  {"key": "model_profiles", "type": "object_map", "default": {}, "group": "runtime",
+  {"key": "model_profiles", "type": "object_list", "default": [], "group": "runtime",
    "item_schema": MODEL_PROFILE_ITEM_SCHEMA,
-   "key_autocomplete": "model_names",
-   "description": "模型 capabilities / 上下文 / 思维链设置。key 可以是裸模型名（适用于所有 target）或复合 id 'model@target'（仅覆盖该 target）"},
+   "nav_label_keys": ["model", "target"],
+   "nav_label_join": "@",
+   "description": "模型 capabilities / 上下文 / 思维链设置。每项写 model（必填）和可选 target，两者拼起来作为最终 key：填 target 时为 'model@target' 仅覆盖该 target；不填 target 时为裸 'model' 适用于所有 target"},
 
   {"key": "dashboard_enabled", "type": "bool", "default": True, "group": "dashboard",
    "description": "Enable the runtime dashboard mounted at /dashboard on its own listener."},
@@ -318,6 +324,8 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "description": "JSON file used to persist dashboard history. Leave empty to disable file persistence."},
   {"key": "dashboard_model_reclaim_enabled", "type": "bool", "default": False, "group": "dashboard",
    "description": "Allow the dashboard Current Models table to request release of eligible idle local models."},
+  {"key": "dashboard_reclaim_idle_seconds", "type": "float", "default": 20.0, "group": "dashboard",
+   "description": "用户在 dashboard 点击关闭按钮时所需的最小空闲秒数。和自动 LRU 回收的 60s 阈值独立；用户判断更宽松，默认 20s。"},
   {"key": "vram_low_free_reclaim_enabled", "type": "bool", "default": True, "group": "dashboard",
    "description": "Enable periodic low-free-VRAM checks that release eligible idle local models."},
   {"key": "vram_low_free_threshold_mib", "type": "float", "default": 200.0, "group": "dashboard",
@@ -1063,7 +1071,14 @@ function collectKnownModelNames() {
     if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams' || field.key === 'ollama_targets' || field.key === 'llama_cpp_targets') walkList(r);
     if (field.key === 'model_profiles' && r && typeof r.read === 'function') {
       const m = r.read();
-      if (m && typeof m === 'object') for (const k of Object.keys(m)) if (k) out.add(k);
+      if (Array.isArray(m)) {
+        for (const entry of m) {
+          if (entry && entry.model) out.add(String(entry.model));
+        }
+      } else if (m && typeof m === 'object') {
+        // legacy dict shape
+        for (const k of Object.keys(m)) if (k) out.add(k);
+      }
     }
   }
   return Array.from(out);
@@ -1311,13 +1326,26 @@ function renderForm(config) {
         })));
       } else if (field.type === 'object_list' && field.nav_label_keys && field.nav_label_keys.length) {
         const labelKeys = field.nav_label_keys;
+        const joinSep = (typeof field.nav_label_join === 'string') ? field.nav_label_join : '';
         sources.push(() => r._items.map((entry, idx) => {
           let label = '';
-          for (const key of labelKeys) {
-            const sub = entry.renderer && entry.renderer.getRenderer
-              ? entry.renderer.getRenderer(key) : null;
-            const v = sub && sub.get ? sub.get() : (sub && sub.read ? sub.read() : '');
-            if (v && typeof v === 'string' && v.trim()) { label = v.trim(); break; }
+          if (joinSep) {
+            // Concatenate every non-empty key value with the given separator.
+            const parts = [];
+            for (const key of labelKeys) {
+              const sub = entry.renderer && entry.renderer.getRenderer
+                ? entry.renderer.getRenderer(key) : null;
+              const v = sub && sub.get ? sub.get() : (sub && sub.read ? sub.read() : '');
+              if (v && typeof v === 'string' && v.trim()) parts.push(v.trim());
+            }
+            label = parts.join(joinSep);
+          } else {
+            for (const key of labelKeys) {
+              const sub = entry.renderer && entry.renderer.getRenderer
+                ? entry.renderer.getRenderer(key) : null;
+              const v = sub && sub.get ? sub.get() : (sub && sub.read ? sub.read() : '');
+              if (v && typeof v === 'string' && v.trim()) { label = v.trim(); break; }
+            }
           }
           return {
             itemBox: entry.itemBox,

@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 _LOG = logging.getLogger(__name__)
 
@@ -973,11 +973,86 @@ class Settings(BaseModel):
     dashboard_retention_seconds: float = 7 * 24 * 60 * 60
     dashboard_data_path: Optional[str] = "logs/dashboard_history.json"
     dashboard_model_reclaim_enabled: bool = False
+    # Manual close-button uses a *separate*, looser idle threshold than the
+    # automatic LRU reclaim path (VRAM_IDLE_RECLAIM_SECONDS = 60s). The
+    # dashboard button is a user-driven decision so we trust the operator
+    # after only a few seconds of idle time.
+    dashboard_reclaim_idle_seconds: float = 20.0
     vram_low_free_reclaim_enabled: bool = True
     vram_low_free_threshold_mib: float = 200.0
 
     # -- Meta ------------------------------------------------------------
     config_path: str = ""
+
+    @field_validator("model_profiles", mode="before")
+    @classmethod
+    def _coerce_model_profiles(cls, value: Any) -> Any:
+        """Accept the new list-of-entries shape as well as the legacy dict.
+
+        New canonical form (mirrors ``exposed_models``)::
+
+            "model_profiles": [
+              {"model": "qwen3", "context_length": 65536, ...},
+              {"model": "deepseek-r1", "target": "deepseek", ...}
+            ]
+
+        Each entry's key is ``model`` (when no target) or
+        ``model@target``. Older configs that still use a dict keyed by
+        composite id keep working.
+        """
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, list):
+            raise ValueError(
+                "'model_profiles' must be a list of {model, target?, ...} "
+                "entries (or the legacy dict form)"
+            )
+        out: Dict[str, Dict[str, Any]] = {}
+        for idx, raw in enumerate(value):
+            if not isinstance(raw, dict):
+                raise ValueError(
+                    f"model_profiles[{idx}] must be an object, got {type(raw).__name__}"
+                )
+            item = dict(raw)
+            model = item.pop("model", None)
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(
+                    f"model_profiles[{idx}]: 'model' is required and must be a "
+                    f"non-empty string"
+                )
+            target = item.pop("target", None)
+            if target is not None and not isinstance(target, str):
+                raise ValueError(
+                    f"model_profiles[{idx}]: 'target' must be a string if set"
+                )
+            target = (target or "").strip()
+            key = f"{model.strip()}@{target}" if target else model.strip()
+            if key in out:
+                raise ValueError(
+                    f"model_profiles: duplicate entry for {key!r}"
+                )
+            out[key] = item
+        return out
+
+    @field_serializer("model_profiles")
+    def _serialize_model_profiles(
+        self, value: Dict[str, Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Emit ``model_profiles`` as a list so the config round-trips in the
+        new canonical shape after ``model_dump()`` / save-to-disk."""
+        out: List[Dict[str, Any]] = []
+        for composite, body in value.items():
+            model, sep, target = composite.partition("@")
+            entry: Dict[str, Any] = {"model": model}
+            if sep and target:
+                entry["target"] = target
+            if isinstance(body, dict):
+                for k, v in body.items():
+                    entry[k] = v
+            out.append(entry)
+        return out
 
     @model_validator(mode="before")
     @classmethod
