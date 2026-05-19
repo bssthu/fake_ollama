@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 
+from .config import outbound_cycle_headers
 from .request_data_log import (
     body_from_bytes,
     body_from_json,
@@ -80,6 +81,7 @@ class OpenAIClient:
             # set both so we work against either flavour.
             h["authorization"] = f"Bearer {self.auth_token}"
             h["x-api-key"] = self.auth_token
+        h.update(outbound_cycle_headers())
         return h
 
     # ------------------------------------------------------------------

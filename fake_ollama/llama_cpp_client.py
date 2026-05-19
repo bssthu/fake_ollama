@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 
+from .config import outbound_cycle_headers
 from .process_utils import (
     create_managed_subprocess_exec,
     create_managed_subprocess_shell,
@@ -173,6 +174,7 @@ class LlamaCppClient:
         if self._auth_token:
             headers["authorization"] = f"Bearer {self._auth_token}"
             headers["x-api-key"] = self._auth_token
+        headers.update(outbound_cycle_headers())
         return headers
 
     async def aclose(self) -> None:

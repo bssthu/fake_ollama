@@ -16,7 +16,16 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 from . import __version__
 from .anthropic_client import AnthropicClient
-from .config import Settings, estimate_tokens_from_anthropic_payload, get_settings
+from .config import (
+    FORWARDED_BY_HEADER,
+    INSTANCE_ID,
+    Settings,
+    estimate_tokens_from_anthropic_payload,
+    get_settings,
+    parse_forwarded_chain,
+    reset_inbound_forwarded_chain,
+    set_inbound_forwarded_chain,
+)
 from .converters import (
     AnthropicStreamTranslator,
     OpenAIChatStreamTranslator,
@@ -44,6 +53,74 @@ from .reverse_converters import (
 )
 
 logger = logging.getLogger("fake_ollama")
+
+
+class ForwardedCycleMiddleware:
+    """Reject inbound requests that already passed through this process.
+
+    On every ``/api/*`` or ``/v1/*`` inbound request:
+
+    * Parse the ``x-fake-ollama-forwarded-by`` header into a chain of
+      instance ids. If our own :data:`fake_ollama.config.INSTANCE_ID`
+      is already present the request has looped back to us → respond
+      508 ``Loop Detected``.
+    * Otherwise stash the chain in a ContextVar so each outbound client
+      can append our id to it when it stamps the same header on the
+      onward request.
+
+    Other paths (``/admin/*``, ``/dashboard/*``, ``/``) bypass the
+    middleware entirely so internal tooling can still talk to us.
+    """
+
+    _MODEL_PREFIXES = ("/api/", "/v1/")
+
+    def __init__(self, app):  # type: ignore[no-untyped-def]
+        self.app = app
+
+    async def __call__(self, scope, receive, send):  # type: ignore[no-untyped-def]
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path") or ""
+        if not any(path.startswith(p) for p in self._MODEL_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+        chain: tuple[str, ...] = ()
+        for raw_name, raw_value in scope.get("headers") or ():
+            if raw_name.decode("latin-1").lower() == FORWARDED_BY_HEADER:
+                chain = parse_forwarded_chain(raw_value.decode("latin-1"))
+                break
+        if INSTANCE_ID in chain:
+            body = json.dumps(
+                {
+                    "error": (
+                        "loop detected: request already passed through this "
+                        "fake_ollama instance"
+                    ),
+                    "instance_id": INSTANCE_ID,
+                    "chain": list(chain),
+                }
+            ).encode("utf-8")
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 508,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (
+                            FORWARDED_BY_HEADER.encode("latin-1"),
+                            ",".join(chain).encode("latin-1"),
+                        ),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        token = set_inbound_forwarded_chain(chain)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_inbound_forwarded_chain(token)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -175,6 +252,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ensure_runtime_monitor = _sync_runtime_monitor
     _install_port_router(app)
     app.add_middleware(RequestDataLogMiddleware)
+    app.add_middleware(ForwardedCycleMiddleware)
     _register_routes(app)
     return app
 

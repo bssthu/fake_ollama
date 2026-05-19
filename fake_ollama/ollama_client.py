@@ -14,6 +14,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 
+from .config import outbound_cycle_headers
 from .process_utils import create_managed_subprocess_shell, terminate_process_tree
 from .request_data_log import (
     body_from_bytes,
@@ -211,10 +212,18 @@ class OllamaClient:
             resp = await self._client.get(
                 self._base + self._health_path,
                 timeout=min(5.0, self._timeout),
+                headers=self._cycle_headers(),
             )
             return 200 <= resp.status_code < 300
         except httpx.HTTPError:
             return False
+
+    @staticmethod
+    def _cycle_headers() -> Dict[str, str]:
+        # Stamp our forwarded-by chain on every upstream request so a
+        # downstream fake_ollama (or any compatible proxy) can detect
+        # request-loops at runtime.
+        return outbound_cycle_headers()
 
     async def _ensure_ready(self) -> None:
         if await self._healthy():
@@ -286,7 +295,7 @@ class OllamaClient:
                             url=url,
                             body=body_from_json(body),
                         )
-                    resp = await self._client.post(url, json=body)
+                    resp = await self._client.post(url, json=body, headers=self._cycle_headers())
                     await resp.aread()
                     if request_data_logging_enabled():
                         log_data_event(
@@ -378,7 +387,7 @@ class OllamaClient:
                     error: Optional[str] = None
                     stream_done = False
                     async with self._client.stream(
-                        "POST", url, json=body
+                        "POST", url, json=body, headers=self._cycle_headers()
                     ) as resp:
                         response_started = True
                         log_data_event(

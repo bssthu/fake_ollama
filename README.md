@@ -177,7 +177,13 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 }
 ```
 
-启动时会做循环检测：如果 `base_url` 的 host:port 与本进程的某个 `ollama_interfaces[*]` / `api_interfaces[*]` / `admin` 监听重合，会直接报 `cycle detected` 拒绝启动。
+启动时会做基于「模型转发图」的循环检测，而不再只看 host:port：
+
+- **case 1（允许，仅 WARNING）**：`base_url` 回指本进程的某个监听端口，但每一跳的模型名（alias）都不同，整条链路最终能落到一个真实的外部 upstream，不会无限递归。日志里会打印 `self-referential upstream is linear (no cycle): ...`，方便你确认这是有意为之。
+- **case 2（拒绝启动）**：链路上至少有一跳重用了同一个公开模型名，导致请求会无限回到自己。会抛 `cycle detected in model-forwarding graph: ...`。Ollama 的 `:latest` 标签会被归一化，`qwen3` 与 `qwen3:latest` 视为同名。
+- **管理端口误配（拒绝启动）**：如果 `base_url` 指向了 `admin` / dashboard 监听（不服务模型流量），直接报错 `cycle detected ... admin/dashboard listener`。
+
+除了启动时的静态检测，运行时所有上游请求都会带上 `x-fake-ollama-forwarded-by` 头（包含本进程的随机 `INSTANCE_ID`）。如果某次请求绕一圈又回到自己（动态 DNS、反向代理改写等绕过静态检测的情况），中间件会直接返回 HTTP 508 `Loop Detected`，避免雪崩。
 
 #### openai_upstreams
 
@@ -467,7 +473,9 @@ python -m fake_ollama --no-request-data-log
 - **`/v1/messages` 返回 404 `model '...' is not exposed on interface 'xxx'`**：该模型不在该 `api_interfaces[*].exposed_models` 里。去 admin UI 勾选。
 - **`/api/chat` 返回 400 `unknown model '...'`**：客户端传的 model 不匹配任何公开 ID，也不在 tagless 回退里。先请求 `/api/tags` 获取当前接口的可用列表。
 - **返回 401**：该接口 `access_tokens` 非空，请求头里没带或带错 token。检查 `x-api-key` / `Authorization: Bearer`。
-- **启动报 `cycle detected`**：某个 `anthropic_upstreams[*].base_url` 指向了 fake_ollama 自己的某个监听端口。改 URL 或删该 upstream。
+- **启动报 `cycle detected in model-forwarding graph`**：某条上游链路在同名模型上回到了自己，会无限递归。给链路上某一跳起一个不同的 alias 就能避免；`:latest` 标签会被归一化，重命名时注意区分。
+- **启动报 `cycle detected ... admin/dashboard listener`**：某个 `*_upstreams[*].base_url` 指向了 fake_ollama 自己的 admin / dashboard 端口（这些端口不服务模型流量）。改 URL 或删该 upstream。
+- **运行时 HTTP 508 `loop detected`**：请求绕一圈又回到本进程（通常是反向代理 / 动态 DNS 绕过了启动期检测）。检查 upstream / 代理链。
 - **启动报端口冲突**：两个 interface（或与 admin / dashboard）共用了同一个 host:port。
 - **找不到日志文件**：默认相对 CWD：`logs/fake_ollama.log` 与 `logs/fake_ollama.requests.jsonl`。在项目根目录启动，或显式 `--log-file` / `--request-data-log-file`。
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`。

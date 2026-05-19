@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 import httpx
 
+from .config import outbound_cycle_headers
 from .request_data_log import (
     body_from_bytes,
     body_from_json,
@@ -56,13 +57,15 @@ class AnthropicClient:
         # Support both Anthropic-native (x-api-key) and OpenAI-style proxies
         # (Authorization: Bearer ...) since "Anthropic-compatible" gateways
         # vary in what they accept.
-        return {
+        h = {
             "x-api-key": token,
             "authorization": f"Bearer {token}",
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
             "accept": "application/json",
         }
+        h.update(outbound_cycle_headers())
+        return h
 
     # ------------------------------------------------------------------
     # requests

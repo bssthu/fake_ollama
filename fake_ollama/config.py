@@ -39,6 +39,8 @@ import os
 import shlex
 import socket
 import subprocess
+import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -67,6 +69,75 @@ DEFAULT_CONFIG_PATH = Path("config.json")
 # stamps it on every outbound request and rejects inbound requests that
 # carry the same instance marker.
 FORWARDED_BY_HEADER = "x-fake-ollama-forwarded-by"
+
+# Per-process identifier appended to the forwarded-by header on every
+# outbound request. Generated once at import time. Tests that need a
+# stable value can monkey-patch ``fake_ollama.config.INSTANCE_ID``.
+INSTANCE_ID: str = uuid.uuid4().hex
+
+# Tracks the forwarded-by chain of the currently-handled inbound request
+# so each outbound HTTP client can stamp the right value without having
+# its signature changed.
+_inbound_forwarded_chain: ContextVar[Tuple[str, ...]] = ContextVar(
+    "fake_ollama_forwarded_chain", default=()
+)
+
+
+def set_inbound_forwarded_chain(chain: Tuple[str, ...]):
+    """Record the forwarded-by chain parsed from the inbound request."""
+    return _inbound_forwarded_chain.set(tuple(chain))
+
+
+def reset_inbound_forwarded_chain(token) -> None:
+    _inbound_forwarded_chain.reset(token)
+
+
+def current_inbound_forwarded_chain() -> Tuple[str, ...]:
+    return _inbound_forwarded_chain.get()
+
+
+def outbound_forwarded_chain() -> str:
+    """Header value for an outbound request, including this process's id."""
+    chain = list(_inbound_forwarded_chain.get())
+    if INSTANCE_ID not in chain:
+        chain.append(INSTANCE_ID)
+    return ",".join(chain)
+
+
+def outbound_cycle_headers() -> Dict[str, str]:
+    """Convenience: ``{FORWARDED_BY_HEADER: ...}`` for client ``_headers``."""
+    return {FORWARDED_BY_HEADER: outbound_forwarded_chain()}
+
+
+def parse_forwarded_chain(raw: str) -> Tuple[str, ...]:
+    """Split a comma-separated forwarded-by header value into a tuple."""
+    if not raw:
+        return ()
+    return tuple(tok.strip() for tok in raw.split(",") if tok.strip())
+
+
+def _normalize_public_id(pid: str) -> str:
+    """Normalize a model id for cycle comparison.
+
+    Ollama treats ``foo`` and ``foo:latest`` as the same model. The cycle
+    detector folds them so an exposure named ``qwen3`` cannot sneak past
+    by being requested as ``qwen3:latest`` on the next hop.
+    """
+    if not pid:
+        return pid
+    if "@" in pid:
+        # Composite ``display@target`` ids: normalise the display half.
+        disp, _, target = pid.rpartition("@")
+        return f"{_normalize_public_id(disp)}@{target}"
+    if pid.endswith(":latest"):
+        return pid[: -len(":latest")]
+    return pid
+
+
+# Sentinel returned by the cycle detector's host resolver to flag that an
+# upstream's base_url points at one of *our* listeners that does not serve
+# model traffic (admin / dashboard). Treated as a hard error.
+_MISROUTED_LISTENER = object()
 
 
 def _model_base(name: str) -> str:
@@ -1034,58 +1105,177 @@ class Settings(BaseModel):
         return endpoints
 
     def detect_upstream_cycles(self) -> None:
-        """Raise if any upstream points back at a listener fake_ollama owns.
+        """Validate same-process forwarding chains by walking the model graph.
 
-        The check is intentionally conservative: it only fires when the
-        upstream URL has a literal host that matches (and a port that
-        matches) one of this process's own bind endpoints. Hostnames are
-        not resolved via DNS to avoid load-time network traffic.
+        The graph nodes are ``(interface_name, normalized_public_id)``
+        pairs (Ollama-style ``:latest`` is folded so ``foo`` and
+        ``foo:latest`` collide). An edge ``A -> B`` exists when interface
+        ``A``'s exposure resolves to a source whose ``base_url`` points
+        back at one of this process's own listeners — i.e. the request
+        would re-enter us at interface ``B`` carrying the next hop's
+        wire-side model id.
+
+        We then run a DFS:
+
+        * Any cycle raises ``ValueError`` (the request would loop
+          forever).
+        * Same-process back-edges that do **not** form a cycle (case 1
+          in the README — different aliases at every hop) are logged as
+          a WARNING and allowed; they describe a legitimate local
+          fan-out for testing.
+
+        The check intentionally does **not** resolve DNS. It only fires
+        when an upstream URL has a literal host that matches (and a
+        port that matches) one of this process's own bind endpoints.
         """
         own = self.own_bind_endpoints()
         if not own:
             return
-        own_ports = {port for _, port in own}
-        # Build a per-port set of host variants accepted as "ourselves".
-        # Binding 0.0.0.0 means "any local address" — that listener accepts
-        # connections to 127.0.0.1, ::1, localhost, and every host iface.
         loopback_hosts = {"127.0.0.1", "0.0.0.0", "localhost", "::1", "::"}
         local_hosts = set(loopback_hosts) | _local_host_aliases()
+
+        # Map each model-serving listener port to the set of host names
+        # that resolve to "ourselves" plus the interface that owns it.
         accept_by_port: Dict[int, set[str]] = {}
-        for host, port in own:
-            hosts = accept_by_port.setdefault(port, set())
-            if host in ("0.0.0.0", "::"):
+        iface_by_port: Dict[int, _InterfaceBase] = {}
+        for it in self.all_interfaces():
+            hosts = accept_by_port.setdefault(it.port, set())
+            if it.host in ("0.0.0.0", "::"):
                 hosts |= local_hosts
             else:
-                hosts.add(host)
-                # 127.0.0.1 and ::1 are interchangeable with 'localhost'.
-                if host in loopback_hosts:
+                hosts.add(it.host)
+                if it.host in loopback_hosts:
                     hosts |= loopback_hosts
+            iface_by_port[it.port] = it
+        # Admin / dashboard ports count as "own" listeners but never
+        # accept model traffic — anyone pointing an upstream at them
+        # is an outright misconfiguration.
+        misroute_ports: set[int] = set()
+        for host, port in own:
+            if port in iface_by_port:
+                continue
+            misroute_ports.add(port)
 
-        def _check(src_kind: str, src_name: str, base_url: str) -> None:
+        def _self_iface_for(base_url: str) -> Optional[_InterfaceBase]:
             parsed = urlparse(base_url or "")
             host = (parsed.hostname or "").lower()
             port = parsed.port
             if not host or port is None:
-                return
-            if port not in own_ports:
-                return
-            allowed = accept_by_port.get(port) or set()
+                return None
+            if port in misroute_ports:
+                # Distinguish from "not us" so we can raise below.
+                return _MISROUTED_LISTENER  # type: ignore[return-value]
+            allowed = accept_by_port.get(port)
+            if allowed is None:
+                return None
             if host in allowed:
-                raise ValueError(
-                    f"cycle detected: {src_kind} {src_name!r} base_url={base_url!r} "
-                    f"points at this fake_ollama process ({host}:{port}). Requests "
-                    f"would loop indefinitely. Use a different upstream URL or "
-                    f"remove this source."
-                )
+                return iface_by_port.get(port)
+            return None
 
-        for src in self.anthropic_upstreams:
-            _check("anthropic_upstream", src.name, src.base_url)
-        for src in self.openai_upstreams:
-            _check("openai_upstream", src.name, src.base_url)
-        for src in self.ollama_targets:
-            _check("ollama_target", src.name, src.base_url)
-        for src in self.llama_cpp_targets:
-            _check("llama_cpp_target", src.name, src.base_url)
+        # Build a graph of (iface_name, normalized_wire_id) nodes.
+        #
+        # Node identity is "the model id this iface receives that
+        # selects this exposure". We use ``alias or model`` (folded
+        # against ``:latest``) because:
+        #
+        # * Inbound clients reach an exposure by sending its alias if
+        #   set, or its bare ``model`` (tagless fallback) otherwise.
+        # * When an upstream loops back to one of our interfaces it
+        #   sends the *wire_id* of its source's matching entry — which
+        #   for case 1 (alias chain) lines up with the next exposure's
+        #   alias, and for case 2 (same name) lines up with the next
+        #   exposure's ``model``.
+        #
+        # Two exposures on the same iface can share an incoming key,
+        # so we use an adjacency *list* — a cycle exists if **any**
+        # path through that node loops.
+        def _entry_key(exp: "ExposureEntry") -> str:
+            return _normalize_public_id(exp.alias or exp.model)
+
+        edges: Dict[Tuple[str, str], List[Optional[Tuple[str, str]]]] = {}
+        same_proc_edges: List[Tuple[Tuple[str, str], Tuple[str, str], str]] = []
+        for it in self.all_interfaces():
+            for exposure in it.exposed_models:
+                node = (it.name, _entry_key(exposure))
+                edges.setdefault(node, [])
+                src = self.source_by_name(exposure.target)
+                if src is None:
+                    edges[node].append(None)
+                    continue
+                base_url = getattr(src, "base_url", "") or ""
+                inner = _self_iface_for(base_url)
+                if inner is _MISROUTED_LISTENER:
+                    raise ValueError(
+                        f"cycle detected: source {src.name!r} base_url={base_url!r} "
+                        f"points at this fake_ollama process's admin/dashboard "
+                        f"listener, which does not serve model traffic. Remove the "
+                        f"upstream or fix the URL."
+                    )
+                if inner is None:
+                    edges[node].append(None)
+                    continue
+                model_entry = src.entry_for(exposure.model)
+                next_pid = (
+                    model_entry.wire_id if model_entry is not None else exposure.model
+                )
+                next_node = (inner.name, _normalize_public_id(next_pid))
+                edges[node].append(next_node)
+                same_proc_edges.append((node, next_node, src.name))
+
+        if not same_proc_edges:
+            # Fast path: nothing self-references, no graph walk needed.
+            return
+
+        # DFS with coloring to find cycles. Adjacency entries that are
+        # ``None`` are dead-ends (external upstream); missing
+        # destination nodes are also dead-ends (the next hop has no
+        # matching exposure -> would 404 at runtime).
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: Dict[Tuple[str, str], int] = {n: WHITE for n in edges}
+        path: List[Tuple[str, str]] = []
+
+        def _visit(n: Tuple[str, str]) -> None:
+            c = color.get(n, WHITE)
+            if c == GRAY:
+                idx = path.index(n)
+                loop = path[idx:] + [n]
+                pretty = " -> ".join(f"{ifn}::{pid}" for ifn, pid in loop)
+                raise ValueError(
+                    f"cycle detected in model-forwarding graph: {pretty}. "
+                    f"At least one hop reuses the same public model id on the "
+                    f"same interface; give one exposure a distinct alias to "
+                    f"break the loop."
+                )
+            if c == BLACK:
+                return
+            if n not in edges:
+                color[n] = BLACK
+                return
+            color[n] = GRAY
+            path.append(n)
+            for nxt in edges[n]:
+                if nxt is not None:
+                    _visit(nxt)
+            path.pop()
+            color[n] = BLACK
+
+        for node in list(edges):
+            _visit(node)
+
+        # No cycle, but there is at least one same-process back-edge.
+        # That is the "linear chain via aliases" case 1 in the README.
+        # Warn so operators notice they have a self-referential config.
+        for src_node, dst_node, src_name in same_proc_edges:
+            _LOG.warning(
+                "self-referential upstream is linear (no cycle): interface "
+                "%r exposure %r -> source %r -> interface %r exposure %r. "
+                "Keep aliases distinct on every hop to keep the chain acyclic.",
+                src_node[0],
+                src_node[1],
+                src_name,
+                dst_node[0],
+                dst_node[1],
+            )
 
     # -- Routing ---------------------------------------------------------
 
