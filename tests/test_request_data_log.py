@@ -43,7 +43,7 @@ def test_request_data_log_records_http_and_backend_payloads(settings, tmp_path):
                 up.base_url, up.auth_token,
                 client=httpx.AsyncClient(transport=transport),
             )
-            for up in settings.upstreams
+            for up in settings.anthropic_upstreams
         }
         with TestClient(app) as client:
             resp = client.post(

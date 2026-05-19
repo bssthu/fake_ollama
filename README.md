@@ -2,55 +2,57 @@
 
 一个轻量的协议适配层，主要做两件事：
 
-1. **正向**（Ollama / Anthropic / OpenAI 兼容入口 → 远端上游）：把 **Anthropic Messages API** 或 **OpenAI Chat Completions API** 兼容的上游（官方 / DeepSeek / Together / Groq / 自建网关 / claude-relay-service）伪装成一台本机 **Ollama** 服务，让只支持 Ollama 协议的客户端（GitHub Copilot 自定义 provider、IDE 插件、桌面 AI 软件）无缝调用 Claude / DeepSeek / GPT 等模型；同时三个前端入口都可用，按需自动翻译协议。
+1. **正向**（Ollama 兼容入口 → 远端上游）：把 **Anthropic Messages API** 或 **OpenAI Chat Completions API** 兼容的上游（官方 / DeepSeek / Together / Groq / 自建网关 / claude-relay-service）伪装成一台本机 **Ollama** 服务，让只支持 Ollama 协议的客户端（GitHub Copilot 自定义 provider、IDE 插件、桌面 AI 软件）无缝调用 Claude / DeepSeek / GPT 等模型。
 2. **反向**（Anthropic / OpenAI 兼容入口 → 本机模型服务）：把本机的 **Ollama** 或 **llama.cpp server** 包装成 **Anthropic Messages API**（`POST /v1/messages`）和 OpenAI Chat Completions（`POST /v1/chat/completions`），让只支持远端 API 的客户端也能调用本地大模型。
 
 附带一个零依赖的 Web 配置编辑器（`/admin`），不必再手改 JSON。
 
-## 三端口架构
+## 架构概览
 
-配置页面、对内 Ollama 兼容入口、对外反向代理的安全边界不同，因此监听被拆成三个端口：
+监听被拆成三组：admin、Ollama 兼容入口（多实例数组）、API 接口（多实例数组）。这三组在配置里是独立的，安全边界、监听端口、白名单、token 都各自配置。
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  fake_ollama 进程（asyncio.gather 同时跑多个 uvicorn）  │
-│                                                         │
-│  admin listener     (默认 127.0.0.1:21433)              │
-│    /admin/*     Web 配置编辑器（无内置鉴权）            │
-│                                                         │
-│  internal listener  (默认 127.0.0.1:21434)              │
-│    /                                                    │
-│    /api/*       Ollama 兼容（正向；本机消费）           │
-│    /v1/chat/completions  /v1/embeddings                 │
-│                                                         │
-│  external listener  (可选；推荐 127.0.0.1:21435)        │
-│    /v1/messages Anthropic 兼容（反向；可对外）          │
-│    /v1/models                                           │
-│    /v1/chat/completions  OpenAI 兼容（反向；可对外）    │
-│    必须带 external_access_tokens 之一                   │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  fake_ollama 进程（asyncio.gather 同时跑多个 uvicorn）           │
+│                                                                  │
+│  admin listener          (默认 127.0.0.1:21433)                  │
+│    /admin/*          Web 配置编辑器（无内置鉴权）                │
+│                                                                  │
+│  ollama_interfaces[*]    （数组，可 0..N 个；典型: 21434）       │
+│    /                 ping                                        │
+│    /api/*            Ollama 兼容（正向）                         │
+│    每个实例可独立配置 host / port / access_tokens / exposed_models│
+│                                                                  │
+│  api_interfaces[*]       （数组，可 0..N 个；典型: 21435）       │
+│    /v1/messages      Anthropic 兼容                              │
+│    /v1/messages/count_tokens                                     │
+│    /v1/chat/completions   OpenAI 兼容                            │
+│    /v1/embeddings    OpenAI 兼容                                 │
+│    /v1/models                                                    │
+│    每个实例可独立配置 host / port / access_tokens / exposed_models│
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-- **admin listener**（默认启用）：只服务 `/admin/*`。配置页面没有内置鉴权，所以默认独立绑定 `127.0.0.1:21433`。不需要 UI 可设 `admin_enabled: false`。
-- **internal listener**（必开）：服务正向调用方（本机 IDE / Copilot）。生产环境**保持 `127.0.0.1`**。
-- **external listener**（可选）：单独承载反向代理 `/v1/messages`、`/v1/models`，以及反向模式的 `/v1/chat/completions`。`external_port` 设为 `null` 时，反向 `/v1/*` API 跟随 internal 端口（适合纯本机使用）；admin 仍默认在独立 admin 端口。
-- 设置 `admin_port` 后，`/admin/*` **只在 admin 端口**可达；internal/external 端口都返回 404。把 `admin_port` 设为 `null` 才会恢复旧的“/admin 挂在 internal 端口”模式，不推荐。
-- 设置 `external_port` 后，`/v1/messages` 与 `/v1/models` **只在 external 端口**可达；它们在 internal/admin 端口返回 404。`/v1/chat/completions` 在 internal/external 两个 API 端口都可达，但按端口分流：internal 端口走 upstream API，external 端口命中 `ollama_targets` / `llama_cpp_targets` 时走本机模型服务。
-- 想让别的机器访问反向代理：把 `external_host` 改 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
+- 每个 `ollama_interfaces[*]` / `api_interfaces[*]` 都是独立的 uvicorn 监听。你可以同时开多个 Ollama 接口（例如本机 21434 + 局域网 0.0.0.0:21434），每个挂不同的白名单和 token。
+- `access_tokens` 为空 = 该接口不需鉴权；非空 = 该接口的所有请求都必须带 `x-api-key` 或 `Authorization: Bearer`。
+- `exposed_models` 是该接口允许看到 / 请求的模型列表，元素是 `{model, target, alias?}` 三元组；不在白名单里的模型在该接口上 404。
+- admin 接口（`admin_host` / `admin_port`）只服务 `/admin/*`，**不会**出现在任何 `ollama_interfaces` / `api_interfaces` 上；同样，`/api/*` 与 `/v1/*` 也**不会**出现在 admin 端口。
+- 想让别的机器访问某个接口：把对应实例的 `host` 改成 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
 
 ## 特性一览
 
-- **多上游路由**：把 Anthropic / OpenAI 兼容（DeepSeek / Together / Groq / 自建网关 / claude-relay-service…）合并到同一个 Ollama 端口
-- **复合模型标识 `model@target`**：每个模型的全局唯一 ID 由「模型名 + 来源 target 名」组成，相同名字但来源不同的模型不会再被混淆；客户端必须按 `model@target` 形式请求，裸名直接 400
+- **多上游路由**：把 Anthropic / OpenAI 兼容（DeepSeek / Together / Groq / 自建网关 / claude-relay-service…）合并到同一组接口
+- **结构化模型标识 `{model, target}`**：每条暴露条目显式声明「上游显示名 + 来源 target 名」，相同名字但来源不同的模型不会再混淆；可选 `alias` 字段在客户端可见的公开 ID 上替换全名
 - **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限——key 支持 `model@target`（最优先）、裸 `model`、tagless base 三级回退
-- **按接口 / 按链路精细化暴露**：顶层两个白名单 `internal_exposed_models` / `external_exposed_models`，分别决定 `/api/*`（内部 Ollama 兼容入口）和 `/v1/*`（对外 Anthropic / OpenAI 兼容 API）允许哪些 `model@target` 可被列出、被请求
-- **本地 target 生命周期接管**：Ollama / llama.cpp 都可配置 health check、按需启动脚本、启动超时、空闲回收；不配置时只转发到你单独启动的服务
-- **本地显存预检**：本地模型可在 `model_profiles` 里填写 `estimated_vram_gb`；启动或加载前会用 `nvidia-smi` 评估可用显存，并尝试回收空闲本地模型
-- **集中式访问 token**（`external_access_tokens`）：一个 token 池统一鉴权所有 `/v1/*` 入口
-- **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP），不再硬编码 `image/png`
-- **零依赖 Web 编辑器**：按「模型来源 / 对用户的接口 / 共享设置 / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
+- **按接口多实例暴露**：`ollama_interfaces[*]` 与 `api_interfaces[*]` 是独立数组，每个实例自带 `host` / `port` / `access_tokens` / `exposed_models`
+- **来源命名清晰区分**：`anthropic_upstreams` / `openai_upstreams`（远端）+ `ollama_targets` / `llama_cpp_targets`（本机）
+- **循环引用检测**：`anthropic_upstreams[*].base_url` 若指向 fake_ollama 自己的某个监听端口，启动时直接报错，避免转发死循环
+- **本地 target 生命周期接管**：Ollama / llama.cpp 都可配置 health check、按需启动脚本、启动超时、空闲回收
+- **本地显存预检**：本地模型可在 `model_profiles` 里填 `estimated_vram_gb`；启动前用 `nvidia-smi` 评估可用显存并尝试回收空闲模型
+- **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP）
+- **零依赖 Web 编辑器**：按「Forward / Reverse / Shared / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
+- **网络错误安全降级**：上游连接断开 / 超时统一返回 502 / 流式错误帧
 - `pytest` + `httpx.MockTransport` 离线单测
-- **网络错误安全降级**：上游连接断开 / 超时等非 HTTP 错误统一返回 502 / 流式错误帧，不会抛出未处理异常
 
 ## 快速开始
 
@@ -62,31 +64,24 @@ pip install -r requirements.txt
 
 # 2. 准备配置
 Copy-Item config.json.example config.json
-Copy-Item .env.example .env
-# 编辑 config.json 填上游；token 推荐放 .env
+# 编辑 config.json 填上游与监听
 
-# 3. 启动（已激活 .venv 时）
+# 3. 启动
 python -m fake_ollama
-# 未激活 .venv 时，显式使用虚拟环境里的 Python
+# 未激活 .venv 时
 .\.venv\Scripts\python.exe -m fake_ollama
-# 如果已经 pip install -e .，也可以用 console script
+# 已 pip install -e .
 fake-ollama
-# 可选：覆盖 internal listener 的 host/port
-python -m fake_ollama --config ./config.json --host 127.0.0.1 --port 21434
-# 可选：覆盖 admin listener
+# 仅覆盖 admin listener
 python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port 21433
 ```
 
-说明：
-- `python -m fake_ollama` 和 `.\.venv\Scripts\python.exe -m fake_ollama` 调的是同一个入口；前者依赖当前 shell 里的 `python` 已指向 `.venv`，后者直接指定虚拟环境解释器，更适合未激活环境、计划任务或服务脚本。
-- 未执行 `pip install -e .` 时，请在项目根目录启动；这样源码包、`./config.json`、`./.env` 和默认日志路径都能按预期解析。
-- 默认运行日志写到当前工作目录下的 `logs/fake_ollama.log`，同时输出到控制台。可用 `--log-file I:\path\fake_ollama.log` 指定固定日志路径，或用 `--no-log-file` 只保留控制台日志。
-- 默认请求数据日志单独写到 `logs/fake_ollama.requests.jsonl`，不会混进运行日志；可用 `--request-data-log-file I:\path\requests.jsonl` 指定路径，或用 `--no-request-data-log` 关闭。
+> 注：CLI 不再有 `--host` / `--port` / `--external-host` / `--external-port`，因为 `ollama_interfaces` / `api_interfaces` 是数组，命令行无法表达；都在 `config.json` 里配置。
 
 启动后：
-- Ollama 客户端连 `http://127.0.0.1:21434`
-- 浏览器打开 <http://127.0.0.1:21433/admin> 用 Web UI 调配置
-- Anthropic 客户端连 **external listener**：`http://127.0.0.1:21435/v1/messages`（默认）
+- Ollama 客户端连 `ollama_interfaces[*].host:port`（典型 `http://127.0.0.1:21434`）
+- 浏览器打开 <http://127.0.0.1:21433/admin>
+- Anthropic / OpenAI 客户端连 `api_interfaces[*].host:port`（典型 `http://127.0.0.1:21435`），带对应 `access_tokens`
 
 ## 配置（config.json）
 
@@ -95,452 +90,389 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 1. 代码默认值
 2. `config.json`（路径优先级：`--config` > `$FAKE_OLLAMA_CONFIG` > `./config.json`）
 
-运行期不再读任何「文本配置」环境变量（旧版的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `FAKE_OLLAMA_HOST` 等均已移除）。唯一会被读取的环境变量是 `FAKE_OLLAMA_CONFIG`，用于选中配置文件路径；`.env` 现在只服务于测试（见 [.env.example](./.env.example)）。
+运行期只读一个环境变量：`FAKE_OLLAMA_CONFIG`，用于选中配置文件路径。所有 token / host / port / 白名单等都只能写在 `config.json`（或 Admin UI）里。
 
-完整示例见 [config.json.example](./config.json.example)；下面只列结构。
+完整示例见 [config.json.example](./config.json.example)。下面分章节描述每块。
 
-### 顶层字段
-
-配置页和示例 `config.json` 现在按四个层次排：
-
-- **正向代理**：远端 Anthropic API -> 本机 Ollama 兼容入口
-- **反向代理**：本机 Ollama / llama.cpp -> 对外 Anthropic / OpenAI 兼容 API
-- **共享设置**：两条链路都会用到的运行默认值和模型 profile
-- **Admin UI**：只影响 `/admin` 配置页面本身
-
-#### 正向代理：远端 API -> 本机 Ollama
-
-##### 本机 Ollama 兼容入口
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `host` | string | `127.0.0.1` | **internal** listener 地址（`/api/*`、`/v1/chat/completions`；OpenAI 端走 upstream） |
-| `port` | int | `21434` | internal listener 端口 |
-| `advertised_version` | string | `0.6.4` | **仅用于 Ollama 兼容入口**的 `/api/version` 返回值；不影响 `/v1/*` |
-
-##### 远端上游
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `upstreams` | array | `[]` | Anthropic 兼容上游（见下）。和 `openai_upstreams` 至少配置一组 |
-| `openai_upstreams` | array | `[]` | OpenAI 兼容上游（OpenAI / DeepSeek / Together / Groq 等，见下）。和 `upstreams` 至少配置一组 |
-
-#### 反向代理：本机模型 -> 对外 API
-
-##### 对外 API listener 与鉴权
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `external_host` | string \| null | `null` | **external** listener 地址（`/v1/messages`、`/v1/models`、`/v1/chat/completions`；OpenAI 端命中本地 target 时走本机模型服务）。`null` = 不开独立 external 端口，反向 `/v1/*` API 跟随 internal 端口 |
-| `external_port` | int \| null | `null` | external listener 端口 |
-| `external_access_tokens` | string[] | `[]` | 访问 external `/v1/*` 反向代理需要的 token 池（`x-api-key` 或 `Authorization: Bearer`）。Web UI 可一键 Generate |
-
-##### 本地模型 targets
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `ollama_targets` | array | `[]` | 反向代理的本机或远端 Ollama 服务（见下） |
-| `llama_cpp_defaults` | object | `{}` | `llama_cpp_targets` 的全局默认值；target 同名字段可覆盖 |
-| `llama_cpp_targets` | array | `[]` | 反向代理的 llama.cpp server（OpenAI 兼容，见下） |
-
-#### 按接口暴露哪些模型
-
-上面四种 source（`upstreams` / `openai_upstreams` / `ollama_targets` / `llama_cpp_targets`）里的每个 `models` 项都会生成一个全局唯一的复合 ID `model@target`。这些复合 ID 是否对外可见 / 可请求由下面两个白名单控制（空列表代表该接口一个模型都不暴露）：
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `internal_exposed_models` | string[] | `[]` | `/api/tags`、`/api/chat`、`/api/generate` 等 **内部 Ollama 兼容入口**允许看到 / 访问的 `model@target` ID |
-| `external_exposed_models` | string[] | `[]` | `/v1/models`、`/v1/messages`、external 端口上的 `/v1/chat/completions` 等 **对外 API 接口**允许的 `model@target` ID |
-
-- 复合 ID 必须使用某个 source 自身声明的显示名（`models` 里的原始名字），后面跟上 `@` 和该 source 的 `name`。source 名不能冲突，也不能包含 `@`。
-- 同一个模型被两个 source 同时提供（例如本机 Ollama + 远端 Anthropic 都上架了 `deepseek-chat`）时，你可以同时勾上 `deepseek-chat@local-ollama` 和 `deepseek-chat@deepseek`，客户端在下拉里会看到两项，可以明确选择走哪一路。
-- 客户端必须传复合 ID（例如 `"model": "deepseek-chat@deepseek"`）。裸名会被服务器 400，提示可用的复合 ID 列表。
-- `/api/tags` 与 `/v1/models` 列出的也是复合 ID；推荐客户端从它们学习可用型号。
-- 在 Admin UI 里，「接口 / Exposure」分组用复选框列出所有 source 产生的复合 ID，可以一键勾选。
-
-#### 共享设置
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `default_max_tokens` | int | `4096` | 客户端没传 `num_predict` 时的默认 |
-| `timeout_seconds` | float | `300` | 所有出站 HTTP 请求超时（上游与本地 target 都会用到） |
-| `use_system_proxy` | bool | `false` | 所有出站 HTTP 请求是否走系统代理（Clash/V2Ray 用户保持 false） |
-| `enforce_context_limit` | bool | `true` | 估算 token 超过 `context_length` 直接 400，避免误传巨 prompt |
-| `model_profiles` | object | `{}` | 正向 / 反向共用的每模型 capabilities / 上下文 / 思维链等设置。key 可以写复合 `model@target`（最优先）、裾 `model`，或者 tagless base；三级回退 |
-
-#### Admin UI
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `admin_enabled` | bool | `true` | 是否注册 `/admin` Web UI |
-| `admin_host` | string | `127.0.0.1` | **admin** listener 地址（`/admin/*`；无内置鉴权，建议保持 localhost） |
-| `admin_port` | int \| null | `21433` | admin listener 端口。`null` = 把 `/admin` 挂回 internal 端口（旧行为，不推荐） |
-
-#### 鉴权与端口的几种组合
-
-| `external_port` | `external_access_tokens` | 行为 |
-| --- | --- | --- |
-| `null` | `[]` | 单端口；`/v1/*` 不需 token（**最宽松**，仅推荐绑 `127.0.0.1` 时） |
-| `null` | 非空 | 单端口；`/v1/*` 需 token |
-| 设置 | 非空 | external 独立端口；`/v1/*` 仅在 external 端口暴露并需 token（**推荐**） |
-| 设置 | `[]` | external 独立端口；`/v1/*` 拒绝所有请求（启动时 WARN） |
-
-### upstreams（正向：Ollama → Anthropic 上游）
-
-每项是一个独立的 Anthropic 兼容端点：
+### 顶层结构
 
 ```jsonc
 {
-  "name": "anthropic",                              // 唯一名字；source 名不能含 @
-  "base_url": "https://api.anthropic.com",           // 上游 base URL
-  "auth_token": "sk-ant-...",                        // 鉴权 token
-  "models": ["claude-3-5-sonnet-20241022",           // 会产生复合 ID:
-             "claude-3-5-haiku-20241022"],           //   claude-3-5-sonnet-20241022@anthropic
-                                                     //   claude-3-5-haiku-20241022@anthropic
-  "model_map": {                                     // 可选：显示名 → 上游真实模型 ID
-    "claude-sonnet": "claude-3-5-sonnet-20241022"
-  }
+  // Admin UI
+  "admin_enabled": true,
+  "admin_host": "127.0.0.1",
+  "admin_port": 21433,
+
+  // Dashboard
+  "dashboard_enabled": true,
+  "dashboard_host": "127.0.0.1",
+  "dashboard_port": 21432,
+  // ... 见下
+
+  // 共享设置
+  "default_max_tokens": 4096,
+  "timeout_seconds": 300.0,
+  "use_system_proxy": false,
+  "enforce_context_limit": true,
+  "advertised_version": "0.6.4",
+
+  // 远端上游
+  "anthropic_upstreams": [ /* … */ ],
+  "openai_upstreams":    [ /* … */ ],
+
+  // 本机 backends
+  "ollama_targets":      [ /* … */ ],
+  "llama_cpp_defaults":  { /* … */ },
+  "llama_cpp_targets":   [ /* … */ ],
+
+  // 对外接口（每项独立监听）
+  "ollama_interfaces":   [ /* … */ ],
+  "api_interfaces":      [ /* … */ ],
+
+  // 每模型 profile
+  "model_profiles":      { /* … */ }
 }
 ```
 
-路由规则：
-- `/api/tags`（正向 Ollama 端）：返回所有被 `internal_exposed_models` 勾选的复合 ID。
-- 一次请求按 `model` 字段查找：必须是复合 `model@target` 形式，路由直接读 `@target` 部分。裸名返回 400 并附带可用复合 ID 列表。
-- `/v1/models` 与 `/v1/messages` 同理，受 `external_exposed_models` 控制。上游请求实际发出时，`@target` 后缀会被剥掉，只发裸模型名给上游。
+### Sources（远端与本机的模型来源）
 
-模型名匹配按 Ollama 规则处理：`model` 与 `model:latest` 等价；省略 tag 只代表 `latest`，不会匹配其他显式 tag（例如 `model:q4_K_M` / `model:q2_k_p`）。
-
-### openai_upstreams（正向：三种入口 → OpenAI 兼容上游）
-
-每项是一个独立的 OpenAI Chat Completions 兼容端点（OpenAI 官方 / DeepSeek / Together / Groq / SiliconFlow / 自建网关等）：
+四种 source，每一项有唯一 `name`（**不能包含 `@`**，且 4 张表里的 name 不能冲突）。每个 source 的 `models` 是 `ModelEntry` 列表，每条只表达「上游真实模型名 + 可选 alias」：
 
 ```jsonc
 {
-  "name": "deepseek",                          // 唯一名字，跨 source 都不能冲突，且不能含 @
-  "base_url": "https://api.deepseek.com",       // 上游 base URL（会自动拼 /v1/chat/completions）
-  "auth_token": "sk-...",                       // 同时以 Authorization: Bearer 与 x-api-key 发送
-  "models": ["deepseek-chat", "deepseek-reasoner"],
-  "model_map": {                                // 可选：显示名 → 上游真实模型 ID
-    "deepseek-r1": "deepseek-reasoner"
-  }
+  "name": "deepseek_remote",
+  "base_url": "https://api.deepseek.com",
+  "auth_token": "sk-...",
+  "models": [
+    { "name": "deepseek-chat" },                            // 公开 ID 默认 = "deepseek-chat@deepseek_remote"
+    { "name": "deepseek-reasoner", "alias": "deepseek-r1" } // 公开 ID = "deepseek-r1"；wire 还是 "deepseek-reasoner"
+  ]
 }
 ```
 
-三个前端入口都能命中 `openai_upstreams`，并按需做协议翻译：
+- **公开 ID（public_id）规则**：当 `alias` 为空时是复合 `name@source.name`；当 `alias` 非空时**就是** `alias`（不再带 `@target` 后缀）。alias 必须全局唯一，不能包含 `@`，也不能与其他 source 的 `name` / `alias` 冲突。
+- **wire 名**：实际发给上游时永远是 `ModelEntry.name`，alias 只影响对外可见 ID。
+- **`model_map` 已移除**：旧版的「显示名 → 上游真实名」映射改用 alias 直接挂在 models 列表里。
 
-| 入口 | 翻译方向 | 说明 |
+四张表的差异：
+
+| 表名 | 协议 | 用途 |
 | --- | --- | --- |
-| `POST /api/chat`、`POST /api/generate`（Ollama 兼容入口） | Ollama → OpenAI；OpenAI → Ollama | 走 `Anthropic` 中间态，复用 thinking / 上下文限制等共享逻辑 |
-| `POST /v1/messages`（Anthropic 兼容入口） | Anthropic → OpenAI；OpenAI → Anthropic | 流式同样回写 Anthropic SSE 事件 |
-| `POST /v1/chat/completions`（OpenAI 兼容入口） | 透传 | 仅按 `model_map` 改写请求 `model`，响应里再改写回显示名 |
+| `anthropic_upstreams` | Anthropic Messages | 远端 Anthropic 兼容 API（含 DeepSeek Anthropic 通道、claude-relay-service 等） |
+| `openai_upstreams`    | OpenAI Chat Completions | 远端 OpenAI 兼容 API（DeepSeek OpenAI 通道、Together、Groq、自建网关等） |
+| `ollama_targets`      | Ollama `/api/chat` | 本机或局域网 Ollama daemon；可生命周期接管 |
+| `llama_cpp_targets`   | OpenAI Chat Completions（llama.cpp server） | 一项 = 一个 llama.cpp server 进程 / 一个模型 / 一个端口 |
 
-请求所携 `model` 必须是复合 `model@target` ID，路由直接看 `@target` 部分；是否允许这一 ID 走该接口受 `internal_exposed_models` / `external_exposed_models` 控制。external 端口仍需 `external_access_tokens` 鉴权。
-
-### ollama_targets（反向：Anthropic → 本机 Ollama）
+#### anthropic_upstreams
 
 ```jsonc
 {
-  "name": "local",                                  // 唯一名字；source 名不能含 @
-  "base_url": "http://127.0.0.1:11434",              // 本机 Ollama URL
-  "models": ["llama3.1", "qwen2.5-coder"],          // 生成复合 ID: llama3.1@local, qwen2.5-coder@local
-  "model_map": { "llama3.1": "llama3.1:8b" },       // 可选：显示名 → Ollama tag
+  "name": "default",
+  "base_url": "https://api.anthropic.com",
+  "auth_token": "sk-ant-...",
+  "models": [
+    { "name": "claude-3-5-sonnet-20241022" },
+    { "name": "claude-3-5-haiku-20241022", "alias": "claude-haiku" }
+  ]
+}
+```
 
-  "auto_start": false,                               // true 时 health 失败会执行 start_command
-  "start_command": null,                             // Windows 示例："\"C:\\Users\\a\\AppData\\Local\\Programs\\Ollama\\ollama.exe\" serve"
+启动时会做循环检测：如果 `base_url` 的 host:port 与本进程的某个 `ollama_interfaces[*]` / `api_interfaces[*]` / `admin` 监听重合，会直接报 `cycle detected` 拒绝启动。
+
+#### openai_upstreams
+
+字段同 `anthropic_upstreams`，协议是 OpenAI Chat Completions（会自动拼 `/v1/chat/completions`），鉴权同时以 `Authorization: Bearer` 和 `x-api-key` 发送。
+
+#### ollama_targets
+
+```jsonc
+{
+  "name": "local",
+  "base_url": "http://127.0.0.1:11434",
+  "models": [
+    { "name": "llama3.1:8b", "alias": "llama3.1" },
+    { "name": "qwen2.5-coder" }
+  ],
+
+  "auto_start": false,
+  "start_command": null,
   "stop_command": null,
-  "idle_timeout_seconds": null,                      // 通常留空，让 Ollama 自己卸载模型
+  "idle_timeout_seconds": null,
   "startup_timeout_seconds": 60,
   "health_path": "/api/version",
   "cwd": null
 }
 ```
 
-对外是否可见由顶层 `external_exposed_models` 控制（要在里面勾上例如 `llama3.1@local`）；对内同理由 `internal_exposed_models` 控制。访问鉴权统一走顶层的 `external_access_tokens`，**不再有 per-target 的 `api_token` 字段**——旧版 `api_token` 在加载时会被自动 hoist 到 `external_access_tokens` 并打 WARN，存盘后清理。
+- `auto_start: false`：fake-ollama 只转发，不接管 daemon。
+- `auto_start: true`：health check 失败时执行 `start_command`；`stop_command` / `idle_timeout_seconds` 控制空闲回收。
+- 模型名匹配按 Ollama 规则：`foo` 与 `foo:latest` 等价；省略 tag 只代表 `latest`。
+- 每个本地模型的显存估算在 `model_profiles[*].estimated_vram_gb` 里配置。请求触发模型加载前，fake-ollama 调用 `nvidia-smi` 检查可用显存；不足时按 LRU 卸载其他空闲超过 60 秒的本地模型，每轮重新读真实 free VRAM。
 
-Ollama target 有两种运行方式：
-- **单独运行模式**：`auto_start: false`（默认）。fake-ollama 只负责转发；Ollama Desktop / system service / 你自己的脚本负责 daemon 生命周期。
-- **接管启动模式**：`auto_start: true` 且配置 `start_command`。fake-ollama 在请求到来且 `health_path` 不通时执行启动命令。`idle_timeout_seconds` 留空时不主动停止 daemon；填了以后只会停止 fake-ollama 自己启动的进程，或执行你配置的 `stop_command`。
-- 进程开始关闭后（例如 Ctrl+C），fake-ollama 会拒绝新的请求工作并禁止再执行 `start_command`，避免在 shutdown drain 阶段把 Ollama 重新拉起。
-- 每个本地模型的显存估算在 `model_profiles[模型名].estimated_vram_gb` 里配置，而不是在 target 上配置。请求命中该模型时，fake-ollama 会在触发本地模型加载前调用 `nvidia-smi` 汇总当前可用 GPU 显存。
-- 如果显存不足，会找出其他已填写 `estimated_vram_gb`、当前无请求、且上次使用在 60 秒之前的本地模型，按最久未使用优先尝试释放；Ollama 会先用 `/api/generate` + `keep_alive: 0` 卸载单个模型，失败时再按可控进程 / `stop_command` 停掉整个 target。每次释放后都会重新读取 `nvidia-smi` 的当前可用显存，只有真实 free VRAM 达标才继续启动新模型。
+#### llama_cpp_targets
 
-请求头形式（与 Anthropic 官方一致）：
+llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**。要跑多个模型，加多个 target。
 
-```
-x-api-key: tk-...
-# 或
-Authorization: Bearer tk-...
-```
-
-详见下文「[反向代理](#反向代理把本地-ollama--llamacpp-当远端-api-用)」。
-
-### llama_cpp_targets（反向：Anthropic / OpenAI → llama.cpp server）
-
-llama.cpp server 自带 OpenAI 兼容接口，fake-ollama 会把多个 server 实例聚合到 external listener。`llama_cpp_targets` 是数组，但**每一项只代表一个模型、一个 llama.cpp server 进程、一个端口和一组启停脚本**；要配置多个 llama.cpp 模型，就新增多个 target，分别设置不同的 `base_url` / 端口、`start_command` / `stop_command`，以及唯一的 `model`。
-
-`llama_cpp_defaults` 可以集中配置所有 target 的通用生命周期参数；target 里写了同名字段就覆盖全局值。`name` 仍然是 target 级标识，用于内部 client 字典、日志和去重，但通常不用写；不填时自动等于 `model`，它不是全局配置。
+`llama_cpp_defaults` 集中配置所有 target 共用的默认值；target 自身字段可覆盖。
 
 ```jsonc
 {
   "llama_cpp_defaults": {
-    "auto_start": true,                           // health 失败时按需启动
-    "idle_timeout_seconds": 1800,                 // 留空表示不做空闲回收
+    "auto_start": true,
+    "idle_timeout_seconds": 1800,
     "startup_timeout_seconds": 600,
     "health_path": "/health",
-    "cwd": "I:\\Projects\\llama.cpp"
+    "cwd": "I:\\Projects\\llama.cpp",
+    "binary_path": "I:\\Projects\\llama.cpp\\llama-server.exe",
+    "gpu_layers": 99,
+    "flash_attn": true
   },
   "llama_cpp_targets": [
     {
-      "base_url": "http://127.0.0.1:21436",
-      "auth_token": "",                          // 可选：llama.cpp --api-key
-      "model": "qwen3.6-27b-hauhau-q2kp",         // 必填；一个 target = 一个模型进程
-      "model_alias": null,                        // 可选：发送给 llama.cpp 的 --alias / OpenAI model ID
-      "start_command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"I:\\Projects\\llama.cpp\\start_qwen36_server.ps1\" -ListenHost 127.0.0.1 -Port 21436",
-      "stop_command": null                        // 可选；未填时只停止 fake-ollama 自己启动的进程
+      "name": "qwen3.6-27b-iq4xs",
+      "base_url": "http://127.0.0.1:21441",
+      "model": "qwen3.6-27b-iq4xs",
+      "alias": null,
+      "model_path": "I:\\path\\to\\qwen.gguf",
+      "mmproj_path": "I:\\path\\to\\mmproj.gguf",
+      "ctx_size": 120000,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0"
     }
   ]
 }
 ```
 
-路由行为：
-- `POST /v1/chat/completions` 命中 `llama_cpp_targets[*].model` 时，基本直通 llama.cpp 的 OpenAI API，只把显示名映射到 `model_alias` 后的真实 alias。
-- `POST /v1/messages` 命中同一模型时，会把 Anthropic Messages 请求转换成 OpenAI Chat Completions，再把响应转换回 Anthropic JSON / SSE。
-- `llama_cpp_targets[*].model` 是单个字符串；旧版 `models: ["..."]` 会在读取时兼容，但新配置请不要再写列表。原因是 llama.cpp server 进程本身加载单个模型，端口、启动脚本、停止脚本和显存回收都应跟这个模型一一对应。
-- 生命周期有两种模式：`auto_start: false` 是单独运行模式，fake-ollama 不接管进程；`auto_start: true` + `start_command` 是接管模式，fake-ollama 负责按需唤起该模型对应的 server 进程。`idle_timeout_seconds` 只在你配置后启用；没有 `stop_command` 时，fake-ollama 不会杀掉它没有亲自启动的外部 llama.cpp 进程。Windows 上由 fake-ollama 启动的 PowerShell/cmd 包装进程会按进程树停止，避免只结束 shell 而留下 `llama-server` 子进程。进程开始关闭后同样会禁止再执行 `start_command`。
-- llama.cpp 模型同样从 `model_profiles[模型名].estimated_vram_gb` 读取显存估算。显存不足时，fake-ollama 可以停止空闲超过 60 秒、且由自己启动或配置了 `stop_command` 的其他 llama.cpp 模型 target；llama.cpp 没有通用的单模型卸载 API，所以回收单位就是该模型对应的 target 进程。释放后会重新读取 `nvidia-smi`，不会用 `estimated_vram_gb` 累加值当作真实可用显存。
+`LlamaCppTarget.alias` 语义：当 `alias` 非空时，**它就是公开 display name**（替换 `model`），仍然作为模型在白名单里的 display；发给 llama.cpp 的 wire name 始终是 `model` 字段。
 
-#### Copilot 走 upstream 调用 Ollama 模型
+### Interfaces（接口与白名单）
 
-如果希望 GitHub Copilot 仍然只连接 internal Ollama 兼容入口（`/api/chat`），但实际模型在本机或另一台机器的 Ollama 上，可以把一个 `upstreams` 项指向 fake_ollama 的 **external listener**：
-
-- 同机部署：`upstreams[*].base_url = "http://127.0.0.1:<external_port>"`
-- 跨机器部署：`upstreams[*].base_url = "http://<ollama-host>:<external_port>"`
-- `upstreams[*].auth_token` 填目标 fake_ollama 的 `external_access_tokens` 之一
-- 目标 fake_ollama 的 `ollama_targets[*].models` 或 `llama_cpp_targets[*].model` 包含这些模型
-
-这样请求路径仍然是 upstream 语义：Copilot → internal `/api/chat` → upstream `/v1/messages` → 目标机器 Ollama / llama.cpp。不要为了图片能力把 internal `/api/chat` 直接改成本机 target，否则跨机器部署会失去这一层转发边界。
-
-### model_profiles
-
-key 是模型显示名，value 是该模型的元数据。GitHub Copilot 等客户端会读 `/api/show` 的 `capabilities` 决定模型在 UI 中是否可选、能否做 tool-calling / 视觉。
+`ollama_interfaces` / `api_interfaces` 都是数组，每一项独立监听：
 
 ```jsonc
 {
-  "claude-3-5-sonnet-20241022": {
-    "capabilities": ["completion", "tools", "vision"],
-    "context_length": 200000,
-    "max_output_tokens": 8192
-  },
-  "deepseek-v4-pro": {
-    "capabilities": ["completion", "tools"],
-    "context_length": 128000,
-    "max_output_tokens": 8192,
-    "thinking_mode": "enabled",
-    "thinking_budget_tokens": 1024,
-    "show_thinking": true
-  },
-  "llama3.1": {
-    "capabilities": ["completion", "tools"],
-    "context_length": 131072,
-    "estimated_vram_gb": 6.0
-  }
+  "ollama_interfaces": [
+    {
+      "name": "ollama",
+      "host": "127.0.0.1",
+      "port": 21434,
+      "access_tokens": [],
+      "exposed_models": [
+        { "model": "claude-3-5-sonnet-20241022", "target": "default" },
+        { "model": "deepseek-r1",                "target": "deepseek_remote" }
+      ]
+    }
+  ],
+  "api_interfaces": [
+    {
+      "name": "api",
+      "host": "127.0.0.1",
+      "port": 21435,
+      "access_tokens": [ "tk-..." ],
+      "exposed_models": [
+        { "model": "llama3.1",  "target": "local" },
+        { "model": "qwen3.6-27b-iq4xs", "target": "qwen3.6-27b-iq4xs", "alias": "qwen-vision" }
+      ]
+    }
+  ]
 }
 ```
 
-字段说明：
+字段：
 
-| 字段 | 默认 | 说明 |
+| 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `capabilities` | `["completion","tools","vision"]` | 子集自这三者；**至少要有 `completion`**，否则 Copilot 会过滤掉 |
-| `context_length` | `200000` | 总上下文 token 上限。服务端会做拦截（输入估算 + `max_tokens` 超过 → 400） |
-| `max_output_tokens` | `null` | 可选；同时是 `max_tokens` 的硬上限 |
-| `estimated_vram_gb` | `null` | 可选；本地 Ollama / llama.cpp 模型加载后预计占用的 GPU 显存（GB），用于启动前预检和空闲模型回收 |
-| `thinking_mode` | `auto` | `auto` / `enabled` / `disabled`，控制是否注入 `thinking` 字段（仅 reasoning 模型有效） |
-| `thinking_budget_tokens` | `1024` | `enabled` 时的预算（DeepSeek 会忽略） |
-| `show_thinking` | `true` | 是否把上游 thinking 透传给客户端：用 `<think>...</think>` 包裹接到正文前面，并在 Ollama 响应里附 `message.thinking`、OpenAI 流式增量里附 `reasoning_content` |
+| `name` | string | 接口唯一标识，仅用于日志 / Admin UI |
+| `host` | string | 监听 host（`127.0.0.1` 或 `0.0.0.0`） |
+| `port` | int | 监听端口；启动时若与其他接口或 admin 端口冲突会报错 |
+| `access_tokens` | string[] | 该接口的 token 池；空 = 该接口不鉴权 |
+| `exposed_models` | array of `ExposureEntry` | 该接口允许看到 / 请求的模型 |
 
-> token 估算用 `字符数 / 3` 的保守启发式（中英都偏高估），目的是宁可早拦也不漏拦——它**不**保证与上游计费完全一致。如需关闭拦截设 `enforce_context_limit: false`。
+每个 `ExposureEntry` 字段：
 
-> Web 编辑器里 `upstreams[*].models`、`ollama_targets[*].models`、`llama_cpp_targets[*].model` 与添加 `model_profiles` 时的 key 输入框都带 **HTML5 datalist 自动补全**。候选来自当前配置里的模型名、已探测到的模型名，以及已有 `model_profiles` key。
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `model` | string | source 里的 `ModelEntry.name`，必须与某个 source 的 `models[*].name` 完全匹配 |
+| `target` | string | source 的 `name`，决定路由到哪 |
+| `alias` | string? | 可选；非空时**作为该 exposure 的公开 ID**，替换 `model@target` 复合形式 |
 
-### 环境变量
+- 公开 ID 优先级：`exposure.alias` > `model_entry.alias` > `"{model}@{target}"`
+- 客户端必须用「公开 ID」请求；裸 model 名（无 `@`）会在做 tagless 匹配后路由（见下），仍找不到时 400。
+- 同一个模型可以在多个接口里同时暴露，alias 可以不同。
+- `/api/tags`（Ollama）与 `/v1/models`（OpenAI）只列出当前接口的公开 ID。
+- mismatch 警告：Admin UI 会在你勾的 `exposed_models` 引用了不存在的 source / model 时高亮提示。
 
-运行期只读一个环境变量：
+#### Tagless 回退匹配
 
-| 变量 | 说明 |
-| --- | --- |
-| `FAKE_OLLAMA_CONFIG` | 同 `--config`，选中 `config.json` 路径。未设时使用 CWD 下的 `./config.json` |
+为了兼容客户端把 `foo:latest` 写成 `foo` 的常见情况，请求 `model` 形如 `foo@target` 时，若没有精确匹配的 exposure，会在「该接口里 target 相同且未设 alias 的 exposure」里按 Ollama 规则（`foo` ≡ `foo:latest`）二次匹配，命中即路由。设了 `alias` 的 exposure 不参与该回退（alias 视为强精确）。
 
-所有听口 host / port、token、模型白名单、上下文限制、超时、代理开关等都只能在 `config.json`（或 Admin UI）里配置。旧版的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `FAKE_OLLAMA_*` 文本变量都已移除，请迁移到 `upstreams[*].auth_token` 与顶层端口字段。
+### 共享设置
 
-`.env` 现在只服务于集成测试场景，可设 `FAKE_OLLAMA_TEST_BASE_URL` / `FAKE_OLLAMA_TEST_AUTH_TOKEN` 控制是否跳过依赖真实上游的 e2e 用例。
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `default_max_tokens` | int | `4096` | 客户端没传时的默认输出上限 |
+| `timeout_seconds` | float | `300` | 所有出站 HTTP 请求超时 |
+| `use_system_proxy` | bool | `false` | 出站是否走系统代理 |
+| `enforce_context_limit` | bool | `true` | 估算 token 超 `context_length` 直接 400 |
+| `advertised_version` | string | `0.6.4` | 仅用于 Ollama 接口的 `/api/version` |
+| `model_profiles` | object | `{}` | 每模型 capabilities / 上下文 / 思维链等。key 三级回退：`model@target` > 裸 `model` > tagless base |
 
-## 反向代理：把本地 Ollama / llama.cpp 当远端 API 用
+### Admin UI / Dashboard
 
-适合**只支持 Anthropic Messages API** 的客户端（如 Claude Code）调用本机 Ollama / llama.cpp 模型，或把上游 Anthropic 服务做带鉴权的转发壳。
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `admin_enabled` | bool | `true` | 是否注册 `/admin` |
+| `admin_host` | string | `127.0.0.1` | admin listener 地址（**无内置鉴权**） |
+| `admin_port` | int | `21433` | admin listener 端口 |
+| `dashboard_enabled` | bool | `true` | 是否启用资源监控 dashboard |
+| `dashboard_host` / `dashboard_port` | | `127.0.0.1` / `21432` | dashboard listener |
+| `dashboard_sample_interval_seconds` | float | `10.0` | 采样间隔 |
+| `dashboard_retention_seconds` | float | `604800.0` | 历史保留窗口 |
+| `dashboard_data_path` | string | `logs/dashboard_history.json` | 历史落盘路径 |
+| `dashboard_model_reclaim_enabled` | bool | `true` | dashboard 是否显示模型回收 |
+| `vram_low_free_reclaim_enabled` | bool | `true` | 检测显存低水位时主动回收 |
+| `vram_low_free_threshold_mib` | float | `200.0` | 低水位阈值（MiB） |
 
-只要在 `config.json` 里配上 `ollama_targets` 或 `llama_cpp_targets`（见上），并填了至少一个 `external_access_tokens`，反向代理 `POST /v1/messages`、`POST /v1/messages/count_tokens` 与 external 端口的 `POST /v1/chat/completions` 就开门工作：
+## 内部 backends 视图
 
-- `model` 命中某个 `ollama_targets[*].models` 且复合 ID 在 `external_exposed_models` 里 → 转换为 Ollama `/api/chat`，再把响应翻译回 Anthropic 的 `message_*` SSE / 非流式 JSON。
-- `model` 命中某个 `llama_cpp_targets[*].model` 且在白名单里 → 调用 llama.cpp `/v1/chat/completions`；Anthropic 入口会做格式转换，OpenAI 入口则基本直通。
-- `model` 命中某个 upstream 提供的复合 ID 且在白名单里 → 透传到该 Anthropic 上游（相当于一个本机鉴权转发壳）。
-- 其他情况 → 400 提示裸名 / 未知 `model@target`，或 404 `model '...@...' is not exposed on external surface`。
+`Settings` 之上有一份协议无关的 `backends` 列表，路由代码用它统一查找：
 
-`POST /v1/messages/count_tokens` 按 Anthropic 官方格式返回 `{"input_tokens": ...}`：命中本地 Ollama / llama.cpp target 时用本地估算，不会为了计数唤起模型；命中外露 upstream 时透传到上游的 count_tokens 接口，所以官方 Anthropic 端可以返回精确值。客户端附带的 `?beta=true` 会被接受；透传 upstream 时会保留这个 query。
+```python
+settings.backends
+# -> List[Backend]，每项 (name, protocol, kind, base_url, source)
+#    protocol: "anthropic" | "openai" | "ollama"
+#    kind:     "remote" | "local"
+#    source:   底层 AnthropicUpstream / OpenaiUpstream / OllamaTarget / LlamaCppTarget
 
-端口分流规则：启用 `external_port` 后，internal 端口上的 `/v1/chat/completions` 保持 forward proxy 语义，走 upstream API；external 端口上的 `/v1/chat/completions` 走反向代理语义，优先命中 `ollama_targets`，再命中 `llama_cpp_targets`。
+settings.resolve_request("deepseek-r1", interface_name="api")
+# -> 按某个接口的视角解析「客户端请求 model」到 (backend, ModelEntry)
+#    会查 exposed_models（含 tagless 回退），找不到返回 None
+```
+
+`resolve_request` 取代了旧版 `backend_for("model@target", surface=...)`：从「surface=internal/external」改成显式传 `interface_name`，因为接口现在是数组。
+
+## 反向代理：把本地模型当远端 API 用
+
+适合**只支持 Anthropic 或 OpenAI API** 的客户端调用本机 Ollama / llama.cpp 模型，或把上游 Anthropic 做带鉴权的转发壳。
+
+只要在某个 `api_interfaces[*].exposed_models` 里勾上对应模型（指向 `ollama_targets` 或 `llama_cpp_targets`），并设置好 `access_tokens`，反向代理 `POST /v1/messages`、`POST /v1/messages/count_tokens` 与 `POST /v1/chat/completions` 就开门工作：
+
+- 命中 `ollama_targets[*].models[*]` → 转换为 Ollama `/api/chat`，再翻译回 Anthropic / OpenAI 响应。
+- 命中 `llama_cpp_targets[*]` → 调用 llama.cpp `/v1/chat/completions`；Anthropic 入口做格式转换，OpenAI 入口基本直通。
+- 命中 anthropic_upstreams / openai_upstreams 提供的模型 → 透传到该上游（带鉴权壳）。
+- 未命中 / 未在白名单 → 404 `model '...' is not exposed on interface 'xxx'`。
+
+`POST /v1/messages/count_tokens` 命中本地 target 时用本地估算；命中外露 upstream 时透传。
 
 支持的转换：
 
 - 文本消息、`system`、`max_tokens` / `temperature` / `top_p` / `top_k` / `stop_sequences`
-- **工具调用**：`tools` + `tool_use` + `tool_result`（流式与非流式都支持；Ollama 仅在 `done` 时一次性返回 `tool_calls`，所以 `input_json_delta` 也是在 done 时一次性发出）
-- Anthropic 的 base64 `image` 块：转到 Ollama 时变成消息里的 `images` 数组；转到 llama.cpp 时变成 OpenAI `image_url` data URI。URL 图片源可直接交给 llama.cpp，转给 Ollama 时会替换为占位文本（安全降级而非 500）。
+- **工具调用**：`tools` + `tool_use` + `tool_result`（流式与非流式都支持）
+- Anthropic base64 `image` 块：转到 Ollama 时变成 `images` 数组；转到 llama.cpp 时变成 OpenAI `image_url` data URI
 
-让 Claude Code 走它（外部端口默认 21435）：
+让 Claude Code 走它：
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:21435"
-$env:ANTHROPIC_AUTH_TOKEN = "tk-填你的-external_access_tokens-之一"
+$env:ANTHROPIC_AUTH_TOKEN = "tk-填你的-api_interface-access_tokens-之一"
 $env:ANTHROPIC_MODEL = "llama3.1"
 claude
 ```
 
-## Web 配置编辑器（/admin）
-
-启动后浏览器打开 <http://127.0.0.1:21433/admin>。左侧侧栏现在是二级目录：一级按“Forward Proxy / Reverse Proxy / Shared Settings / Admin UI”分块，二级再列具体配置组；每个字段一行：
-
-- 左侧复选框 = **是否包含该字段**；取消勾选会从保存的 JSON 里移除，让它回退到默认值。
-- 右侧是输入控件（按字段类型自适应：文本 / 数字 / 复选框 / 多行列表 / key-value 表 / 嵌套对象列表 / **从兄弟字段拉取的复选框列表**）。
-- `upstreams`、`ollama_targets`、`llama_cpp_targets`、`model_profiles` 是可重复组，自带 +add / Remove。
-- **Detect models**：upstream / Ollama 卡片会把探测结果合并或替换 `models` 字段；llama.cpp 卡片会把选择结果写入单个 `model` 字段。多个 llama.cpp 模型请拆成多个 target。
-- **Exposure**：不再在每个 source 卡片里写 `expose_external`。「对用户的接口 / Exposure」分组里有两个复选框列表（`internal_exposed_models` / `external_exposed_models`），列出所有 source 产生的 `model@target` 复合 ID，供你分别勾选。
-- **model_profiles 添加**：key 输入框带浏览器原生 datalist 自动补全，key 可以是复合 `model@target`（最优先匹配）、裸 `model` 名，或 tagless base。
-- **external_access_tokens**：每行带 Show / Generate 按钮；列表底部还有"+ generate token"直接追加随机 token。
-- 顶部三个按钮：
-  - **Save & Reload**：用 `Settings` 校验 → 写回磁盘 → 原子替换 `app.state.settings`，并重建上游连接池（旧连接异步关闭，正在进行的请求不受影响）。
-  - **Discard & Reload from disk**：丢弃当前编辑，从磁盘重新加载。
-  - **Toggle raw JSON**：当 schema 不够覆盖你的需求时，切回原始 JSON 文本框直接编辑。
-- 校验失败会显示来自 Pydantic 的具体错误，配置不会被写入。
-
-不需要这个 UI 的话设 `"admin_enabled": false`，相关路由不会注册。默认情况下 `/admin` 只挂在 admin listener 上，**不会被 internal 或 external 端口暴露**。只有显式设置 `"admin_port": null` 时才会回到旧的 internal 单端口模式。
-
-## 内部 backends 视图（重构准备）
-
-`config.json` 当前仍按历史形态分成 `upstreams` / `ollama_targets` / `llama_cpp_targets` 三个列表（admin UI 也按这个结构渲染），但在 `Settings` 之上现在统一暴露一个协议无关的 `backends` 视图，路由代码可以不再关心一个 backend 是从哪个列表来的：
-
-```python
-settings.backends
-# -> List[Backend]，每个元素带 (name, protocol, kind, base_url, models, source)
-#    protocol: "anthropic" | "ollama" | "openai"
-#    kind:     "remote" | "local"
-#    source:   底层的 Upstream / OllamaTarget / LlamaCppTarget 对象，
-#              需要协议专属字段（启停命令、llama.cpp 启动参数等）时用
-
-settings.backend_for("llama3.1@local")
-# -> 按复合 ID 直接查找 backend，找不到返回 None
-
-settings.backend_for("private-model@anthropic", surface="external")
-# -> 额外按 external_exposed_models 过滤；未列出的复合 ID 会被跳过
-```
-
-设计意图：
-
-- **`protocol`** 决定走哪套 wire format converter（Anthropic Messages、Ollama `/api/chat`、OpenAI Chat Completions）。
-- **`kind`** 决定是否参与生命周期管理：`local` 才会触发 health check / `auto_start` / VRAM 回收；远端 backend 上设 `auto_start` 没有意义、会被忽略。
-- 下一轮加 OpenAI 兼容端口时，新增的 `openai_upstreams` / `openai_targets` 会自动归并进同一份 `backends` 列表，server 路由不再需要新增一组 if/elif 分支。
-
-新增字段细节见 `tests/test_backends.py`。
-
 ## 视觉输入（图片）
 
-- `/api/chat`、`/api/generate`：消息里传 `images: ["<base64>", ...]`，服务端从 base64 magic bytes 嗅探 PNG / JPEG / GIF / WEBP 并设置正确的 `media_type`。
-- `/api/chat` 也兼容 OpenAI 风格的多段 `content`：`{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}` 会转成 Anthropic 图片块。
-- `/v1/chat/completions`：`content` 用 OpenAI 风格 `{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}`，data URI 的 `media_type` 直接透传；也支持 HTTP(S) URL，转为 Anthropic `source.type=url` 块。
-- `/v1/messages` 反向代理到本机 Ollama 时：Anthropic base64 `image` 块会转成 Ollama `images` 数组；反向代理到 llama.cpp 时会转成 OpenAI `image_url` data URI。external 端口的 `/v1/chat/completions` 命中本地 target 时也会保留对应协议的图片格式。
-- 上游不支持图片时（如 DeepSeek）会返回错误，fake-ollama 不预拦截。
+- `/api/chat`、`/api/generate`：消息里传 `images: ["<base64>", ...]`，服务端从 base64 magic bytes 嗅探 PNG / JPEG / GIF / WEBP。
+- `/api/chat` 也兼容 OpenAI 风格多段 `content`：`{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}`。
+- `/v1/chat/completions` 与 `/v1/messages`：参见 OpenAI / Anthropic 官方多段 content 格式。
+- 上游不支持图片时（如 DeepSeek text-only）会返回错误，fake-ollama 不预拦截。
+
+## Web 配置编辑器（/admin）
+
+启动后浏览器打开 <http://127.0.0.1:21433/admin>。左侧侧栏按 「Forward Proxy / Reverse Proxy / Shared Settings / Admin UI」 分块：
+
+- 每个字段左侧复选框 = 「是否写入 JSON」；取消勾选 = 回退默认值。
+- `anthropic_upstreams` / `openai_upstreams` / `ollama_targets` / `llama_cpp_targets` / `ollama_interfaces` / `api_interfaces` / `model_profiles` 都是可重复组，自带 +add / Remove。
+- 视觉上 Ollama 和 llama.cpp source 卡片用不同强调色和图标分组，方便区分。
+- **Detect models**：upstream / Ollama 卡片支持探测后合并到 `models`；llama.cpp 卡片支持探测后写入单个 `model`。
+- **Exposure**：每个接口卡片里的 `exposed_models` 是结构化表格，`model` / `target` 都带 datalist 自动补全；mismatch（引用了不存在的 source / model）会高亮。
+- **access_tokens**：每行带 Show / Generate；列表底部有 "+ generate token"。
+- 顶部按钮：**Save & Reload** / **Discard & Reload from disk** / **Toggle raw JSON**。
+- 校验失败会显示 Pydantic 详细错误，配置不会被写入。
+
+`/admin` 只挂在独立 admin listener 上，**不会**被任何 `ollama_interfaces` / `api_interfaces` 暴露。
 
 ## 测试
 
 ```powershell
 pip install -e ".[test]"
 
-# 离线单测（默认）
+# 离线单测
 pytest
 
-# live 集成测试（需要 .env 里有有效 ANTHROPIC_BASE_URL/TOKEN）
+# live 集成测试（需要 .env 里有 FAKE_OLLAMA_TEST_BASE_URL / FAKE_OLLAMA_TEST_AUTH_TOKEN）
 pytest -m integration
 ```
 
-`tests/conftest.py` 在缺少凭据时自动跳过 `@pytest.mark.integration` 用例，单测不会真正访问网络。
+`tests/conftest.py` 在缺少凭据时自动跳过 `@pytest.mark.integration` 用例。
 
 ## 手动验证示例
 
 ```powershell
-# Ollama 端（internal:21434）
+# Ollama 接口（默认 21434）
 curl http://127.0.0.1:21434/api/tags
 curl -X POST http://127.0.0.1:21434/api/chat `
   -H "Content-Type: application/json" `
-  -d '{"model":"claude-3-5-sonnet-20241022","stream":false,"messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"claude-3-5-sonnet-20241022@default","stream":false,"messages":[{"role":"user","content":"hi"}]}'
 
-# Anthropic 反向代理（external:21435，需 token）
+# API 接口（默认 21435，需 token）
 curl http://127.0.0.1:21435/v1/models -H "x-api-key: tk-..."
 curl -X POST http://127.0.0.1:21435/v1/messages `
   -H "Content-Type: application/json" -H "x-api-key: tk-..." `
   -d '{"model":"llama3.1","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
-curl -X POST "http://127.0.0.1:21435/v1/messages/count_tokens?beta=true" `
-  -H "Content-Type: application/json" -H "x-api-key: tk-..." `
-  -d '{"model":"llama3.1","messages":[{"role":"user","content":"hi"}]}'
 
-# llama.cpp OpenAI 端（同一个 external 端口）
+# llama.cpp OpenAI 直通（同一个 API 接口）
 curl -X POST http://127.0.0.1:21435/v1/chat/completions `
   -H "Content-Type: application/json" -H "x-api-key: tk-..." `
-  -d '{"model":"qwen3.6-27b-hauhau-q2kp","stream":false,"messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"qwen-vision","stream":false,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ## 请求数据日志
 
-`logs/fake_ollama.log` 只放运行状态、生命周期、access 摘要等普通日志。完整请求/响应数据默认写到独立 JSONL 文件 `logs/fake_ollama.requests.jsonl`，方便定位 agent 工作到一半中断时到底断在 agent、fake_ollama、上游 API，还是本地 Ollama / llama.cpp。
+`logs/fake_ollama.log` 只放运行日志；完整请求 / 响应数据默认写到 `logs/fake_ollama.requests.jsonl`。
 
-每一行是一条 JSON 事件，核心字段：
+每行是一条 JSON 事件，核心字段：
 
-- `request_id`：同一次入口请求共享同一个 id；入口 HTTP、转换后的后端请求、后端响应 chunk、返回给 agent 的 chunk 都能串起来。
-- `event`：常见值包括 `http_request_start`、`http_request_body`、`backend_request`、`backend_response_body`、`http_response_body`、`http_request_end`、`backend_error`。
-- `body`：完整请求体 / 响应体 / 流式 chunk。文本按 UTF-8 记录，非文本按 base64 记录。
-- `headers`：会记录请求头，但 `Authorization`、`x-api-key`、cookie 等敏感头只保留 sha256 指纹，不写明文 token。
+- `request_id`：同一次入口请求贯穿入口 HTTP、后端请求、响应 chunk、返给 agent 的 chunk。
+- `event`：`http_request_start` / `http_request_body` / `backend_request` / `backend_response_body` / `http_response_body` / `http_request_end` / `backend_error`。
+- `body`：完整请求体 / 响应体 / 流式 chunk。文本 UTF-8，非文本 base64。
+- `headers`：`Authorization` / `x-api-key` / cookie 等敏感头只留 sha256 指纹。
 
-默认只记录服务 API（`/api/*`、`/v1/*`），不记录 `/admin/*`，避免把配置页里的密钥写进数据日志。这个文件会包含 prompt、工具调用参数、模型输出和图片 base64，排查完请按敏感日志处理；默认按 100MB * 10 个文件轮转。
-
-常用启动参数：
+只记录 `/api/*` 与 `/v1/*`，不记录 `/admin/*`。默认 100MB × 10 个文件轮转。
 
 ```powershell
-# 指定固定的数据日志路径
-python -m fake_ollama --request-data-log-file I:\Projects\fake_ollama\logs\agent-debug.jsonl
-
-# 只保留运行日志，不记录完整请求/响应数据
+python -m fake_ollama --request-data-log-file I:\path\requests.jsonl
 python -m fake_ollama --no-request-data-log
 ```
 
 ## 安全提示
 
-- `.env` / `config.json` 已加入 `.gitignore`，请勿提交真实 token。
-- `logs/fake_ollama.requests.jsonl*` 会包含完整 prompt、工具参数、模型输出和可能的图片 base64。即使 token 头已脱敏，也应按敏感数据处理，不要直接发给第三方。
-- **internal listener 默认仅绑 `127.0.0.1`**；要局域网共享请显式 `--host 0.0.0.0` 并自行做访问控制。
-- **external listener** 默认也是 `127.0.0.1`。要对外暴露反向代理：要么 `external_host: "0.0.0.0"`，要么保持 `127.0.0.1` + 用 Nginx/Caddy 反代（更推荐，可以加 TLS）。
-- **`/admin` Web UI 没有任何鉴权**。它默认只挂在独立 admin listener 上，并默认绑定 `127.0.0.1`。如果你把 `admin_host` 改成 `0.0.0.0` 或设置 `admin_port: null`，必须自行加一层带认证的反向代理（nginx/Caddy basic auth 等），或直接 `"admin_enabled": false`。
-- 反向代理 token：建议在 Web UI 用 Generate 生成 ≥24 字节的随机串，不要复用其他系统的 token。Token 池里可以放多个，便于按客户端轮换。
+- `.env` / `config.json` 已加入 `.gitignore`，不要提交真实 token。
+- `logs/fake_ollama.requests.jsonl*` 会包含 prompt、工具参数、模型输出、图片 base64，应按敏感数据处理。
+- 所有接口默认 `127.0.0.1`。要对外暴露：要么把对应实例的 `host` 改 `0.0.0.0`，要么保持 `127.0.0.1` + Nginx/Caddy 反代加 TLS。
+- **`/admin` 无任何鉴权**，默认绑 `127.0.0.1`。若改成 `0.0.0.0` 必须自己加一层鉴权反代，或 `"admin_enabled": false`。
+- 反向代理 token：建议用 Web UI 的 Generate 生成 ≥24 字节随机串，不要复用其他系统 token。Token 池可放多个，便于按客户端轮换。
 
 ## 故障排查
 
-- **/v1/messages 返回 404 `model '...@...' is not exposed on external surface`**：该复合 ID 不在顶层 `external_exposed_models` 里。去 admin UI 「对用户的接口 / Exposure」里勾选它。
-- **/v1/messages 返回 400 `model '...' must be qualified as 'model@target'`**：客户端传了裸名。改为传复合 ID，可以先请求 `/v1/models` 获取当前可用列表。
-- **/v1/messages 返回 401**：`external_access_tokens` 为空（且 `external_port` 已设置 → 启动时已 WARN），或请求头里的 token 不在池里。检查 `x-api-key` / `Authorization: Bearer` 是否带对了。
-- **/v1/messages 在 internal 端口返回 404**：你启用了 `external_port`，反向代理已经只在 external 端口可达。请改连 external 端口。
-- **启动后找不到日志文件**：默认路径都相对当前工作目录：运行日志是 `logs/fake_ollama.log`，请求数据日志是 `logs/fake_ollama.requests.jsonl`。确认是在项目根目录启动，或显式传 `--log-file I:\Projects\fake_ollama\logs\fake_ollama.log` 和 `--request-data-log-file I:\Projects\fake_ollama\logs\fake_ollama.requests.jsonl`；如果传了 `--no-log-file` / `--no-request-data-log`，对应文件不会写。
-- **agent 工作到一半中断，想复盘链路**：打开 `logs/fake_ollama.requests.jsonl`，按最后一次请求的 `request_id` 过滤。若 `backend_response_body` 已经有完整模型输出但 `http_response_body` 不完整，重点看 fake_ollama 转换/回传；若后端 chunk 停在中途并出现 `backend_error`，重点看本地模型或上游；若 `http_request_error` 是 `CancelledError`，通常是调用方连接先断开。
-- **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`（默认）。
-- **503 / `Insufficient GPU VRAM`**：某个本地 Ollama / llama.cpp 模型在 `model_profiles` 里配了 `estimated_vram_gb`，但 `nvidia-smi` 汇总的当前可用显存不足；fake-ollama 会尝试释放空闲 60 秒以上的可回收模型，并在释放后重新读取真实 free VRAM，仍不够才返回 503。Anthropic `/v1/messages` 会返回 `type=error`、`error.type=overloaded_error` 和英文 message；OpenAI/Ollama 入口会返回同样的英文错误文本。降低该模型的 `estimated_vram_gb`、等待旧模型空闲、配置有效的 `stop_command`，或手动释放显存后重试。
-- **400 thinking content must be passed back**（DeepSeek）：模型在某轮启用了 thinking，但下一轮历史里没把 `thinking` 块带回。fake-ollama 已做了缓存回查 + 当 profile 是 `auto + show_thinking=false` 时主动注入 `thinking: {type:"disabled"}` 绕过；如果你确实想要 thinking，把对应 profile 设为 `"thinking_mode": "enabled"`。
-- **503 `No available accounts: this group only allows Claude Code clients`**：上游（claude-relay-service 等）侧的账号池限制，要求请求来自 Claude Code 客户端且池里有可用账号。这种限制无法通过改请求体绕过，需在上游后台调整该 API Key 的客户端限制 / 账户池。
+- **`/v1/messages` 返回 404 `model '...' is not exposed on interface 'xxx'`**：该模型不在该 `api_interfaces[*].exposed_models` 里。去 admin UI 勾选。
+- **`/api/chat` 返回 400 `unknown model '...'`**：客户端传的 model 不匹配任何公开 ID，也不在 tagless 回退里。先请求 `/api/tags` 获取当前接口的可用列表。
+- **返回 401**：该接口 `access_tokens` 非空，请求头里没带或带错 token。检查 `x-api-key` / `Authorization: Bearer`。
+- **启动报 `cycle detected`**：某个 `anthropic_upstreams[*].base_url` 指向了 fake_ollama 自己的某个监听端口。改 URL 或删该 upstream。
+- **启动报端口冲突**：两个 interface（或与 admin / dashboard）共用了同一个 host:port。
+- **找不到日志文件**：默认相对 CWD：`logs/fake_ollama.log` 与 `logs/fake_ollama.requests.jsonl`。在项目根目录启动，或显式 `--log-file` / `--request-data-log-file`。
+- **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`。
+- **503 `Insufficient GPU VRAM`**：某个本地模型在 `model_profiles` 里配了 `estimated_vram_gb`，但 `nvidia-smi` 显示当前可用显存不足；fake-ollama 已尝试回收空闲超过 60 秒的模型仍不够。降低估算、等模型空闲、配 `stop_command`，或手动释放显存。
+- **400 thinking content must be passed back**（DeepSeek）：某轮启用 thinking 但下一轮历史没把 `thinking` 块带回。fake-ollama 已做缓存回查 + auto+show_thinking=false 时注入 disabled；要 thinking 请显式 `"thinking_mode": "enabled"`。
 
 ## 参考文档
 

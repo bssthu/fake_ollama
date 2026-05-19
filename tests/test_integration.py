@@ -36,7 +36,7 @@ def live_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     # the endpoint is alive and gating auth — that's healthy.
     import httpx
 
-    base_url = settings.upstreams[0].base_url
+    base_url = settings.anthropic_upstreams[0].base_url
     try:
         with httpx.Client(timeout=5.0, trust_env=settings.use_system_proxy) as cli:
             probe = cli.get(base_url + "/v1/models")
@@ -54,7 +54,7 @@ def live_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
 def test_live_chat_non_streaming(live_settings: Settings):
     app = create_app(live_settings)
     with TestClient(app) as client:
-        model = live_settings.models[0]
+        model = live_settings.ollama_interfaces[0].public_ids()[0]
         resp = client.post(
             "/api/chat",
             json={
@@ -83,7 +83,7 @@ def test_live_chat_non_streaming(live_settings: Settings):
 def test_live_chat_streaming(live_settings: Settings):
     app = create_app(live_settings)
     with TestClient(app) as client:
-        model = live_settings.models[0]
+        model = live_settings.ollama_interfaces[0].public_ids()[0]
         with client.stream(
             "POST",
             "/api/chat",

@@ -67,7 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.vram_coordinator = VramCoordinator()
         if not getattr(app.state, "dashboard_state", None):
             app.state.dashboard_state = DashboardState()
-        for up in app.state.settings.upstreams:
+        for up in app.state.settings.anthropic_upstreams:
             if up.name in app.state.clients:
                 continue
             app.state.clients[up.name] = AnthropicClient(
@@ -231,18 +231,6 @@ def request_shutdown(app: FastAPI) -> None:
             pass
 
 
-def _client_for(app: FastAPI, settings: Settings, model_name: str) -> AnthropicClient:
-    """Pick the AnthropicClient that should serve the given model."""
-    name = settings.upstream_name_for(model_name)
-    clients: Dict[str, AnthropicClient] = app.state.clients
-    if name not in clients:
-        # Fall back to the first available client. Should not happen in
-        # normal operation but keeps tests that inject a single client
-        # under any key working.
-        return next(iter(clients.values()))
-    return clients[name]
-
-
 def _openai_client_for(app: FastAPI, upstream_name: str) -> OpenAIClient:
     """Resolve the configured :class:`OpenAIClient` for an upstream name."""
     clients: Dict[str, OpenAIClient] = getattr(app.state, "openai_clients", {})
@@ -255,59 +243,54 @@ def _openai_client_for(app: FastAPI, upstream_name: str) -> OpenAIClient:
     return client
 
 
-def _surface_for(request: Request) -> str:
-    """Map a request URL (and listener) to its user-facing surface.
+def _interface_for(request: Request):
+    """Return the ``OllamaInterface``/``ApiInterface`` that owns this request.
 
-    The two surfaces gate which composite ``model@target`` ids are
-    visible / callable:
-
-    * ``external`` — the Anthropic / OpenAI-compatible API exposed to
-      remote clients. Whitelisted via ``Settings.external_exposed_models``.
-    * ``internal`` — the Ollama-compatible surface for local clients.
-      Whitelisted via ``Settings.internal_exposed_models``.
-
-    Selection rules:
-
-    * ``/v1/messages*`` and ``/v1/models`` are external-only routes, so
-      they always count as ``external`` regardless of which listener
-      served them.
-    * ``/v1/chat/completions`` is shared between listeners. When a
-      dedicated external listener is configured we use the listener
-      port to disambiguate; otherwise it defaults to ``internal`` so
-      local clients can use the OpenAI-compatible endpoint without
-      acquiring an external access token.
-    * Everything else (``/api/*``, root, etc.) is ``internal``.
+    Looks up the interface by local listener port. Returns ``None`` when
+    the request landed on the admin or dashboard listener (or any other
+    listener that does not handle model traffic).
     """
     settings: Settings = request.app.state.settings
-    path = request.url.path
-    if _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES):
-        return "external"
-    if _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES):
-        if (
-            settings.external_listener_enabled
-            and _local_port(request) == settings.external_port
-        ):
-            return "external"
-        return "internal"
-    return "internal"
+    local_port = _local_port(request)
+    if local_port is not None:
+        for it in settings.ollama_interfaces:
+            if it.port == local_port:
+                return it
+        for it in settings.api_interfaces:
+            if it.port == local_port:
+                return it
+    # No matching listener (TestClient / ASGI direct call, or unknown port):
+    # best effort fallback so unit tests can hit /api/* and /v1/* without
+    # binding real sockets.
+    if settings.ollama_interfaces:
+        return settings.ollama_interfaces[0]
+    if settings.api_interfaces:
+        return settings.api_interfaces[0]
+    return None
 
 
 def _dispatch(
     request: Request, settings: Settings, requested_model: str
 ) -> tuple["Backend", str]:  # type: ignore[name-defined]
-    """Resolve a client-requested composite ``model@target`` for ``request``.
+    """Resolve a client-requested public model id for ``request``.
 
-    * Performs the external-surface auth check (when applicable).
-    * Returns ``(backend, real_model)`` where ``real_model`` is the bare
-      model name the source advertises; callers further wrap it via
-      ``backend.source.resolve_model(real_model)`` to get the wire-side
-      id (handles ``model_map``).
+    * Identifies which interface owns the request (by local port).
+    * Performs the per-interface auth check (when access_tokens is set).
+    * Returns ``(backend, real_model)`` where ``real_model`` is the
+      source-level display name (alias_or_name); callers further wrap
+      it via ``backend.source.resolve_model(real_model)`` to get the
+      wire-side id.
     * Raises ``HTTPException`` with 400/401/404 on bad input.
     """
-    surface = _surface_for(request)
-    if surface == "external" and settings.auth_required_for_v1:
+    iface = _interface_for(request)
+    if iface is None:
+        raise HTTPException(
+            status_code=404,
+            detail="this listener does not serve model traffic",
+        )
+    if iface.auth_required:
         token = _bearer_or_api_key(request)
-        if not settings.is_valid_external_token(token):
+        if not iface.is_valid_token(token):
             raise HTTPException(
                 status_code=401,
                 detail=(
@@ -316,7 +299,9 @@ def _dispatch(
                 ),
             )
     try:
-        backend, model = settings.resolve_request(requested_model, surface=surface)
+        backend, model = settings.resolve_request(
+            requested_model, interface_name=iface.name
+        )
     except ValueError as exc:
         msg = str(exc)
         if (
@@ -498,11 +483,12 @@ def _bearer_or_api_key(request: Request) -> str:
 _ADMIN_ONLY_PATH_PREFIXES = ("/admin",)
 # Path prefixes that are only served by the dashboard listener.
 _DASHBOARD_ONLY_PATH_PREFIXES = ("/dashboard",)
-# Path prefixes that are only served by the external reverse-proxy listener.
-_EXTERNAL_ONLY_PATH_PREFIXES = ("/v1/messages", "/v1/models")
-# Paths available on both listeners. The handler may still choose different
-# backends based on the local server port.
+# Paths only served on api_interfaces (Anthropic + OpenAI public API).
+_API_ONLY_PATH_PREFIXES = ("/v1/messages", "/v1/models")
+# Paths served by both ollama_interfaces and api_interfaces.
 _SHARED_V1_PATH_PREFIXES = ("/v1/chat/completions",)
+# Paths only served on ollama_interfaces (Ollama-compatible /api/*).
+_OLLAMA_ONLY_PATH_PREFIXES = ("/api",)
 
 
 def _has_path_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
@@ -521,10 +507,14 @@ def _listener_name(request: Request) -> str:
         return "admin"
     if settings.dashboard_listener_enabled and local_port == settings.dashboard_port:
         return "dashboard"
-    if settings.external_listener_enabled and local_port == settings.external_port:
-        return "external"
-    if local_port in (None, settings.port):
-        return "internal"
+    iface = _interface_for(request)
+    if iface is not None:
+        from .config import OllamaInterface
+
+        prefix = "ollama" if isinstance(iface, OllamaInterface) else "api"
+        return f"{prefix}:{iface.name}"
+    if local_port is None:
+        return "unknown"
     return f"port-{local_port}"
 
 
@@ -535,7 +525,7 @@ def _request_surface(path: str) -> str:
         return "dashboard"
     if path == "/v1/messages/count_tokens" or path.startswith("/v1/messages/count_tokens/"):
         return "anthropic-count-tokens"
-    if _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES):
+    if _has_path_prefix(path, _API_ONLY_PATH_PREFIXES):
         return "anthropic" if path.startswith("/v1/messages") else "models"
     if _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES):
         return "openai"
@@ -589,23 +579,25 @@ def _log_request_exception(request: Request, duration_ms: float) -> None:
 
 
 def _is_external_request(request: Request) -> bool:
+    """True when the request landed on an ``api_interfaces[*]`` listener."""
     settings: Settings = request.app.state.settings
-    if not settings.external_listener_enabled:
+    local_port = _local_port(request)
+    if local_port is None:
         return False
-    return _local_port(request) == settings.external_port
+    return any(it.port == local_port for it in settings.api_interfaces)
 
 
 def _install_port_router(app: FastAPI) -> None:
-    """Split admin/internal/external routes by listen port.
+    """Route requests to the listener that owns each path.
 
-    - Admin port (settings.admin_port) serves only /admin/*.
-    - External port (settings.external_port) serves the external-only routes
-      plus selected shared /v1 routes.
-    - Internal port serves everything EXCEPT the external-only routes; shared
-      /v1 routes can use the local port to choose their backend.
+    Every TCP listener fake_ollama owns sees the same FastAPI ``app``;
+    this middleware enforces which paths are valid per listener:
 
-    If admin_port is null, /admin stays on the internal listener as an
-    explicit legacy/single-port choice.
+    * admin port → only ``/admin/*``
+    * dashboard port → only ``/dashboard/*`` (``/`` redirects to ``/dashboard/``)
+    * ``ollama_interfaces[*].port`` → ``/`` plus ``/api/*`` plus ``/v1/chat/completions``
+    * ``api_interfaces[*].port`` → ``/v1/messages*``, ``/v1/models``, ``/v1/chat/completions``
+    * any other port → 404
     """
 
     @app.middleware("http")
@@ -629,35 +621,91 @@ def _install_port_router(app: FastAPI) -> None:
                     JSONResponse({"detail": "server is shutting down"}, status_code=503)
                 )
 
+            # Determine which listener this request hit.
+            is_admin = (
+                settings.admin_listener_enabled and local_port == settings.admin_port
+            )
+            is_dashboard = (
+                settings.dashboard_listener_enabled
+                and local_port == settings.dashboard_port
+            )
+            ollama_iface = next(
+                (it for it in settings.ollama_interfaces if it.port == local_port),
+                None,
+            )
+            api_iface = next(
+                (it for it in settings.api_interfaces if it.port == local_port),
+                None,
+            )
             admin_only = _has_path_prefix(path, _ADMIN_ONLY_PATH_PREFIXES)
-            if settings.admin_listener_enabled:
-                admin = local_port == settings.admin_port
-                if admin and not admin_only:
-                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
-                if (not admin) and admin_only:
-                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
-
             dashboard_only = _has_path_prefix(path, _DASHBOARD_ONLY_PATH_PREFIXES)
-            if settings.dashboard_listener_enabled:
-                dashboard = local_port == settings.dashboard_port
-                if dashboard and path == "/":
-                    return _finish(RedirectResponse("/dashboard/"))
-                if dashboard and not dashboard_only:
-                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
-                if (not dashboard) and dashboard_only:
-                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+            api_only = _has_path_prefix(path, _API_ONLY_PATH_PREFIXES)
+            shared_v1 = _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES)
+            ollama_only = _has_path_prefix(path, _OLLAMA_ONLY_PATH_PREFIXES)
 
-            if not settings.external_listener_enabled:
+            # TestClient / ASGI direct calls present a synthetic local_port
+            # (e.g. 80 from Starlette TestClient) that won't match any
+            # configured listener. When no listener matches, fall back to
+            # a configured interface so unit tests can hit /api/* and /v1/*
+            # without binding real ports. Prefer an api_interface for
+            # api-only paths, otherwise the first ollama_interface.
+            if (
+                not is_admin
+                and not is_dashboard
+                and ollama_iface is None
+                and api_iface is None
+            ):
+                if api_only and settings.api_interfaces:
+                    api_iface = settings.api_interfaces[0]
+                elif settings.ollama_interfaces:
+                    ollama_iface = settings.ollama_interfaces[0]
+                elif settings.api_interfaces:
+                    api_iface = settings.api_interfaces[0]
+
+            # Admin listener: only /admin/*.
+            if is_admin:
+                if not admin_only:
+                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
                 return _finish(await call_next(request))
 
-            external = local_port == settings.external_port
-            external_only = _has_path_prefix(path, _EXTERNAL_ONLY_PATH_PREFIXES)
-            shared = _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES)
-            if external and not (external_only or shared):
+            # Dashboard listener: only /dashboard/* and a / redirect.
+            if is_dashboard:
+                if path == "/":
+                    return _finish(RedirectResponse("/dashboard/"))
+                if not dashboard_only:
+                    return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+                return _finish(await call_next(request))
+
+            # Admin/dashboard paths can only be served on their own listeners.
+            if admin_only or dashboard_only:
                 return _finish(JSONResponse({"detail": "not found"}, status_code=404))
-            if (not external) and external_only:
-                return _finish(JSONResponse({"detail": "not found"}, status_code=404))
-            return _finish(await call_next(request))
+
+            # Ollama interface: /, /api/*, shared /v1.
+            if ollama_iface is not None:
+                if api_only:
+                    return _finish(
+                        JSONResponse({"detail": "not found"}, status_code=404)
+                    )
+                if ollama_only or shared_v1 or path in ("/",):
+                    return _finish(await call_next(request))
+                return _finish(
+                    JSONResponse({"detail": "not found"}, status_code=404)
+                )
+
+            # API interface: /v1/messages*, /v1/models, shared /v1.
+            if api_iface is not None:
+                if ollama_only:
+                    return _finish(
+                        JSONResponse({"detail": "not found"}, status_code=404)
+                    )
+                if api_only or shared_v1:
+                    return _finish(await call_next(request))
+                return _finish(
+                    JSONResponse({"detail": "not found"}, status_code=404)
+                )
+
+            # Unknown listener — should not happen, but fail closed.
+            return _finish(JSONResponse({"detail": "not found"}, status_code=404))
         except Exception:
             _log_request_exception(request, (time.perf_counter() - started_at) * 1000.0)
             raise
@@ -687,11 +735,9 @@ def _register_routes(app: FastAPI) -> None:
         settings: Settings = app.state.settings
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         models = []
-        # Surface-aware enumeration: /api/tags on the internal listener
-        # shows the internal whitelist; if mounted on the external port
-        # (unusual) it shows the external whitelist.
-        surface = _surface_for(request)
-        for name in settings.exposed_composite_ids(surface):
+        iface = _interface_for(request)
+        public_ids = iface.public_ids() if iface is not None else []
+        for name in public_ids:
             profile = settings.profile_for(name)
             models.append(
                 {
@@ -780,12 +826,13 @@ def _register_routes(app: FastAPI) -> None:
     async def openai_models(request: Request) -> Dict[str, Any]:
         settings: Settings = app.state.settings
         now = int(datetime.now(timezone.utc).timestamp())
-        # Auth gate: required whenever external_access_tokens is non-empty
-        # OR an external listener is configured (in which case an empty
-        # token list means nothing can pass — the operator must add one).
-        if settings.auth_required_for_v1:
+        iface = _interface_for(request)
+        if iface is None:
+            raise HTTPException(status_code=404, detail="unknown listener")
+        # Auth gate: per-interface access_tokens.
+        if iface.auth_required:
             token = _bearer_or_api_key(request)
-            if not settings.is_valid_external_token(token):
+            if not iface.is_valid_token(token):
                 raise HTTPException(
                     status_code=401,
                     detail=(
@@ -796,8 +843,7 @@ def _register_routes(app: FastAPI) -> None:
 
         seen: Dict[str, None] = {}
         names: List[str] = []
-        surface = _surface_for(request)
-        for n in settings.exposed_composite_ids(surface):
+        for n in iface.public_ids():
             if n not in seen:
                 seen[n] = None
                 names.append(n)

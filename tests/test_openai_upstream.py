@@ -1,17 +1,4 @@
-"""Tests for the OpenAI-compatible upstream support.
-
-These tests pin down three things end-to-end:
-
-1. ``OpenAIUpstream`` participates in :class:`Backend` aggregation with
-   ``protocol="openai"`` / ``kind="remote"`` and the correct routing
-   precedence (locals win, openai upstreams precede Anthropic ones).
-2. :class:`OpenAIClient` posts to ``/v1/chat/completions`` with Bearer
-   auth and yields back the body as-is.
-3. All three frontend surfaces (Ollama ``/api/chat``, OpenAI
-   ``/v1/chat/completions``, Anthropic ``/v1/messages``) successfully
-   route through an OpenAI upstream and produce a response in the
-   shape the client expects.
-"""
+"""Tests for the OpenAI-compatible upstream support."""
 
 from __future__ import annotations
 
@@ -24,30 +11,34 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fake_ollama.config import (
+    AnthropicUpstream,
+    ApiInterface,
     Backend,
+    ExposureEntry,
     LlamaCppDefaults,
+    ModelEntry,
+    OllamaInterface,
     OllamaTarget,
     OpenAIUpstream,
     Settings,
-    Upstream,
 )
 from fake_ollama.openai_client import OpenAIClient
 from fake_ollama.server import create_app
 
 
 # ---------------------------------------------------------------------------
-# Config layer
+# Helpers
 # ---------------------------------------------------------------------------
 
 
 def _settings_with_openai(**overrides: Any) -> Settings:
-    base = dict(
-        upstreams=[
-            Upstream(
+    base: Dict[str, Any] = dict(
+        anthropic_upstreams=[
+            AnthropicUpstream(
                 name="anthropic",
                 base_url="http://anthropic.test",
                 auth_token="ak",
-                models=["claude-3-5-sonnet"],
+                models=[ModelEntry(name="claude-3-5-sonnet")],
             )
         ],
         openai_upstreams=[
@@ -55,26 +46,46 @@ def _settings_with_openai(**overrides: Any) -> Settings:
                 name="deepseek",
                 base_url="http://openai.test",
                 auth_token="sk-openai",
-                models=["deepseek-chat", "deepseek-reasoner"],
-                model_map={"deepseek-reasoner": "deepseek-r1"},
+                models=[
+                    ModelEntry(name="deepseek-chat"),
+                    # display "deepseek-reasoner" → wire "deepseek-r1"
+                    ModelEntry(name="deepseek-r1", alias="deepseek-reasoner"),
+                ],
             )
         ],
         ollama_targets=[],
         llama_cpp_targets=[],
         llama_cpp_defaults=LlamaCppDefaults(),
-        internal_exposed_models=[
-            "claude-3-5-sonnet@anthropic",
-            "deepseek-chat@deepseek",
-            "deepseek-reasoner@deepseek",
+        ollama_interfaces=[
+            OllamaInterface(
+                name="ollama",
+                port=21434,
+                exposed_models=[
+                    ExposureEntry(model="claude-3-5-sonnet", target="anthropic"),
+                    ExposureEntry(model="deepseek-chat", target="deepseek"),
+                    ExposureEntry(model="deepseek-reasoner", target="deepseek"),
+                ],
+            )
         ],
-        external_exposed_models=[
-            "claude-3-5-sonnet@anthropic",
-            "deepseek-chat@deepseek",
-            "deepseek-reasoner@deepseek",
+        api_interfaces=[
+            ApiInterface(
+                name="api",
+                port=21435,
+                exposed_models=[
+                    ExposureEntry(model="claude-3-5-sonnet", target="anthropic"),
+                    ExposureEntry(model="deepseek-chat", target="deepseek"),
+                    ExposureEntry(model="deepseek-reasoner", target="deepseek"),
+                ],
+            )
         ],
     )
     base.update(overrides)
     return Settings(**base)
+
+
+# ---------------------------------------------------------------------------
+# Config layer
+# ---------------------------------------------------------------------------
 
 
 def test_backend_from_openai_upstream_is_remote_openai() -> None:
@@ -82,74 +93,55 @@ def test_backend_from_openai_upstream_is_remote_openai() -> None:
         name="dseek",
         base_url="https://api.deepseek.com",
         auth_token="sk",
-        models=["deepseek-chat"],
+        models=[ModelEntry(name="deepseek-chat")],
     )
-    b = Backend.from_openai_upstream(up)
+    settings = Settings(openai_upstreams=[up], ollama_interfaces=[])
+    b = Backend.from_source(up, settings)
     assert b.protocol == "openai"
     assert b.kind == "remote"
     assert b.name == "dseek"
     assert b.auth_token == "sk"
-    assert b.models == ["deepseek-chat"]
+    assert b.source.serves("deepseek-chat")
     assert b.supports_lifecycle is False
 
 
-def test_settings_backends_includes_openai_upstream() -> None:
+def test_settings_backend_by_name_finds_openai() -> None:
     settings = _settings_with_openai()
-    protocols = [(b.name, b.protocol, b.kind) for b in settings.backends]
-    # Local backends first, then openai_upstreams (before anthropic).
-    assert protocols == [
-        ("deepseek", "openai", "remote"),
-        ("anthropic", "anthropic", "remote"),
-    ]
-
-
-def test_backend_for_routes_to_openai_upstream() -> None:
-    settings = _settings_with_openai()
-    b = settings.backend_for("deepseek-chat@deepseek")
+    b = settings.backend_by_name("deepseek")
     assert b is not None
     assert b.protocol == "openai"
     assert b.kind == "remote"
-    assert b.name == "deepseek"
 
 
-def test_backend_for_prefers_local_over_openai_upstream() -> None:
-    settings = _settings_with_openai(
-        ollama_targets=[
-            OllamaTarget(
-                name="local",
-                base_url="http://127.0.0.1:11434",
-                models=["deepseek-chat"],
-                auto_start=True,
-            )
-        ],
-        internal_exposed_models=[
-            "claude-3-5-sonnet@anthropic",
-            "deepseek-chat@deepseek",
-            "deepseek-reasoner@deepseek",
-            "deepseek-chat@local",
-        ],
-        external_exposed_models=[
-            "claude-3-5-sonnet@anthropic",
-            "deepseek-chat@deepseek",
-            "deepseek-reasoner@deepseek",
-            "deepseek-chat@local",
-        ],
+def test_resolve_request_routes_to_openai_upstream() -> None:
+    settings = _settings_with_openai()
+    b, display = settings.resolve_request(
+        "deepseek-chat@deepseek", interface_name="ollama"
     )
-    b = settings.backend_for("deepseek-chat@local")
-    assert b is not None
-    assert b.protocol == "ollama"
-    assert b.kind == "local"
+    assert b.protocol == "openai"
+    assert b.name == "deepseek"
+    assert display == "deepseek-chat"
+
+
+def test_resolve_request_alias_maps_to_wire_id() -> None:
+    settings = _settings_with_openai()
+    b, display = settings.resolve_request(
+        "deepseek-reasoner@deepseek", interface_name="api"
+    )
+    assert display == "deepseek-reasoner"
+    # Source maps the display alias back to the wire id "deepseek-r1".
+    assert b.source.resolve_model(display) == "deepseek-r1"
 
 
 def test_settings_validates_duplicate_names_across_protocols() -> None:
     with pytest.raises(Exception):
         Settings(
-            upstreams=[
-                Upstream(
+            anthropic_upstreams=[
+                AnthropicUpstream(
                     name="shared",
                     base_url="http://a.test",
                     auth_token="x",
-                    models=["m"],
+                    models=[ModelEntry(name="m")],
                 )
             ],
             openai_upstreams=[
@@ -157,45 +149,20 @@ def test_settings_validates_duplicate_names_across_protocols() -> None:
                     name="shared",
                     base_url="http://o.test",
                     auth_token="y",
-                    models=["m2"],
+                    models=[ModelEntry(name="m2")],
                 )
             ],
+            ollama_interfaces=[],
         )
 
 
-def test_settings_allows_openai_only_config() -> None:
-    settings = Settings(
-        upstreams=[],
-        openai_upstreams=[
-            OpenAIUpstream(
-                name="o",
-                base_url="http://o.test",
-                auth_token="y",
-                models=["gpt-4o"],
-            )
-        ],
-        external_exposed_models=["gpt-4o@o"],
-    )
-    backend = settings.backend_by_name("o")
-    assert backend is not None and backend.protocol == "openai"
-    assert settings.is_exposed("external", "gpt-4o@o") is True
-
-
-def test_settings_models_aggregates_openai_upstreams() -> None:
+def test_settings_all_source_composite_ids_includes_openai() -> None:
     settings = _settings_with_openai()
-    assert set(settings.all_composite_ids()) == {
+    assert set(settings.all_source_composite_ids()) == {
         "claude-3-5-sonnet@anthropic",
         "deepseek-chat@deepseek",
         "deepseek-reasoner@deepseek",
     }
-
-
-def test_openai_upstream_resolve_model_uses_model_map() -> None:
-    settings = _settings_with_openai()
-    up = settings.backend_by_name("deepseek")
-    assert up is not None
-    assert up.source.resolve_model("deepseek-reasoner") == "deepseek-r1"
-    assert up.source.resolve_model("deepseek-chat") == "deepseek-chat"
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +182,7 @@ def test_openai_client_chat_posts_to_v1_chat_completions_with_bearer() -> None:
             200,
             json={
                 "id": "cmpl-1",
-                "model": "deepseek-chat@deepseek",
+                "model": "deepseek-chat",
                 "choices": [
                     {
                         "index": 0,
@@ -281,8 +248,6 @@ def test_openai_client_stream_chat_yields_raw_sse_lines() -> None:
             await http_client.aclose()
 
     lines = asyncio.run(run())
-    # httpx aiter_lines splits on \n and strips terminators; both data:
-    # lines and [DONE] should appear.
     assert any(line.startswith("data: ") and '"he"' in line for line in lines)
     assert lines[-1].strip() == "data: [DONE]"
 
@@ -295,8 +260,6 @@ def test_openai_client_stream_chat_yields_raw_sse_lines() -> None:
 def _install_openai_client(
     app, *, response: Dict[str, Any] | None = None, stream_lines: List[str] | None = None,
 ) -> Dict[str, Any]:
-    """Replace ``app.state.openai_clients`` with a stub that records calls."""
-
     captured: Dict[str, Any] = {"chat_calls": [], "stream_calls": []}
 
     class _Stub:
@@ -350,7 +313,6 @@ def test_ollama_chat_routes_via_openai_upstream() -> None:
         assert body["done"] is True
         assert body["message"]["role"] == "assistant"
         assert "PONG" in body["message"]["content"]
-        # The upstream was reached with the resolved model (display name == real id here).
         assert captured["chat_calls"], "OpenAIClient.chat was not called"
         assert captured["chat_calls"][0]["model"] == "deepseek-chat"
 
@@ -370,9 +332,8 @@ def test_openai_chat_routes_via_openai_upstream_passthrough() -> None:
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        # Display model name preserved (composite id requested) in response.
         assert body["model"] == "deepseek-reasoner@deepseek"
-        # Upstream sees the resolved (mapped) model id.
+        # Upstream sees the resolved (wire) model id.
         assert captured["chat_calls"][0]["model"] == "deepseek-r1"
 
 
@@ -394,7 +355,6 @@ def test_anthropic_messages_routes_via_openai_upstream() -> None:
         body = resp.json()
         assert body["type"] == "message"
         assert body["role"] == "assistant"
-        # The Anthropic shape should carry the assistant reply in content blocks.
         joined = "".join(
             blk.get("text", "")
             for blk in body.get("content", [])

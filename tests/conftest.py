@@ -17,21 +17,40 @@ load_dotenv()
 def _write_default_config(path) -> None:
     """Write a minimal config.json used by the generic ``settings`` fixture."""
     data = {
-        "upstreams": [
+        "anthropic_upstreams": [
             {
                 "name": "default",
                 "base_url": "http://upstream.test",
                 "auth_token": "test-token",
-                "models": ["claude-3-5-sonnet-20241022", "llama-test"],
+                "models": [
+                    {"name": "claude-3-5-sonnet-20241022"},
+                    {"name": "llama-test"},
+                ],
             }
         ],
-        "internal_exposed_models": [
-            "claude-3-5-sonnet-20241022@default",
-            "llama-test@default",
+        "ollama_interfaces": [
+            {
+                "name": "ollama",
+                "host": "127.0.0.1",
+                "port": 21434,
+                "access_tokens": [],
+                "exposed_models": [
+                    {"model": "claude-3-5-sonnet-20241022", "target": "default"},
+                    {"model": "llama-test", "target": "default"},
+                ],
+            }
         ],
-        "external_exposed_models": [
-            "claude-3-5-sonnet-20241022@default",
-            "llama-test@default",
+        "api_interfaces": [
+            {
+                "name": "api",
+                "host": "127.0.0.1",
+                "port": 21435,
+                "access_tokens": [],
+                "exposed_models": [
+                    {"model": "claude-3-5-sonnet-20241022", "target": "default"},
+                    {"model": "llama-test", "target": "default"},
+                ],
+            }
         ],
         "default_max_tokens": 1024,
     }

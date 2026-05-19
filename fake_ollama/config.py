@@ -1,34 +1,51 @@
-"""Application configuration.
+"""Application configuration (v2 schema).
 
-Configuration is layered, in order of increasing priority:
+This module models the new configuration layout used since the
+"multi-interface + per-source aliases" refactor:
 
-  1. Defaults (hard-coded in this module)
-  2. ``config.json`` (path overridable via ``--config`` CLI flag or
-     ``FAKE_OLLAMA_CONFIG`` env var; default ``./config.json``)
-  3. Environment variables (``FAKE_OLLAMA_*`` and the legacy single-upstream
-     ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN`` pair)
+* Sources (``anthropic_upstreams``, ``openai_upstreams``, ``ollama_targets``,
+  ``llama_cpp_targets``) declare models as objects: ``{name, alias?,
+  upstream_id?}``. ``alias`` is the source-level display name; ``upstream_id``
+  is the wire-side identifier sent to the backend. The composite source id
+  is ``<alias_or_name>@<source_name>``.
 
-The structured ``upstreams`` and ``model_profiles`` sections are best edited
-in ``config.json``. Secrets can be kept out of the JSON file by leaving the
-``auth_token`` placeholder there and overriding via env var.
+* Interfaces (``ollama_interfaces`` for /api/*, ``api_interfaces`` for
+  /v1/messages + /v1/chat/completions + /v1/models) are arrays. Each
+  interface has its own ``host``, ``port``, ``access_tokens``, and
+  ``exposed_models``. ``exposed_models[*]`` references a (target, model)
+  pair from any source and optionally renames it via ``alias`` for clients.
+
+* The legacy single ``host`` / ``port`` / ``external_*`` /
+  ``internal_exposed_models`` / ``external_exposed_models`` fields are
+  removed. Loaders raise on these keys instead of silently migrating.
+
+Module-level helpers:
+
+* ``Settings.resolve_request(public_id, interface_name)`` looks up the
+  client-facing model id within a specific interface and returns
+  ``(backend, real_model)``.
+* ``Settings.detect_upstream_cycles()`` walks every upstream's
+  ``base_url`` against every interface's bind address and raises if any
+  upstream points back at this process.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import logging
 import math
 import os
 import shlex
+import socket
 import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
-import logging
-
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _LOG = logging.getLogger(__name__)
 
@@ -44,11 +61,16 @@ VALID_THINKING_MODES = ("auto", "enabled", "disabled")
 
 CONFIG_ENV_VAR = "FAKE_OLLAMA_CONFIG"
 DEFAULT_CONFIG_PATH = Path("config.json")
-LEGACY_UPSTREAM_NAME = "default"
+
+# Header used to detect runtime cycles when a fake_ollama process talks to
+# another fake_ollama process through one of its own upstreams. Routing
+# stamps it on every outbound request and rejects inbound requests that
+# carry the same instance marker.
+FORWARDED_BY_HEADER = "x-fake-ollama-forwarded-by"
 
 
 def _model_base(name: str) -> str:
-    """Return the Ollama-style tagless model name."""
+    """Return the Ollama-style tagless model name (``foo:tag`` -> ``foo``)."""
     return name.split(":", 1)[0] if ":" in name else name
 
 
@@ -66,26 +88,23 @@ def _shell_quote(value: str) -> str:
     return shlex.quote(value)
 
 
-def _find_configured_model(display_name: str, models: Iterable[str]) -> Optional[str]:
-    """Find the configured display name matching a client-supplied model.
+def _find_configured_model(display_name: str, candidates: Iterable[str]) -> Optional[str]:
+    """Match a client-supplied name against ``candidates`` Ollama-style.
 
-    Ollama model names are ``model:tag`` where an omitted tag defaults to
-    ``latest``. Therefore ``foo`` and ``foo:latest`` are equivalent, but
-    ``foo`` must not match a different explicit tag such as ``foo:q4_K_M``.
+    ``foo`` and ``foo:latest`` are equivalent; an explicit tag must match
+    exactly. ``foo`` will not match ``foo:q4_K_M`` etc.
     """
-    model_list = list(models)
-    if display_name in model_list:
+    candidates = list(candidates)
+    if display_name in candidates:
         return display_name
-
     base = _model_base(display_name)
     if ":" in display_name:
         tag = display_name.split(":", 1)[1]
-        if tag == "latest" and base in model_list:
+        if tag == "latest" and base in candidates:
             return base
         return None
-
     latest = f"{base}:latest"
-    if latest in model_list:
+    if latest in candidates:
         return latest
     return None
 
@@ -115,15 +134,19 @@ class ModelProfile:
         thinking = str(data.get("thinking", data.get("thinking_mode", "auto"))).lower()
         if thinking not in VALID_THINKING_MODES:
             thinking = "auto"
-        budget = data.get("thinking_budget_tokens") or data.get("thinking_budget") or DEFAULT_THINKING_BUDGET_TOKENS
+        budget = (
+            data.get("thinking_budget_tokens")
+            or data.get("thinking_budget")
+            or DEFAULT_THINKING_BUDGET_TOKENS
+        )
         show = data.get("show_thinking")
         raw_vram = data.get("estimated_vram_gb")
-        estimated_vram_gb = None
+        estimated_vram_gb: Optional[float] = None
         if raw_vram not in (None, ""):
             try:
-                parsed_vram = float(raw_vram)
-                if parsed_vram > 0:
-                    estimated_vram_gb = parsed_vram
+                parsed = float(raw_vram)
+                if parsed > 0:
+                    estimated_vram_gb = parsed
             except (TypeError, ValueError):
                 estimated_vram_gb = None
         return cls(
@@ -138,85 +161,212 @@ class ModelProfile:
 
 
 # ---------------------------------------------------------------------------
-# Upstream
+# Model entry (per-source)
 # ---------------------------------------------------------------------------
 
 
-class Upstream(BaseModel):
-    """A single Anthropic-compatible upstream endpoint."""
+class ModelEntry(BaseModel):
+    """One model advertised by a source (upstream or local target).
+
+    * ``name`` — required; the model id the source itself knows about.
+    * ``alias`` — optional; renames the model for fake_ollama's purposes.
+      When set, the composite source id becomes ``<alias>@<source>`` and
+      every downstream reference (interface exposure, profiles, routing)
+      should use the alias instead of ``name``.
+    * ``upstream_id`` — optional; the actual wire-side id sent to the
+      backend. Falls back to ``name``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    alias: Optional[str] = None
+    upstream_id: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_nonempty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("model entry 'name' must be non-empty")
+        if "@" in v:
+            raise ValueError(
+                "model entry 'name' must not contain '@'; '@' is reserved "
+                "for composite model@target ids"
+            )
+        return v
+
+    @field_validator("alias")
+    @classmethod
+    def _alias_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if "@" in v:
+            raise ValueError(
+                "model entry 'alias' must not contain '@'; '@' is reserved "
+                "for composite model@target ids"
+            )
+        return v
+
+    @field_validator("upstream_id")
+    @classmethod
+    def _upstream_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @property
+    def display(self) -> str:
+        """The name used in the composite ``<display>@<source>`` id."""
+        return self.alias or self.name
+
+    @property
+    def wire_id(self) -> str:
+        """The id actually sent to the backend."""
+        return self.upstream_id or self.name
+
+
+def _coerce_model_entries(value: Any) -> List[Dict[str, Any]]:
+    """Normalise a ``models`` field into a list of ModelEntry-shaped dicts.
+
+    Accepts:
+    * a list of strings (bare model names; alias/upstream_id default to None)
+    * a list of dicts (already in the canonical shape)
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("'models' must be a list")
+    out: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            out.append({"name": item})
+        elif isinstance(item, dict):
+            out.append(dict(item))
+        elif isinstance(item, ModelEntry):
+            out.append(item.model_dump())
+        else:
+            raise ValueError(
+                f"each models[] entry must be a string or object, got {type(item).__name__}"
+            )
+    return out
+
+
+def _validate_unique_displays(entries: List[ModelEntry], context: str) -> None:
+    seen: Dict[str, None] = {}
+    dupes: List[str] = []
+    for e in entries:
+        d = e.display
+        if d in seen:
+            dupes.append(d)
+        else:
+            seen[d] = None
+    if dupes:
+        raise ValueError(
+            f"duplicate model display names {sorted(set(dupes))} in {context}; "
+            f"each entry must have a unique alias_or_name within its source"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Source classes
+# ---------------------------------------------------------------------------
+
+
+class _SourceBase(BaseModel):
+    """Shared lookup helpers for upstream-style sources."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     base_url: str
     auth_token: str = ""
-    # Display names this upstream serves. The union across upstreams (with
-    # order preserved and duplicates dropped, first occurrence wins) is what
-    # /api/tags reports.
-    models: List[str] = Field(default_factory=list)
-    # Display name -> upstream-side model id. Falls through to the display
-    # name itself when not present.
-    model_map: Dict[str, str] = Field(default_factory=dict)
+    models: List[ModelEntry] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def _name_nonempty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("source 'name' must be non-empty")
+        if "@" in v:
+            raise ValueError(
+                f"source name {v!r} contains '@'; '@' is reserved as the "
+                "model/target separator in composite ids"
+            )
+        return v
 
     @field_validator("base_url")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+        return (v or "").rstrip("/")
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def _coerce_models(cls, v: Any) -> Any:
+        return _coerce_model_entries(v)
+
+    @model_validator(mode="after")
+    def _check_unique(self) -> "_SourceBase":
+        _validate_unique_displays(self.models, f"source {self.name!r}")
+        return self
+
+    # -- public-ish view ------------------------------------------------
+
+    @property
+    def display_models(self) -> List[str]:
+        """Display names this source advertises (alias_or_name per entry)."""
+        return [e.display for e in self.models]
+
+    def entry_for(self, display_name: str) -> Optional[ModelEntry]:
+        """Return the ModelEntry matching ``display_name`` (Ollama-style)."""
+        match = _find_configured_model(display_name, self.display_models)
+        if match is None:
+            return None
+        for e in self.models:
+            if e.display == match:
+                return e
+        return None
 
     def matching_model(self, display_name: str) -> Optional[str]:
-        return _find_configured_model(display_name, self.models)
+        """Display name that matches ``display_name`` (or None)."""
+        entry = self.entry_for(display_name)
+        return entry.display if entry is not None else None
 
     def resolve_model(self, display_name: str) -> str:
-        configured = self.matching_model(display_name)
-        for key in (display_name, configured, _model_base(display_name)):
-            if key and key in self.model_map:
-                return self.model_map[key]
-        if configured:
-            base = _model_base(configured)
-            if base in self.model_map:
-                return self.model_map[base]
-            return configured
-        if ":" in display_name:
-            base = _model_base(display_name)
-            if base in self.model_map:
-                return self.model_map[base]
-            return base
-        return display_name
+        """Map ``display_name`` to the backend wire-side id."""
+        entry = self.entry_for(display_name)
+        if entry is None:
+            return display_name
+        return entry.wire_id
 
     def serves(self, display_name: str) -> bool:
-        return self.matching_model(display_name) is not None
+        return self.entry_for(display_name) is not None
 
 
-class OpenAIUpstream(Upstream):
-    """An OpenAI-compatible remote upstream (OpenAI, DeepSeek, Together, …).
-
-    The data shape and routing semantics are identical to
-    :class:`Upstream`; only the wire format spoken to the upstream
-    differs (POST ``/v1/chat/completions`` instead of ``/v1/messages``).
-    Keeping it as a distinct Pydantic class lets the admin UI / config
-    file declare which protocol an entry uses without resorting to a
-    free-form ``protocol`` field on the unified backend list.
-    """
+class AnthropicUpstream(_SourceBase):
+    """A single Anthropic Messages-compatible upstream endpoint."""
 
 
-class OllamaTarget(BaseModel):
-    """A local-side Ollama-compatible server we expose as Anthropic API.
+# Back-compat alias for any external imports that still say ``Upstream``.
+Upstream = AnthropicUpstream
 
-    Used by the reverse proxy ``POST /v1/messages`` endpoint: when an
-    incoming request's ``model`` is served by an OllamaTarget, fake-ollama
-    converts the request to Ollama's ``/api/chat`` format, calls the target,
-    and converts the response back to the Anthropic Messages format.
 
-    Access control for the reverse-proxy surface lives at the Settings level
-    (``external_access_tokens``); targets themselves no longer carry tokens.
-    """
+class OpenAIUpstream(_SourceBase):
+    """An OpenAI Chat Completions-compatible upstream endpoint."""
 
-    name: str
+
+class OllamaTarget(_SourceBase):
+    """A local-side Ollama-compatible server we proxy ``/v1/*`` to."""
+
+    model_config = ConfigDict(extra="forbid")
+
     base_url: str = "http://127.0.0.1:11434"
-    # Anthropic-side display names this target serves.
-    models: List[str] = Field(default_factory=list)
-    # Anthropic-side display name -> Ollama-side model id.
-    model_map: Dict[str, str] = Field(default_factory=dict)
-    # Optional daemon lifecycle management. Leave ``auto_start`` false when
-    # Ollama is installed as a separately managed service / desktop app.
+    auth_token: str = ""
     auto_start: bool = False
     start_command: Optional[str] = None
     stop_command: Optional[str] = None
@@ -225,13 +375,6 @@ class OllamaTarget(BaseModel):
     health_path: str = "/api/version"
     cwd: Optional[str] = None
 
-    model_config = {"extra": "ignore"}  # tolerate legacy ``api_token`` field
-
-    @field_validator("base_url")
-    @classmethod
-    def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
-
     @field_validator("health_path")
     @classmethod
     def _normalise_health_path(cls, v: str) -> str:
@@ -239,51 +382,25 @@ class OllamaTarget(BaseModel):
             return "/api/version"
         return v if v.startswith("/") else "/" + v
 
-    def matching_model(self, display_name: str) -> Optional[str]:
-        return _find_configured_model(display_name, self.models)
-
-    def resolve_model(self, display_name: str) -> str:
-        configured = self.matching_model(display_name)
-        for key in (display_name, configured, _model_base(display_name)):
-            if key and key in self.model_map:
-                return self.model_map[key]
-        if configured:
-            base = _model_base(configured)
-            if base in self.model_map:
-                return self.model_map[base]
-            return configured
-        return display_name
-
-    def serves(self, display_name: str) -> bool:
-        return self.matching_model(display_name) is not None
-
 
 class LlamaCppDefaults(BaseModel):
     """Defaults inherited by each llama.cpp target unless overridden."""
+
+    model_config = ConfigDict(extra="forbid")
 
     auto_start: bool = False
     idle_timeout_seconds: Optional[float] = None
     startup_timeout_seconds: float = 120.0
     health_path: str = "/health"
     cwd: Optional[str] = None
-    # Defaults for synthesised start commands. Targets that leave
-    # ``start_command`` empty have one built from these (plus their own
-    # model_path / mmproj_path / port etc.).
     binary_path: Optional[str] = None
     runtime_root: Optional[str] = None
     gpu_layers: Optional[int] = None
     ctx_size: Optional[int] = None
     parallel: Optional[int] = None
-    # Logical (-b) / physical (-ub) batch sizes. llama.cpp defaults are
-    # 2048 / 512; leave None to inherit llama.cpp's default.
     batch_size: Optional[int] = None
     ubatch_size: Optional[int] = None
-    # Enable FlashAttention. Current llama.cpp expects a value:
-    # -fa/--flash-attn [on|off|auto].
     flash_attn: Optional[bool] = None
-    # KV cache quantisation (llama.cpp -ctk / -ctv). Default upstream is f16;
-    # common values are f16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl. Lowering
-    # these can cut KV-cache VRAM substantially at some quality cost.
     cache_type_k: Optional[str] = None
     cache_type_v: Optional[str] = None
     extra_args: Optional[str] = None
@@ -297,24 +414,27 @@ class LlamaCppDefaults(BaseModel):
 
 
 class LlamaCppTarget(BaseModel):
-    """One llama.cpp server process exposed through fake-ollama's reverse proxy.
+    """One llama.cpp server process exposed through fake-ollama.
 
-    llama.cpp server speaks OpenAI-compatible ``/v1/chat/completions`` and
-    ``/v1/models``. A llama.cpp server process loads one model, so each target
-    represents exactly one display model with its own port and lifecycle
-    commands. Configure additional models as additional ``llama_cpp_targets``.
+    Each ``llama_cpp_targets`` entry represents exactly one model, one
+    server process, one port, and one set of lifecycle commands.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str = ""
     base_url: str = "http://127.0.0.1:8080"
     auth_token: str = ""
-    model: str = ""
-    model_alias: Optional[str] = None
 
-    # Optional lifecycle management. If ``auto_start`` is true and the health
-    # check fails, fake-ollama runs ``start_command`` before forwarding the
-    # request. ``idle_timeout_seconds`` stops only processes started by this
-    # fake-ollama instance unless ``stop_command`` is configured.
+    # Single model the process loads.
+    model: str = ""
+    # Source-level display alias: renames the model in the composite id.
+    alias: Optional[str] = None
+    # Wire-side id sent to llama.cpp (--alias and the OpenAI ``model``
+    # field returned by the upstream).
+    upstream_id: Optional[str] = None
+
+    # Optional lifecycle management.
     auto_start: Optional[bool] = None
     start_command: Optional[str] = None
     stop_command: Optional[str] = None
@@ -323,9 +443,7 @@ class LlamaCppTarget(BaseModel):
     health_path: Optional[str] = None
     cwd: Optional[str] = None
 
-    # Synthesised start_command parameters. Used only when ``start_command``
-    # is not set: fake-ollama assembles a llama-server invocation from these
-    # fields plus ``base_url`` (for host/port).
+    # Synthesised start_command parameters.
     binary_path: Optional[str] = None
     runtime_root: Optional[str] = None
     model_path: Optional[str] = None
@@ -333,8 +451,6 @@ class LlamaCppTarget(BaseModel):
     gpu_layers: Optional[int] = None
     ctx_size: Optional[int] = None
     parallel: Optional[int] = None
-    # See LlamaCppDefaults; unset on target = inherit defaults; defaults
-    # unset = llama.cpp defaults (2048 / 512 / off / f16).
     batch_size: Optional[int] = None
     ubatch_size: Optional[int] = None
     flash_attn: Optional[bool] = None
@@ -342,41 +458,30 @@ class LlamaCppTarget(BaseModel):
     cache_type_v: Optional[str] = None
     extra_args: Optional[str] = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def _migrate_legacy_single_model_fields(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        out = dict(data)
-        legacy_models = out.pop("models", None)
-        if not out.get("model") and legacy_models is not None:
-            if isinstance(legacy_models, list) and len(legacy_models) == 1:
-                out["model"] = legacy_models[0]
-            else:
-                raise ValueError(
-                    "Each llama_cpp_target must declare exactly one model. Replace "
-                    "legacy `models` lists with a single `model` string and "
-                    "configure one target per llama.cpp process."
-                )
-
-        legacy_map = out.pop("model_map", None)
-        if not out.get("model_alias") and isinstance(legacy_map, dict):
-            model = str(out.get("model") or "")
-            base = _model_base(model) if model else ""
-            for key in (model, base):
-                if key and key in legacy_map:
-                    out["model_alias"] = legacy_map[key]
-                    break
-            else:
-                values = [v for v in legacy_map.values() if v]
-                if len(values) == 1:
-                    out["model_alias"] = values[0]
-        return out
-
     @field_validator("base_url")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+        return (v or "").rstrip("/")
+
+    @field_validator("alias")
+    @classmethod
+    def _alias_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if "@" in v:
+            raise ValueError("llama_cpp_targets[*].alias must not contain '@'")
+        return v
+
+    @field_validator("upstream_id")
+    @classmethod
+    def _upstream_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
     @field_validator("health_path")
     @classmethod
@@ -388,35 +493,67 @@ class LlamaCppTarget(BaseModel):
         return v if v.startswith("/") else "/" + v
 
     @model_validator(mode="after")
-    def _validate_single_model_process(self) -> "LlamaCppTarget":
+    def _post_init(self) -> "LlamaCppTarget":
         if not self.model:
             raise ValueError(
-                "Each llama_cpp_target must declare a non-empty `model` because "
-                "each llama.cpp server process loads one model. Configure a "
-                "separate llama_cpp_targets entry with its own base_url, "
-                "start_command, stop_command, and port for each model."
+                "Each llama_cpp_target must declare a non-empty `model`. "
+                "Each llama.cpp server process loads one model; configure "
+                "additional models as additional llama_cpp_targets."
             )
         if not self.name:
-            object.__setattr__(self, "name", self.model)
+            object.__setattr__(self, "name", self.alias or self.model)
+        if "@" in self.name:
+            raise ValueError(
+                f"llama_cpp_target name {self.name!r} contains '@'; reserved separator"
+            )
         return self
 
+    # -- presentation helpers ------------------------------------------
+
     @property
-    def models(self) -> List[str]:
-        return [self.model] if self.model else []
+    def display(self) -> str:
+        return self.alias or self.model
+
+    @property
+    def models(self) -> List[ModelEntry]:
+        """Mimic the multi-entry ``models`` shape used by other sources."""
+        return [ModelEntry(name=self.model, alias=self.alias, upstream_id=self.upstream_id)]
+
+    @property
+    def display_models(self) -> List[str]:
+        return [self.display]
+
+    def entry_for(self, display_name: str) -> Optional[ModelEntry]:
+        for candidate in (self.display, self.model):
+            match = _find_configured_model(display_name, [candidate])
+            if match is not None:
+                return self.models[0]
+        return None
+
+    def matching_model(self, display_name: str) -> Optional[str]:
+        entry = self.entry_for(display_name)
+        return entry.display if entry is not None else None
+
+    def resolve_model(self, display_name: str) -> str:
+        entry = self.entry_for(display_name)
+        if entry is None:
+            return display_name
+        return entry.wire_id
+
+    def serves(self, display_name: str) -> bool:
+        return self.entry_for(display_name) is not None
 
     def with_defaults(self, defaults: LlamaCppDefaults) -> "LlamaCppTarget":
+        def pick(field: str) -> Any:
+            cur = getattr(self, field)
+            return cur if cur is not None else getattr(defaults, field)
+
         return self.model_copy(
             update={
                 "auto_start": (
-                    self.auto_start
-                    if self.auto_start is not None
-                    else defaults.auto_start
+                    self.auto_start if self.auto_start is not None else defaults.auto_start
                 ),
-                "idle_timeout_seconds": (
-                    self.idle_timeout_seconds
-                    if self.idle_timeout_seconds is not None
-                    else defaults.idle_timeout_seconds
-                ),
+                "idle_timeout_seconds": pick("idle_timeout_seconds"),
                 "startup_timeout_seconds": (
                     self.startup_timeout_seconds
                     if self.startup_timeout_seconds is not None
@@ -424,96 +561,29 @@ class LlamaCppTarget(BaseModel):
                 ),
                 "health_path": self.health_path or defaults.health_path,
                 "cwd": self.cwd if self.cwd is not None else defaults.cwd,
-                "binary_path": (
-                    self.binary_path
-                    if self.binary_path is not None
-                    else defaults.binary_path
-                ),
-                "runtime_root": (
-                    self.runtime_root
-                    if self.runtime_root is not None
-                    else defaults.runtime_root
-                ),
-                "gpu_layers": (
-                    self.gpu_layers
-                    if self.gpu_layers is not None
-                    else defaults.gpu_layers
-                ),
-                "ctx_size": (
-                    self.ctx_size
-                    if self.ctx_size is not None
-                    else defaults.ctx_size
-                ),
-                "parallel": (
-                    self.parallel
-                    if self.parallel is not None
-                    else defaults.parallel
-                ),
-                "batch_size": (
-                    self.batch_size
-                    if self.batch_size is not None
-                    else defaults.batch_size
-                ),
-                "ubatch_size": (
-                    self.ubatch_size
-                    if self.ubatch_size is not None
-                    else defaults.ubatch_size
-                ),
-                "flash_attn": (
-                    self.flash_attn
-                    if self.flash_attn is not None
-                    else defaults.flash_attn
-                ),
-                "cache_type_k": (
-                    self.cache_type_k
-                    if self.cache_type_k is not None
-                    else defaults.cache_type_k
-                ),
-                "cache_type_v": (
-                    self.cache_type_v
-                    if self.cache_type_v is not None
-                    else defaults.cache_type_v
-                ),
-                "extra_args": (
-                    self.extra_args
-                    if self.extra_args is not None
-                    else defaults.extra_args
-                ),
+                "binary_path": pick("binary_path"),
+                "runtime_root": pick("runtime_root"),
+                "gpu_layers": pick("gpu_layers"),
+                "ctx_size": pick("ctx_size"),
+                "parallel": pick("parallel"),
+                "batch_size": pick("batch_size"),
+                "ubatch_size": pick("ubatch_size"),
+                "flash_attn": pick("flash_attn"),
+                "cache_type_k": pick("cache_type_k"),
+                "cache_type_v": pick("cache_type_v"),
+                "extra_args": pick("extra_args"),
             }
         )
 
     def synthesize_start_command(self) -> Optional[str]:
-        """Return ``start_command`` if set, otherwise build one from fields.
-
-        Returns ``None`` only when no ``start_command`` is configured *and*
-        ``model_path`` is empty (in which case fake-ollama cannot launch the
-        server itself and falls back to the legacy "bring your own process"
-        behaviour).
-        """
         if self.start_command:
             return self.start_command
         argv = self.synthesize_start_argv()
         if argv is None:
             return None
-        # Use platform-appropriate quoting: shlex.quote (POSIX single quotes)
-        # would break on Windows because cmd.exe does not strip single
-        # quotes and would refuse to launch the executable.
         return " ".join(_shell_quote(a) for a in argv)
 
     def synthesize_start_argv(self) -> Optional[List[str]]:
-        """Return argv for launching ``llama-server`` directly (exec, no shell).
-
-        Returns ``None`` if a user-provided ``start_command`` is set (we
-        cannot safely split an arbitrary shell string into argv) or if no
-        ``model_path`` is configured.
-
-        Preferring exec over shell is important on Windows: ``cmd.exe /c``
-        wraps the actual server in a launcher process whose lifecycle is
-        decoupled from the child. When fake-ollama later wants to free
-        VRAM by killing the server, the wrapper may already have exited
-        (returncode set), leaving the real ``llama-server.exe`` orphaned
-        and unkillable via the captured PID.
-        """
         if self.start_command:
             return None
         if not self.model_path:
@@ -524,12 +594,9 @@ class LlamaCppTarget(BaseModel):
         binary = self._resolve_binary(self.binary_path)
         argv: List[str] = [
             binary,
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--model",
-            self.model_path,
+            "--host", host,
+            "--port", str(port),
+            "--model", self.model_path,
         ]
         if self.mmproj_path:
             argv += ["--mmproj", self.mmproj_path]
@@ -549,8 +616,8 @@ class LlamaCppTarget(BaseModel):
             argv += ["-ctk", str(self.cache_type_k)]
         if self.cache_type_v:
             argv += ["-ctv", str(self.cache_type_v)]
-        if self.model_alias:
-            argv += ["--alias", self.model_alias]
+        if self.upstream_id:
+            argv += ["--alias", self.upstream_id]
         if self.auth_token:
             argv += ["--api-key", self.auth_token]
         if self.extra_args:
@@ -562,16 +629,6 @@ class LlamaCppTarget(BaseModel):
     def effective_env(
         self, base_env: Optional[Dict[str, str]] = None
     ) -> Optional[Dict[str, str]]:
-        """Return env dict for launching this target, or ``None`` if no
-        adjustments are needed (caller will inherit os.environ).
-
-        The CUDA-build llama.cpp release ships with a separate
-        ``cudart-llama-bin-win-cuda-XX.X-x64`` folder containing
-        ``cudart64_*.dll`` etc. Without that directory on PATH, llama-server
-        fails to load CUDA and silently falls back to CPU (no VRAM growth).
-        Mirrors the original PowerShell launcher's
-        ``$env:PATH = \"$binRoot;$runtimeRoot;\" + $env:PATH``.
-        """
         if not self.runtime_root and not self.binary_path:
             return None
         env = dict(base_env if base_env is not None else os.environ)
@@ -600,15 +657,6 @@ class LlamaCppTarget(BaseModel):
 
     @staticmethod
     def _resolve_binary(binary_path: Optional[str]) -> str:
-        """Resolve ``binary_path`` to an actual executable.
-
-        Users sometimes paste the extracted llama.cpp release folder (e.g.
-        ``C:\\...\\llama-b8994-bin-win-cuda-13.1-x64``) instead of the
-        ``llama-server[.exe]`` inside it. A bare directory passed as a shell
-        command silently fails on Windows (``cmd.exe`` reports it as
-        "is not recognized") and the caller would then wait the full
-        ``startup_timeout_seconds`` with no useful diagnostic.
-        """
         if not binary_path:
             return "llama-server"
         try:
@@ -622,19 +670,182 @@ class LlamaCppTarget(BaseModel):
                     return str(candidate)
         return binary_path
 
-    def matching_model(self, display_name: str) -> Optional[str]:
-        return _find_configured_model(display_name, [self.model])
 
-    def resolve_model(self, display_name: str) -> str:
-        configured = self.matching_model(display_name)
-        if configured and self.model_alias:
-            return self.model_alias
-        if configured:
-            return configured
-        return display_name
+# ---------------------------------------------------------------------------
+# Interfaces
+# ---------------------------------------------------------------------------
 
-    def serves(self, display_name: str) -> bool:
-        return self.matching_model(display_name) is not None
+
+class ExposureEntry(BaseModel):
+    """One entry in an interface's ``exposed_models`` list.
+
+    References a ``(target, model)`` pair (where ``model`` is the
+    source-level display name, i.e. alias-or-name). Optional ``alias``
+    overrides the client-facing public id; without it the public id is
+    the composite ``<model>@<target>`` string.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    target: str
+    alias: Optional[str] = None
+
+    @field_validator("model", "target")
+    @classmethod
+    def _nonempty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("exposure entry 'model' and 'target' must be non-empty")
+        return v
+
+    @field_validator("alias")
+    @classmethod
+    def _alias_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @property
+    def composite_id(self) -> str:
+        """The pre-alias ``model@target`` identifier."""
+        return f"{self.model}@{self.target}"
+
+    @property
+    def public_id(self) -> str:
+        """Client-facing id on the owning interface."""
+        return self.alias or self.composite_id
+
+
+def _coerce_exposure_entries(value: Any) -> List[Dict[str, Any]]:
+    """Normalise an ``exposed_models`` field into ExposureEntry dicts."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("'exposed_models' must be a list")
+    out: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            out.append(dict(item))
+        elif isinstance(item, ExposureEntry):
+            out.append(item.model_dump())
+        elif isinstance(item, str):
+            # Allow the shorthand "model@target" string.
+            if "@" not in item:
+                raise ValueError(
+                    f"exposed_models string entry {item!r} must be 'model@target'"
+                )
+            model, _, target = item.rpartition("@")
+            if not model or not target:
+                raise ValueError(
+                    f"exposed_models string entry {item!r} is not a valid 'model@target'"
+                )
+            out.append({"model": model, "target": target})
+        else:
+            raise ValueError(
+                f"each exposed_models[] entry must be an object or 'model@target' "
+                f"string, got {type(item).__name__}"
+            )
+    return out
+
+
+class _InterfaceBase(BaseModel):
+    """Shared interface fields (Ollama-compatible vs API-compatible)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    host: str = "127.0.0.1"
+    port: int
+    access_tokens: List[str] = Field(default_factory=list)
+    exposed_models: List[ExposureEntry] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def _name_nonempty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("interface 'name' must be non-empty")
+        return v
+
+    @field_validator("access_tokens")
+    @classmethod
+    def _dedupe_tokens(cls, v: List[str]) -> List[str]:
+        seen: Dict[str, None] = {}
+        for tk in v:
+            if tk and tk not in seen:
+                seen[tk] = None
+        return list(seen.keys())
+
+    @field_validator("exposed_models", mode="before")
+    @classmethod
+    def _coerce_exposed(cls, v: Any) -> Any:
+        return _coerce_exposure_entries(v)
+
+    @model_validator(mode="after")
+    def _check_unique_public_ids(self) -> "_InterfaceBase":
+        seen: Dict[str, ExposureEntry] = {}
+        dupes: List[str] = []
+        for e in self.exposed_models:
+            pid = e.public_id
+            if pid in seen:
+                dupes.append(pid)
+            else:
+                seen[pid] = e
+        if dupes:
+            raise ValueError(
+                f"interface {self.name!r}: duplicate public model ids "
+                f"{sorted(set(dupes))} in exposed_models. Each entry must produce "
+                f"a unique client-facing id (alias if set, else model@target)."
+            )
+        return self
+
+    @property
+    def auth_required(self) -> bool:
+        return bool(self.access_tokens)
+
+    def is_valid_token(self, token: str) -> bool:
+        if not token:
+            return False
+        return token in self.access_tokens
+
+    def exposure_for_public_id(self, public_id: str) -> Optional[ExposureEntry]:
+        for e in self.exposed_models:
+            if e.public_id == public_id:
+                return e
+        # Tagless Ollama-style match: client "foo@target" should also match
+        # exposed "foo:latest@target" (and vice versa) when the entry has no
+        # explicit alias. Split on '@' so the tagless matcher only sees the
+        # display-name half.
+        if "@" in public_id:
+            req_display, _, req_target = public_id.rpartition("@")
+            same_target = [
+                e for e in self.exposed_models
+                if not e.alias and e.target == req_target
+            ]
+            displays = [e.model for e in same_target]
+            match = _find_configured_model(req_display, displays)
+            if match is not None:
+                for e in same_target:
+                    if e.model == match:
+                        return e
+        return None
+
+    def public_ids(self) -> List[str]:
+        return [e.public_id for e in self.exposed_models]
+
+
+class OllamaInterface(_InterfaceBase):
+    """An Ollama-compatible listener (/api/* and /v1/chat/completions)."""
+
+    port: int = 21434
+
+
+class ApiInterface(_InterfaceBase):
+    """An OpenAI / Anthropic-compatible listener (/v1/*)."""
+
+    port: int = 21435
 
 
 # ---------------------------------------------------------------------------
@@ -642,32 +853,48 @@ class LlamaCppTarget(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class Settings(BaseModel):
-    # ---- Internal listener (Ollama-compatible /api/*) -------------------
-    host: str = "127.0.0.1"
-    port: int = 21434
-    # ---- External listener (reverse-proxy /v1/*; optional) --------------
-    # When ``external_port`` is set, /v1/* moves off the internal listener
-    # and is served on this separate (host, port). When unset, /v1/* stays
-    # on the internal listener (single-port mode).
-    external_host: Optional[str] = None
-    external_port: Optional[int] = None
-    # Tokens accepted on /v1/messages and /v1/models (x-api-key or Bearer).
-    # Required when an external listener is configured. Optional otherwise:
-    # if non-empty, /v1/* on the internal listener also requires auth.
-    external_access_tokens: List[str] = Field(default_factory=list)
+_REMOVED_TOP_LEVEL_KEYS = {
+    "host": "ollama_interfaces[*].host",
+    "port": "ollama_interfaces[*].port",
+    "external_host": "api_interfaces[*].host",
+    "external_port": "api_interfaces[*].port",
+    "external_access_tokens": "api_interfaces[*].access_tokens",
+    "internal_exposed_models": "ollama_interfaces[*].exposed_models",
+    "external_exposed_models": "api_interfaces[*].exposed_models",
+    "upstreams": "anthropic_upstreams",
+}
 
-    # ---- Admin listener (/admin/* only) ---------------------------------
-    # The admin UI has no authentication, so it lives on its own localhost
-    # listener by default instead of sharing the Ollama-compatible port.
-    # Set admin_port=null to intentionally mount /admin on the internal
-    # listener (legacy/single-port mode).
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # -- Sources ---------------------------------------------------------
+    anthropic_upstreams: List[AnthropicUpstream] = Field(default_factory=list)
+    openai_upstreams: List[OpenAIUpstream] = Field(default_factory=list)
+    ollama_targets: List[OllamaTarget] = Field(default_factory=list)
+    llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
+    llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
+
+    # -- Interfaces ------------------------------------------------------
+    ollama_interfaces: List[OllamaInterface] = Field(
+        default_factory=lambda: [OllamaInterface(name="ollama", port=21434)]
+    )
+    api_interfaces: List[ApiInterface] = Field(default_factory=list)
+
+    # -- Runtime knobs ---------------------------------------------------
+    advertised_version: str = "0.6.4"
+    default_max_tokens: int = 4096
+    timeout_seconds: float = 300.0
+    use_system_proxy: bool = False
+    enforce_context_limit: bool = True
+    model_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    # -- Admin UI listener ----------------------------------------------
+    admin_enabled: bool = True
     admin_host: str = "127.0.0.1"
     admin_port: Optional[int] = 21433
 
-    # ---- Dashboard listener (/dashboard/* only) ------------------------
-    # Runtime metrics are exposed on their own localhost listener so the
-    # unauthenticated dashboard does not share the admin or API ports.
+    # -- Dashboard listener ---------------------------------------------
     dashboard_enabled: bool = True
     dashboard_host: str = "127.0.0.1"
     dashboard_port: Optional[int] = 21432
@@ -675,236 +902,263 @@ class Settings(BaseModel):
     dashboard_retention_seconds: float = 7 * 24 * 60 * 60
     dashboard_data_path: Optional[str] = "logs/dashboard_history.json"
     dashboard_model_reclaim_enabled: bool = False
-
-    # Low-VRAM safety monitor. Every dashboard_sample_interval_seconds it
-    # checks nvidia-smi; if free VRAM is below the threshold, it asks the
-    # coordinator to release eligible idle local models.
     vram_low_free_reclaim_enabled: bool = True
     vram_low_free_threshold_mib: float = 200.0
 
-    advertised_version: str = "0.6.4"
-    default_max_tokens: int = 4096
-    timeout_seconds: float = 300.0
-    use_system_proxy: bool = False
-    enforce_context_limit: bool = True
-    upstreams: List[Upstream] = Field(default_factory=list)
-    openai_upstreams: List[OpenAIUpstream] = Field(default_factory=list)
-    ollama_targets: List[OllamaTarget] = Field(default_factory=list)
-    llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
-    llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
-    # Per-interface exposed-model whitelists. Each entry is a composite
-    # ``model@target`` identifier; ``model`` here is the **display name**
-    # the target/upstream advertises (i.e. an entry from its ``models``
-    # list, not the wire-side id from ``model_map``). Default ``[]``
-    # means nothing is exposed on that interface; a fresh config must
-    # opt models in explicitly. ``None`` is reserved for "expose all"
-    # if you ever want it back; the admin UI normalises empty to ``[]``.
-    internal_exposed_models: List[str] = Field(default_factory=list)
-    external_exposed_models: List[str] = Field(default_factory=list)
-    model_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
-
-    # Web admin UI (mounted at /admin). Set to false to disable entirely.
-    admin_enabled: bool = True
-
-    # Where the JSON config came from (empty string if no file was used).
+    # -- Meta ------------------------------------------------------------
     config_path: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_top_level(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        bad = [k for k in data if k in _REMOVED_TOP_LEVEL_KEYS]
+        if bad:
+            hints = ", ".join(f"{k} -> {_REMOVED_TOP_LEVEL_KEYS[k]}" for k in bad)
+            raise ValueError(
+                f"unsupported legacy top-level config keys: {bad}. Migrate manually: {hints}"
+            )
+        return data
 
     @model_validator(mode="after")
     def _validate(self) -> "Settings":
-        # All backend source names must be globally unique because they
-        # form the right-hand side of the composite ``model@target``
-        # identifier used by both /api/tags and routing. Allowing two
-        # sources to share a name would make composite identifiers
-        # ambiguous.
+        # 1. Source name uniqueness (global, across all source kinds).
         all_source_names: List[str] = []
-        for up in self.upstreams:
-            all_source_names.append(up.name)
-        for up in self.openai_upstreams:
-            all_source_names.append(up.name)
-        for t in self.ollama_targets:
-            all_source_names.append(t.name)
-        for t in self.llama_cpp_targets:
-            all_source_names.append(t.name or t.model)
+        for src in self.all_sources():
+            all_source_names.append(src.name)
         dupes = sorted({n for n in all_source_names if all_source_names.count(n) > 1})
         if dupes:
             raise ValueError(
-                f"Duplicate source names across upstreams/openai_upstreams/"
-                f"ollama_targets/llama_cpp_targets: {dupes}. Source names "
-                f"are used as the target component of composite model IDs "
-                f"(model@target) and must be globally unique."
+                f"Duplicate source names across anthropic_upstreams/openai_upstreams/"
+                f"ollama_targets/llama_cpp_targets: {dupes}. Source names are used as "
+                f"the right side of composite model ids and must be globally unique."
             )
-        # ``@`` is reserved as the composite-identifier separator.
-        for name in all_source_names:
-            if "@" in name:
+
+        # 2. Interface name uniqueness within each list.
+        for label, items in (
+            ("ollama_interfaces", self.ollama_interfaces),
+            ("api_interfaces", self.api_interfaces),
+        ):
+            names = [it.name for it in items]
+            inter_dupes = sorted({n for n in names if names.count(n) > 1})
+            if inter_dupes:
                 raise ValueError(
-                    f"Source name {name!r} contains '@'; '@' is reserved "
-                    f"as the model/target separator in composite IDs."
+                    f"Duplicate interface names in {label}: {inter_dupes}"
                 )
-        enabled_ports = {"internal": self.port}
-        if self.external_port is not None:
-            enabled_ports["external"] = self.external_port
+
+        # 3. Interface ports distinct across every listener fake_ollama owns.
+        port_owners: Dict[int, str] = {}
+        for it in self.ollama_interfaces:
+            tag = f"ollama_interface[{it.name}]"
+            if it.port in port_owners:
+                raise ValueError(
+                    f"{tag} port={it.port} conflicts with {port_owners[it.port]}"
+                )
+            port_owners[it.port] = tag
+        for it in self.api_interfaces:
+            tag = f"api_interface[{it.name}]"
+            if it.port in port_owners:
+                raise ValueError(
+                    f"{tag} port={it.port} conflicts with {port_owners[it.port]}"
+                )
+            port_owners[it.port] = tag
         if self.admin_enabled and self.admin_port is not None:
-            enabled_ports["admin"] = self.admin_port
-        if self.dashboard_enabled and self.dashboard_port is not None:
-            enabled_ports["dashboard"] = self.dashboard_port
-        seen_ports: Dict[int, str] = {}
-        for label, port in enabled_ports.items():
-            if port in seen_ports:
+            if self.admin_port in port_owners:
                 raise ValueError(
-                    f"{label}_port={port} conflicts with {seen_ports[port]}_port; "
-                    "internal, external, admin, and dashboard listeners must use distinct ports"
+                    f"admin_port={self.admin_port} conflicts with {port_owners[self.admin_port]}"
                 )
-            seen_ports[port] = label
-        # Normalize tokens: drop blanks and dedupe.
-        seen: Dict[str, None] = {}
-        for tk in self.external_access_tokens:
-            if tk and tk not in seen:
-                seen[tk] = None
-        object.__setattr__(self, "external_access_tokens", list(seen.keys()))
-        # External listener requires at least one access token.
-        if self.external_port is not None and not self.external_access_tokens:
-            _LOG.warning(
-                "external_port=%s is set but external_access_tokens is empty; "
-                "/v1/* will refuse all requests until you add at least one "
-                "token (Web UI: External → Generate).",
-                self.external_port,
-            )
-        # Tokens configured but no ollama_target is unusual but allowed (the
-        # tokens then only gate the upstream-passthrough side of /v1/*).
+            port_owners[self.admin_port] = "admin"
+        if self.dashboard_enabled and self.dashboard_port is not None:
+            if self.dashboard_port in port_owners:
+                raise ValueError(
+                    f"dashboard_port={self.dashboard_port} conflicts with "
+                    f"{port_owners[self.dashboard_port]}"
+                )
+            port_owners[self.dashboard_port] = "dashboard"
+
+        # 4. Exposure entries reference real (target, model) pairs.
+        all_composite_ids = set(self.all_source_composite_ids())
+        for it in list(self.ollama_interfaces) + list(self.api_interfaces):
+            for e in it.exposed_models:
+                cid = e.composite_id
+                if cid not in all_composite_ids:
+                    raise ValueError(
+                        f"interface {it.name!r}: exposed_models references unknown "
+                        f"target/model {cid!r}. Available composite ids: "
+                        f"{sorted(all_composite_ids)}"
+                    )
+
+        # 5. Cycle detection: any upstream whose base_url points back at any
+        # interface this process listens on means /v1/messages would
+        # recurse forever.
+        self.detect_upstream_cycles()
         return self
 
-    # -- External-listener helpers ---------------------------------------
+    # -- Source enumeration ---------------------------------------------
 
-    @property
-    def external_listener_enabled(self) -> bool:
-        return self.external_port is not None
+    def all_sources(self) -> List[Any]:
+        """All configured sources in routing order (local first, then remote)."""
+        return [
+            *self.ollama_targets,
+            *self.llama_cpp_targets,
+            *self.openai_upstreams,
+            *self.anthropic_upstreams,
+        ]
 
-    @property
-    def admin_listener_enabled(self) -> bool:
-        return self.admin_enabled and self.admin_port is not None
-
-    @property
-    def dashboard_listener_enabled(self) -> bool:
-        return self.dashboard_enabled and self.dashboard_port is not None
-
-    # -- Composite model identity ---------------------------------------
-    #
-    # Every model the user can talk to is identified globally by a
-    # composite ``model@target`` string, where ``model`` is the display
-    # name the source advertises and ``target`` is the source's ``name``.
-    # The composite form is the *only* form clients may send (bare model
-    # names are 400'd) and is what /api/tags / /v1/models expose. Inside
-    # routing we split composite -> (target_name, model) and look the
-    # backend up by target name directly.
-
-    COMPOSITE_SEP: str = "@"
-
-    @staticmethod
-    def compose_model_id(model: str, target: str) -> str:
-        return f"{model}@{target}"
-
-    @staticmethod
-    def split_composite(name: str) -> Optional[tuple[str, str]]:
-        """Split ``model@target`` into ``(model, target)``; ``None`` if not composite."""
-        if "@" not in name:
-            return None
-        model, _, target = name.rpartition("@")
-        if not model or not target:
-            return None
-        return model, target
-
-    def all_composite_ids(self) -> List[str]:
-        """Every ``model@target`` advertised by any configured source.
-
-        Order: ollama_targets → llama_cpp_targets → openai_upstreams →
-        anthropic upstreams; within each source the source's own model
-        order is preserved. Duplicates within one source are dropped.
-        """
+    def all_source_composite_ids(self) -> List[str]:
+        """Every ``<display>@<source>`` id any source advertises."""
         out: List[str] = []
         seen: Dict[str, None] = {}
-        for backend in self.backends:
-            for model in backend.models:
-                cid = self.compose_model_id(model, backend.name)
+        for src in self.all_sources():
+            for entry in src.models:
+                cid = f"{entry.display}@{src.name}"
                 if cid not in seen:
                     seen[cid] = None
                     out.append(cid)
         return out
 
-    def exposed_composite_ids(self, surface: str) -> List[str]:
-        """Composite ids the given surface (``internal`` / ``external``) exposes.
+    # -- Cycle detection -------------------------------------------------
 
-        Order matches ``all_composite_ids``; entries listed in the
-        per-surface whitelist but not actually backed by any source are
-        silently skipped.
+    def own_bind_endpoints(self) -> List[Tuple[str, int]]:
+        """Return (host, port) tuples for every listener this process owns."""
+        endpoints: List[Tuple[str, int]] = []
+        for it in self.ollama_interfaces:
+            endpoints.append((it.host, it.port))
+        for it in self.api_interfaces:
+            endpoints.append((it.host, it.port))
+        if self.admin_enabled and self.admin_port is not None:
+            endpoints.append((self.admin_host, self.admin_port))
+        if self.dashboard_enabled and self.dashboard_port is not None:
+            endpoints.append((self.dashboard_host, self.dashboard_port))
+        return endpoints
+
+    def detect_upstream_cycles(self) -> None:
+        """Raise if any upstream points back at a listener fake_ollama owns.
+
+        The check is intentionally conservative: it only fires when the
+        upstream URL has a literal host that matches (and a port that
+        matches) one of this process's own bind endpoints. Hostnames are
+        not resolved via DNS to avoid load-time network traffic.
         """
-        if surface == "internal":
-            allowed = set(self.internal_exposed_models)
-        elif surface == "external":
-            allowed = set(self.external_exposed_models)
-        else:
-            raise ValueError(f"unknown surface: {surface!r}")
-        return [cid for cid in self.all_composite_ids() if cid in allowed]
+        own = self.own_bind_endpoints()
+        if not own:
+            return
+        own_ports = {port for _, port in own}
+        # Build a per-port set of host variants accepted as "ourselves".
+        # Binding 0.0.0.0 means "any local address" — that listener accepts
+        # connections to 127.0.0.1, ::1, localhost, and every host iface.
+        loopback_hosts = {"127.0.0.1", "0.0.0.0", "localhost", "::1", "::"}
+        local_hosts = set(loopback_hosts) | _local_host_aliases()
+        accept_by_port: Dict[int, set[str]] = {}
+        for host, port in own:
+            hosts = accept_by_port.setdefault(port, set())
+            if host in ("0.0.0.0", "::"):
+                hosts |= local_hosts
+            else:
+                hosts.add(host)
+                # 127.0.0.1 and ::1 are interchangeable with 'localhost'.
+                if host in loopback_hosts:
+                    hosts |= loopback_hosts
 
-    def is_exposed(self, surface: str, composite_id: str) -> bool:
-        if surface == "internal":
-            return composite_id in self.internal_exposed_models
-        if surface == "external":
-            return composite_id in self.external_exposed_models
-        raise ValueError(f"unknown surface: {surface!r}")
+        def _check(src_kind: str, src_name: str, base_url: str) -> None:
+            parsed = urlparse(base_url or "")
+            host = (parsed.hostname or "").lower()
+            port = parsed.port
+            if not host or port is None:
+                return
+            if port not in own_ports:
+                return
+            allowed = accept_by_port.get(port) or set()
+            if host in allowed:
+                raise ValueError(
+                    f"cycle detected: {src_kind} {src_name!r} base_url={base_url!r} "
+                    f"points at this fake_ollama process ({host}:{port}). Requests "
+                    f"would loop indefinitely. Use a different upstream URL or "
+                    f"remove this source."
+                )
 
-    def is_valid_external_token(self, token: str) -> bool:
-        """True iff ``token`` is in ``external_access_tokens``."""
-        if not token:
-            return False
-        return token in self.external_access_tokens
+        for src in self.anthropic_upstreams:
+            _check("anthropic_upstream", src.name, src.base_url)
+        for src in self.openai_upstreams:
+            _check("openai_upstream", src.name, src.base_url)
+        for src in self.ollama_targets:
+            _check("ollama_target", src.name, src.base_url)
+        for src in self.llama_cpp_targets:
+            _check("llama_cpp_target", src.name, src.base_url)
 
-    @property
-    def auth_required_for_v1(self) -> bool:
-        """Whether /v1/messages and /v1/models require a token.
+    # -- Routing ---------------------------------------------------------
 
-        True when any access token is configured OR an external listener is
-        enabled (in which case auth is mandatory regardless of token list,
-        though an empty list means no token can pass — effectively closed).
+    def source_by_name(self, name: str) -> Optional[Any]:
+        for src in self.all_sources():
+            if src.name == name:
+                return src
+        return None
+
+    def backend_by_name(self, name: str) -> Optional["Backend"]:
+        src = self.source_by_name(name)
+        if src is None:
+            return None
+        return Backend.from_source(src, self)
+
+    def interface_by_name(self, name: str) -> Optional[_InterfaceBase]:
+        for it in self.ollama_interfaces:
+            if it.name == name:
+                return it
+        for it in self.api_interfaces:
+            if it.name == name:
+                return it
+        return None
+
+    def all_interfaces(self) -> List[_InterfaceBase]:
+        return [*self.ollama_interfaces, *self.api_interfaces]
+
+    def resolve_request(
+        self, requested: str, *, interface_name: str
+    ) -> Tuple["Backend", str]:
+        """Resolve a client-supplied model id on a specific interface.
+
+        Returns ``(backend, display_model)`` where ``display_model`` is the
+        source-level display name (alias_or_name). Callers feed it to
+        ``backend.source.resolve_model`` to get the wire-side id.
         """
-        return bool(self.external_access_tokens) or self.external_listener_enabled
+        iface = self.interface_by_name(interface_name)
+        if iface is None:
+            raise ValueError(f"unknown interface {interface_name!r}")
+        entry = iface.exposure_for_public_id(requested)
+        if entry is None:
+            ids = iface.public_ids()
+            raise ValueError(
+                f"model {requested!r} is not exposed on interface "
+                f"{interface_name!r}; available: {ids}"
+            )
+        backend = self.backend_by_name(entry.target)
+        if backend is None:
+            raise ValueError(
+                f"interface {interface_name!r} exposes model {requested!r} via "
+                f"target {entry.target!r} which is not configured (config drift)"
+            )
+        if not backend.serves(entry.model):
+            raise ValueError(
+                f"interface {interface_name!r} exposes model {requested!r} but "
+                f"target {entry.target!r} does not serve display name {entry.model!r}"
+            )
+        return backend, entry.model
 
-    # -- Backwards-compatible aggregated views ---------------------------
+    # -- Profile lookup --------------------------------------------------
 
-    @property
-    def models(self) -> List[str]:
-        """All advertised composite model ids across every source."""
-        return self.all_composite_ids()
-
-    # -- Routing helpers -------------------------------------------------
-
-    def effective_llama_cpp_target(self, target: LlamaCppTarget) -> LlamaCppTarget:
-        return target.with_defaults(self.llama_cpp_defaults)
-
-    def profile_for(self, composite_or_bare: str) -> ModelProfile:
-        """Look up a profile by composite ``model@target`` then fall back.
-
-        Lookup order:
-        1. Exact composite id (most specific).
-        2. Bare model name (generic default shared across all targets
-           that serve this model).
-        3. Tagless base of the bare model (Ollama-style; ``foo:latest``
-           falls back to ``foo``).
-
-        Returns the built-in defaults when nothing matches.
-        """
-        keys: List[str] = []
-        split = self.split_composite(composite_or_bare)
-        if split is not None:
-            model, _target = split
-            keys.append(composite_or_bare)
-            keys.append(model)
-            if ":" in model:
-                keys.append(_model_base(model))
-        else:
-            keys.append(composite_or_bare)
-            if ":" in composite_or_bare:
-                keys.append(_model_base(composite_or_bare))
-        for k in keys:
+    def profile_for(self, key: str) -> ModelProfile:
+        """Look up a profile by ``model@target`` then fall back to bare name."""
+        candidates: List[str] = [key]
+        if "@" in key:
+            display, _, _ = key.rpartition("@")
+            if display:
+                candidates.append(display)
+                if ":" in display:
+                    candidates.append(_model_base(display))
+        elif ":" in key:
+            candidates.append(_model_base(key))
+        for k in candidates:
             if k in self.model_profiles:
                 return ModelProfile.from_dict(self.model_profiles[k])
             match = _find_configured_model(k, self.model_profiles.keys())
@@ -916,95 +1170,20 @@ class Settings(BaseModel):
             max_output_tokens=None,
         )
 
-    # -- Unified backends view -------------------------------------------
+    # -- llama.cpp defaults convenience ---------------------------------
+
+    def effective_llama_cpp_target(self, target: LlamaCppTarget) -> LlamaCppTarget:
+        return target.with_defaults(self.llama_cpp_defaults)
+
+    # -- Listener helpers -----------------------------------------------
 
     @property
-    def backends(self) -> List["Backend"]:
-        """Backends in routing priority order.
+    def admin_listener_enabled(self) -> bool:
+        return self.admin_enabled and self.admin_port is not None
 
-        Local backends (Ollama, then llama.cpp) come before remote
-        Anthropic upstreams so the same display name on both a local
-        target and a remote upstream resolves to the local one. This
-        mirrors the precedence the legacy three-handler routing
-        already implemented via ``ollama_target_for`` /
-        ``llama_cpp_target_for`` being consulted before falling back to
-        ``upstreams``.
-        """
-        out: List[Backend] = []
-        for tgt in self.ollama_targets:
-            out.append(Backend.from_ollama_target(tgt))
-        for raw_t in self.llama_cpp_targets:
-            out.append(
-                Backend.from_llama_cpp_target(self.effective_llama_cpp_target(raw_t))
-            )
-        for up in self.openai_upstreams:
-            out.append(Backend.from_openai_upstream(up))
-        for up in self.upstreams:
-            out.append(Backend.from_anthropic_upstream(up))
-        return out
-
-    def backend_by_name(self, target_name: str) -> Optional["Backend"]:
-        """Look up a backend by its source name (the right side of ``model@target``)."""
-        for backend in self.backends:
-            if backend.name == target_name:
-                return backend
-        return None
-
-    def resolve_request(
-        self, requested: str, *, surface: str
-    ) -> tuple["Backend", str]:
-        """Resolve a client-supplied model id on ``surface``.
-
-        ``requested`` must be a composite ``model@target`` string; bare
-        model names are rejected with ``ValueError`` carrying a
-        client-friendly message listing valid composite ids exposed on
-        the surface. The returned tuple is ``(backend, display_model)``
-        where ``display_model`` is the bare model name; callers feed it
-        through ``backend.resolve_model`` to get the wire-side id.
-        """
-        split = self.split_composite(requested)
-        if split is None:
-            exposed = self.exposed_composite_ids(surface)
-            raise ValueError(
-                f"model {requested!r} must be specified as 'model@target'; "
-                f"available on {surface}: {exposed}"
-            )
-        model, target_name = split
-        backend = self.backend_by_name(target_name)
-        if backend is None:
-            raise ValueError(
-                f"unknown target {target_name!r} in model id {requested!r}"
-            )
-        if not backend.serves(model):
-            raise ValueError(
-                f"target {target_name!r} does not serve model {model!r}"
-            )
-        composite_id = self.compose_model_id(model, target_name)
-        if not self.is_exposed(surface, composite_id):
-            raise ValueError(
-                f"model {composite_id!r} is not exposed on {surface}"
-            )
-        return backend, model
-
-    def backend_for(
-        self, composite_id: str, *, surface: Optional[str] = None
-    ) -> Optional["Backend"]:
-        """Return the backend that should handle ``composite_id`` on ``surface``.
-
-        ``composite_id`` is a ``model@target`` string. Returns ``None``
-        when the target is unknown, does not serve the named model, or
-        (when ``surface`` is given) is not exposed on that surface.
-        """
-        split = self.split_composite(composite_id)
-        if split is None:
-            return None
-        model, target_name = split
-        backend = self.backend_by_name(target_name)
-        if backend is None or not backend.serves(model):
-            return None
-        if surface is not None and not self.is_exposed(surface, composite_id):
-            return None
-        return backend
+    @property
+    def dashboard_listener_enabled(self) -> bool:
+        return self.dashboard_enabled and self.dashboard_port is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1012,95 +1191,62 @@ class Settings(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-_BackendSource = Any  # Upstream | OllamaTarget | LlamaCppTarget
-
-
 @dataclass(frozen=True)
 class Backend:
-    """A protocol-tagged view over one backend declaration.
-
-    ``Backend`` is intentionally a thin façade: routing code stays
-    independent of which legacy field (``upstreams`` / ``ollama_targets``
-    / ``llama_cpp_targets``) declared the backend, while still letting
-    callers reach into ``source`` for protocol-specific fields (lifecycle
-    commands, llama.cpp launch args, etc.).
-
-    Tags:
-
-    * ``protocol``: wire format spoken to this backend. ``anthropic`` for
-      Anthropic Messages API upstreams, ``ollama`` for the Ollama
-      ``/api/chat`` JSON format, ``openai`` for the OpenAI Chat
-      Completions format that llama.cpp server and (future) remote
-      OpenAI-compatible upstreams speak.
-    * ``kind``: ``remote`` for HTTP-only backends fake-ollama only proxies
-      to; ``local`` for backends fake-ollama may also own the process
-      lifecycle of (health check, auto-start, idle stop). ``auto_start``
-      on a ``remote`` backend is meaningless and ignored.
-    """
+    """A protocol-tagged thin façade over one configured source."""
 
     name: str
-    protocol: str  # "anthropic" | "ollama" | "openai"
+    protocol: str  # "anthropic" | "openai" | "ollama"
     kind: str  # "remote" | "local"
     base_url: str
     auth_token: str
-    models: List[str]
-    source: _BackendSource
-
-    # -- Constructors ----------------------------------------------------
+    source: Any
 
     @classmethod
-    def from_anthropic_upstream(cls, up: "Upstream") -> "Backend":
-        return cls(
-            name=up.name,
-            protocol="anthropic",
-            kind="remote",
-            base_url=up.base_url,
-            auth_token=up.auth_token,
-            models=list(up.models),
-            source=up,
-        )
+    def from_source(cls, src: Any, settings: Settings) -> "Backend":
+        if isinstance(src, AnthropicUpstream):
+            return cls(
+                name=src.name,
+                protocol="anthropic",
+                kind="remote",
+                base_url=src.base_url,
+                auth_token=src.auth_token,
+                source=src,
+            )
+        if isinstance(src, OpenAIUpstream):
+            return cls(
+                name=src.name,
+                protocol="openai",
+                kind="remote",
+                base_url=src.base_url,
+                auth_token=src.auth_token,
+                source=src,
+            )
+        if isinstance(src, OllamaTarget):
+            kind = "local" if (src.auto_start or src.stop_command) else "remote"
+            return cls(
+                name=src.name,
+                protocol="ollama",
+                kind=kind,
+                base_url=src.base_url,
+                auth_token=src.auth_token,
+                source=src,
+            )
+        if isinstance(src, LlamaCppTarget):
+            effective = settings.effective_llama_cpp_target(src)
+            return cls(
+                name=effective.name,
+                protocol="openai",
+                kind="local",
+                base_url=effective.base_url,
+                auth_token=effective.auth_token,
+                source=effective,
+            )
+        raise TypeError(f"cannot build Backend from {type(src).__name__}")
 
-    @classmethod
-    def from_openai_upstream(cls, up: "OpenAIUpstream") -> "Backend":
-        return cls(
-            name=up.name,
-            protocol="openai",
-            kind="remote",
-            base_url=up.base_url,
-            auth_token=up.auth_token,
-            models=list(up.models),
-            source=up,
-        )
-
-    @classmethod
-    def from_ollama_target(cls, tgt: "OllamaTarget") -> "Backend":
-        # Ollama targets are usually local (``http://127.0.0.1:11434``)
-        # but may point at a remote daemon; the practical differentiator
-        # is whether fake-ollama owns the lifecycle (``auto_start``).
-        kind = "local" if tgt.auto_start or tgt.stop_command else "remote"
-        return cls(
-            name=tgt.name,
-            protocol="ollama",
-            kind=kind,
-            base_url=tgt.base_url,
-            auth_token="",
-            models=list(tgt.models),
-            source=tgt,
-        )
-
-    @classmethod
-    def from_llama_cpp_target(cls, tgt: "LlamaCppTarget") -> "Backend":
-        return cls(
-            name=tgt.name or tgt.model,
-            protocol="openai",
-            kind="local",
-            base_url=tgt.base_url,
-            auth_token=tgt.auth_token,
-            models=list(tgt.models),
-            source=tgt,
-        )
-
-    # -- Routing helpers -------------------------------------------------
+    @property
+    def models(self) -> List[str]:
+        return list(self.source.display_models)
 
     def serves(self, display_name: str) -> bool:
         return self.source.serves(display_name)
@@ -1108,11 +1254,8 @@ class Backend:
     def resolve_model(self, display_name: str) -> str:
         return self.source.resolve_model(display_name)
 
-    # -- Lifecycle helpers ----------------------------------------------
-
     @property
     def supports_lifecycle(self) -> bool:
-        """Whether ``auto_start`` / ``idle_timeout`` are meaningful here."""
         return self.kind == "local"
 
     @property
@@ -1123,7 +1266,7 @@ class Backend:
 
 
 # ---------------------------------------------------------------------------
-# Loader
+# Loader helpers
 # ---------------------------------------------------------------------------
 
 
@@ -1148,13 +1291,6 @@ def _read_json(path: Optional[Path]) -> Dict[str, Any]:
 
 
 def load_settings(config_path: Optional[str | Path] = None) -> Settings:
-    """Build a Settings object from JSON config.
-
-    All runtime knobs live in the config file (or are set via the admin
-    UI); the only environment variable consulted at load time is
-    ``FAKE_OLLAMA_CONFIG`` which selects the config-file path. Use
-    ``tests/conftest.py`` to inject test-only env if you need it.
-    """
     resolved = _resolve_config_path(config_path)
     data = _read_json(resolved)
     settings = Settings(**data)
@@ -1168,13 +1304,38 @@ def get_settings() -> Settings:
     return load_settings()
 
 
+@lru_cache(maxsize=1)
+def _local_host_aliases() -> set[str]:
+    """Best-effort list of host strings that name this machine.
+
+    Used by ``detect_upstream_cycles`` to decide whether an upstream URL
+    points at a 0.0.0.0-bound listener owned by this process. We avoid
+    DNS resolution; this only inspects the local host's own names.
+    """
+    out: set[str] = set()
+    try:
+        out.add(socket.gethostname().lower())
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            ip = info[4][0]
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            out.add(ip.lower())
+    except (OSError, socket.gaierror):
+        pass
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Token estimation (rough – used only for the cost guardrail)
 # ---------------------------------------------------------------------------
 
 
 def estimate_tokens_from_anthropic_payload(body: Dict[str, Any]) -> int:
-    """Rough token estimate of an Anthropic /v1/messages request body."""
     chars = 0
     images = 0
 

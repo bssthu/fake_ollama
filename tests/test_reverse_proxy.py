@@ -101,32 +101,50 @@ class _FakeLlamaCppClient:
 
 @pytest.fixture
 def reverse_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Settings with one upstream + one ollama_target serving 'llama3.1'."""
+    """Settings with one anthropic upstream + one ollama_target serving 'llama3.1'.
+
+    Both are exposed on the api_interface (requires token "rev-tk-1") and the
+    ollama_interface (no token).
+    """
     return Settings(
-        upstreams=[
+        anthropic_upstreams=[
             {
                 "name": "default",
                 "base_url": "http://upstream.test",
                 "auth_token": "tk",
-                "models": ["claude-3-5-sonnet-20241022"],
+                "models": [{"name": "claude-3-5-sonnet-20241022"}],
             }
         ],
         ollama_targets=[
             {
                 "name": "local",
                 "base_url": "http://127.0.0.1:11434",
-                "models": ["llama3.1"],
-                "model_map": {"llama3.1": "llama3.1:8b"},
+                "models": [{"name": "llama3.1:8b", "alias": "llama3.1"}],
             }
         ],
-        external_access_tokens=["rev-tk-1"],
-        internal_exposed_models=[
-            "claude-3-5-sonnet-20241022@default",
-            "llama3.1@local",
+        ollama_interfaces=[
+            {
+                "name": "ollama",
+                "host": "127.0.0.1",
+                "port": 21434,
+                "access_tokens": [],
+                "exposed_models": [
+                    {"model": "claude-3-5-sonnet-20241022", "target": "default"},
+                    {"model": "llama3.1", "target": "local"},
+                ],
+            }
         ],
-        external_exposed_models=[
-            "claude-3-5-sonnet-20241022@default",
-            "llama3.1@local",
+        api_interfaces=[
+            {
+                "name": "api",
+                "host": "127.0.0.1",
+                "port": 21435,
+                "access_tokens": ["rev-tk-1"],
+                "exposed_models": [
+                    {"model": "claude-3-5-sonnet-20241022", "target": "default"},
+                    {"model": "llama3.1", "target": "local"},
+                ],
+            }
         ],
     )
 
@@ -136,27 +154,54 @@ _AUTH = {"x-api-key": "rev-tk-1"}
 
 
 def _expose_all(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Auto-populate internal/external_exposed_models for every backend's models.
+    """Auto-populate exposed_models on both interfaces for every backend's
+    display models.
 
     Lets bulk-rewritten tests construct ``Settings(**_expose_all(data))``
-    without manually listing composite ids.
+    without manually listing every exposure entry.
     """
-    exposed: List[str] = []
-    for section in ("upstreams", "openai_upstreams", "ollama_targets"):
+    exposures: List[Dict[str, str]] = []
+
+    def _display_for_entry(entry: Any) -> str:
+        if isinstance(entry, dict):
+            return entry.get("alias") or entry["name"]
+        return str(entry)
+
+    for section in ("anthropic_upstreams", "openai_upstreams", "ollama_targets"):
         for src in data.get(section, []) or []:
             name = src["name"]
             for m in src.get("models", []) or []:
-                exposed.append(f"{m}@{name}")
+                exposures.append({"model": _display_for_entry(m), "target": name})
     for tgt in data.get("llama_cpp_targets", []) or []:
         name = tgt["name"]
-        m = tgt.get("model")
-        if m:
-            exposed.append(f"{m}@{name}")
-    # Union with any caller-provided lists.
-    existing_int = set(data.get("internal_exposed_models") or [])
-    existing_ext = set(data.get("external_exposed_models") or [])
-    data["internal_exposed_models"] = sorted(existing_int | set(exposed))
-    data["external_exposed_models"] = sorted(existing_ext | set(exposed))
+        display = tgt.get("alias") or tgt.get("model")
+        if display:
+            exposures.append({"model": display, "target": name})
+
+    def _merge(existing: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen = {(e["model"], e["target"]) for e in existing}
+        merged = list(existing)
+        for e in exposures:
+            key = (e["model"], e["target"])
+            if key not in seen:
+                merged.append(e)
+                seen.add(key)
+        return merged
+
+    if not data.get("ollama_interfaces"):
+        data["ollama_interfaces"] = [{
+            "name": "ollama", "host": "127.0.0.1", "port": 21434,
+            "access_tokens": [], "exposed_models": [],
+        }]
+    if not data.get("api_interfaces"):
+        data["api_interfaces"] = [{
+            "name": "api", "host": "127.0.0.1", "port": 21435,
+            "access_tokens": ["rev-tk-1"], "exposed_models": [],
+        }]
+    for iface in data["ollama_interfaces"]:
+        iface["exposed_models"] = _merge(iface.get("exposed_models") or [])
+    for iface in data["api_interfaces"]:
+        iface["exposed_models"] = _merge(iface.get("exposed_models") or [])
     return data
 
 
@@ -166,7 +211,7 @@ def _build_client(
     fake_ollama: Optional[_FakeOllamaClient] = None,
     fake_llama_cpp: Optional[_FakeLlamaCppClient] = None,
     upstream_transport: Optional[httpx.MockTransport] = None,
-    base_url: str = "http://testserver",
+    base_url: str = "http://testserver:21435",
 ) -> TestClient:
     from fake_ollama.anthropic_client import AnthropicClient
 
@@ -187,7 +232,7 @@ def _build_client(
                 up.base_url, up.auth_token,
                 client=httpx.AsyncClient(transport=upstream_transport),
             )
-            for up in settings.upstreams
+            for up in settings.anthropic_upstreams
         }
     return TestClient(app, base_url=base_url)
 
@@ -539,6 +584,7 @@ def test_openai_target_disables_ollama_thinking_from_profile(reverse_settings):
     with client:
         resp = client.post(
             "/v1/chat/completions",
+            headers=_AUTH,
             json={
                 "model": "llama3.1@local",
                 "messages": [{"role": "user", "content": "hello"}],
@@ -565,6 +611,7 @@ def test_openai_chat_non_stream_routes_to_ollama_target(reverse_settings):
     with client:
         resp = client.post(
             "/v1/chat/completions",
+            headers=_AUTH,
             json={
                 "model": "llama3.1@local",
                 "messages": [
@@ -609,6 +656,7 @@ def test_openai_chat_image_routes_to_ollama_target(reverse_settings):
     with client:
         resp = client.post(
             "/v1/chat/completions",
+            headers=_AUTH,
             json={
                 "model": "llama3.1@local",
                 "messages": [
@@ -655,6 +703,7 @@ def test_openai_chat_stream_routes_to_ollama_target(reverse_settings):
         with client.stream(
             "POST",
             "/v1/chat/completions",
+            headers=_AUTH,
             json={
                 "model": "llama3.1@local",
                 "messages": [{"role": "user", "content": "hello"}],
@@ -684,7 +733,6 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
             "name": "qwen36",
             "base_url": "http://127.0.0.1:21436",
             "model": "qwen3.6",
-            "model_alias": "qwen3.6-alias",
         }
     ]
     data["model_profiles"] = {"qwen3.6": {"show_thinking": False}}
@@ -693,7 +741,7 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
         chat_response={
             "id": "chatcmpl_local",
             "object": "chat.completion",
-            "model": "qwen3.6-alias",
+            "model": "qwen3.6",
             "choices": [
                 {
                     "index": 0,
@@ -726,7 +774,7 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
     assert body["content"] == [{"type": "text", "text": "hi from llama.cpp"}]
     assert body["usage"] == {"input_tokens": 8, "output_tokens": 4}
     sent = fake.last_chat_payload
-    assert sent["model"] == "qwen3.6-alias"
+    assert sent["model"] == "qwen3.6"
     assert sent["messages"] == [{"role": "user", "content": "hello"}]
     assert sent["max_tokens"] == 100
     assert sent["chat_template_kwargs"] == {"enable_thinking": False}
@@ -948,7 +996,6 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
             "name": "qwen36",
             "base_url": "http://127.0.0.1:21436",
             "model": "qwen3.6",
-            "model_alias": "qwen3.6-alias",
         }
     ]
     settings = Settings(**_expose_all(data))
@@ -956,7 +1003,7 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
         chat_response={
             "id": "chatcmpl_local",
             "object": "chat.completion",
-            "model": "qwen3.6-alias",
+            "model": "qwen3.6",
             "choices": [
                 {
                     "index": 0,
@@ -970,6 +1017,7 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
     with client:
         resp = client.post(
             "/v1/chat/completions",
+            headers=_AUTH,
             json={
                 "model": "qwen3.6@qwen36",
                 "messages": [{"role": "user", "content": "hello"}],
@@ -980,7 +1028,7 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
     assert resp.status_code == 200
     assert resp.json()["model"] == "qwen3.6@qwen36"
     assert resp.json()["choices"][0]["message"]["content"] == "direct openai"
-    assert fake.last_chat_payload["model"] == "qwen3.6-alias"
+    assert fake.last_chat_payload["model"] == "qwen3.6"
 
 
 def test_reverse_streaming_routes_to_llama_cpp_target(reverse_settings):
@@ -1161,8 +1209,6 @@ def test_v1_models_includes_llama_cpp_targets_when_authed(reverse_settings):
 
 def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
     data = reverse_settings.model_dump()
-    data["external_host"] = "127.0.0.1"
-    data["external_port"] = 21435
     settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient()
     captured: Dict[str, Any] = {}
@@ -1206,8 +1252,6 @@ def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
 
 def test_openai_chat_external_port_routes_to_ollama_target(reverse_settings):
     data = reverse_settings.model_dump()
-    data["external_host"] = "127.0.0.1"
-    data["external_port"] = 21435
     settings = Settings(**_expose_all(data))
     fake = _FakeOllamaClient(
         chat_response={
@@ -1245,12 +1289,16 @@ def test_openai_chat_external_port_routes_to_ollama_target(reverse_settings):
 
 def test_reverse_tagless_alias_routes_to_tagged_ollama_target(reverse_settings):
     data = reverse_settings.model_dump()
-    data["ollama_targets"][0]["models"] = ["qwen3.5-2b:latest"]
-    data["ollama_targets"][0]["model_map"] = {}
-    # Tagless alias: expose both forms so a bare request can be routed.
-    data["internal_exposed_models"] = ["qwen3.5-2b@local"]
-    data["external_exposed_models"] = ["qwen3.5-2b@local"]
-    settings = Settings(**_expose_all(data))
+    # Source advertises only the tagged display; the interface exposes a
+    # tagless alias that should route to it via Ollama-style tagless matching.
+    data["ollama_targets"][0]["models"] = [{"name": "qwen3.5-2b:latest"}]
+    data["ollama_interfaces"][0]["exposed_models"] = [
+        {"model": "qwen3.5-2b:latest", "target": "local"}
+    ]
+    data["api_interfaces"][0]["exposed_models"] = [
+        {"model": "qwen3.5-2b:latest", "target": "local"}
+    ]
+    settings = Settings(**data)
     fake = _FakeOllamaClient(
         chat_response={
             "model": "qwen3.5-2b:latest",
@@ -1278,11 +1326,14 @@ def test_reverse_tagless_alias_routes_to_tagged_ollama_target(reverse_settings):
 
 def test_reverse_tagless_alias_does_not_route_to_non_latest_tag(reverse_settings):
     data = reverse_settings.model_dump()
-    data["upstreams"][0]["expose_external"] = []
-    data["ollama_targets"][0]["models"] = ["qwen3.6-27b:q2_k_p"]
-    data["ollama_targets"][0]["model_map"] = {}
-    data["ollama_targets"][0]["expose_external"] = ["qwen3.6-27b:q2_k_p"]
-    settings = Settings(**_expose_all(data))
+    data["ollama_targets"][0]["models"] = [{"name": "qwen3.6-27b:q2_k_p"}]
+    data["ollama_interfaces"][0]["exposed_models"] = [
+        {"model": "qwen3.6-27b:q2_k_p", "target": "local"}
+    ]
+    data["api_interfaces"][0]["exposed_models"] = [
+        {"model": "qwen3.6-27b:q2_k_p", "target": "local"}
+    ]
+    settings = Settings(**data)
     fake = _FakeOllamaClient()
     client = _build_client(settings, fake_ollama=fake)
     with client:
@@ -1573,66 +1624,10 @@ def test_reverse_missing_token_returns_401(reverse_settings):
         assert resp.status_code == 200
 
 
-def test_reverse_token_required_in_settings():
-    """Legacy per-target ``api_token`` is silently dropped (extra='ignore').
-
-    The Settings instance still loads and the target is still routable;
-    auth is now centralised on ``external_access_tokens``.
-    """
-    s = Settings(
-        upstreams=[
-            {
-                "name": "u",
-                "base_url": "http://x.test",
-                "auth_token": "t",
-                "models": ["m"],
-            }
-        ],
-        ollama_targets=[
-            {
-                "name": "local",
-                "base_url": "http://127.0.0.1:11434",
-                "models": ["llama3.1"],
-                "api_token": "ignored",
-            }
-        ],
-        internal_exposed_models=["m@u", "llama3.1@local"],
-        external_exposed_models=["m@u", "llama3.1@local"],
-    )
-    # Target is routable regardless of legacy api_token.
-    assert s.backend_for("llama3.1@local") is not None
-    # No central tokens -> no auth required for /v1/* (legacy permissive mode).
-    assert s.auth_required_for_v1 is False
-    assert s.is_valid_external_token("ignored") is False
-
-
-def test_legacy_target_api_token_is_silently_dropped(tmp_path, monkeypatch):
-    """Loading config.json with legacy per-target ``api_token`` no longer
-    migrates it; auth tokens must be set centrally."""
-    cfg = tmp_path / "config.json"
-    cfg.write_text(
-        json.dumps({
-            "upstreams": [{"name": "u", "base_url": "http://x.test",
-                           "auth_token": "t", "models": ["m"]}],
-            "ollama_targets": [
-                {"name": "local", "base_url": "http://127.0.0.1:11434",
-                 "models": ["llama3.1"], "api_token": "legacy-tk"}
-            ],
-            "internal_exposed_models": ["m@u", "llama3.1@local"],
-            "external_exposed_models": ["m@u", "llama3.1@local"],
-        }),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("FAKE_OLLAMA_CONFIG", str(cfg))
-    s = load_settings()
-    assert s.external_access_tokens == []
-    assert s.backend_for("llama3.1@local") is not None
-
-
 def test_v1_models_includes_reverse_targets_when_authed(reverse_settings):
     client = _build_client(reverse_settings, fake_ollama=_FakeOllamaClient())
     with client:
-        # Without token: 401 because external_access_tokens is non-empty.
+        # Without token: 401 because api_interface has access_tokens.
         r = client.get("/v1/models")
         assert r.status_code == 401
         # With token: lists upstream + ollama target models.
@@ -1644,14 +1639,21 @@ def test_v1_models_includes_reverse_targets_when_authed(reverse_settings):
 
 
 def test_v1_models_open_when_no_tokens(tmp_path, monkeypatch):
-    """No external_access_tokens -> /v1/models requires no auth."""
+    """Empty access_tokens on the api_interface -> /v1/models requires no auth."""
     cfg = tmp_path / "config.json"
     cfg.write_text(
         json.dumps({
-            "upstreams": [{"name": "u", "base_url": "http://upstream.test",
-                           "auth_token": "tk", "models": ["m1"]}],
-            "internal_exposed_models": ["m1@u"],
-            "external_exposed_models": ["m1@u"],
+            "anthropic_upstreams": [{
+                "name": "u", "base_url": "http://upstream.test",
+                "auth_token": "tk",
+                "models": [{"name": "m1"}],
+            }],
+            "ollama_interfaces": [],
+            "api_interfaces": [{
+                "name": "api", "host": "127.0.0.1", "port": 21435,
+                "access_tokens": [],
+                "exposed_models": [{"model": "m1", "target": "u"}],
+            }],
         }),
         encoding="utf-8",
     )
@@ -1666,10 +1668,12 @@ def test_v1_models_open_when_no_tokens(tmp_path, monkeypatch):
 
 
 def test_expose_external_hides_upstream_models(reverse_settings):
-    """Removing a composite id from external_exposed_models hides it from /v1/*."""
+    """Removing a composite id from api_interface exposed_models hides it from /v1/*."""
     data = reverse_settings.model_dump()
-    # Keep the upstream model in internal but hide it from external.
-    data["external_exposed_models"] = ["llama3.1@local"]
+    # Keep upstream in ollama_interface but hide it from api_interface.
+    data["api_interfaces"][0]["exposed_models"] = [
+        {"model": "llama3.1", "target": "local"}
+    ]
     s = Settings(**data)
     client = _build_client(s, fake_ollama=_FakeOllamaClient())
     with client:
@@ -1683,7 +1687,9 @@ def test_expose_external_hides_upstream_models(reverse_settings):
 def test_expose_external_blocks_passthrough(reverse_settings):
     """A non-exposed upstream model gets 404 on /v1/messages passthrough."""
     data = reverse_settings.model_dump()
-    data["external_exposed_models"] = ["llama3.1@local"]
+    data["api_interfaces"][0]["exposed_models"] = [
+        {"model": "llama3.1", "target": "local"}
+    ]
     s = Settings(**data)
 
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
@@ -1704,12 +1710,18 @@ def test_expose_external_blocks_passthrough(reverse_settings):
 
 
 def test_expose_external_explicit_subset(reverse_settings):
-    """Only composite ids in external_exposed_models are visible."""
+    """Only composite ids in api_interface exposed_models are visible on /v1/*."""
     data = reverse_settings.model_dump()
-    data["upstreams"][0]["models"] = ["public-m", "private-m"]
-    data["external_exposed_models"] = ["public-m@default"]
-    data["internal_exposed_models"] = [
-        "public-m@default", "private-m@default", "llama3.1@local",
+    data["anthropic_upstreams"][0]["models"] = [
+        {"name": "public-m"}, {"name": "private-m"}
+    ]
+    data["api_interfaces"][0]["exposed_models"] = [
+        {"model": "public-m", "target": "default"}
+    ]
+    data["ollama_interfaces"][0]["exposed_models"] = [
+        {"model": "public-m", "target": "default"},
+        {"model": "private-m", "target": "default"},
+        {"model": "llama3.1", "target": "local"},
     ]
     s = Settings(**data)
     client = _build_client(s, fake_ollama=_FakeOllamaClient())

@@ -1,20 +1,12 @@
 {
-  "_": "fake-ollama configuration. Every model the proxy can route to has a globally-unique composite id 'model@target', where 'target' is the name of the upstream / target entry below. Clients must request models by their composite id; bare model names are rejected with 400. The two exposed-models lists at the bottom decide which composite ids are visible on each user-facing surface.",
+  "_": "fake-ollama configuration. Each model the proxy can route to has a composite source id 'display@source' where 'display' is the source-level alias (or name if no alias) and 'source' is the name of the upstream / target entry. Public ids are decided per-interface in 'exposed_models' (alias if set, otherwise 'model@target'). Clients must request models by their public id; bare model names are rejected with 400.",
 
-  "host": "127.0.0.1",
-  "port": 21434,
   "advertised_version": "0.6.4",
 
   "default_max_tokens": 4096,
   "timeout_seconds": 300.0,
   "use_system_proxy": false,
   "enforce_context_limit": true,
-
-  "external_host": "127.0.0.1",
-  "external_port": 21435,
-  "external_access_tokens": [
-    "tk-replace-me-with-a-long-random-string"
-  ],
 
   "admin_enabled": true,
   "admin_host": "127.0.0.1",
@@ -30,25 +22,26 @@
   "vram_low_free_reclaim_enabled": true,
   "vram_low_free_threshold_mib": 200.0,
 
-  "_model_sources": "==== Model sources (remote) ============================",
+  "_model_sources_remote": "==== Remote model sources ==============================",
 
-  "upstreams": [
+  "anthropic_upstreams": [
     {
       "name": "anthropic",
       "base_url": "https://api.anthropic.com",
       "auth_token": "sk-ant-...",
       "models": [
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022"
-      ],
-      "model_map": {}
+        {"name": "claude-3-5-sonnet-20241022"},
+        {"name": "claude-3-5-haiku-20241022"}
+      ]
     },
     {
       "name": "deepseek",
       "base_url": "https://api.deepseek.com/anthropic",
       "auth_token": "sk-deepseek-...",
-      "models": ["deepseek-chat", "deepseek-reasoner"],
-      "model_map": {}
+      "models": [
+        {"name": "deepseek-chat"},
+        {"name": "deepseek-reasoner", "alias": "deepseek-r1"}
+      ]
     }
   ],
 
@@ -57,21 +50,23 @@
       "name": "deepseek-openai",
       "base_url": "https://api.deepseek.com",
       "auth_token": "sk-deepseek-...",
-      "models": ["deepseek-chat", "deepseek-reasoner"],
-      "model_map": {}
+      "models": [
+        {"name": "deepseek-chat"},
+        {"name": "deepseek-reasoner"}
+      ]
     }
   ],
 
-  "_model_sources_local": "==== Model sources (local) =============================",
+  "_model_sources_ollama": "==== Ollama sources ====================================",
 
   "ollama_targets": [
     {
       "name": "local-ollama",
       "base_url": "http://127.0.0.1:11434",
-      "models": ["llama3.1", "qwen2.5-coder"],
-      "model_map": {
-        "llama3.1": "llama3.1:8b"
-      },
+      "models": [
+        {"name": "llama3.1:8b", "alias": "llama3.1"},
+        {"name": "qwen2.5-coder"}
+      ],
       "auto_start": false,
       "start_command": null,
       "stop_command": null,
@@ -81,6 +76,8 @@
       "cwd": null
     }
   ],
+
+  "_model_sources_llama_cpp": "==== llama.cpp sources =================================",
 
   "llama_cpp_defaults": {
     "auto_start": true,
@@ -107,7 +104,8 @@
       "base_url": "http://127.0.0.1:21436",
       "auth_token": "",
       "model": "qwen3.6-27b-hauhau-q2kp",
-      "model_alias": null,
+      "alias": null,
+      "upstream_id": null,
       "model_path": "I:\\Projects\\LLM_Models\\Qwen\\Qwen3.6-27B-Uncensored\\Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q2_K.gguf",
       "mmproj_path": null,
       "ctx_size": 60000,
@@ -117,7 +115,7 @@
     }
   ],
 
-  "_profiles": "==== Model profiles ==================================== Keys are looked up most-specific first: 'model@target' overrides bare 'model', which overrides the tagless base (e.g. 'foo' for 'foo:latest').",
+  "_profiles": "==== Model profiles ==================================== Keys looked up most-specific first: 'model@source' overrides bare 'model', which overrides the tagless base (e.g. 'foo' for 'foo:latest').",
 
   "model_profiles": {
     "claude-3-5-sonnet-20241022": {
@@ -157,20 +155,38 @@
     }
   },
 
-  "_exposed": "==== Per-surface model whitelists ====================== Each entry is a composite 'model@target' id. Empty list = nothing exposed on that surface. 'internal' = /api/* (Ollama-compatible); 'external' = /v1/messages, /v1/models, and /v1/chat/completions on the external listener.",
+  "_interfaces": "==== Interfaces ======================================== Each interface array entry is an independent listener (name/host/port/access_tokens/exposed_models). 'ollama_interfaces' = Ollama-compatible /api/* + /v1/chat/completions. 'api_interfaces' = Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/models. Each exposed_models entry is {model, target, alias?}; public id = alias if set, else 'model@target'.",
 
-  "internal_exposed_models": [
-    "claude-3-5-sonnet-20241022@anthropic",
-    "deepseek-chat@deepseek",
-    "deepseek-reasoner@deepseek",
-    "llama3.1@local-ollama",
-    "qwen2.5-coder@local-ollama",
-    "qwen3.6-27b-hauhau-q2kp@qwen3.6-27b-hauhau-q2kp"
+  "ollama_interfaces": [
+    {
+      "name": "ollama",
+      "host": "127.0.0.1",
+      "port": 21434,
+      "access_tokens": [],
+      "exposed_models": [
+        {"model": "claude-3-5-sonnet-20241022", "target": "anthropic"},
+        {"model": "deepseek-chat", "target": "deepseek"},
+        {"model": "deepseek-r1", "target": "deepseek"},
+        {"model": "llama3.1", "target": "local-ollama"},
+        {"model": "qwen2.5-coder", "target": "local-ollama"},
+        {"model": "qwen3.6-27b-hauhau-q2kp", "target": "qwen3.6-27b-hauhau-q2kp"}
+      ]
+    }
   ],
 
-  "external_exposed_models": [
-    "claude-3-5-sonnet-20241022@anthropic",
-    "deepseek-chat@deepseek",
-    "qwen3.6-27b-hauhau-q2kp@qwen3.6-27b-hauhau-q2kp"
+  "api_interfaces": [
+    {
+      "name": "api",
+      "host": "127.0.0.1",
+      "port": 21435,
+      "access_tokens": [
+        "tk-replace-me-with-a-long-random-string"
+      ],
+      "exposed_models": [
+        {"model": "claude-3-5-sonnet-20241022", "target": "anthropic", "alias": "claude-sonnet"},
+        {"model": "deepseek-chat", "target": "deepseek"},
+        {"model": "qwen3.6-27b-hauhau-q2kp", "target": "qwen3.6-27b-hauhau-q2kp"}
+      ]
+    }
   ]
 }

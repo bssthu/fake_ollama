@@ -34,7 +34,7 @@ def _make_client(settings, transport: httpx.MockTransport) -> TestClient:
             up.auth_token,
             client=httpx.AsyncClient(transport=transport),
         )
-        for up in settings.upstreams
+        for up in settings.anthropic_upstreams
     }
     return TestClient(app)
 
@@ -84,27 +84,32 @@ def test_version_endpoint(settings):
 
 def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
     settings = Settings(
-        upstreams=[
+        anthropic_upstreams=[
             {
                 "name": "default",
                 "base_url": "http://upstream.test",
                 "auth_token": "tok",
-                "models": ["claude-3-5-sonnet-20241022"],
+                "models": [{"name": "claude-3-5-sonnet-20241022"}],
             }
         ],
-        internal_exposed_models=["claude-3-5-sonnet-20241022@default"],
-        external_exposed_models=["claude-3-5-sonnet-20241022@default"],
-        external_host="127.0.0.1",
-        external_port=21435,
-        external_access_tokens=["rev-tk-1"],
+        ollama_interfaces=[
+            {"name": "ollama", "host": "127.0.0.1", "port": 21434,
+             "access_tokens": [],
+             "exposed_models": [{"model": "claude-3-5-sonnet-20241022", "target": "default"}]}
+        ],
+        api_interfaces=[
+            {"name": "api", "host": "127.0.0.1", "port": 21435,
+             "access_tokens": ["rev-tk-1"],
+             "exposed_models": [{"model": "claude-3-5-sonnet-20241022", "target": "default"}]}
+        ],
     )
     app = create_app(settings)
     caplog.set_level(logging.INFO, logger="fake_ollama")
 
-    with TestClient(app, base_url="http://testserver:21434") as internal:
-        assert internal.get("/api/version").status_code == 200
-    with TestClient(app, base_url="http://testserver:21435") as external:
-        assert external.get("/v1/models", headers={"x-api-key": "rev-tk-1"}).status_code == 200
+    with TestClient(app, base_url="http://testserver:21434") as ollama:
+        assert ollama.get("/api/version").status_code == 200
+    with TestClient(app, base_url="http://testserver:21435") as api:
+        assert api.get("/v1/models", headers={"x-api-key": "rev-tk-1"}).status_code == 200
     with TestClient(app, base_url="http://testserver:21433") as admin:
         assert admin.get("/admin/").status_code == 200
 
@@ -114,13 +119,13 @@ def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
         if record.name == "fake_ollama" and record.getMessage().startswith("access ")
     ]
     assert any(
-        "listener=internal" in message
+        "listener=ollama" in message
         and "surface=ollama" in message
         and "path=/api/version" in message
         for message in access_messages
     )
     assert any(
-        "listener=external" in message
+        "listener=api" in message
         and "surface=models" in message
         and "path=/v1/models" in message
         for message in access_messages
@@ -191,15 +196,19 @@ def test_chat_tagless_alias_uses_configured_tagged_model():
 
     settings = Settings(
         default_max_tokens=1024,
-        upstreams=[
+        anthropic_upstreams=[
             {
                 "name": "tagged",
                 "base_url": "http://upstream.test",
                 "auth_token": "test-token",
-                "models": ["qwen3.5-2b:latest"],
+                "models": [{"name": "qwen3.5-2b:latest"}],
             }
         ],
-        internal_exposed_models=["qwen3.5-2b@tagged", "qwen3.5-2b:latest@tagged"],
+        ollama_interfaces=[
+            {"name": "ollama", "port": 21434, "exposed_models": [
+                {"model": "qwen3.5-2b:latest", "target": "tagged"}
+            ]}
+        ],
     )
     captured: Dict[str, Any] = {}
 
@@ -548,16 +557,26 @@ def _profile_settings(monkeypatch=None):
     """Build Settings with two tiny custom profiles."""
     return Settings(
         default_max_tokens=64,
-        upstreams=[
+        anthropic_upstreams=[
             {
                 "name": "default",
                 "base_url": "http://upstream.test",
                 "auth_token": "test-token",
-                "models": ["tiny-model", "big-model"],
+                "models": [{"name": "tiny-model"}, {"name": "big-model"}],
             }
         ],
-        internal_exposed_models=["tiny-model@default", "big-model@default"],
-        external_exposed_models=["tiny-model@default", "big-model@default"],
+        ollama_interfaces=[
+            {"name": "ollama", "port": 21434, "exposed_models": [
+                {"model": "tiny-model", "target": "default"},
+                {"model": "big-model", "target": "default"},
+            ]}
+        ],
+        api_interfaces=[
+            {"name": "api", "port": 21435, "exposed_models": [
+                {"model": "tiny-model", "target": "default"},
+                {"model": "big-model", "target": "default"},
+            ]}
+        ],
         model_profiles={
             "tiny-model": {
                 "capabilities": ["completion"],
@@ -781,16 +800,24 @@ def _thinking_settings(monkeypatch=None, *, mode="enabled", show=True, enforce_c
     return Settings(
         default_max_tokens=256,
         enforce_context_limit=enforce_context_limit,
-        upstreams=[
+        anthropic_upstreams=[
             {
                 "name": "default",
                 "base_url": "http://upstream.test",
                 "auth_token": "test-token",
-                "models": ["deepseek-v4-pro"],
+                "models": [{"name": "deepseek-v4-pro"}],
             }
         ],
-        internal_exposed_models=["deepseek-v4-pro@default"],
-        external_exposed_models=["deepseek-v4-pro@default"],
+        ollama_interfaces=[
+            {"name": "ollama", "port": 21434, "exposed_models": [
+                {"model": "deepseek-v4-pro", "target": "default"}
+            ]}
+        ],
+        api_interfaces=[
+            {"name": "api", "port": 21435, "exposed_models": [
+                {"model": "deepseek-v4-pro", "target": "default"}
+            ]}
+        ],
         model_profiles={
             "deepseek-v4-pro": {
                 "capabilities": ["completion", "tools"],

@@ -599,7 +599,7 @@ def test_synthesize_start_command_builds_full_command():
         gpu_layers=99,
         ctx_size=8192,
         parallel=4,
-        model_alias="qa",
+        upstream_id="qa",
         auth_token="secret",
         extra_args="--jinja",
     )

@@ -22,14 +22,15 @@ from fake_ollama.dashboard import (
 
 def _settings(path: Path, *, retention_seconds: float = 3600.0) -> Settings:
     return Settings(
-        upstreams=[
+        anthropic_upstreams=[
             {
                 "name": "u",
                 "base_url": "http://upstream.test",
                 "auth_token": "tok",
-                "models": ["m"],
+                "models": [{"name": "m"}],
             }
         ],
+        ollama_interfaces=[],
         dashboard_data_path=str(path),
         dashboard_retention_seconds=retention_seconds,
         dashboard_sample_interval_seconds=10.0,

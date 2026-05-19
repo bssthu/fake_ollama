@@ -68,8 +68,6 @@ def main() -> None:
         default=None,
         help="path to config.json (default: $FAKE_OLLAMA_CONFIG or ./config.json)",
     )
-    parser.add_argument("--host", default=None, help="internal bind host (default from config)")
-    parser.add_argument("--port", type=int, default=None, help="internal bind port (default from config)")
     parser.add_argument("--admin-host", default=None, help="admin bind host (default from config)")
     parser.add_argument("--admin-port", type=int, default=None, help="admin bind port (default from config)")
     parser.add_argument("--dashboard-host", default=None, help="dashboard bind host (default from config)")
@@ -122,10 +120,6 @@ def main() -> None:
     )
 
     updates = {}
-    if args.host is not None:
-        updates["host"] = args.host
-    if args.port is not None:
-        updates["port"] = args.port
     if args.admin_host is not None:
         updates["admin_host"] = args.admin_host
     if args.admin_port is not None:
@@ -139,60 +133,34 @@ def main() -> None:
         data.update(updates)
         settings = type(settings)(**data)
 
-    host = settings.host
-    port = settings.port
-
     app = create_app(settings)
 
-    # Internal listener: /api/* (+ /v1/* if no external listener).
-    internal_cfg = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        log_level=args.log_level,
-        log_config=None,
-        access_log=False,
-    )
+    configs: list[tuple[str, str, int, uvicorn.Config]] = []
 
-    configs = [("internal", host, port, internal_cfg)]
-    if settings.external_listener_enabled:
-        ext_host = settings.external_host or "127.0.0.1"
-        ext_port = int(settings.external_port)  # type: ignore[arg-type]
-        external_cfg = uvicorn.Config(
+    def _add(label: str, host: str, port: int) -> None:
+        cfg = uvicorn.Config(
             app,
-            host=ext_host,
-            port=ext_port,
+            host=host,
+            port=port,
             log_level=args.log_level,
             log_config=None,
             access_log=False,
         )
-        configs.append(("external", ext_host, ext_port, external_cfg))
+        configs.append((label, host, port, cfg))
+
+    for it in settings.ollama_interfaces:
+        _add(f"ollama:{it.name}", it.host, it.port)
+    for it in settings.api_interfaces:
+        _add(f"api:{it.name}", it.host, it.port)
     if settings.admin_listener_enabled:
-        admin_cfg = uvicorn.Config(
-            app,
-            host=settings.admin_host,
-            port=int(settings.admin_port),  # type: ignore[arg-type]
-            log_level=args.log_level,
-            log_config=None,
-            access_log=False,
-        )
-        configs.append(("admin", settings.admin_host, int(settings.admin_port), admin_cfg))
+        _add("admin", settings.admin_host, int(settings.admin_port))  # type: ignore[arg-type]
     if settings.dashboard_listener_enabled:
-        dashboard_cfg = uvicorn.Config(
-            app,
-            host=settings.dashboard_host,
-            port=int(settings.dashboard_port),  # type: ignore[arg-type]
-            log_level=args.log_level,
-            log_config=None,
-            access_log=False,
-        )
-        configs.append(
-            (
-                "dashboard",
-                settings.dashboard_host,
-                int(settings.dashboard_port),  # type: ignore[arg-type]
-                dashboard_cfg,
-            )
+        _add("dashboard", settings.dashboard_host, int(settings.dashboard_port))  # type: ignore[arg-type]
+
+    if not configs:
+        raise SystemExit(
+            "no listeners configured: define at least one entry in "
+            "ollama_interfaces or api_interfaces"
         )
 
     logger.info(

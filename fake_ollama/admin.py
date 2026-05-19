@@ -49,44 +49,49 @@ from .ollama_client import OllamaClient
 # - ``secret`` fields render as <input type=password>.
 # - ``object_list`` / ``object_map`` carry an ``item_schema`` for inner fields.
 
+MODEL_ENTRY_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "name", "type": "string", "default": "", "required": True,
+     "autocomplete": "model_names",
+     "description": "上游侧的真实模型名/ID。一个 source 内允许同名出现多次（需为每条指定不同的 alias）"},
+    {"key": "alias", "type": "string", "default": None,
+     "description": "可选：对外公开的别名。填了则接口层以 alias 为 public id；未填则以 name 为 public id。不能含 '@'"},
+]
+
 UPSTREAM_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "name", "type": "string", "default": "", "required": True,
-     "description": "唯一名字（routing key）"},
+     "description": "唯一名字（routing key）。不能含 '@'"},
     {"key": "base_url", "type": "string", "default": "", "required": True,
      "description": "Anthropic 兼容上游 base URL，例如 https://api.anthropic.com"},
     {"key": "auth_token", "type": "string", "default": "", "secret": True,
-     "description": "上游 API token；建议放 .env 而非提交到仓库"},
-    {"key": "models", "type": "string_list", "default": [],
-     "autocomplete": "model_names",
-     "description": "该 upstream 提供的模型显示名（一行一个）。是否暴露由顶层 internal_exposed_models / external_exposed_models 决定（按 model@target 复合 id）"},
-    {"key": "model_map", "type": "string_map", "default": {},
-     "description": "可选：显示名 → 上游真实模型 ID"},
+     "description": "上游 API token。建议放 .env 而非提交到仓库"},
+    {"key": "models", "type": "object_list", "default": [],
+     "item_schema": MODEL_ENTRY_ITEM_SCHEMA,
+     "nav_label_keys": ["alias", "name"],
+     "description": "该 upstream 提供的模型列表。是否被外露取决于哪个 interface 的 exposed_models 包含它。复合 source id = alias_or_name@source_name"},
 ]
 
 OPENAI_UPSTREAM_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "name", "type": "string", "default": "", "required": True,
-     "description": "唯一名字（routing key）；不可与 Anthropic upstreams 同名"},
+     "description": "唯一名字（routing key）。不可与其它 source 同名，且不能含 '@'"},
     {"key": "base_url", "type": "string", "default": "", "required": True,
      "description": "OpenAI 兼容上游 base URL，例如 https://api.openai.com 或 https://api.deepseek.com"},
     {"key": "auth_token", "type": "string", "default": "", "secret": True,
      "description": "上游 API token；同时以 Authorization: Bearer 与 x-api-key 发出，兼容大多数网关"},
-    {"key": "models", "type": "string_list", "default": [],
-     "autocomplete": "model_names",
-     "description": "该 OpenAI upstream 提供的模型显示名（一行一个）。是否暴露由顶层 internal_exposed_models / external_exposed_models 决定（按 model@target 复合 id）"},
-    {"key": "model_map", "type": "string_map", "default": {},
-     "description": "可选：显示名 → 上游真实模型 ID（如 gpt-4o → gpt-4o-2024-08-06）"},
+    {"key": "models", "type": "object_list", "default": [],
+     "item_schema": MODEL_ENTRY_ITEM_SCHEMA,
+     "nav_label_keys": ["alias", "name"],
+     "description": "该 OpenAI upstream 提供的模型列表。复合 source id = alias_or_name@source_name"},
 ]
 
 OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "name", "type": "string", "default": "", "required": True,
-     "description": "唯一名字"},
+     "description": "唯一名字。不能含 '@'"},
     {"key": "base_url", "type": "string", "default": "http://127.0.0.1:11434",
      "description": "本机 Ollama 服务 URL"},
-    {"key": "models", "type": "string_list", "default": [],
-     "autocomplete": "model_names",
-     "description": "该本机 Ollama target 可服务的模型显示名（一行一个）。是否暴露由顶层 internal_exposed_models / external_exposed_models 决定（按 model@target 复合 id）"},
-    {"key": "model_map", "type": "string_map", "default": {},
-     "description": "可选：显示名 → Ollama 模型 ID（如 llama3.1 → llama3.1:8b）"},
+    {"key": "models", "type": "object_list", "default": [],
+     "item_schema": MODEL_ENTRY_ITEM_SCHEMA,
+     "nav_label_keys": ["alias", "name"],
+     "description": "该本机 Ollama target 可服务的模型列表。复合 source id = alias_or_name@source_name"},
     {"key": "auto_start", "type": "bool", "default": False,
      "description": "请求到来且 health 检查失败时，是否执行 start_command 启动 Ollama daemon"},
     {"key": "start_command", "type": "string", "default": None,
@@ -112,9 +117,11 @@ LLAMA_CPP_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选：llama.cpp --api-key；fake-ollama 调用该 target 时会带上 Bearer / x-api-key"},
     {"key": "model", "type": "string", "default": "", "required": True,
      "autocomplete": "model_names",
-      "description": "该 llama.cpp target 可服务的唯一模型显示名；一个 target = 一个模型进程。是否暴露由顶层 internal_exposed_models / external_exposed_models 决定"},
-    {"key": "model_alias", "type": "string", "default": None,
-     "description": "可选：发送给 llama.cpp 的真实 OpenAI model / --alias。不填则使用 model"},
+      "description": "该 llama.cpp target 服务的唯一模型显示名；一个 target = 一个模型进程。不能含 '@'"},
+    {"key": "alias", "type": "string", "default": None,
+     "description": "可选：对外公开的别名；填了以 alias 作为 public id。不能含 '@'"},
+    {"key": "upstream_id", "type": "string", "default": None,
+     "description": "可选：发送给 llama.cpp 的真实 OpenAI model / --alias。不填则使用 model 字段"},
     {"key": "auto_start", "type": "bool", "default": None,
      "description": "可选覆盖全局 llama_cpp_defaults.auto_start；请求到来且 health 检查失败时，是否执行 start_command 启动 llama.cpp"},
     {"key": "start_command", "type": "string", "default": None,
@@ -210,9 +217,37 @@ MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "是否把上游 thinking 透传给客户端（<think> 块）"},
 ]
 
+EXPOSURE_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "model", "type": "string", "default": "", "required": True,
+     "autocomplete": "model_names",
+     "description": "source 中某个模型的公开名（alias 或 name）"},
+    {"key": "target", "type": "string", "default": "", "required": True,
+     "description": "提供该模型的 source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets 中的某个 name）"},
+    {"key": "alias", "type": "string", "default": None,
+     "description": "可选：该接口上对外公开的 public id。不填则默认为 'model@target'。同一接口内 alias 不可重复"},
+]
+
+OLLAMA_INTERFACE_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "name", "type": "string", "default": "", "required": True,
+     "description": "interface 唯一名字"},
+    {"key": "host", "type": "string", "default": "127.0.0.1",
+     "description": "监听地址。建议保持 127.0.0.1；需要外部访问请配合 Nginx 等反代"},
+    {"key": "port", "type": "int", "default": 21434, "required": True,
+     "description": "监听端口；所有 interface/admin/dashboard 不可冲突"},
+    {"key": "access_tokens", "type": "string_list", "default": [],
+     "secret_each": True, "generate_each": True,
+     "description": "该 interface 的访问 token 池。留空 = 不需要鉴权"},
+    {"key": "exposed_models", "type": "object_list", "default": [],
+     "item_schema": EXPOSURE_ITEM_SCHEMA,
+     "nav_label_keys": ["alias", "model"],
+     "description": "该 interface 外露的模型。需明确填写 model + target；可选 alias 改变公开 id"},
+]
+
+API_INTERFACE_ITEM_SCHEMA: List[Dict[str, Any]] = OLLAMA_INTERFACE_ITEM_SCHEMA
+
 CONFIG_SCHEMA: List[Dict[str, Any]] = [
   # ---- Model sources (远端 + 本机) -----------------------------------------
-  {"key": "upstreams", "type": "object_list", "default": [], "group": "model_sources_remote",
+  {"key": "anthropic_upstreams", "type": "object_list", "default": [], "group": "model_sources_remote",
    "item_schema": UPSTREAM_ITEM_SCHEMA,
    "detect_models": "anthropic",
    "nav_label_keys": ["name"],
@@ -224,41 +259,35 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "nav_label_keys": ["name"],
    "description": "OpenAI 兼容远端上游（OpenAI / DeepSeek / Together / Groq 等）"},
 
-  {"key": "ollama_targets", "type": "object_list", "default": [], "group": "model_sources_local",
+  {"key": "ollama_targets", "type": "object_list", "default": [], "group": "model_sources_ollama",
    "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
    "detect_models": "ollama",
    "nav_label_keys": ["name"],
    "description": "本机或远端 Ollama 服务"},
-  {"key": "llama_cpp_defaults", "type": "object", "default": {}, "group": "model_sources_local",
+  {"key": "llama_cpp_defaults", "type": "object", "default": {}, "group": "model_sources_llama_cpp",
    "item_schema": LLAMA_CPP_DEFAULTS_SCHEMA,
    "nav_label": "Defaults",
    "description": "llama.cpp targets 的全局默认值；每个 target 勾选同名字段后可覆盖"},
-  {"key": "llama_cpp_targets", "type": "object_list", "default": [], "group": "model_sources_local",
+  {"key": "llama_cpp_targets", "type": "object_list", "default": [], "group": "model_sources_llama_cpp",
    "item_schema": LLAMA_CPP_TARGET_ITEM_SCHEMA,
    "detect_models": "llama_cpp",
    "nav_label_keys": ["name", "model"],
     "description": "llama.cpp server（OpenAI 兼容）；一个 target = 一个模型 / 进程 / 端口"},
 
-  # ---- Interface: internal (Ollama 兼容入口 + OpenAI 内部入口) -------------
-  {"key": "host", "type": "string", "default": "127.0.0.1", "group": "interface_internal",
-   "description": "内部监听地址（Ollama 兼容 /api/* 与 /v1/*）。生产环境请保持 127.0.0.1"},
-  {"key": "port", "type": "int", "default": 21434, "group": "interface_internal",
-   "description": "内部监听端口"},
-  {"key": "advertised_version", "type": "string", "default": "0.6.4", "group": "interface_internal",
-   "description": "仅用于 Ollama 兼容入口的 GET /api/version 返回值"},
-  {"key": "internal_exposed_models", "type": "string_list", "default": [], "group": "interface_internal",
-   "description": "内部接口允许访问的模型复合 id 白名单（格式：model@target）。默认空 = 全部隐藏；必须显式列出才会被 /api/tags 与内部 /v1/models 看到"},
+  # ---- Interfaces ---------------------------------------------------------
+  {"key": "advertised_version", "type": "string", "default": "0.6.4", "group": "interface_ollama",
+   "description": "仅用于 Ollama 接口的 GET /api/version 返回值"},
+  {"key": "ollama_interfaces", "type": "object_list",
+   "default": [{"name": "ollama", "host": "127.0.0.1", "port": 21434, "access_tokens": [], "exposed_models": []}],
+   "group": "interface_ollama",
+   "item_schema": OLLAMA_INTERFACE_ITEM_SCHEMA,
+   "nav_label_keys": ["name"],
+   "description": "Ollama 兼容接口数组。每个 entry 独立的 host/port/access_tokens/exposed_models。服务 /api/* 与 /v1/chat/completions"},
 
-  # ---- Interface: external (对外 Anthropic / OpenAI 兼容) -----------------
-  {"key": "external_host", "type": "string", "default": None, "group": "interface_external",
-   "description": "对外服务监听地址。填 127.0.0.1 仅本机（推荐 + Nginx）；填 0.0.0.0 直接对外。不填则不启用独立对外端口"},
-  {"key": "external_port", "type": "int", "default": None, "group": "interface_external",
-   "description": "对外服务监听端口。填了才会启用独立端口"},
-  {"key": "external_access_tokens", "type": "string_list", "default": [], "group": "interface_external",
-   "secret_each": True, "generate_each": True,
-   "description": "对外 /v1/* 访问 token 池"},
-  {"key": "external_exposed_models", "type": "string_list", "default": [], "group": "interface_external",
-   "description": "对外接口允许访问的模型复合 id 白名单（格式：model@target）。默认空 = 全部隐藏；必须显式列出才会被对外 /v1/models、/v1/messages、/v1/chat/completions 接受"},
+  {"key": "api_interfaces", "type": "object_list", "default": [], "group": "interface_api",
+   "item_schema": API_INTERFACE_ITEM_SCHEMA,
+   "nav_label_keys": ["name"],
+   "description": "API 接口数组（Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/models）。每个 entry 独立的 host/port/access_tokens/exposed_models"},
 
   # ---- Runtime & profiles --------------------------------------------------
   {"key": "default_max_tokens", "type": "int", "default": 4096, "group": "runtime",
@@ -304,9 +333,10 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
 
 GROUP_LABELS: List[Dict[str, str]] = [
   {"key": "model_sources_remote", "label": "Remote Sources", "hint": "远端模型来源：Anthropic / OpenAI 兼容上游", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的所有模型来源（target / API）"},
-  {"key": "model_sources_local", "label": "Local Sources", "hint": "本机模型来源：Ollama 服务、llama.cpp 进程", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的所有模型来源（target / API）"},
-  {"key": "interface_internal", "label": "Internal Interface", "hint": "内部接口（Ollama 兼容 /api/* 与内部 /v1/*）；通过 internal_exposed_models 显式暴露具体的 model@target", "section": "interfaces", "section_label": "Interfaces", "section_hint": "对用户暴露的接口；分别选择暴露哪些 model@target"},
-  {"key": "interface_external", "label": "External Interface", "hint": "对外接口（Anthropic /v1/messages + OpenAI /v1/chat/completions）；通过 external_exposed_models 显式暴露具体的 model@target", "section": "interfaces", "section_label": "Interfaces", "section_hint": "对用户暴露的接口；分别选择暴露哪些 model@target"},
+  {"key": "model_sources_ollama", "label": "Ollama Sources", "hint": "本机或远端 Ollama 服务", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的所有模型来源（target / API）"},
+  {"key": "model_sources_llama_cpp", "label": "llama.cpp Sources", "hint": "本机 llama.cpp server 进程", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的所有模型来源（target / API）"},
+  {"key": "interface_ollama", "label": "Ollama Interface", "hint": "Ollama 兼容接口（/api/* 与 /v1/chat/completions）。每个 entry 各自选择暴露哪些模型", "section": "interfaces", "section_label": "Interfaces", "section_hint": "对用户暴露的接口；每个 entry 都是独立的 host/port/access_tokens/exposed_models"},
+  {"key": "interface_api", "label": "API Interface", "hint": "Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/models。每个 entry 各自选择暴露哪些模型", "section": "interfaces", "section_label": "Interfaces", "section_hint": "对用户暴露的接口；每个 entry 都是独立的 host/port/access_tokens/exposed_models"},
   {"key": "runtime", "label": "Runtime & Profiles", "hint": "运行时缺省值、出站网络与每模型 capability/thinking profile", "section": "runtime", "section_label": "Runtime", "section_hint": "跨所有 target / 接口共享的运行时设置"},
   {"key": "dashboard", "label": "Dashboard", "hint": "Runtime graphs and the low-VRAM safety monitor", "section": "dashboard", "section_label": "Dashboard", "section_hint": "Memory, VRAM, and loaded local model telemetry"},
   {"key": "admin", "label": "Admin UI", "hint": "配置页面自身的开关与监听地址（无内置鉴权）", "section": "admin", "section_label": "Admin UI", "section_hint": "仅影响 /admin 配置页面本身"},
@@ -1016,12 +1046,21 @@ function collectKnownModelNames() {
     const arr = renderer.read();
     if (!Array.isArray(arr)) return;
     for (const item of arr) {
-      if (item && Array.isArray(item.models)) for (const n of item.models) if (n) out.add(n);
+      if (item && Array.isArray(item.models)) {
+        for (const m of item.models) {
+          if (typeof m === 'string') { if (m) out.add(m); }
+          else if (m && typeof m === 'object') {
+            if (m.name) out.add(m.name);
+            if (m.alias) out.add(m.alias);
+          }
+        }
+      }
       if (item && item.model) out.add(item.model);
+      if (item && item.alias) out.add(item.alias);
     }
   }
   for (const {field, r} of topRenderers) {
-    if (field.key === 'upstreams' || field.key === 'ollama_targets' || field.key === 'llama_cpp_targets') walkList(r);
+    if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams' || field.key === 'ollama_targets' || field.key === 'llama_cpp_targets') walkList(r);
     if (field.key === 'model_profiles' && r && typeof r.read === 'function') {
       const m = r.read();
       if (m && typeof m === 'object') for (const k of Object.keys(m)) if (k) out.add(k);
@@ -1516,8 +1555,8 @@ def _settings_to_dict(s: Settings) -> Dict[str, Any]:
         if not isinstance(target, dict):
             continue
         for key in [
-            "model_alias",
-            "expose_external",
+            "upstream_id",
+            "alias",
             "auto_start",
             "start_command",
             "stop_command",
@@ -1607,7 +1646,7 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     vram_coordinator = getattr(app.state, "vram_coordinator", None)
 
     new_clients: Dict[str, AnthropicClient] = {}
-    for up in new_settings.upstreams:
+    for up in new_settings.anthropic_upstreams:
         new_clients[up.name] = AnthropicClient(
             up.base_url,
             up.auth_token,
