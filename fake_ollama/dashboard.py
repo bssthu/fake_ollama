@@ -833,13 +833,14 @@ function renderTable(models) {
       <td>${escapeHtml(m.target_id)}</td>
       <td>${fmtGiB(m.estimated_vram_mib)}</td>
       <td>${m.active_requests || 0}</td>
+      <td>${m.queued_requests || 0}</td>
       <td>${fmtAge(m.idle_seconds)}</td>
       <td>${m.reclaimable ? 'yes' : 'no'}</td>
       <td class="action"><button type="button" class="icon danger" data-reclaim-key="${escapeHtml(m.key)}" title="${escapeHtml(title)}"${disabled}>X</button></td>
     </tr>`;
   }).join('');
   $('modelTable').innerHTML = `<table>
-    <thead><tr><th>Model</th><th>Backend</th><th>Target</th><th>Est. VRAM</th><th>Active</th><th>Idle</th><th>Reclaimable</th><th>Action</th></tr></thead>
+    <thead><tr><th>Model</th><th>Backend</th><th>Target</th><th>Est. VRAM</th><th>Active</th><th>Queued</th><th>Idle</th><th>Reclaimable</th><th>Action</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
   for (const btn of $('modelTable').querySelectorAll('button[data-reclaim-key]')) {

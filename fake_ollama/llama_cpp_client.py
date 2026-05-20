@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Optional
 
@@ -61,11 +62,15 @@ class LlamaCppClient:
         target_name: str = "llama.cpp",
         vram_coordinator: Optional[VramCoordinator] = None,
         client: Optional[httpx.AsyncClient] = None,
+        max_concurrent_requests: Optional[int] = None,
+        request_read_timeout_seconds: Optional[float] = None,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._auth_token = auth_token
         self._timeout = timeout
         self._trust_env = trust_env
+        self._request_read_timeout_seconds = request_read_timeout_seconds
+        self._max_concurrent_requests = max_concurrent_requests
         self._auto_start = auto_start
         # Prefer argv (exec) over a shell string when both are provided:
         # exec captures the actual server PID instead of a cmd.exe wrapper,
@@ -80,8 +85,40 @@ class LlamaCppClient:
         self._launch_env = launch_env
         self.target_id = f"llama.cpp:{target_name}"
         self._vram_coordinator = vram_coordinator
-        self._client = client or httpx.AsyncClient(timeout=timeout, trust_env=trust_env)
-        self._owns_client = client is None
+        if client is not None:
+            self._client = client
+            self._owns_client = False
+        else:
+            # Allow caller to override only the upstream *read* timeout, so a
+            # request that is queued behind other in-flight requests on a
+            # single-slot llama.cpp server does not get killed by httpx's
+            # default 5-tuple timeout. A negative or zero value disables the
+            # read timeout entirely (httpx None == no timeout).
+            if request_read_timeout_seconds is None:
+                httpx_timeout: httpx.Timeout = httpx.Timeout(timeout)
+            else:
+                read_t = (
+                    None
+                    if request_read_timeout_seconds <= 0
+                    else float(request_read_timeout_seconds)
+                )
+                httpx_timeout = httpx.Timeout(timeout, read=read_t)
+            self._client = httpx.AsyncClient(
+                timeout=httpx_timeout, trust_env=trust_env
+            )
+            self._owns_client = True
+        # Local concurrency gate: when the upstream llama.cpp server only has
+        # a small number of decoding slots (typically ``--parallel N``), we
+        # serialise extra requests in fake_ollama instead of letting them all
+        # pile up on the upstream TCP socket where they would otherwise time
+        # out. ``None`` keeps the original unbounded behaviour.
+        if max_concurrent_requests is not None and max_concurrent_requests > 0:
+            self._request_semaphore: Optional[asyncio.Semaphore] = asyncio.Semaphore(
+                max_concurrent_requests
+            )
+        else:
+            self._request_semaphore = None
+        self._queued = 0
         self._process: Optional[asyncio.subprocess.Process] = None
         self._started_by_us = False
         self._start_lock = asyncio.Lock()
@@ -90,6 +127,13 @@ class LlamaCppClient:
         self._last_used = time.monotonic()
         self._loaded_model: Optional[_LoadedModel] = None
         self._shutdown_requested = False
+        # Set when ``begin_shutdown`` is called so every request currently
+        # blocked in ``_concurrency_slot`` wakes up at once and bails out,
+        # instead of draining the queue one-by-one as the active request
+        # finishes (or the upstream is killed and each next slot owner has
+        # to discover the connection error). Lazily created on first use so
+        # we don't bind to a loop at __init__ time.
+        self._shutdown_event: Optional[asyncio.Event] = None
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
 
@@ -102,8 +146,136 @@ class LlamaCppClient:
         return self._active
 
     @property
+    def queued_requests(self) -> int:
+        return self._queued
+
+    @property
     def last_used_monotonic(self) -> float:
         return self._last_used
+
+    def _get_shutdown_event(self) -> asyncio.Event:
+        ev = self._shutdown_event
+        if ev is None:
+            ev = asyncio.Event()
+            if self._shutdown_requested:
+                ev.set()
+            self._shutdown_event = ev
+        return ev
+
+    @asynccontextmanager
+    async def _concurrency_slot(self):
+        sem = self._request_semaphore
+        if sem is None:
+            if self._shutdown_requested:
+                raise asyncio.CancelledError(
+                    f"{self.target_id} shutting down"
+                )
+            yield
+            return
+        if self._shutdown_requested:
+            raise asyncio.CancelledError(
+                f"{self.target_id} shutting down"
+            )
+        # Fast path: if a slot is immediately available, don't bother logging
+        # — this is the common case under low load and we want zero noise.
+        if sem.locked() or self._queued > 0:
+            logger.info(
+                "[%s] queueing request (active=%d queued=%d -> %d, cap=%d)",
+                self.target_id,
+                self._active,
+                self._queued,
+                self._queued + 1,
+                self._max_concurrent_requests or 0,
+            )
+            queued_log = True
+        else:
+            queued_log = False
+        self._queued += 1
+        t0 = time.monotonic()
+        shutdown_event = self._get_shutdown_event()
+        acquire_task = asyncio.ensure_future(sem.acquire())
+        shutdown_task = asyncio.ensure_future(shutdown_event.wait())
+        try:
+            try:
+                done, _pending = await asyncio.wait(
+                    {acquire_task, shutdown_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except BaseException:
+                acquire_task.cancel()
+                shutdown_task.cancel()
+                self._queued -= 1
+                if queued_log:
+                    logger.info(
+                        "[%s] queue exit (cancelled before slot, waited=%.2fs, queued=%d)",
+                        self.target_id,
+                        time.monotonic() - t0,
+                        self._queued,
+                    )
+                raise
+            if acquire_task in done and not acquire_task.cancelled():
+                # We won the race. If shutdown also fired we still hand the
+                # slot back immediately — no point starting new upstream work.
+                shutdown_task.cancel()
+                if shutdown_event.is_set():
+                    sem.release()
+                    self._queued -= 1
+                    if queued_log:
+                        logger.info(
+                            "[%s] queue exit (shutdown after slot, waited=%.2fs, queued=%d)",
+                            self.target_id,
+                            time.monotonic() - t0,
+                            self._queued,
+                        )
+                    raise asyncio.CancelledError(
+                        f"{self.target_id} shutting down"
+                    )
+            else:
+                # shutdown won. Cancel the pending acquire; if it already
+                # acquired between wait() returning and us cancelling, give
+                # the slot back so the next waiter (also being cancelled)
+                # doesn't get blocked.
+                if acquire_task.cancel() is False and not acquire_task.cancelled():
+                    try:
+                        await acquire_task
+                    except BaseException:
+                        pass
+                    else:
+                        sem.release()
+                self._queued -= 1
+                if queued_log:
+                    logger.info(
+                        "[%s] queue exit (shutdown, waited=%.2fs, queued=%d)",
+                        self.target_id,
+                        time.monotonic() - t0,
+                        self._queued,
+                    )
+                raise asyncio.CancelledError(
+                    f"{self.target_id} shutting down"
+                )
+        finally:
+            if not shutdown_task.done():
+                shutdown_task.cancel()
+        self._queued -= 1
+        if queued_log:
+            logger.info(
+                "[%s] slot acquired (waited=%.2fs, active=%d queued=%d)",
+                self.target_id,
+                time.monotonic() - t0,
+                self._active + 1,
+                self._queued,
+            )
+        try:
+            yield
+        finally:
+            sem.release()
+            if queued_log:
+                logger.info(
+                    "[%s] slot released (active=%d queued=%d)",
+                    self.target_id,
+                    self._active,
+                    self._queued,
+                )
 
     def has_vram_reservation(self, model: str) -> bool:
         return self._loaded_model is not None
@@ -145,8 +317,16 @@ class LlamaCppClient:
             return []
         now = time.monotonic() if now is None else now
         loaded = self._loaded_model
-        idle_seconds = max(0.0, now - loaded.last_used_monotonic)
-        in_flight = bool(self._active or self._request_refs)
+        # ``last_used_monotonic`` is only refreshed when a request *finishes*
+        # (via ``_touch_vram_reservation``). For long-running streams or while
+        # requests sit in the local queue the model is obviously not idle, so
+        # we report 0 idle whenever there is any in-flight or queued work —
+        # otherwise the dashboard misleadingly shows a busy model as idle.
+        in_flight = bool(self._active or self._request_refs or self._queued)
+        if in_flight:
+            idle_seconds = 0.0
+        else:
+            idle_seconds = max(0.0, now - loaded.last_used_monotonic)
         can_stop = bool(self._started_by_us or self._stop_command)
         return [
             {
@@ -156,6 +336,7 @@ class LlamaCppClient:
                 "estimated_vram_gb": loaded.estimated_vram_gb,
                 "estimated_vram_mib": loaded.estimated_vram_gb * 1024.0,
                 "active_requests": self._active,
+                "queued_requests": self._queued,
                 "request_refs": self._request_refs,
                 "idle_seconds": idle_seconds,
                 "reclaimable": (
@@ -165,7 +346,19 @@ class LlamaCppClient:
         ]
 
     def begin_shutdown(self) -> None:
+        if self._shutdown_requested:
+            return
         self._shutdown_requested = True
+        queued_before = self._queued
+        ev = self._shutdown_event
+        if ev is not None:
+            ev.set()
+        if queued_before:
+            logger.info(
+                "[%s] shutdown requested; releasing %d queued request(s) at once",
+                self.target_id,
+                queued_before,
+            )
 
     def _headers(self, *, stream: bool = False) -> Dict[str, str]:
         headers = {"content-type": "application/json"}
@@ -325,75 +518,76 @@ class LlamaCppClient:
             except BaseException:
                 self._discard_vram_pending(model)
                 raise
-            self._active += 1
-            try:
+            async with self._concurrency_slot():
+                self._active += 1
                 try:
-                    url = f"{self._base}/v1/chat/completions"
-                    headers = self._headers()
-                    if request_data_logging_enabled():
+                    try:
+                        url = f"{self._base}/v1/chat/completions"
+                        headers = self._headers()
+                        if request_data_logging_enabled():
+                            log_data_event(
+                                "backend_request",
+                                backend="llama.cpp",
+                                target_id=self.target_id,
+                                operation="chat",
+                                method="POST",
+                                url=url,
+                                headers=headers_from_mapping(headers),
+                                body=body_from_json(body),
+                            )
+                        resp = await self._client.post(
+                            url,
+                            json=body,
+                            headers=headers,
+                        )
+                        await resp.aread()
+                        if request_data_logging_enabled():
+                            log_data_event(
+                                "backend_response_start",
+                                backend="llama.cpp",
+                                target_id=self.target_id,
+                                operation="chat",
+                                method="POST",
+                                url=url,
+                                status=resp.status_code,
+                                headers=headers_from_mapping(dict(resp.headers)),
+                            )
+                            log_data_event(
+                                "backend_response_body",
+                                backend="llama.cpp",
+                                target_id=self.target_id,
+                                operation="chat",
+                                method="POST",
+                                url=url,
+                                body=body_from_bytes(resp.content),
+                            )
+                            log_data_event(
+                                "backend_response_end",
+                                backend="llama.cpp",
+                                target_id=self.target_id,
+                                operation="chat",
+                                method="POST",
+                                url=url,
+                                status=resp.status_code,
+                                response_bytes=len(resp.content),
+                            )
+                        resp.raise_for_status()
+                    except BaseException as exc:
                         log_data_event(
-                            "backend_request",
+                            "backend_error",
                             backend="llama.cpp",
                             target_id=self.target_id,
                             operation="chat",
                             method="POST",
-                            url=url,
-                            headers=headers_from_mapping(headers),
-                            body=body_from_json(body),
+                            url=f"{self._base}/v1/chat/completions",
+                            error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
                         )
-                    resp = await self._client.post(
-                        url,
-                        json=body,
-                        headers=headers,
-                    )
-                    await resp.aread()
-                    if request_data_logging_enabled():
-                        log_data_event(
-                            "backend_response_start",
-                            backend="llama.cpp",
-                            target_id=self.target_id,
-                            operation="chat",
-                            method="POST",
-                            url=url,
-                            status=resp.status_code,
-                            headers=headers_from_mapping(dict(resp.headers)),
-                        )
-                        log_data_event(
-                            "backend_response_body",
-                            backend="llama.cpp",
-                            target_id=self.target_id,
-                            operation="chat",
-                            method="POST",
-                            url=url,
-                            body=body_from_bytes(resp.content),
-                        )
-                        log_data_event(
-                            "backend_response_end",
-                            backend="llama.cpp",
-                            target_id=self.target_id,
-                            operation="chat",
-                            method="POST",
-                            url=url,
-                            status=resp.status_code,
-                            response_bytes=len(resp.content),
-                        )
-                    resp.raise_for_status()
-                except BaseException as exc:
-                    log_data_event(
-                        "backend_error",
-                        backend="llama.cpp",
-                        target_id=self.target_id,
-                        operation="chat",
-                        method="POST",
-                        url=f"{self._base}/v1/chat/completions",
-                        error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
-                    )
-                    self._discard_vram_pending(model)
-                    raise
-                self._mark_vram_reserved(model, estimated_vram_gb)
-                return resp.json()
-            finally:
-                self._active -= 1
+                        self._discard_vram_pending(model)
+                        raise
+                    self._mark_vram_reserved(model, estimated_vram_gb)
+                    return resp.json()
+                finally:
+                    self._active -= 1
         finally:
             self._touch_vram_reservation(model)
             self._end_request_lifecycle()
@@ -415,105 +609,58 @@ class LlamaCppClient:
             except BaseException:
                 self._discard_vram_pending(model)
                 raise
-            self._active += 1
-            marked = False
-            try:
+            async with self._concurrency_slot():
+                self._active += 1
+                marked = False
                 try:
-                    url = f"{self._base}/v1/chat/completions"
-                    headers = self._headers(stream=True)
-                    if request_data_logging_enabled():
-                        log_data_event(
-                            "backend_request",
-                            backend="llama.cpp",
-                            target_id=self.target_id,
-                            operation="stream_chat",
-                            method="POST",
-                            url=url,
-                            headers=headers_from_mapping(headers),
-                            body=body_from_json(body),
-                        )
-                    response_started = False
-                    response_bytes = 0
-                    outcome = "complete"
-                    error: Optional[str] = None
-                    stream_done = False
-                    async with self._client.stream(
-                        "POST",
-                        url,
-                        json=body,
-                        headers=headers,
-                    ) as resp:
-                        response_started = True
-                        log_data_event(
-                            "backend_response_start",
-                            backend="llama.cpp",
-                            target_id=self.target_id,
-                            operation="stream_chat",
-                            method="POST",
-                            url=url,
-                            status=resp.status_code,
-                            headers=headers_from_mapping(dict(resp.headers)),
-                        )
-                        if resp.status_code >= 400:
-                            error_body = await resp.aread()
-                            response_bytes += len(error_body)
+                    try:
+                        url = f"{self._base}/v1/chat/completions"
+                        headers = self._headers(stream=True)
+                        if request_data_logging_enabled():
                             log_data_event(
-                                "backend_response_body",
+                                "backend_request",
                                 backend="llama.cpp",
                                 target_id=self.target_id,
                                 operation="stream_chat",
                                 method="POST",
                                 url=url,
-                                body=body_from_bytes(error_body),
+                                headers=headers_from_mapping(headers),
+                                body=body_from_json(body),
                             )
+                        response_started = False
+                        response_bytes = 0
+                        outcome = "complete"
+                        error: Optional[str] = None
+                        stream_done = False
+                        async with self._client.stream(
+                            "POST",
+                            url,
+                            json=body,
+                            headers=headers,
+                        ) as resp:
+                            response_started = True
                             log_data_event(
-                                "backend_response_end",
+                                "backend_response_start",
                                 backend="llama.cpp",
                                 target_id=self.target_id,
                                 operation="stream_chat",
                                 method="POST",
                                 url=url,
                                 status=resp.status_code,
-                                outcome="exception",
-                                response_bytes=response_bytes,
-                                error=f"http status {resp.status_code}",
+                                headers=headers_from_mapping(dict(resp.headers)),
                             )
-                            resp.raise_for_status()
-                        self._mark_vram_reserved(model, estimated_vram_gb)
-                        marked = True
-                        try:
-                            async for raw_line in resp.aiter_lines():
-                                if raw_line:
-                                    response_bytes += len(raw_line.encode("utf-8"))
-                                    if raw_line.strip() == "data: [DONE]":
-                                        stream_done = True
-                                    log_data_event(
-                                        "backend_response_body",
-                                        backend="llama.cpp",
-                                        target_id=self.target_id,
-                                        operation="stream_chat",
-                                        method="POST",
-                                        url=url,
-                                        body=body_from_text(raw_line),
-                                    )
-                                    yield raw_line
-                        except BaseException as exc:
-                            if exc.__class__.__name__ == "GeneratorExit":
-                                outcome = "complete" if stream_done else "closed"
-                                error = None if stream_done else "consumer closed stream"
-                            else:
-                                outcome = (
-                                    "cancelled"
-                                    if exc.__class__.__name__ == "CancelledError"
-                                    else "exception"
+                            if resp.status_code >= 400:
+                                error_body = await resp.aread()
+                                response_bytes += len(error_body)
+                                log_data_event(
+                                    "backend_response_body",
+                                    backend="llama.cpp",
+                                    target_id=self.target_id,
+                                    operation="stream_chat",
+                                    method="POST",
+                                    url=url,
+                                    body=body_from_bytes(error_body),
                                 )
-                                error = (
-                                    f"{exc.__class__.__module__}."
-                                    f"{exc.__class__.__name__}: {exc}"
-                                )
-                            raise
-                        finally:
-                            if response_started:
                                 log_data_event(
                                     "backend_response_end",
                                     backend="llama.cpp",
@@ -522,26 +669,74 @@ class LlamaCppClient:
                                     method="POST",
                                     url=url,
                                     status=resp.status_code,
-                                    outcome=outcome,
+                                    outcome="exception",
                                     response_bytes=response_bytes,
-                                    error=error,
+                                    error=f"http status {resp.status_code}",
                                 )
-                except BaseException as exc:
-                    if exc.__class__.__name__ != "GeneratorExit":
-                        log_data_event(
-                            "backend_error",
-                            backend="llama.cpp",
-                            target_id=self.target_id,
-                            operation="stream_chat",
-                            method="POST",
-                            url=f"{self._base}/v1/chat/completions",
-                            error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
-                        )
-                    if not marked:
-                        self._discard_vram_pending(model)
-                    raise
-            finally:
-                self._active -= 1
+                                resp.raise_for_status()
+                            self._mark_vram_reserved(model, estimated_vram_gb)
+                            marked = True
+                            try:
+                                async for raw_line in resp.aiter_lines():
+                                    if raw_line:
+                                        response_bytes += len(raw_line.encode("utf-8"))
+                                        if raw_line.strip() == "data: [DONE]":
+                                            stream_done = True
+                                        log_data_event(
+                                            "backend_response_body",
+                                            backend="llama.cpp",
+                                            target_id=self.target_id,
+                                            operation="stream_chat",
+                                            method="POST",
+                                            url=url,
+                                            body=body_from_text(raw_line),
+                                        )
+                                        yield raw_line
+                            except BaseException as exc:
+                                if exc.__class__.__name__ == "GeneratorExit":
+                                    outcome = "complete" if stream_done else "closed"
+                                    error = None if stream_done else "consumer closed stream"
+                                else:
+                                    outcome = (
+                                        "cancelled"
+                                        if exc.__class__.__name__ == "CancelledError"
+                                        else "exception"
+                                    )
+                                    error = (
+                                        f"{exc.__class__.__module__}."
+                                        f"{exc.__class__.__name__}: {exc}"
+                                    )
+                                raise
+                            finally:
+                                if response_started:
+                                    log_data_event(
+                                        "backend_response_end",
+                                        backend="llama.cpp",
+                                        target_id=self.target_id,
+                                        operation="stream_chat",
+                                        method="POST",
+                                        url=url,
+                                        status=resp.status_code,
+                                        outcome=outcome,
+                                        response_bytes=response_bytes,
+                                        error=error,
+                                    )
+                    except BaseException as exc:
+                        if exc.__class__.__name__ != "GeneratorExit":
+                            log_data_event(
+                                "backend_error",
+                                backend="llama.cpp",
+                                target_id=self.target_id,
+                                operation="stream_chat",
+                                method="POST",
+                                url=f"{self._base}/v1/chat/completions",
+                                error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
+                            )
+                        if not marked:
+                            self._discard_vram_pending(model)
+                        raise
+                finally:
+                    self._active -= 1
         finally:
             self._touch_vram_reservation(model)
             self._end_request_lifecycle()

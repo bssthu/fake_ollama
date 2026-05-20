@@ -203,6 +203,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 launch_env=tgt.effective_env(),
                 target_name=tgt.name,
                 vram_coordinator=app.state.vram_coordinator,
+                max_concurrent_requests=tgt.effective_max_concurrent_requests,
+                request_read_timeout_seconds=tgt.request_read_timeout_seconds,
             )
             owned_llama_cpp_names.append(tgt.name)
         _sync_local_target_idle_monitor(app)

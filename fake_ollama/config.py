@@ -475,6 +475,19 @@ class LlamaCppDefaults(BaseModel):
     cache_type_k: Optional[str] = None
     cache_type_v: Optional[str] = None
     extra_args: Optional[str] = None
+    # Concurrency / timeout knobs honoured by LlamaCppClient.
+    # ``max_concurrent_requests``:
+    #   * ``None`` -> no fake_ollama-level queue; requests pass straight
+    #     through to the upstream llama.cpp server, which manages its own
+    #     ``--parallel`` slots.  This is the default.
+    #   * ``0``    -> explicitly disable the gate (same as ``None``).
+    #   * ``>0``   -> cap simultaneous upstream requests, queue the rest.
+    # ``request_read_timeout_seconds``:
+    #   * ``None`` -> inherit ``timeout_seconds``.
+    #   * ``<=0``  -> disable the read timeout entirely (httpx ``None``).
+    #   * ``>0``   -> override only the read leg of the httpx timeout.
+    max_concurrent_requests: Optional[int] = None
+    request_read_timeout_seconds: Optional[float] = None
 
     @field_validator("health_path")
     @classmethod
@@ -528,6 +541,8 @@ class LlamaCppTarget(BaseModel):
     cache_type_k: Optional[str] = None
     cache_type_v: Optional[str] = None
     extra_args: Optional[str] = None
+    max_concurrent_requests: Optional[int] = None
+    request_read_timeout_seconds: Optional[float] = None
 
     @field_validator("base_url")
     @classmethod
@@ -584,6 +599,28 @@ class LlamaCppTarget(BaseModel):
     @property
     def display(self) -> str:
         return self.alias or self.model
+
+    @property
+    def effective_max_concurrent_requests(self) -> Optional[int]:
+        """Resolved concurrency gate honoured by ``LlamaCppClient``.
+
+        Only an explicit ``max_concurrent_requests`` installs a fake_ollama-
+        level queue.  We deliberately do NOT inherit from ``parallel``:
+
+        * ``parallel`` controls llama.cpp's own slot count and HTTP-level
+          queue.  When several requests pile up at the upstream the server
+          can pre-tokenise / prefill the next prompt while the current one
+          is still decoding, so slot transitions are seamless.
+        * A proxy-side cap (this value) is strictly serial: request B does
+          not even start its HTTP call to llama.cpp until request A's stream
+          fully closes, which adds one full round-trip + tokenisation latency
+          per transition and makes ``cap=1`` markedly slower than the
+          ``cap=None`` baseline even though both serialise the slot.
+
+        ``0`` is preserved as the explicit "no gate" sentinel and is
+        semantically identical to ``None``.
+        """
+        return self.max_concurrent_requests
 
     @property
     def models(self) -> List[ModelEntry]:
@@ -643,6 +680,8 @@ class LlamaCppTarget(BaseModel):
                 "cache_type_k": pick("cache_type_k"),
                 "cache_type_v": pick("cache_type_v"),
                 "extra_args": pick("extra_args"),
+                "max_concurrent_requests": pick("max_concurrent_requests"),
+                "request_read_timeout_seconds": pick("request_read_timeout_seconds"),
             }
         )
 

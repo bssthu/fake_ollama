@@ -162,6 +162,10 @@ LLAMA_CPP_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选覆盖全局 llama_cpp_defaults.health_path；健康检查路径"},
     {"key": "cwd", "type": "string", "default": None,
      "description": "可选覆盖全局 llama_cpp_defaults.cwd；执行 start_command / stop_command 时的工作目录"},
+    {"key": "max_concurrent_requests", "type": "int", "default": None,
+     "description": "可选：fake_ollama 内部限制同时打上游 llama.cpp 的请求数，超出的在内存里 FIFO 排队。留空时若配了 parallel 则默认跟 parallel 一致；0 = 明确不限制"},
+    {"key": "request_read_timeout_seconds", "type": "float", "default": None,
+     "description": "可选：单独调整 fake_ollama -> llama.cpp 的 read timeout（秒）。留空沿用全局 timeout_seconds；<=0 表示不超时（适合长排队 / 长生成，避免 502 ReadTimeout）"},
 ]
 
 LLAMA_CPP_DEFAULTS_SCHEMA: List[Dict[str, Any]] = [
@@ -197,6 +201,10 @@ LLAMA_CPP_DEFAULTS_SCHEMA: List[Dict[str, Any]] = [
      "description": "默认 -ctv KV cache V 类型（同上）。留空 = llama.cpp 默认 f16；target 可覆盖"},
     {"key": "extra_args", "type": "string", "default": None,
      "description": "默认追加到自动拼装命令末尾的参数串；target 可覆盖"},
+    {"key": "max_concurrent_requests", "type": "int", "default": None,
+     "description": "默认 fake_ollama 内部限制同时打上游 llama.cpp 的请求数；target 可覆盖。留空且配了 parallel 时会自动取 parallel；0 = 不限制"},
+    {"key": "request_read_timeout_seconds", "type": "float", "default": None,
+     "description": "默认 fake_ollama -> llama.cpp 的 read timeout 覆盖；target 可覆盖。留空沿用全局 timeout_seconds；<=0 = 不超时"},
 ]
 
 MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
@@ -1663,6 +1671,10 @@ def _llama_cpp_client_matches(
         and getattr(client, "_health_path", None) == target.health_path
         and getattr(client, "_cwd", None) == target.cwd
         and getattr(client, "_launch_env", None) == target.effective_env()
+        and getattr(client, "_max_concurrent_requests", None)
+            == target.effective_max_concurrent_requests
+        and getattr(client, "_request_read_timeout_seconds", None)
+            == target.request_read_timeout_seconds
     )
 
 
@@ -1740,6 +1752,8 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             launch_env=tgt.effective_env(),
             target_name=tgt.name,
             vram_coordinator=vram_coordinator,
+            max_concurrent_requests=tgt.effective_max_concurrent_requests,
+            request_read_timeout_seconds=tgt.request_read_timeout_seconds,
         )
 
     app.state.settings = new_settings

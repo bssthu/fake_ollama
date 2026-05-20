@@ -251,6 +251,24 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 
 `LlamaCppTarget.alias` 语义：当 `alias` 非空时，**它就是公开 display name**（替换 `model`），仍然作为模型在白名单里的 display；发给 llama.cpp 的 wire name 始终是 `model` 字段。
 
+#### 排队与超时（避免 502 ReadTimeout）
+
+llama.cpp server 默认只有 `--parallel 1` 个解码 slot，并发请求会被上游 HTTP 层接收但串行 decode，前面的请求把后面的吃掉太久就会触发 fake_ollama 这一层的 httpx read timeout，被记成 `status=502 error=ReadTimeout`。
+
+per-target / `llama_cpp_defaults` 上有两个旋钮专门解决这个：
+
+- `max_concurrent_requests`：fake_ollama 内部用 `asyncio.Semaphore` 限制同时打上游的请求数，超出部分在内存里 FIFO 排队（占 `_request_refs`，不会被空闲回收当作 idle）。
+  - **留空 / `0`（默认）→ 完全透传**，请求直接到 llama.cpp，由上游的 `--parallel` slot 队列调度。这是唯一能保证上下文切换阶段有 prefill 流水线的模式。
+  - **正数 → 显式开启代理层队列**，cap 为该值；Ctrl+C 时整个队列会被一次性 cancel。
+
+> 不从 `parallel` 自动继承：代理侧 cap=1 是严格串行，req B 必须等 req A 的 SSE [DONE] 之后才能开始处理，多一轮 fake_ollama↔llama.cpp 往返 + tokenization 延迟，实测比 cap=None 明显慢。需要代理层队列请显式配置。
+- `request_read_timeout_seconds`：只覆盖 fake_ollama → llama.cpp 这一段的 httpx read timeout。
+  - 留空 → 沿用全局 `timeout_seconds`。
+  - `<=0` → read 不超时（适合排队 + 长生成场景，宁可一直等也不要 502）。
+  - 正数 → 显式覆盖。
+
+dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排队的请求数。
+
 ### Interfaces（接口与白名单）
 
 `ollama_interfaces` / `api_interfaces` 都是数组，每一项独立监听：
