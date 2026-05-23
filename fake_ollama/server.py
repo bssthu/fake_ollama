@@ -8,7 +8,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -41,7 +41,7 @@ from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
 from .request_data_log import RequestDataLogMiddleware
 from .vram import LocalTargetResourceError, VramCoordinator
-from .dashboard import DashboardState, run_runtime_monitor
+from .dashboard import DashboardState, RequestMetrics, run_runtime_monitor
 from .reverse_converters import (
     anthropic_to_ollama_chat as anthropic_to_ollama_chat_payload,
     anthropic_to_openai_chat as anthropic_to_openai_chat_payload,
@@ -144,6 +144,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.vram_coordinator = VramCoordinator()
         if not getattr(app.state, "dashboard_state", None):
             app.state.dashboard_state = DashboardState()
+        if not getattr(app.state, "request_metrics", None):
+            app.state.request_metrics = RequestMetrics()
         for up in app.state.settings.anthropic_upstreams:
             if up.name in app.state.clients:
                 continue
@@ -250,6 +252,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.shutdown_requested = False
     app.state.vram_coordinator = VramCoordinator()
     app.state.dashboard_state = DashboardState()
+    app.state.request_metrics = RequestMetrics()
     app.state.ensure_local_target_idle_monitor = _sync_local_target_idle_monitor
     app.state.ensure_runtime_monitor = _sync_runtime_monitor
     _install_port_router(app)
@@ -391,6 +394,12 @@ def _dispatch(
         ):
             raise HTTPException(status_code=404, detail=msg) from exc
         raise HTTPException(status_code=400, detail=msg) from exc
+    metrics: Optional[RequestMetrics] = getattr(
+        request.app.state, "request_metrics", None
+    )
+    rid = getattr(request.state, "request_metric_id", None)
+    if metrics is not None and rid is not None:
+        metrics.set_target(rid, backend.name)
     return backend, model
 
 
@@ -687,12 +696,39 @@ def _install_port_router(app: FastAPI) -> None:
         path = request.url.path
         started_at = time.perf_counter()
 
+        metrics: Optional[RequestMetrics] = getattr(
+            request.app.state, "request_metrics", None
+        )
+        rid: Optional[int] = None
+        if metrics is not None:
+            ctx = _request_log_context(request)
+            # Skip the management-plane surfaces — dashboard self-polls every
+            # ~10s and admin is config traffic. Counting them buries real
+            # model requests and (on a freshly-restarted process) makes the
+            # Stats panel look like it only contains dashboard hits.
+            if ctx["surface"] not in ("dashboard", "admin"):
+                rid = metrics.begin(
+                    listener=ctx["listener"],
+                    port=ctx["port"],
+                    surface=ctx["surface"],
+                    client=ctx["client"],
+                    method=ctx["method"],
+                    path=ctx["path"],
+                )
+        request.state.request_metric_id = rid
+
+        finalized = False
+
         def _finish(response):
+            nonlocal finalized
+            finalized = True
             _log_request_access(
                 request,
                 response.status_code,
                 (time.perf_counter() - started_at) * 1000.0,
             )
+            if rid is not None and metrics is not None:
+                metrics.end(rid, status=response.status_code)
             return response
 
         try:
@@ -786,8 +822,22 @@ def _install_port_router(app: FastAPI) -> None:
 
             # Unknown listener — should not happen, but fail closed.
             return _finish(JSONResponse({"detail": "not found"}, status_code=404))
-        except Exception:
-            _log_request_exception(request, (time.perf_counter() - started_at) * 1000.0)
+        except BaseException as exc:
+            # ``CancelledError`` is a BaseException in 3.8+; catching only
+            # ``Exception`` leaves the in-flight record orphaned when the
+            # client disconnects or the request is cancelled upstream.
+            if not finalized:
+                elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+                if isinstance(exc, asyncio.CancelledError):
+                    # 499 = "client closed request" (nginx convention) —
+                    # distinguishes cancellation from a real 5xx in stats.
+                    status_code = 499
+                    _log_request_access(request, status_code, elapsed_ms)
+                else:
+                    status_code = 500
+                    _log_request_exception(request, elapsed_ms)
+                if rid is not None and metrics is not None:
+                    metrics.end(rid, status=status_code)
             raise
 
 
@@ -1034,6 +1084,12 @@ def _log_upstream_error(
         body,
         json.dumps(summary, ensure_ascii=False),
     )
+    metrics: Optional[RequestMetrics] = getattr(
+        request.app.state, "request_metrics", None
+    )
+    rid = getattr(request.state, "request_metric_id", None)
+    if metrics is not None and rid is not None:
+        metrics.set_error_type(rid, exc.__class__.__name__)
 
 
 def _upstream_error(exc: httpx.HTTPError) -> JSONResponse:

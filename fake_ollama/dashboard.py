@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import json
 import logging
 import math
 import os
 import tempfile
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -285,6 +288,221 @@ def _write_dashboard_samples(path: Path, samples: list[dict[str, Any]]) -> None:
                 pass
 
 
+_DEFAULT_STATS_WINDOWS: Tuple[float, ...] = (300.0, 3600.0)
+_REQUEST_METRICS_DEFAULT_HISTORY = 5000
+
+
+@dataclass
+class _RequestRecord:
+    req_id: int
+    listener: str
+    port: Any
+    surface: str
+    client: str
+    method: str
+    path: str
+    started_wall: float
+    started_monotonic: float
+    finished_monotonic: Optional[float] = None
+    status: Optional[int] = None
+    error_type: Optional[str] = None
+    target: Optional[str] = None
+
+
+def _status_class(status: Optional[int]) -> str:
+    if status is None:
+        return "unknown"
+    if 200 <= status < 300:
+        return "2xx"
+    if 300 <= status < 400:
+        return "3xx"
+    if 400 <= status < 500:
+        return "4xx"
+    if 500 <= status < 600:
+        return "5xx"
+    return "other"
+
+
+def _quantile_ms(sorted_ms: List[float], q: float) -> Optional[float]:
+    if not sorted_ms:
+        return None
+    if q <= 0:
+        return sorted_ms[0]
+    if q >= 1:
+        return sorted_ms[-1]
+    # Nearest-rank: simple and stable for the dashboard.
+    idx = max(0, min(len(sorted_ms) - 1, int(math.ceil(q * len(sorted_ms))) - 1))
+    return sorted_ms[idx]
+
+
+class RequestMetrics:
+    """In-memory tracker for in-flight requests and recent completions.
+
+    Used by the dashboard to surface request-level health that is otherwise
+    only visible by grep'ing the access log. All mutating methods are
+    expected to be called from a single asyncio event loop; no locking.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_history: int = _REQUEST_METRICS_DEFAULT_HISTORY,
+    ) -> None:
+        self._inflight: Dict[int, _RequestRecord] = {}
+        self._history: Deque[_RequestRecord] = deque(maxlen=max_history)
+        self._next_id = 1
+
+    def begin(
+        self,
+        *,
+        listener: str,
+        port: Any,
+        surface: str,
+        client: str,
+        method: str,
+        path: str,
+        started_monotonic: Optional[float] = None,
+        started_wall: Optional[float] = None,
+    ) -> int:
+        rid = self._next_id
+        self._next_id += 1
+        self._inflight[rid] = _RequestRecord(
+            req_id=rid,
+            listener=listener,
+            port=port,
+            surface=surface,
+            client=client,
+            method=method,
+            path=path,
+            started_wall=time.time() if started_wall is None else started_wall,
+            started_monotonic=(
+                time.monotonic() if started_monotonic is None else started_monotonic
+            ),
+        )
+        return rid
+
+    def set_error_type(self, rid: int, error_type: str) -> None:
+        rec = self._inflight.get(rid)
+        if rec is not None and not rec.error_type:
+            rec.error_type = error_type
+
+    def set_target(self, rid: int, target: Optional[str]) -> None:
+        rec = self._inflight.get(rid)
+        if rec is not None:
+            rec.target = target
+
+    def end(
+        self,
+        rid: int,
+        *,
+        status: int,
+        finished_monotonic: Optional[float] = None,
+    ) -> None:
+        rec = self._inflight.pop(rid, None)
+        if rec is None:
+            return
+        rec.finished_monotonic = (
+            time.monotonic() if finished_monotonic is None else finished_monotonic
+        )
+        rec.status = status
+        self._history.append(rec)
+
+    def inflight_snapshot(self, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        now_m = time.monotonic()
+        items: List[Dict[str, Any]] = []
+        for rec in self._inflight.values():
+            items.append(
+                {
+                    "req_id": rec.req_id,
+                    "listener": rec.listener,
+                    "port": rec.port,
+                    "surface": rec.surface,
+                    "target": rec.target,
+                    "client": rec.client,
+                    "method": rec.method,
+                    "path": rec.path,
+                    "started_at": rec.started_wall,
+                    "elapsed_ms": (now_m - rec.started_monotonic) * 1000.0,
+                    "error_type": rec.error_type,
+                }
+            )
+        items.sort(key=lambda x: x["elapsed_ms"], reverse=True)
+        if limit is not None and limit > 0:
+            items = items[:limit]
+        return items
+
+    def stats(
+        self,
+        *,
+        windows: Iterable[float] = _DEFAULT_STATS_WINDOWS,
+        now_wall: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        now = time.time() if now_wall is None else now_wall
+        windows = sorted({float(w) for w in windows if w and w > 0})
+        result: Dict[str, Any] = {}
+        history = list(self._history)
+        history.sort(key=lambda r: r.started_wall)
+        starts = [r.started_wall for r in history]
+        for window in windows:
+            cutoff = now - window
+            lo = bisect.bisect_left(starts, cutoff)
+            recs = history[lo:]
+            groups: Dict[Tuple[str, Any, str, Optional[str]], Dict[str, Any]] = {}
+            for rec in recs:
+                if rec.finished_monotonic is None:
+                    continue
+                key = (rec.listener, rec.port, rec.surface, rec.target)
+                bucket = groups.get(key)
+                if bucket is None:
+                    bucket = {
+                        "listener": rec.listener,
+                        "port": rec.port,
+                        "surface": rec.surface,
+                        "target": rec.target,
+                        "total": 0,
+                        "by_status_class": {},
+                        "errors": {},
+                        "_durations_ms": [],
+                    }
+                    groups[key] = bucket
+                bucket["total"] += 1
+                cls = _status_class(rec.status)
+                bucket["by_status_class"][cls] = bucket["by_status_class"].get(cls, 0) + 1
+                if rec.error_type:
+                    bucket["errors"][rec.error_type] = (
+                        bucket["errors"].get(rec.error_type, 0) + 1
+                    )
+                duration = (rec.finished_monotonic - rec.started_monotonic) * 1000.0
+                bucket["_durations_ms"].append(duration)
+
+            group_list: List[Dict[str, Any]] = []
+            for bucket in groups.values():
+                durations = sorted(bucket.pop("_durations_ms"))
+                bucket["p50_ms"] = _quantile_ms(durations, 0.5)
+                bucket["p95_ms"] = _quantile_ms(durations, 0.95)
+                bucket["max_ms"] = durations[-1] if durations else None
+                group_list.append(bucket)
+            group_list.sort(
+                key=lambda g: (
+                    str(g["listener"]),
+                    str(g["port"]),
+                    str(g["surface"]),
+                    str(g["target"] or ""),
+                )
+            )
+            result[str(int(window))] = {
+                "window_seconds": window,
+                "total": sum(g["total"] for g in group_list),
+                "groups": group_list,
+            }
+        return {
+            "now": now,
+            "history_size": len(self._history),
+            "history_capacity": self._history.maxlen or 0,
+            "windows": result,
+        }
+
+
 class DashboardState:
     def __init__(self) -> None:
         self._samples: list[dict[str, Any]] = []
@@ -380,6 +598,20 @@ class DashboardState:
         async with self._lock:
             samples = [_clone_sample(s) for s in self._samples if s["ts"] >= cutoff]
         settings = app.state.settings
+        metrics: Optional[RequestMetrics] = getattr(
+            app.state, "request_metrics", None
+        )
+        if metrics is None:
+            inflight: List[Dict[str, Any]] = []
+            request_stats: Dict[str, Any] = {
+                "now": now,
+                "history_size": 0,
+                "history_capacity": 0,
+                "windows": {},
+            }
+        else:
+            inflight = metrics.inflight_snapshot(limit=200)
+            request_stats = metrics.stats(now_wall=now)
         return {
             "now": now,
             "range_seconds": range_seconds,
@@ -395,6 +627,8 @@ class DashboardState:
             },
             "samples": samples,
             "current_models": _collect_model_snapshots(app),
+            "inflight_requests": inflight,
+            "request_stats": request_stats,
         }
 
 
@@ -610,6 +844,21 @@ td.model {
 td.action {
   text-align: center;
 }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.path { max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+td.errors { color: var(--danger); white-space: normal; }
+.panel-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.panel-toolbar button {
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 13px;
+}
 .empty {
   padding: 20px 6px;
   color: var(--muted);
@@ -635,6 +884,7 @@ td.action {
     <div class="metric"><span>Free RAM</span><strong id="ramNow">-</strong></div>
     <div class="metric"><span>Free VRAM</span><strong id="vramNow">-</strong></div>
     <div class="metric"><span>Loaded Models</span><strong id="modelNow">0</strong></div>
+    <div class="metric"><span>In-flight Requests</span><strong id="inflightNow">0</strong></div>
   </section>
   <section class="panel">
     <div class="panel-head"><h2>Available Memory</h2></div>
@@ -653,6 +903,17 @@ td.action {
     <div class="panel-head"><h2>Current Models</h2></div>
     <div id="modelTable"></div>
   </section>
+  <section class="panel">
+    <div class="panel-head"><h2>In-flight Requests</h2><span class="status" id="inflightStatus"></span></div>
+    <div id="inflightTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Request Stats</h2>
+      <div class="panel-toolbar" id="statsWindowButtons"></div>
+    </div>
+    <div id="statsTable"></div>
+  </section>
 </main>
 <script>
 const ranges = [
@@ -667,6 +928,11 @@ let selectedRange = 3600;
 let latest = null;
 const hiddenModels = new Set();
 const colors = ['#0f766e', '#2563eb', '#b45309', '#9333ea', '#dc2626', '#0891b2', '#4d7c0f', '#be185d', '#475569', '#ea580c'];
+const statsWindows = [
+  {label: '5m', key: '300'},
+  {label: '1h', key: '3600'},
+];
+let selectedStatsWindow = '300';
 
 function $(id) { return document.getElementById(id); }
 function escapeHtml(value) {
@@ -682,6 +948,31 @@ function fmtAge(sec) {
   if (sec < 60) return Math.round(sec) + 's';
   if (sec < 3600) return Math.round(sec / 60) + 'm';
   return (sec / 3600).toFixed(1) + 'h';
+}
+function fmtMs(ms) {
+  if (ms === null || ms === undefined) return '-';
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return '-';
+  if (n < 1000) return Math.round(n) + 'ms';
+  if (n < 60000) return (n / 1000).toFixed(1) + 's';
+  if (n < 3600000) return Math.round(n / 1000) + 's';
+  return (n / 60000).toFixed(1) + 'm';
+}
+function fmtElapsed(ms) {
+  if (ms === null || ms === undefined) return '-';
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return '-';
+  const s = n / 1000;
+  if (s < 60) return s.toFixed(1) + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm' + Math.round(s % 60) + 's';
+  return Math.floor(s / 3600) + 'h' + Math.round((s % 3600) / 60) + 'm';
+}
+function fmtErrorsCell(errors) {
+  if (!errors) return '';
+  const entries = Object.entries(errors).filter(([, n]) => Number(n) > 0);
+  if (!entries.length) return '';
+  entries.sort((a, b) => Number(b[1]) - Number(a[1]));
+  return entries.slice(0, 3).map(([k, n]) => `${escapeHtml(k)}: ${n}`).join(', ');
 }
 function modelLabel(model) {
   return `${model.model} / ${model.target_id}`;
@@ -703,6 +994,22 @@ function setupRangeButtons() {
       selectedRange = r.seconds;
       setupRangeButtons();
       loadData();
+    };
+    host.append(b);
+  }
+}
+
+function setupStatsWindowButtons() {
+  const host = $('statsWindowButtons');
+  host.innerHTML = '';
+  for (const w of statsWindows) {
+    const b = document.createElement('button');
+    b.textContent = w.label;
+    b.className = w.key === selectedStatsWindow ? 'active' : '';
+    b.onclick = () => {
+      selectedStatsWindow = w.key;
+      setupStatsWindowButtons();
+      renderStats();
     };
     host.append(b);
   }
@@ -896,6 +1203,68 @@ async function reclaimModel(key, force = false) {
   }
 }
 
+function renderInflight() {
+  const items = (latest && latest.inflight_requests) || [];
+  $('inflightNow').textContent = String(items.length);
+  const status = $('inflightStatus');
+  if (items.length) {
+    const oldest = items[0];
+    status.textContent = `${items.length} active — oldest ${fmtElapsed(oldest.elapsed_ms)}`;
+  } else {
+    status.textContent = '';
+  }
+  const host = $('inflightTable');
+  if (!items.length) {
+    host.innerHTML = '<div class="empty">No in-flight requests</div>';
+    return;
+  }
+  const rows = items.map(r => `<tr>
+    <td>${escapeHtml(r.surface || '-')}</td>
+    <td>${escapeHtml(r.target || '-')}</td>
+    <td>${escapeHtml(r.listener || '-')}:${escapeHtml(r.port ?? '-')}</td>
+    <td>${escapeHtml(r.method || '-')}</td>
+    <td class="path" title="${escapeHtml(r.path || '')}">${escapeHtml(r.path || '-')}</td>
+    <td>${escapeHtml(r.client || '-')}</td>
+    <td class="num">${fmtElapsed(r.elapsed_ms)}</td>
+    <td class="errors">${escapeHtml(r.error_type || '')}</td>
+  </tr>`).join('');
+  host.innerHTML = `<table>
+    <thead><tr><th>Surface</th><th>Target</th><th>Listener</th><th>Method</th><th>Path</th><th>Client</th><th class="num">Elapsed</th><th>Error</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderStats() {
+  const host = $('statsTable');
+  const stats = latest && latest.request_stats;
+  const window = stats && stats.windows && stats.windows[selectedStatsWindow];
+  if (!window || !window.groups || !window.groups.length) {
+    host.innerHTML = '<div class="empty">No completed requests in this window</div>';
+    return;
+  }
+  const groups = window.groups.slice().sort((a, b) => (b.total || 0) - (a.total || 0));
+  const rows = groups.map(g => {
+    const cls = g.by_status_class || {};
+    return `<tr>
+      <td>${escapeHtml(g.surface || '-')}</td>
+      <td>${escapeHtml(g.target || '-')}</td>
+      <td>${escapeHtml(g.listener || '-')}:${escapeHtml(g.port ?? '-')}</td>
+      <td class="num">${g.total || 0}</td>
+      <td class="num">${cls['2xx'] || 0}</td>
+      <td class="num">${cls['4xx'] || 0}</td>
+      <td class="num">${cls['5xx'] || 0}</td>
+      <td class="num">${fmtMs(g.p50_ms)}</td>
+      <td class="num">${fmtMs(g.p95_ms)}</td>
+      <td class="num">${fmtMs(g.max_ms)}</td>
+      <td class="errors">${fmtErrorsCell(g.errors)}</td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `<table>
+    <thead><tr><th>Surface</th><th>Target</th><th>Listener</th><th class="num">Total</th><th class="num">2xx</th><th class="num">4xx</th><th class="num">5xx</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th><th>Errors</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
 function render() {
   if (!latest) return;
   const samples = latest.samples || [];
@@ -933,6 +1302,9 @@ function render() {
     hidden: hiddenModels.has(m.key),
     value: s => (s.models && s.models[m.key] !== undefined) ? s.models[m.key] : 0,
   })), {stepped: true});
+
+  renderInflight();
+  renderStats();
 }
 
 async function loadData() {
@@ -948,6 +1320,7 @@ async function loadData() {
 }
 
 setupRangeButtons();
+setupStatsWindowButtons();
 loadData();
 setInterval(loadData, 10000);
 window.addEventListener('resize', render);
