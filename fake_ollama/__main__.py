@@ -24,6 +24,43 @@ logger = logging.getLogger("fake_ollama")
 DEFAULT_LOG_FILE = Path("logs") / "fake_ollama.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
+_ANSI_RESET = "\033[0m"
+_LEVEL_COLORS = {
+    logging.DEBUG: "\033[36m",      # cyan
+    logging.INFO: "",                # default
+    logging.WARNING: "\033[33m",    # yellow
+    logging.ERROR: "\033[31m",      # red
+    logging.CRITICAL: "\033[1;31m", # bold red
+}
+
+
+class _ColorFormatter(logging.Formatter):
+    """Formatter that wraps the level name with ANSI colors for terminals."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = _LEVEL_COLORS.get(record.levelno, "")
+        if color:
+            original = record.levelname
+            record.levelname = f"{color}{original}{_ANSI_RESET}"
+            try:
+                return super().format(record)
+            finally:
+                record.levelname = original
+        return super().format(record)
+
+
+def _enable_color_on_stream(stream) -> bool:
+    if not hasattr(stream, "isatty") or not stream.isatty():
+        return False
+    if sys.platform == "win32":
+        try:
+            import colorama
+
+            colorama.just_fix_windows_console()
+        except Exception:
+            return False
+    return True
+
 
 class _ShutdownAwareServer(uvicorn.Server):
     def __init__(self, config: uvicorn.Config, on_shutdown_requested: Callable[[], None]) -> None:
@@ -40,23 +77,26 @@ def _configure_logging(level_name: str, *, log_file: Optional[str]) -> None:
     if not isinstance(level, int):
         level = logging.INFO
 
-    formatter = logging.Formatter(LOG_FORMAT)
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    plain_formatter = logging.Formatter(LOG_FORMAT)
+    stream_handler = logging.StreamHandler(sys.stderr)
+    if _enable_color_on_stream(sys.stderr):
+        stream_handler.setFormatter(_ColorFormatter(LOG_FORMAT))
+    else:
+        stream_handler.setFormatter(plain_formatter)
+
+    handlers: list[logging.Handler] = [stream_handler]
 
     if log_file:
         path = Path(log_file)
         path.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(
-            RotatingFileHandler(
-                path,
-                maxBytes=10 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            )
+        file_handler = RotatingFileHandler(
+            path,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
         )
-
-    for handler in handlers:
-        handler.setFormatter(formatter)
+        file_handler.setFormatter(plain_formatter)
+        handlers.append(file_handler)
 
     logging.basicConfig(level=level, handlers=handlers, force=True)
 
