@@ -212,6 +212,7 @@ MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "autocomplete": "model_names",
      "description": "模型名（裸名应用于所有 target；与 target 一起拼出最终 key 'model@target' 仅覆盖该 target）"},
     {"key": "target", "type": "string", "default": "",
+     "autocomplete": "source_names",
      "description": "可选：source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets 中的某个 name）。留空 = 对该 model 名所有 target 生效"},
     {"key": "capabilities", "type": "string_list",
      "default": ["completion", "tools", "vision"],
@@ -235,6 +236,7 @@ EXPOSURE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "autocomplete": "model_names",
      "description": "source 中某个模型的公开名（alias 或 name）"},
     {"key": "target", "type": "string", "default": "", "required": True,
+     "autocomplete": "source_names",
      "description": "提供该模型的 source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets 中的某个 name）"},
     {"key": "alias", "type": "string", "default": None,
      "description": "可选：该接口上对外公开的 public id。不填则默认为 'model@target'。同一接口内 alias 不可重复"},
@@ -485,6 +487,7 @@ _INDEX_HTML = r"""<!doctype html>
   <main class="content">
     <div id="form"></div>
 <datalist id="dl-model-names"></datalist>
+<datalist id="dl-source-names"></datalist>
 <textarea id="raw" hidden></textarea>
     <details style="margin-top: 1rem;">
       <summary>当前 schema（只读）</summary>
@@ -567,6 +570,18 @@ function makeScalar(field, value) {
   } else {
     input = el('input', {type: 'text'});
     input.value = value == null ? '' : String(value);
+  }
+  // Wire datalist-based autocomplete on text inputs (skips bool / number / secret).
+  if ((field.type === 'string' || !field.type) && !field.secret && field.autocomplete) {
+    if (field.autocomplete === 'model_names') {
+      input.setAttribute('list', 'dl-model-names');
+      input.addEventListener('focus', refreshModelDatalist);
+      input.addEventListener('input', refreshModelDatalist);
+    } else if (field.autocomplete === 'source_names') {
+      input.setAttribute('list', 'dl-source-names');
+      input.addEventListener('focus', refreshSourceDatalist);
+      input.addEventListener('input', refreshSourceDatalist);
+    }
   }
   // Wrap secret/generate fields with toggle + generate buttons.
   if (field.secret || field.generate) {
@@ -1103,6 +1118,42 @@ function refreshModelDatalist() {
   }
 }
 
+// ---- Source-name autocomplete (datalist for exposed_models.target & model_profiles.target) ----
+function collectKnownSourceNames() {
+  const out = new Set();
+  function walkList(renderer, fallbackKey) {
+    if (!renderer || typeof renderer.read !== 'function') return;
+    const arr = renderer.read();
+    if (!Array.isArray(arr)) return;
+    for (const item of arr) {
+      if (!item) continue;
+      // llama.cpp targets fall back to the `model` field when `name` is empty.
+      const n = item.name || (fallbackKey ? item[fallbackKey] : '');
+      if (n) out.add(String(n));
+    }
+  }
+  for (const {field, r} of topRenderers) {
+    if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams'
+        || field.key === 'ollama_targets') {
+      walkList(r);
+    } else if (field.key === 'llama_cpp_targets') {
+      walkList(r, 'model');
+    }
+  }
+  return Array.from(out);
+}
+function refreshSourceDatalist() {
+  const dl = document.getElementById('dl-source-names');
+  if (!dl) return;
+  const names = collectKnownSourceNames();
+  dl.innerHTML = '';
+  for (const n of names) {
+    const o = document.createElement('option');
+    o.value = n;
+    dl.append(o);
+  }
+}
+
 // renderField returns {node, read, isPresent}
 function renderField(field, value, ctx) {
   const present = value !== undefined;
@@ -1436,8 +1487,9 @@ function renderForm(config) {
   }
   applyNavFilter();
 
-  // Populate the model-name autocomplete datalist now that all fields exist.
+  // Populate autocomplete datalists now that all fields exist.
   refreshModelDatalist();
+  refreshSourceDatalist();
 }
 
 function applyNavFilter() {
