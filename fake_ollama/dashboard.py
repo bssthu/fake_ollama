@@ -123,6 +123,86 @@ def _collect_model_snapshots(app: FastAPI) -> list[dict[str, object]]:
     return snapshots
 
 
+_TARGET_TELEMETRY_TIMEOUT_S = 2.0
+_TARGET_TELEMETRY_STDERR_BYTES = 16384
+_TARGET_TELEMETRY_STDERR_EVENTS = 40
+
+
+async def _collect_target_telemetry(app: FastAPI) -> List[Dict[str, Any]]:
+    """Gather per-target queue/slot/stderr telemetry for the dashboard.
+
+    Runs each ``llama_cpp_client``'s queue/slot/stderr collectors concurrently
+    with a short timeout so a slow or wedged upstream cannot block the
+    dashboard data endpoint. Anything that fails to respond in time is
+    surfaced as an error string instead of being silently dropped.
+    """
+    clients = getattr(app.state, "llama_cpp_clients", None) or {}
+    if not clients:
+        return []
+
+    async def _one(name: str, client: Any) -> Dict[str, Any]:
+        # queue_wait_metrics is in-memory, no need to gate it on the timeout.
+        queue: Optional[Dict[str, Any]] = None
+        get_queue = getattr(client, "queue_wait_metrics", None)
+        if callable(get_queue):
+            try:
+                queue = get_queue()
+            except Exception as exc:
+                queue = {"error": f"{exc.__class__.__name__}: {exc}"}
+
+        slots_payload: Dict[str, Any] = {"slots": None, "error": "not supported"}
+        fetch_slots = getattr(client, "fetch_upstream_slots", None)
+        if callable(fetch_slots):
+            try:
+                slots_payload = await asyncio.wait_for(
+                    fetch_slots(timeout=_TARGET_TELEMETRY_TIMEOUT_S),
+                    timeout=_TARGET_TELEMETRY_TIMEOUT_S + 0.5,
+                )
+            except asyncio.TimeoutError:
+                slots_payload = {"slots": None, "error": "timeout"}
+            except Exception as exc:
+                slots_payload = {
+                    "slots": None,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+
+        stderr_payload: Dict[str, Any] = {"available": False, "events": []}
+        fetch_stderr = getattr(client, "fetch_recent_stderr_events", None)
+        if callable(fetch_stderr):
+            try:
+                stderr_payload = await asyncio.wait_for(
+                    fetch_stderr(
+                        max_bytes=_TARGET_TELEMETRY_STDERR_BYTES,
+                        limit=_TARGET_TELEMETRY_STDERR_EVENTS,
+                    ),
+                    timeout=_TARGET_TELEMETRY_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                stderr_payload = {"available": False, "events": [], "error": "timeout"}
+            except Exception as exc:
+                stderr_payload = {
+                    "available": False,
+                    "events": [],
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+
+        target_id = getattr(client, "target_id", None) or f"llama.cpp:{name}"
+        return {
+            "name": name,
+            "target_id": target_id,
+            "queue": queue,
+            "slots": slots_payload,
+            "stderr": stderr_payload,
+        }
+
+    results = await asyncio.gather(
+        *[_one(name, client) for name, client in list(clients.items())],
+        return_exceptions=False,
+    )
+    results.sort(key=lambda r: str(r.get("target_id") or ""))
+    return results
+
+
 def _dashboard_model_reclaim_enabled(settings: Any) -> bool:
     return bool(getattr(settings, "dashboard_model_reclaim_enabled", False))
 
@@ -612,6 +692,7 @@ class DashboardState:
         else:
             inflight = metrics.inflight_snapshot(limit=200)
             request_stats = metrics.stats(now_wall=now)
+        target_telemetry = await _collect_target_telemetry(app)
         return {
             "now": now,
             "range_seconds": range_seconds,
@@ -629,6 +710,7 @@ class DashboardState:
             "current_models": _collect_model_snapshots(app),
             "inflight_requests": inflight,
             "request_stats": request_stats,
+            "target_telemetry": target_telemetry,
         }
 
 
@@ -847,6 +929,33 @@ td.action {
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.path { max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
 td.errors { color: var(--danger); white-space: normal; }
+.event-list {
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  max-height: 280px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.event-list .row {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+}
+.event-list .row:last-child { border-bottom: none; }
+.event-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-right: 8px;
+  border-radius: 4px;
+  background: #eef2ff;
+  color: #1e40af;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+.event-tag.error { background: #fee2e2; color: var(--danger); }
+.event-tag.stop { background: #ecfeff; color: #075985; }
+.event-tag.done { background: #ecfccb; color: #3f6212; }
+.subtle { color: var(--muted); font-size: 12px; }
 .panel-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -913,6 +1022,18 @@ td.errors { color: var(--danger); white-space: normal; }
       <div class="panel-toolbar" id="statsWindowButtons"></div>
     </div>
     <div id="statsTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Queue Wait (per target)</h2><span class="status" id="queueWindowLabel">last 5m</span></div>
+    <div id="queueTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Upstream Slots</h2><span class="status" id="slotsStatus"></span></div>
+    <div id="slotsTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Recent Upstream Events</h2><span class="status" id="stderrStatus"></span></div>
+    <div id="stderrEvents"></div>
   </section>
 </main>
 <script>
@@ -1265,6 +1386,139 @@ function renderStats() {
   </table>`;
 }
 
+function fmtSeconds(sec) {
+  if (sec === null || sec === undefined) return '-';
+  const n = Number(sec);
+  if (!Number.isFinite(n)) return '-';
+  if (n < 1) return (n * 1000).toFixed(0) + 'ms';
+  if (n < 60) return n.toFixed(1) + 's';
+  if (n < 3600) return Math.floor(n / 60) + 'm' + Math.round(n % 60) + 's';
+  return Math.floor(n / 3600) + 'h' + Math.round((n % 3600) / 60) + 'm';
+}
+
+function renderQueueWait() {
+  const host = $('queueTable');
+  const telemetry = (latest && latest.target_telemetry) || [];
+  const rows = telemetry
+    .map(t => t.queue || {target_id: t.target_id})
+    .filter(q => q && (q.queued !== undefined || q.active !== undefined || q.history_size !== undefined));
+  if (!rows.length) {
+    host.innerHTML = '<div class="empty">No llama.cpp targets configured</div>';
+    return;
+  }
+  const trs = rows.map(q => {
+    const cap = Number(q.capacity || 0);
+    const capText = cap > 0 ? `${q.active || 0} / ${cap}` : `${q.active || 0} / -`;
+    return `<tr>
+      <td>${escapeHtml(q.target_id || '-')}</td>
+      <td class="num">${capText}</td>
+      <td class="num">${q.queued || 0}</td>
+      <td class="num">${fmtSeconds(q.pending_max_seconds)}</td>
+      <td class="num">${fmtSeconds(q.p50_seconds)}</td>
+      <td class="num">${fmtSeconds(q.p95_seconds)}</td>
+      <td class="num">${fmtSeconds(q.max_seconds)}</td>
+      <td class="num">${q.history_size || 0}</td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `<table>
+    <thead><tr><th>Target</th><th class="num">Active / Cap</th><th class="num">Queued</th><th class="num">Pending&nbsp;max</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th><th class="num">Samples</th></tr></thead>
+    <tbody>${trs}</tbody>
+  </table>`;
+}
+
+function renderUpstreamSlots() {
+  const host = $('slotsTable');
+  const telemetry = (latest && latest.target_telemetry) || [];
+  const status = $('slotsStatus');
+  if (!telemetry.length) {
+    host.innerHTML = '<div class="empty">No llama.cpp targets configured</div>';
+    status.textContent = '';
+    return;
+  }
+  let totalSlots = 0;
+  let processing = 0;
+  const sections = telemetry.map(t => {
+    const payload = t.slots || {};
+    const slots = payload.slots;
+    if (!Array.isArray(slots)) {
+      const err = payload.error ? escapeHtml(payload.error) : 'unavailable';
+      return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> <span class="subtle">${err}</span></div>`;
+    }
+    if (!slots.length) {
+      return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> <span class="subtle">no slots</span></div>`;
+    }
+    const rows = slots.map(s => {
+      const state = s.state !== undefined ? String(s.state) : '-';
+      const isProcessing =
+        s.is_processing === true || state === 'processing' || (typeof s.state === 'number' && s.state === 1);
+      if (isProcessing) processing += 1;
+      totalSlots += 1;
+      const nPast = s.n_past !== undefined ? s.n_past : (s.prompt && s.prompt.n_past);
+      const nDecoded = s.n_decoded !== undefined ? s.n_decoded : s.n_predict;
+      const nCtx = s.n_ctx !== undefined ? s.n_ctx : (s.params && s.params.n_ctx);
+      const taskId = s.id_task !== undefined ? s.id_task : s.task_id;
+      return `<tr>
+        <td class="num">${s.id !== undefined ? s.id : '-'}</td>
+        <td>${escapeHtml(state)}</td>
+        <td class="num">${taskId !== undefined && taskId !== null ? taskId : '-'}</td>
+        <td class="num">${nPast !== undefined && nPast !== null ? nPast : '-'}</td>
+        <td class="num">${nDecoded !== undefined && nDecoded !== null ? nDecoded : '-'}</td>
+        <td class="num">${nCtx !== undefined && nCtx !== null ? nCtx : '-'}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong>
+      <table>
+        <thead><tr><th class="num">Slot</th><th>State</th><th class="num">Task</th><th class="num">n_past</th><th class="num">n_decoded</th><th class="num">n_ctx</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+  }).join('');
+  host.innerHTML = `<div class="event-list">${sections}</div>`;
+  status.textContent = totalSlots ? `${processing}/${totalSlots} processing` : '';
+}
+
+function renderUpstreamEvents() {
+  const host = $('stderrEvents');
+  const status = $('stderrStatus');
+  const telemetry = (latest && latest.target_telemetry) || [];
+  if (!telemetry.length) {
+    host.innerHTML = '<div class="empty">No llama.cpp targets configured</div>';
+    status.textContent = '';
+    return;
+  }
+  let totalEvents = 0;
+  let errors = 0;
+  const sections = telemetry.map(t => {
+    const stderr = t.stderr || {};
+    const header = stderr.path
+      ? `<span class="subtle">${escapeHtml(stderr.path)}</span>`
+      : '<span class="subtle">no stderr log</span>';
+    if (!stderr.available) {
+      const reason = stderr.error ? ` — ${escapeHtml(stderr.error)}` : '';
+      return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> ${header}${reason}</div>`;
+    }
+    const events = (stderr.events || []).slice().reverse();
+    totalEvents += events.length;
+    if (!events.length) {
+      return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> ${header}<div class="subtle">no recent events</div></div>`;
+    }
+    const lines = events.map(ev => {
+      const cls =
+        ev.type === 'error' ? 'error' :
+        ev.type === 'stop_processing' ? 'stop' :
+        ev.type === 'prompt_processing_done' ? 'done' : '';
+      if (ev.type === 'error') errors += 1;
+      return `<div class="row"><span class="event-tag ${cls}">${escapeHtml(ev.type)}</span>${escapeHtml(ev.text)}</div>`;
+    }).join('');
+    return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> ${header}
+      <div class="event-list">${lines}</div></div>`;
+  }).join('');
+  host.innerHTML = `<div>${sections}</div>`;
+  const parts = [];
+  if (totalEvents) parts.push(`${totalEvents} events`);
+  if (errors) parts.push(`${errors} error`);
+  status.textContent = parts.join(' • ');
+}
+
 function render() {
   if (!latest) return;
   const samples = latest.samples || [];
@@ -1305,6 +1559,9 @@ function render() {
 
   renderInflight();
   renderStats();
+  renderQueueWait();
+  renderUpstreamSlots();
+  renderUpstreamEvents();
 }
 
 async function loadData() {

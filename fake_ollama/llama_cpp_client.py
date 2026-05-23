@@ -8,13 +8,16 @@ health-check, auto-start, and idle stop for processes it starts itself.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import re
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -36,6 +39,55 @@ from .request_data_log import (
 from .vram import VRAM_IDLE_RECLAIM_SECONDS, VramCoordinator, VramReleaseCandidate
 
 logger = logging.getLogger("fake_ollama")
+
+
+# Compiled once, used by ``fetch_recent_stderr_events`` to classify the
+# llama-server stderr lines that carry useful state transitions.  We classify
+# rather than logging every line so the dashboard event stream stays short.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_STDERR_EVENT_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    (
+        "prompt_processing_done",
+        re.compile(
+            r"slot update_slots:\s*id\s+(?P<slot>\d+)\s*\|\s*task\s+(?P<task>\d+)\s*\|\s*prompt processing done,\s*n_tokens\s*=\s*(?P<n_tokens>\d+),\s*batch\.n_tokens\s*=\s*(?P<batch>\d+)"
+        ),
+    ),
+    (
+        "stop_processing",
+        re.compile(
+            r"slot\s+release:\s*id\s+(?P<slot>\d+)\s*\|\s*task\s+(?P<task>\d+)\s*\|\s*stop processing:\s*n_tokens\s*=\s*(?P<n_tokens>\d+)(?:,\s*truncated\s*=\s*(?P<truncated>\d+))?"
+        ),
+    ),
+    (
+        "new_prompt",
+        re.compile(
+            r"slot update_slots:\s*id\s+(?P<slot>\d+)\s*\|\s*task\s+(?P<task>\d+)\s*\|\s*new prompt,\s*n_ctx_slot\s*=\s*(?P<ctx>\d+),\s*n_keep\s*=\s*(?P<keep>\d+),\s*task\.n_tokens\s*=\s*(?P<n_tokens>\d+)"
+        ),
+    ),
+    (
+        "launch_slot",
+        re.compile(
+            r"slot launch_slot_:\s*id\s+(?P<slot>\d+)\s*\|\s*task\s+(?P<task>\d+)\s*\|\s*processing task"
+        ),
+    ),
+    (
+        "error",
+        re.compile(
+            r"(?i)\b(error|abort(?:ed)?|failed|out of memory|cuda\s+error|cublas\s+error)\b"
+        ),
+    ),
+)
+
+
+def _quantile_seconds(sorted_values: List[float], q: float) -> Optional[float]:
+    if not sorted_values:
+        return None
+    if q <= 0:
+        return sorted_values[0]
+    if q >= 1:
+        return sorted_values[-1]
+    idx = max(0, min(len(sorted_values) - 1, int(math.ceil(q * len(sorted_values))) - 1))
+    return sorted_values[idx]
 
 
 @dataclass
@@ -122,6 +174,17 @@ class LlamaCppClient:
         else:
             self._request_semaphore = None
         self._queued = 0
+        # Rolling history of completed-queue wait times (wall_ts, wait_seconds).
+        # Used by the dashboard to surface p50/p95 wait latency per target.
+        self._wait_history: Deque[Tuple[float, float]] = deque(maxlen=200)
+        # Currently waiting in the gate: pending_id -> t0 (monotonic). Lets
+        # the dashboard report the longest still-waiting request.
+        self._wait_pending: Dict[int, float] = {}
+        self._wait_next_id = 1
+        # Cached snapshot of llama-server GET /slots (data, error, ts_wall),
+        # populated by ``fetch_upstream_slots``. Dashboard reads this without
+        # blocking if a recent sample exists.
+        self._slots_cache: Optional[Tuple[float, Optional[List[Dict[str, Any]]], Optional[str]]] = None
         self._process: Optional[asyncio.subprocess.Process] = None
         self._started_by_us = False
         self._start_lock = asyncio.Lock()
@@ -195,6 +258,9 @@ class LlamaCppClient:
             queued_log = False
         self._queued += 1
         t0 = time.monotonic()
+        pending_id = self._wait_next_id
+        self._wait_next_id += 1
+        self._wait_pending[pending_id] = t0
         shutdown_event = self._get_shutdown_event()
         acquire_task = asyncio.ensure_future(sem.acquire())
         shutdown_task = asyncio.ensure_future(shutdown_event.wait())
@@ -208,6 +274,7 @@ class LlamaCppClient:
                 acquire_task.cancel()
                 shutdown_task.cancel()
                 self._queued -= 1
+                self._wait_pending.pop(pending_id, None)
                 if queued_log:
                     logger.info(
                         "[%s] queue exit (cancelled before slot, waited=%.2fs, queued=%d)",
@@ -223,6 +290,7 @@ class LlamaCppClient:
                 if shutdown_event.is_set():
                     sem.release()
                     self._queued -= 1
+                    self._wait_pending.pop(pending_id, None)
                     if queued_log:
                         logger.info(
                             "[%s] queue exit (shutdown after slot, waited=%.2fs, queued=%d)",
@@ -246,6 +314,7 @@ class LlamaCppClient:
                     else:
                         sem.release()
                 self._queued -= 1
+                self._wait_pending.pop(pending_id, None)
                 if queued_log:
                     logger.info(
                         "[%s] queue exit (shutdown, waited=%.2fs, queued=%d)",
@@ -260,6 +329,11 @@ class LlamaCppClient:
             if not shutdown_task.done():
                 shutdown_task.cancel()
         self._queued -= 1
+        self._wait_pending.pop(pending_id, None)
+        # Record the completed wait. Only acquisitions that actually proceed
+        # past the gate land here — cancellations / shutdowns are excluded so
+        # the percentiles reflect "real" queue latency.
+        self._wait_history.append((time.time(), time.monotonic() - t0))
         if queued_log:
             logger.info(
                 "[%s] slot acquired (waited=%.2fs, active=%d queued=%d)",
@@ -861,3 +935,180 @@ class LlamaCppClient:
             )
             return False
         return False
+
+    # ------------------------------------------------------------------
+    # Dashboard telemetry
+    # ------------------------------------------------------------------
+
+    def queue_wait_metrics(
+        self,
+        *,
+        now_monotonic: Optional[float] = None,
+        now_wall: Optional[float] = None,
+        history_window_seconds: float = 300.0,
+    ) -> Dict[str, Any]:
+        """Snapshot of queue depth and recent wait-time percentiles.
+
+        The dashboard pairs this with the access log to distinguish "upstream
+        is slow" (active high, queue empty) from "we are admission-gated"
+        (queue grows, p95 wait climbs into the read-timeout window).
+        """
+        now_m = time.monotonic() if now_monotonic is None else now_monotonic
+        now_w = time.time() if now_wall is None else now_wall
+        cutoff = now_w - max(1.0, float(history_window_seconds))
+        recent = sorted(s for ts, s in self._wait_history if ts >= cutoff)
+        if self._wait_pending:
+            pending_max: Optional[float] = max(
+                now_m - t0 for t0 in self._wait_pending.values()
+            )
+        else:
+            pending_max = None
+        return {
+            "target_id": self.target_id,
+            "active": self._active,
+            "queued": self._queued,
+            "capacity": self._max_concurrent_requests or 0,
+            "history_window_seconds": float(history_window_seconds),
+            "history_size": len(recent),
+            "p50_seconds": _quantile_seconds(recent, 0.5),
+            "p95_seconds": _quantile_seconds(recent, 0.95),
+            "max_seconds": recent[-1] if recent else None,
+            "pending_max_seconds": pending_max,
+        }
+
+    async def fetch_upstream_slots(
+        self, *, timeout: float = 2.0
+    ) -> Dict[str, Any]:
+        """Pull llama-server's GET /slots and cache the result.
+
+        Returns ``{"slots": [...], "error": None}`` on success. The endpoint
+        is opt-in on recent llama-server builds (``--slots``); a 4xx/5xx is
+        not a bug here, just data we can't surface — we report the reason
+        instead of raising so the dashboard keeps rendering everything else.
+        """
+        url = self._base + "/slots"
+        try:
+            resp = await self._client.get(
+                url,
+                headers=self._headers(),
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            error = f"{exc.__class__.__name__}: {exc}"
+            self._slots_cache = (time.time(), None, error)
+            return {"slots": None, "error": error, "url": url}
+        if resp.status_code == 501 or resp.status_code == 404:
+            error = f"slots endpoint not available (HTTP {resp.status_code}); start llama-server with --slots"
+            self._slots_cache = (time.time(), None, error)
+            return {"slots": None, "error": error, "url": url}
+        if resp.status_code >= 400:
+            try:
+                detail = resp.text[:200]
+            except Exception:
+                detail = ""
+            error = f"HTTP {resp.status_code}{f': {detail}' if detail else ''}"
+            self._slots_cache = (time.time(), None, error)
+            return {"slots": None, "error": error, "url": url}
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as exc:
+            error = f"invalid JSON: {exc}"
+            self._slots_cache = (time.time(), None, error)
+            return {"slots": None, "error": error, "url": url}
+        if not isinstance(data, list):
+            error = "slots response is not a list"
+            self._slots_cache = (time.time(), None, error)
+            return {"slots": None, "error": error, "url": url}
+        self._slots_cache = (time.time(), data, None)
+        return {"slots": data, "error": None, "url": url}
+
+    def slots_cache_snapshot(self) -> Dict[str, Any]:
+        """Return the most recent ``fetch_upstream_slots`` result, or empty."""
+        cache = self._slots_cache
+        if cache is None:
+            return {"ts": None, "slots": None, "error": None}
+        ts, slots, error = cache
+        return {"ts": ts, "slots": slots, "error": error}
+
+    async def fetch_recent_stderr_events(
+        self,
+        *,
+        max_bytes: int = 16384,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Tail the spawned llama-server's stderr log for state-change lines.
+
+        The log lines we surface (prompt processing done / stop processing /
+        launch slot / new prompt / errors) come from llama-server itself, so
+        even when the proxy thinks "slot acquired" the dashboard can see what
+        the upstream is actually doing right now.
+        """
+        path = self._stderr_log_path()
+        empty: Dict[str, Any] = {
+            "path": str(path) if path else None,
+            "available": False,
+            "mtime": None,
+            "size": None,
+            "events": [],
+        }
+        if path is None:
+            return empty
+
+        def _tail() -> Optional[Tuple[float, int, bytes]]:
+            try:
+                stat = path.stat()
+            except OSError:
+                return None
+            try:
+                with open(path, "rb") as fh:
+                    if stat.st_size > max_bytes:
+                        fh.seek(-max_bytes, 2)
+                    raw = fh.read()
+                return stat.st_mtime, stat.st_size, raw
+            except OSError:
+                return None
+
+        result = await asyncio.to_thread(_tail)
+        if result is None:
+            return empty
+        mtime, size, raw = result
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        # Drop the first line if we seeked into the middle of one — it's
+        # almost certainly truncated and would confuse the pattern match.
+        if size > max_bytes and len(lines) > 1:
+            lines = lines[1:]
+
+        events: List[Dict[str, Any]] = []
+        for raw_line in lines:
+            line = _ANSI_ESCAPE_RE.sub("", raw_line).rstrip()
+            if not line:
+                continue
+            for kind, pattern in _STDERR_EVENT_PATTERNS:
+                m = pattern.search(line)
+                if m is None:
+                    continue
+                ev: Dict[str, Any] = {"type": kind, "text": line}
+                gd = m.groupdict() if hasattr(m, "groupdict") else {}
+                if gd:
+                    parsed: Dict[str, Any] = {}
+                    for k, v in gd.items():
+                        if v is None:
+                            continue
+                        try:
+                            parsed[k] = int(v)
+                        except (TypeError, ValueError):
+                            parsed[k] = v
+                    if parsed:
+                        ev["fields"] = parsed
+                events.append(ev)
+                break
+        if limit > 0 and len(events) > limit:
+            events = events[-limit:]
+        return {
+            "path": str(path),
+            "available": True,
+            "mtime": mtime,
+            "size": size,
+            "events": events,
+        }
