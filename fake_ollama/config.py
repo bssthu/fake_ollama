@@ -1162,7 +1162,20 @@ class Settings(BaseModel):
                 )
             port_owners[self.dashboard_port] = "dashboard"
 
-        # 4. Exposure entries reference real (target, model) pairs.
+        # 4. Duplicate base_url within llama_cpp_targets — each llama.cpp
+        # server process must listen on a distinct address.
+        seen_lc_urls: Dict[str, str] = {}
+        for tgt in self.llama_cpp_targets:
+            url = tgt.base_url.rstrip("/")
+            if url in seen_lc_urls:
+                raise ValueError(
+                    f"llama_cpp_target {tgt.name!r} has the same base_url {url!r} as "
+                    f"{seen_lc_urls[url]!r}. Each llama.cpp server process must listen "
+                    f"on a distinct address."
+                )
+            seen_lc_urls[url] = tgt.name
+
+        # 5. Exposure entries reference real (target, model) pairs.
         all_composite_ids = set(self.all_source_composite_ids())
         for it in list(self.ollama_interfaces) + list(self.api_interfaces):
             for e in it.exposed_models:
@@ -1174,7 +1187,7 @@ class Settings(BaseModel):
                         f"{sorted(all_composite_ids)}"
                     )
 
-        # 5. Cycle detection: any upstream whose base_url points back at any
+        # 6. Cycle detection: any upstream whose base_url points back at any
         # interface this process listens on means /v1/messages would
         # recurse forever.
         self.detect_upstream_cycles()

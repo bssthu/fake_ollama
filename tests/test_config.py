@@ -322,6 +322,36 @@ def test_llama_cpp_defaults_are_inherited_and_overridden():
     assert visible.health_path == "/healthz"
 
 
+def test_llama_cpp_duplicate_base_url_rejected():
+    with pytest.raises(ValueError, match="same base_url"):
+        Settings(
+            llama_cpp_targets=[
+                {"model": "modelA", "base_url": "http://127.0.0.1:8080"},
+                {"model": "modelB", "base_url": "http://127.0.0.1:8080"},
+            ]
+        )
+
+
+def test_llama_cpp_duplicate_base_url_trailing_slash_normalised():
+    with pytest.raises(ValueError, match="same base_url"):
+        Settings(
+            llama_cpp_targets=[
+                {"model": "modelA", "base_url": "http://127.0.0.1:8080/"},
+                {"model": "modelB", "base_url": "http://127.0.0.1:8080"},
+            ]
+        )
+
+
+def test_llama_cpp_distinct_base_urls_ok():
+    s = Settings(
+        llama_cpp_targets=[
+            {"model": "modelA", "base_url": "http://127.0.0.1:8080"},
+            {"model": "modelB", "base_url": "http://127.0.0.1:8081"},
+        ]
+    )
+    assert len(s.llama_cpp_targets) == 2
+
+
 # ---------------------------------------------------------------------------
 # End-to-end smoke test through the FastAPI app
 # ---------------------------------------------------------------------------
