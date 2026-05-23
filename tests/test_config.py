@@ -352,6 +352,97 @@ def test_llama_cpp_distinct_base_urls_ok():
     assert len(s.llama_cpp_targets) == 2
 
 
+def test_llama_cpp_quantized_v_cache_without_flash_attn_rejected():
+    """``cache_type_v`` quantized without ``flash_attn`` would crash
+    llama-server with 0xC0000005 on the first request. The loader must
+    reject it up front instead of letting the launch fail opaquely."""
+    with pytest.raises(ValueError, match="flash_attn=true"):
+        Settings(
+            llama_cpp_targets=[
+                {
+                    "model": "qa",
+                    "base_url": "http://127.0.0.1:8080",
+                    "cache_type_v": "q8_0",
+                }
+            ]
+        )
+
+
+def test_llama_cpp_quantized_k_cache_without_flash_attn_rejected():
+    with pytest.raises(ValueError, match="cache_type_k='q8_0'"):
+        Settings(
+            llama_cpp_targets=[
+                {
+                    "model": "qa",
+                    "base_url": "http://127.0.0.1:8080",
+                    "cache_type_k": "q8_0",
+                }
+            ]
+        )
+
+
+def test_llama_cpp_quantized_cache_with_flash_attn_ok():
+    s = Settings(
+        llama_cpp_targets=[
+            {
+                "model": "qa",
+                "base_url": "http://127.0.0.1:8080",
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "flash_attn": True,
+            }
+        ]
+    )
+    assert s.llama_cpp_targets[0].flash_attn is True
+
+
+def test_llama_cpp_quantized_cache_inherits_flash_attn_from_defaults():
+    """``flash_attn`` set on ``llama_cpp_defaults`` satisfies the check;
+    the validator runs *after* defaults are folded into each target."""
+    s = Settings(
+        llama_cpp_defaults={"flash_attn": True},
+        llama_cpp_targets=[
+            {
+                "model": "qa",
+                "base_url": "http://127.0.0.1:8080",
+                "cache_type_v": "q8_0",
+            }
+        ],
+    )
+    eff = s.effective_llama_cpp_target(s.llama_cpp_targets[0])
+    assert eff.flash_attn is True
+
+
+def test_llama_cpp_empty_cache_type_k_ignored():
+    """Empty-string ``cache_type_k`` (the shape the admin UI emits when
+    the field is cleared) must not be treated as a quantized type."""
+    s = Settings(
+        llama_cpp_targets=[
+            {
+                "model": "qa",
+                "base_url": "http://127.0.0.1:8080",
+                "cache_type_k": "",
+                "cache_type_v": "f16",
+            }
+        ]
+    )
+    assert s.llama_cpp_targets[0].cache_type_k == ""
+
+
+def test_llama_cpp_f16_cache_without_flash_attn_ok():
+    s = Settings(
+        llama_cpp_targets=[
+            {
+                "model": "qa",
+                "base_url": "http://127.0.0.1:8080",
+                "cache_type_k": "f16",
+                "cache_type_v": "f16",
+            }
+        ]
+    )
+    assert s.llama_cpp_targets[0].cache_type_v == "f16"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end smoke test through the FastAPI app
 # ---------------------------------------------------------------------------

@@ -594,6 +594,54 @@ class LlamaCppTarget(BaseModel):
             )
         return self
 
+    # KV-cache types that require flash-attention to run. Anything in this
+    # set as ``-ctk`` / ``-ctv`` will crash llama-server's CUDA attention
+    # kernel on the first request unless ``-fa on`` is also passed.
+    _QUANTIZED_KV_CACHE_TYPES = frozenset(
+        {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}
+    )
+
+    @staticmethod
+    def _normalised_cache_type(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        s = str(value).strip().lower()
+        return s or None
+
+    def validate_kv_cache_requires_flash_attn(self) -> None:
+        """Reject KV-cache configs that crash llama-server at runtime.
+
+        llama.cpp requires flash-attention (``-fa on``) whenever the K or V
+        KV-cache is anything other than the default f16. Without flash
+        attention, the CUDA attention kernel cannot read a quantized cache
+        and the server aborts with a memory access violation (Windows exit
+        ``3221225477`` / ``0xC0000005``) on the first request. This check
+        must be run *after* defaults are applied, since ``flash_attn`` can
+        come from ``llama_cpp_defaults``.
+        """
+        k = self._normalised_cache_type(self.cache_type_k)
+        v = self._normalised_cache_type(self.cache_type_v)
+        if k is None and v is None:
+            return
+        if self.flash_attn:
+            return
+        issues: List[str] = []
+        for label, val in (("cache_type_k", k), ("cache_type_v", v)):
+            if val in self._QUANTIZED_KV_CACHE_TYPES:
+                issues.append(f"{label}={val!r}")
+        if not issues and k is not None and v is not None and k != v:
+            issues.append(f"cache_type_k={k!r} != cache_type_v={v!r}")
+        if not issues:
+            return
+        raise ValueError(
+            f"llama_cpp_target {self.name!r}: {', '.join(issues)} requires "
+            f"flash_attn=true (-fa on). llama-server's CUDA attention kernel "
+            f"cannot read a quantized KV-cache without flash-attention and "
+            f"crashes on the first request (Windows exit 3221225477 / "
+            f"0xC0000005). Set \"flash_attn\": true on the target or in "
+            f"llama_cpp_defaults."
+        )
+
     # -- presentation helpers ------------------------------------------
 
     @property
@@ -1174,6 +1222,12 @@ class Settings(BaseModel):
                     f"on a distinct address."
                 )
             seen_lc_urls[url] = tgt.name
+
+        # 4b. KV-cache / flash-attention consistency, evaluated after
+        # ``llama_cpp_defaults`` is folded in so a target that inherits
+        # ``flash_attn`` from defaults is accepted.
+        for tgt in self.llama_cpp_targets:
+            self.effective_llama_cpp_target(tgt).validate_kv_cache_requires_flash_attn()
 
         # 5. Exposure entries reference real (target, model) pairs.
         all_composite_ids = set(self.all_source_composite_ids())
