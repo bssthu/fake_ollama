@@ -491,6 +491,13 @@ button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
 }
+button.soft-disabled {
+  cursor: pointer;
+  opacity: 0.45;
+}
+button.soft-disabled:hover {
+  opacity: 0.65;
+}
 button.icon {
   width: 30px;
   min-width: 30px;
@@ -822,11 +829,13 @@ function renderTable(models) {
   }
   const reclaimAllowed = Boolean(latest && latest.permissions && latest.permissions.dashboard_model_reclaim_enabled);
   const rows = models.map(m => {
-    const canReclaim = reclaimAllowed && Boolean(m.reclaimable);
+    const canForceReclaim = reclaimAllowed && !m.reclaimable;
     const title = !reclaimAllowed
       ? 'Dashboard model reclaim is disabled in settings'
-      : (m.reclaimable ? 'Close and reclaim this model' : 'Model is not eligible for reclaim yet');
-    const disabled = canReclaim ? '' : ' disabled';
+      : (m.reclaimable ? 'Close and reclaim this model' : 'Force close this model');
+    const disabled = reclaimAllowed ? '' : ' disabled';
+    const softDisabled = canForceReclaim ? ' soft-disabled' : '';
+    const force = canForceReclaim ? 'true' : 'false';
     return `<tr>
       <td class="model">${escapeHtml(m.model)}</td>
       <td>${escapeHtml(m.backend)}</td>
@@ -836,7 +845,7 @@ function renderTable(models) {
       <td>${m.queued_requests || 0}</td>
       <td>${fmtAge(m.idle_seconds)}</td>
       <td>${m.reclaimable ? 'yes' : 'no'}</td>
-      <td class="action"><button type="button" class="icon danger" data-reclaim-key="${escapeHtml(m.key)}" title="${escapeHtml(title)}"${disabled}>X</button></td>
+      <td class="action"><button type="button" class="icon danger${softDisabled}" data-reclaim-key="${escapeHtml(m.key)}" data-reclaim-force="${force}" title="${escapeHtml(title)}"${disabled}>X</button></td>
     </tr>`;
   }).join('');
   $('modelTable').innerHTML = `<table>
@@ -844,22 +853,35 @@ function renderTable(models) {
     <tbody>${rows}</tbody>
   </table>`;
   for (const btn of $('modelTable').querySelectorAll('button[data-reclaim-key]')) {
-    btn.addEventListener('click', () => reclaimModel(btn.getAttribute('data-reclaim-key') || ''));
+    btn.addEventListener('click', () => reclaimModel(
+      btn.getAttribute('data-reclaim-key') || '',
+      btn.getAttribute('data-reclaim-force') === 'true'
+    ));
   }
 }
 
-async function reclaimModel(key) {
+async function reclaimModel(key, force = false) {
   if (!key) return;
   const current = (latest && latest.current_models) || [];
   const model = current.find(m => m.key === key);
   const label = model ? modelLabel(model) : key;
-  if (!window.confirm(`Close and reclaim ${label}?`)) return;
-  $('status').textContent = `reclaiming ${label}...`;
+  if (force) {
+    const active = Number(model && model.active_requests || 0);
+    const queued = Number(model && model.queued_requests || 0);
+    const activity = [];
+    if (active) activity.push(`${active} active`);
+    if (queued) activity.push(`${queued} queued`);
+    const suffix = activity.length ? ` (${activity.join(', ')})` : '';
+    if (!window.confirm(`Force close ${label}${suffix}? This can interrupt in-flight requests.`)) return;
+  } else if (!window.confirm(`Close and reclaim ${label}?`)) {
+    return;
+  }
+  $('status').textContent = `${force ? 'force closing' : 'reclaiming'} ${label}...`;
   try {
     const resp = await fetch('/dashboard/reclaim-model', {
       method: 'POST',
       headers: {'content-type': 'application/json'},
-      body: JSON.stringify({key}),
+      body: JSON.stringify({key, force}),
     });
     const text = await resp.text();
     let payload = {};
@@ -867,10 +889,10 @@ async function reclaimModel(key) {
     if (!resp.ok) {
       throw new Error(payload.detail || payload.reason || payload.error || text || resp.statusText);
     }
-    $('status').textContent = `reclaim requested for ${label}`;
+    $('status').textContent = `${force ? 'force close requested' : 'reclaim requested'} for ${label}`;
     await loadData();
   } catch (err) {
-    $('status').textContent = 'reclaim failed: ' + err.message;
+    $('status').textContent = `${force ? 'force close' : 'reclaim'} failed: ${err.message}`;
   }
 }
 
@@ -997,6 +1019,11 @@ def register_dashboard_routes(app: FastAPI) -> None:
         if coordinator is None:
             raise HTTPException(status_code=503, detail="VRAM coordinator unavailable")
 
-        result = await coordinator.reclaim_model(target_id=target_id, model=model)
+        force = payload.get("force") is True
+        result = await coordinator.reclaim_model(
+            target_id=target_id,
+            model=model,
+            force=force,
+        )
         status_code = 200 if result.get("released") else 409
         return JSONResponse(result, status_code=status_code)

@@ -66,10 +66,12 @@ class _SnapshotClient:
 class _RecordingCoordinator:
     def __init__(self, result: dict[str, object]) -> None:
         self.result = result
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, bool]] = []
 
-    async def reclaim_model(self, *, target_id: str, model: str) -> dict[str, object]:
-        self.calls.append((target_id, model))
+    async def reclaim_model(
+        self, *, target_id: str, model: str, force: bool = False
+    ) -> dict[str, object]:
+        self.calls.append((target_id, model, force))
         return dict(self.result)
 
 
@@ -239,4 +241,27 @@ def test_dashboard_reclaim_model_calls_coordinator_when_enabled(tmp_path: Path) 
 
     assert resp.status_code == 200
     assert resp.json()["released"] is True
-    assert coord.calls == [("ollama:t", "m")]
+    assert coord.calls == [("ollama:t", "m", False)]
+
+
+def test_dashboard_reclaim_model_passes_force_when_enabled(tmp_path: Path) -> None:
+    settings = _settings(tmp_path / "history.json").model_copy(
+        update={"dashboard_model_reclaim_enabled": True}
+    )
+    coord = _RecordingCoordinator(
+        {"target_id": "ollama:t", "model": "m", "released": True}
+    )
+    snapshot = _model_snapshot()
+    snapshot["reclaimable"] = False
+    snapshot["active_requests"] = 1
+    app = _route_app(settings, snapshot=snapshot, coordinator=coord)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/dashboard/reclaim-model",
+            json={"key": "ollama|ollama:t|m", "force": True},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["released"] is True
+    assert coord.calls == [("ollama:t", "m", True)]

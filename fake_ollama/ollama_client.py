@@ -127,6 +127,24 @@ class OllamaClient:
             )
         return candidates
 
+    def vram_force_release_candidates(
+        self, *, now: float
+    ) -> list[VramReleaseCandidate]:
+        candidates: list[VramReleaseCandidate] = []
+        for model, loaded in self._loaded_models.items():
+            candidates.append(
+                VramReleaseCandidate(
+                    owner_id=self.target_id,
+                    model=model,
+                    estimated_vram_gb=loaded.estimated_vram_gb,
+                    last_used_monotonic=loaded.last_used_monotonic,
+                    release=lambda model=model: self._release_model_for_vram(
+                        model, force=True
+                    ),
+                )
+            )
+        return candidates
+
     def loaded_model_snapshots(
         self,
         *,
@@ -528,8 +546,8 @@ class OllamaClient:
                 return True
         return False
 
-    async def _release_model_for_vram(self, model: str) -> bool:
-        if self._active or self._request_refs:
+    async def _release_model_for_vram(self, model: str, *, force: bool = False) -> bool:
+        if not force and (self._active or self._request_refs):
             return False
         if await self._unload_model(model):
             self._loaded_models.pop(model, None)

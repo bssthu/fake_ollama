@@ -283,6 +283,57 @@ async def test_reclaim_model_requires_idle_eligible_candidate():
 
 
 @pytest.mark.asyncio
+async def test_reclaim_model_force_uses_force_candidate_for_active_model():
+    coord = VramCoordinator(provider=_free_provider(100.0))
+
+    class _ActiveParticipant:
+        target_id = "target"
+        active_requests = 1
+
+        def __init__(self) -> None:
+            self.released = False
+            self.last_used = time.monotonic()
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return model == "old"
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            raise AssertionError("force reclaim should not use idle candidates")
+
+        def vram_force_release_candidates(self, *, now: float):
+            return [
+                VramReleaseCandidate(
+                    owner_id=self.target_id,
+                    model="old",
+                    estimated_vram_gb=1.0,
+                    last_used_monotonic=self.last_used,
+                    release=self.release,
+                )
+            ]
+
+        async def release(self) -> bool:
+            self.released = True
+            return True
+
+    participant = _ActiveParticipant()
+    coord.register(participant)
+
+    result = await coord.reclaim_model(
+        target_id="target", model="old", idle_seconds=60.0, force=True
+    )
+
+    assert participant.released is True
+    assert result == {
+        "target_id": "target",
+        "model": "old",
+        "estimated_vram_gb": 1.0,
+        "released": True,
+        "reason": None,
+        "forced": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_total_capacity_allows_best_effort_reclaim_when_estimates_are_short():
     free_mib = {"mib": 512.0}
     coord = VramCoordinator(

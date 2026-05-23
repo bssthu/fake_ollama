@@ -310,6 +310,24 @@ class LlamaCppClient:
             )
         ]
 
+    def vram_force_release_candidates(
+        self, *, now: float
+    ) -> list[VramReleaseCandidate]:
+        if self._loaded_model is None:
+            return []
+        if not (self._started_by_us or self._stop_command):
+            return []
+        loaded = self._loaded_model
+        return [
+            VramReleaseCandidate(
+                owner_id=self.target_id,
+                model=loaded.model,
+                estimated_vram_gb=loaded.estimated_vram_gb,
+                last_used_monotonic=loaded.last_used_monotonic,
+                release=lambda: self._release_server_for_vram(force=True),
+            )
+        ]
+
     def loaded_model_snapshots(
         self,
         *,
@@ -802,8 +820,8 @@ class LlamaCppClient:
     async def release_for_vram(self) -> bool:
         return await self._release_server_for_vram()
 
-    async def _release_server_for_vram(self) -> bool:
-        if self._active or self._request_refs:
+    async def _release_server_for_vram(self, *, force: bool = False) -> bool:
+        if not force and (self._active or self._request_refs):
             return False
         if not (self._started_by_us or self._stop_command):
             return False

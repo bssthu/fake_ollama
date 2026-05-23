@@ -409,47 +409,72 @@ class VramCoordinator:
         target_id: str,
         model: str,
         idle_seconds: float = VRAM_IDLE_RECLAIM_SECONDS,
+        force: bool = False,
     ) -> dict[str, object]:
-        """Release one eligible idle local model by target/model identity."""
+        """Release one local model by target/model identity.
+
+        Normal dashboard reclaim uses the same idle eligibility as automatic
+        VRAM reclaim. Force mode is user-confirmed and asks participants for
+        a stronger release path that may interrupt in-flight work.
+        """
         async with self._lock:
-            for candidate in self._eligible_candidates(
-                "", idle_seconds=idle_seconds, include_same_model=True
-            ):
+            candidates = (
+                self._force_candidates()
+                if force
+                else self._eligible_candidates(
+                    "", idle_seconds=idle_seconds, include_same_model=True
+                )
+            )
+            for candidate in candidates:
                 if candidate.owner_id != target_id or candidate.model != model:
                     continue
 
                 released = await candidate.release()
                 if released:
                     self._pending.pop((candidate.owner_id, candidate.model), None)
-                    logger.info(
-                        "dashboard requested release of idle local model %s on %s; estimated VRAM %.2f GiB",
-                        candidate.model,
-                        candidate.owner_id,
-                        candidate.estimated_vram_gb,
-                    )
+                    if force:
+                        logger.info(
+                            "dashboard force-closed local model %s on %s; estimated VRAM %.2f GiB",
+                            candidate.model,
+                            candidate.owner_id,
+                            candidate.estimated_vram_gb,
+                        )
+                    else:
+                        logger.info(
+                            "dashboard requested release of idle local model %s on %s; estimated VRAM %.2f GiB",
+                            candidate.model,
+                            candidate.owner_id,
+                            candidate.estimated_vram_gb,
+                        )
                     reason = None
                 else:
                     logger.warning(
-                        "dashboard failed to release idle local model %s on %s",
+                        "dashboard failed to release local model %s on %s",
                         candidate.model,
                         candidate.owner_id,
                     )
                     reason = "release_failed"
 
-                return {
+                result: dict[str, object] = {
                     "target_id": candidate.owner_id,
                     "model": candidate.model,
                     "estimated_vram_gb": candidate.estimated_vram_gb,
                     "released": released,
                     "reason": reason,
                 }
+                if force:
+                    result["forced"] = True
+                return result
 
-            return {
+            result = {
                 "target_id": target_id,
                 "model": model,
                 "released": False,
                 "reason": "not_eligible",
             }
+            if force:
+                result["forced"] = True
+            return result
 
     # -- Internals -----------------------------------------------------
 
@@ -534,6 +559,22 @@ class VramCoordinator:
                 if not include_same_model and candidate.model == requested_model:
                     continue
                 candidates.append(candidate)
+        candidates.sort(
+            key=lambda item: (item.last_used_monotonic, item.owner_id, item.model)
+        )
+        return candidates
+
+    def _force_candidates(self) -> list[VramReleaseCandidate]:
+        now = time.monotonic()
+        candidates: list[VramReleaseCandidate] = []
+        for participant in self._participants.values():
+            getter = getattr(participant, "vram_force_release_candidates", None)
+            if callable(getter):
+                candidates.extend(getter(now=now))
+                continue
+            candidates.extend(
+                participant.vram_release_candidates(now=now, idle_seconds=0.0)
+            )
         candidates.sort(
             key=lambda item: (item.last_used_monotonic, item.owner_id, item.model)
         )
