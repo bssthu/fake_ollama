@@ -608,6 +608,41 @@ class LlamaCppTarget(BaseModel):
         s = str(value).strip().lower()
         return s or None
 
+    @staticmethod
+    def _effective_cache_type(value: Optional[str]) -> str:
+        """Resolve a cache type to what llama-server actually uses.
+
+        ``None``, ``""`` and ``"f16"`` all map to ``"f16"`` because that
+        is llama-server's default when ``-ctk`` / ``-ctv`` is omitted.
+        Anything else is returned in lower-case so equality checks are
+        case-insensitive.
+        """
+        s = (value or "").strip().lower()
+        return s or "f16"
+
+    def validate_kv_cache_types_match(self) -> None:
+        """Reject asymmetric K/V cache configurations.
+
+        llama.cpp's CUDA flash-attention kernel only has fast, well-tuned
+        paths for matched K/V cache types. Mismatched pairs (e.g. K=f16 /
+        V=q8_0) fall back to a generic path that runs much slower and
+        leaves the GPU under-utilised. A missing field defaults to f16, so
+        a config like ``cache_type_k=""`` + ``cache_type_v="q8_0"`` is
+        still asymmetric and is rejected here.
+        """
+        k_eff = self._effective_cache_type(self.cache_type_k)
+        v_eff = self._effective_cache_type(self.cache_type_v)
+        if k_eff == v_eff:
+            return
+        raise ValueError(
+            f"llama_cpp_target {self.name!r}: cache_type_k={self.cache_type_k!r} "
+            f"and cache_type_v={self.cache_type_v!r} resolve to different types "
+            f"({k_eff} vs {v_eff}). llama.cpp's CUDA flash-attention kernel only "
+            f"has fast paths for matched K/V; mismatches fall back to a slow "
+            f"generic path that drops GPU utilisation. Set both to the same value, "
+            f"or leave both unset to keep the default f16."
+        )
+
     def validate_kv_cache_requires_flash_attn(self) -> None:
         """Reject KV-cache configs that crash llama-server at runtime.
 
@@ -1227,7 +1262,9 @@ class Settings(BaseModel):
         # ``llama_cpp_defaults`` is folded in so a target that inherits
         # ``flash_attn`` from defaults is accepted.
         for tgt in self.llama_cpp_targets:
-            self.effective_llama_cpp_target(tgt).validate_kv_cache_requires_flash_attn()
+            effective = self.effective_llama_cpp_target(tgt)
+            effective.validate_kv_cache_requires_flash_attn()
+            effective.validate_kv_cache_types_match()
 
         # 5. Exposure entries reference real (target, model) pairs.
         all_composite_ids = set(self.all_source_composite_ids())

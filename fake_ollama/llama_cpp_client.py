@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -418,6 +421,28 @@ class LlamaCppClient:
         if loaded is not None and self._vram_coordinator is not None:
             self._vram_coordinator.discard_pending(self.target_id, loaded.model)
 
+    def _stderr_log_path(self) -> Optional[Path]:
+        """Derive a per-target stderr log file for the spawned llama-server.
+
+        Captures llama-server's own diagnostics (offload report, batch/slot
+        counts, tok/s, CUDA errors) which the proxy's normal log cannot see.
+        Returns ``None`` if we cannot derive a stable, filesystem-safe name
+        from the target — the caller falls back to DEVNULL in that case.
+        """
+        parsed = urlparse(self._base)
+        port = parsed.port
+        host = (parsed.hostname or "").strip()
+        safe_target = re.sub(r"[^A-Za-z0-9._-]+", "_", self.target_id).strip("_")
+        if port:
+            stem = f"llama-server-{port}"
+        elif safe_target:
+            stem = f"llama-server-{safe_target}"
+        else:
+            return None
+        if host and host not in {"127.0.0.1", "localhost", "::1"}:
+            stem = f"{stem}-{re.sub(r'[^A-Za-z0-9._-]+', '_', host)}"
+        return Path("logs") / f"{stem}.err.log"
+
     async def _healthy(self) -> bool:
         try:
             resp = await self._client.get(
@@ -450,6 +475,13 @@ class LlamaCppClient:
                     "refusing auto-start"
                 )
             if self._process is None or self._process.returncode is not None:
+                stderr_log = self._stderr_log_path()
+                if stderr_log is not None:
+                    logger.info(
+                        "[%s] capturing llama-server stderr to %s",
+                        self.target_id,
+                        stderr_log,
+                    )
                 if self._start_argv:
                     logger.info(
                         "starting llama.cpp target: %s",
@@ -459,6 +491,7 @@ class LlamaCppClient:
                         self._start_argv,
                         cwd=self._cwd,
                         env=self._launch_env,
+                        stderr=stderr_log,
                     )
                 else:
                     logger.info("starting llama.cpp target: %s", self._start_command)
@@ -466,6 +499,7 @@ class LlamaCppClient:
                         self._start_command,
                         cwd=self._cwd,
                         env=self._launch_env,
+                        stderr=stderr_log,
                     )
                 self._started_by_us = True
 

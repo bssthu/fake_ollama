@@ -405,6 +405,7 @@ def test_llama_cpp_quantized_cache_inherits_flash_attn_from_defaults():
             {
                 "model": "qa",
                 "base_url": "http://127.0.0.1:8080",
+                "cache_type_k": "q8_0",
                 "cache_type_v": "q8_0",
             }
         ],
@@ -441,6 +442,91 @@ def test_llama_cpp_f16_cache_without_flash_attn_ok():
         ]
     )
     assert s.llama_cpp_targets[0].cache_type_v == "f16"
+
+
+# ---------------------------------------------------------------------------
+# Asymmetric K/V cache types — slow generic CUDA path
+# ---------------------------------------------------------------------------
+
+
+def test_llama_cpp_only_v_quantized_rejected_even_with_flash_attn():
+    """K defaults to f16 when omitted, so ``cache_type_v="q8_0"`` alone
+    leaves the kernel running an asymmetric f16/q8_0 attention path."""
+    with pytest.raises(ValueError, match="resolve to different types"):
+        Settings(
+            llama_cpp_targets=[
+                {
+                    "model": "qa",
+                    "base_url": "http://127.0.0.1:8080",
+                    "cache_type_v": "q8_0",
+                    "flash_attn": True,
+                }
+            ]
+        )
+
+
+def test_llama_cpp_empty_k_with_quantized_v_rejected():
+    """The admin UI emits ``cache_type_k=""`` when the field is cleared.
+    Combined with a quantized V, that is still asymmetric and must be
+    rejected even though K is not ``None``."""
+    with pytest.raises(ValueError, match="resolve to different types"):
+        Settings(
+            llama_cpp_targets=[
+                {
+                    "model": "qa",
+                    "base_url": "http://127.0.0.1:8080",
+                    "cache_type_k": "",
+                    "cache_type_v": "q8_0",
+                    "flash_attn": True,
+                }
+            ]
+        )
+
+
+def test_llama_cpp_mixed_quant_types_rejected():
+    with pytest.raises(ValueError, match="resolve to different types"):
+        Settings(
+            llama_cpp_targets=[
+                {
+                    "model": "qa",
+                    "base_url": "http://127.0.0.1:8080",
+                    "cache_type_k": "q4_0",
+                    "cache_type_v": "q8_0",
+                    "flash_attn": True,
+                }
+            ]
+        )
+
+
+def test_llama_cpp_explicit_f16_k_with_missing_v_ok():
+    """``f16`` is llama-server's default for an omitted ``-ctv``, so an
+    explicit ``cache_type_k="f16"`` paired with no V is still symmetric."""
+    s = Settings(
+        llama_cpp_targets=[
+            {
+                "model": "qa",
+                "base_url": "http://127.0.0.1:8080",
+                "cache_type_k": "f16",
+            }
+        ]
+    )
+    assert s.llama_cpp_targets[0].cache_type_k == "f16"
+
+
+def test_llama_cpp_matched_quant_cache_with_flash_attn_ok():
+    s = Settings(
+        llama_cpp_targets=[
+            {
+                "model": "qa",
+                "base_url": "http://127.0.0.1:8080",
+                "cache_type_k": "q5_1",
+                "cache_type_v": "q5_1",
+                "flash_attn": True,
+            }
+        ]
+    )
+    assert s.llama_cpp_targets[0].cache_type_k == "q5_1"
+    assert s.llama_cpp_targets[0].cache_type_v == "q5_1"
 
 
 # ---------------------------------------------------------------------------
