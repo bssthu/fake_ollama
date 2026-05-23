@@ -520,6 +520,18 @@ class LlamaCppClient:
                 raise
             async with self._concurrency_slot():
                 self._active += 1
+                # Promote the pending reservation to "loaded" *before* the
+                # POST. ``_ensure_ready`` has already confirmed /health
+                # returned 200, which on llama-server means the model is
+                # in VRAM. The dashboard should reflect that immediately,
+                # because for non-stream requests with a long prompt the
+                # upstream withholds response headers until after the
+                # entire prefill+decode completes (it needs Content-Length),
+                # which can take minutes. ``client.post`` and
+                # ``client.stream`` both block on those headers, so any
+                # mark-after-status-code scheme stays invisible the whole
+                # time.
+                self._mark_vram_reserved(model, estimated_vram_gb)
                 try:
                     try:
                         url = f"{self._base}/v1/chat/completions"
@@ -540,7 +552,6 @@ class LlamaCppClient:
                             json=body,
                             headers=headers,
                         )
-                        await resp.aread()
                         if request_data_logging_enabled():
                             log_data_event(
                                 "backend_response_start",
@@ -572,6 +583,7 @@ class LlamaCppClient:
                                 response_bytes=len(resp.content),
                             )
                         resp.raise_for_status()
+                        return resp.json()
                     except BaseException as exc:
                         log_data_event(
                             "backend_error",
@@ -582,10 +594,7 @@ class LlamaCppClient:
                             url=f"{self._base}/v1/chat/completions",
                             error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
                         )
-                        self._discard_vram_pending(model)
                         raise
-                    self._mark_vram_reserved(model, estimated_vram_gb)
-                    return resp.json()
                 finally:
                     self._active -= 1
         finally:

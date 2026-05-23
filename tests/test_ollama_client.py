@@ -562,3 +562,148 @@ async def test_ollama_client_reports_insufficient_vram_before_request():
         await client.aclose()
 
     assert chat_called is False
+
+
+# ---------------------------------------------------------------------------
+# pre-mark VRAM: model visible in dashboard during in-flight non-stream chat
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_chat_marks_vram_before_response_arrives():
+    """_loaded_model must appear in loaded_model_snapshots() while the POST is
+    still in-flight, before any response headers arrive.
+
+    Regression: llama-server's non-stream path withholds all response headers
+    until after prefill+decode finishes (needs Content-Length). Any
+    mark-after-status-code scheme stays invisible to the dashboard for the
+    entire generation — which can be minutes on a large-prompt analysis task.
+    """
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200)
+        in_flight.set()
+        await release.wait()
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+
+    client = LlamaCppClient(
+        "http://127.0.0.1:21441",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        task = asyncio.create_task(
+            client.chat({"model": "m", "messages": []}, estimated_vram_gb=10.0)
+        )
+        await asyncio.wait_for(in_flight.wait(), timeout=2.0)
+
+        # POST is blocked inside the transport — no response headers yet.
+        # The dashboard snapshot must already show the model as loaded.
+        snaps = client.loaded_model_snapshots()
+        assert len(snaps) == 1
+        assert snaps[0]["model"] == "m"
+        assert snaps[0]["estimated_vram_gb"] == 10.0
+
+        release.set()
+        await asyncio.wait_for(task, timeout=2.0)
+        # Snapshot still present after completion.
+        assert len(client.loaded_model_snapshots()) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ollama_chat_marks_vram_before_response_arrives():
+    """_loaded_models must be populated before the HTTP response arrives.
+
+    Same class of bug as the llama.cpp variant: non-stream Ollama chat also
+    withholds response headers on long generations.
+    """
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.0.0-test"})
+        in_flight.set()
+        await release.wait()
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "ok"}, "done": True},
+        )
+
+    client = OllamaClient(
+        "http://127.0.0.1:11434",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        task = asyncio.create_task(
+            client.chat({"model": "m", "messages": []}, estimated_vram_gb=10.0)
+        )
+        await asyncio.wait_for(in_flight.wait(), timeout=2.0)
+
+        snaps = client.loaded_model_snapshots()
+        assert len(snaps) == 1
+        assert snaps[0]["model"] == "m"
+        assert snaps[0]["estimated_vram_gb"] == 10.0
+
+        release.set()
+        await asyncio.wait_for(task, timeout=2.0)
+        assert len(client.loaded_model_snapshots()) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_chat_keeps_vram_reservation_on_upstream_error():
+    """After an upstream error the VRAM reservation must be kept, not discarded.
+
+    _ensure_ready confirmed the server was healthy (model in VRAM) before the
+    POST. Clearing the reservation on a 5xx would cause the dashboard to show
+    no model even though VRAM is still occupied.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200)
+        return httpx.Response(500, json={"error": "overloaded"})
+
+    client = LlamaCppClient(
+        "http://127.0.0.1:21441",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.chat({"model": "m", "messages": []}, estimated_vram_gb=8.0)
+        # Reservation must survive the error — model is still in VRAM.
+        snaps = client.loaded_model_snapshots()
+        assert len(snaps) == 1
+        assert snaps[0]["model"] == "m"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ollama_chat_keeps_vram_reservation_on_upstream_error():
+    """Same reservation-survives-error guarantee for the Ollama client."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.0.0-test"})
+        return httpx.Response(500, json={"error": "overloaded"})
+
+    client = OllamaClient(
+        "http://127.0.0.1:11434",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.chat({"model": "m", "messages": []}, estimated_vram_gb=8.0)
+        snaps = client.loaded_model_snapshots()
+        assert len(snaps) == 1
+        assert snaps[0]["model"] == "m"
+    finally:
+        await client.aclose()
