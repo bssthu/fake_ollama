@@ -50,7 +50,7 @@
 - **来源命名清晰区分**：`anthropic_upstreams` / `openai_upstreams`（远端）+ `ollama_targets` / `llama_cpp_targets` / `comfyui_targets`（本机）
 - **循环引用检测**：`anthropic_upstreams[*].base_url` 若指向 fake_ollama 自己的某个监听端口，启动时直接报错，避免转发死循环
 - **本地 target 生命周期接管**：Ollama / llama.cpp / ComfyUI 都可配置 health check、按需启动脚本、启动超时、空闲回收
-- **ComfyUI 图片后端**：可把 Z-Image-Turbo 等 ComfyUI API workflow 暴露为 OpenAI 兼容图片生成 / 图片编辑接口，支持 per-target 默认分辨率、steps、sampler、denoise、模型文件名与节点 ID 配置。
+- **ComfyUI 图片后端**：可把 Z-Image-Turbo / Qwen-Image-Edit / SenseNova-U1 等 ComfyUI API workflow 暴露为 OpenAI 兼容图片生成 / 图片编辑接口。采用声明式 `preset` + bindings 结构，接入新模型只改配置 + JSON；多个图片模型可共用一个 ComfyUI 实例并由 VRAM 协调器互斥换出，避免爆显存。
 - **本地显存预检**：本地模型可在 `model_profiles` 里填 `estimated_vram_gb`；启动前用 `nvidia-smi` 评估可用显存并尝试回收空闲模型
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP）
 - **零依赖 Web 编辑器**：按「Forward / Reverse / Shared / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
@@ -260,13 +260,31 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 
 ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名，fake_ollama 通过 ComfyUI HTTP API 提交 workflow、轮询 history、读取 output 图片，并把结果包装成 OpenAI Images 兼容响应。
 
-内置 workflow 面向 Z-Image-Turbo，默认使用 FP8 diffusion + 轻量 text encoder 的 ComfyUI 模型文件：
+每个 target 用 **`preset`** 选择工作流形态（声明式绑定，新增模型只改配置 + JSON、不动代码）：
+
+| preset | 适用模型 | 加载方式 / 特点 |
+|---|---|---|
+| `z_image_turbo`（默认） | Z-Image-Turbo | 独立 UNET/CLIP/VAE + KSampler；沿用 `diffusion_model` / `text_encoder_model` / `vae_model` / 各 `*_node_id` 字段 |
+| `qwen_image_edit_aio` | Qwen-Image-Edit 整合检查点（如 Qwen-Rapid-AIO） | `CheckpointLoaderSimple` 一次加载 UNet+CLIP+VAE；文生图用 `CLIPTextEncode`，图生图用 `TextEncodeQwenImageEditPlus`（参考图经 conditioning 注入，编辑 `denoise=1.0`） |
+| `sensenova_u1` | SenseNova-U1-8B（自定义节点 `ComfyUI_SenseNova_U1`） | 融合模型节点 + 融合采样节点；分辨率走 `target_pixels` 比例桶（请求 `size` 映射到最近比例，实际输出为该桶原生尺寸） |
+
+每个 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` 与 `<preset>_i2i.json`。要接入**其它** ComfyUI 模型，提供 API 格式工作流 JSON（`text_to_image_workflow_path` / `image_to_image_workflow_path`），再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可，两者按 `{"t2i": {...}, "i2i": {...}}` 分模式书写。
+
+> **客户端可能按模型名判断是否图片模型**：部分客户端（如 CherryStudio）靠模型 id 的正则/子串匹配来决定走聊天接口还是 `/v1/images/*`——只认 `z-image*` / `qwen-image*` / `flux*` / `sd*` 等已知图片模型名。若把图片模型暴露成它不认识的名字（如 `sensenova`），它会当普通聊天模型发到 `/v1/chat/completions`，被 fake_ollama 以 400「use /v1/images/...」拒绝。对策：在 `exposed_models[*].alias` 里给这类模型起一个**包含已知图片模型关键词的别名**（例如 `sensenova-z-image`）；这只改客户端看到的 id，后端 target 与 `model_profiles` 仍按真实模型名匹配，不受影响。
+
+> **多模型共用一个 ComfyUI 实例 + 显存互斥**：把多个 target 的 `base_url` / `start_command` 指向同一个 ComfyUI（如下例三个图片模型共用 `:21480`）。fake_ollama 的 VRAM 协调器按各模型 `model_profiles.estimated_vram_gb` 准入与 LRU 换出，大图模型运行前会先挤出空闲的 llama.cpp 模型；同实例内的图片模型切换由 ComfyUI 自身的智能内存负责（显存放不下时自动 offload 到内存）。这样在 24GB 卡上接入 28GB 的 Qwen 检查点也不会爆显存。
+
+> **24GB 卡（RTX 4090）实测性能与显存提示**：
+> - **Qwen-Image-Edit AIO（fp8 28GB）**：显存**腾干净**时 DiT 完全驻留（文本编码器一次性放 CPU），文生图 ~5s/张（冷加载 ~25s）、图生图 ~15s/张；但若显存被占（DiT 放不下）会退化为**逐步从内存流式加载，单步从 ~0.7s 涨到 ~18s（约 110s/张），非常卡**。所以把它的 `estimated_vram_gb` 设得较高（20），让协调器先把 GPU 腾出来，确保驻留跑得快。本地只有 28GB fp8 整合检查点；想更省显存需另找更小的量化版本（如 Q4 GGUF 的 DiT ~12GB）。
+> - **SenseNova-U1-8B**：原生只在 ~4MP（如 1:1=2048²）出图，**激活就占满 ~20GB+ 显存**。整模驻留（`prefetch_count=0`）会 **OOM**，故 `fake_ollama/workflows/sensenova_u1_*.json` 里设 `prefetch_count=2`（层流式：仅 3 层驻留、其余固定在内存异步预取），避免 OOM；代价是较慢（~100s/张）。显存更紧可调小、更宽裕想快一点可调大。`estimated_vram_gb` 要按**实际峰值**填（这里设 20，不是模型权重大小），否则协调器以为只占十几 GB 而放行其它模型同时驻留，运行到 2048² 激活峰值时仍会 OOM。
+
+内置 Z-Image-Turbo workflow 默认使用 FP8 diffusion + 轻量 text encoder 的 ComfyUI 模型文件：
 
 - `models/diffusion_models/z-image-turbo-fp8-e4m3fn.safetensors`
 - `models/text_encoders/qwen_3_4b_fp4_mixed.safetensors`
 - `models/vae/ae.safetensors`
 
-示例：
+示例（Z-Image-Turbo + Qwen-Image + SenseNova 共用同一个 ComfyUI 实例）：
 
 ```jsonc
 {
@@ -275,22 +293,47 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "name": "z-image-turbo-comfyui",
       "base_url": "http://127.0.0.1:21480",
       "model": "z-image-turbo",
+      "preset": "z_image_turbo",
       "auto_start": true,
       "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
       "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
       "diffusion_model": "z-image-turbo-fp8-e4m3fn.safetensors",
       "text_encoder_model": "qwen_3_4b_fp4_mixed.safetensors",
       "vae_model": "ae.safetensors",
-      "default_width": 1024,
-      "default_height": 1024,
       "default_steps": 8,
       "default_cfg": 1.0,
       "default_sampler_name": "res_multistep",
       "default_scheduler": "simple",
       "default_denoise": 1.0,
-      "default_edit_denoise": 0.25,
-      "seed_mode": "random",
-      "seed": 0
+      "default_edit_denoise": 0.25
+    },
+    {
+      "name": "qwen-image-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "qwen-image",
+      "preset": "qwen_image_edit_aio",
+      "auto_start": true,
+      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "default_steps": 6,
+      "default_cfg": 1.0,
+      "default_sampler_name": "euler_ancestral",
+      "default_scheduler": "beta",
+      "default_denoise": 1.0,
+      "default_edit_denoise": 1.0,
+      "output_prefix": "fake_ollama/qwen-image"
+    },
+    {
+      "name": "sensenova-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "sensenova",
+      "preset": "sensenova_u1",
+      "auto_start": true,
+      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "output_prefix": "fake_ollama/sensenova"
     }
   ],
   "api_interfaces": [
@@ -300,7 +343,9 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "port": 21435,
       "access_tokens": ["tk-..."],
       "exposed_models": [
-        { "model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo" }
+        { "model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo" },
+        { "model": "qwen-image", "target": "qwen-image-comfyui", "alias": "qwen-image" },
+        { "model": "sensenova", "target": "sensenova-comfyui", "alias": "sensenova-z-image" }
       ]
     }
   ],
@@ -311,6 +356,20 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "capabilities": ["image_generation", "image_edit"],
       "context_length": 4096,
       "estimated_vram_gb": 16
+    },
+    {
+      "model": "qwen-image",
+      "target": "qwen-image-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 20
+    },
+    {
+      "model": "sensenova",
+      "target": "sensenova-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 20
     }
   ]
 }

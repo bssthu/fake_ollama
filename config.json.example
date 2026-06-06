@@ -115,7 +115,7 @@
     }
   ],
 
-  "_model_sources_comfyui": "==== ComfyUI image workflow sources =====================",
+  "_model_sources_comfyui": "==== ComfyUI image workflow sources ===================== 每个 target 用 preset 选择工作流形态：z_image_turbo（独立 UNET/CLIP/VAE + KSampler，沿用下面的 diffusion_model/node id 字段）、qwen_image_edit_aio（CheckpointLoaderSimple 整合检查点 + Qwen-Image-Edit，文生图/图生图）、sensenova_u1（自定义节点 ComfyUI_SenseNova_U1，按比例出图）。多个 target 可共用同一个 ComfyUI 实例（相同 base_url + start_command），由 VRAM 协调器按 model_profiles 的 estimated_vram_gb 互斥换出，避免叠加爆显存。需要接入其它 ComfyUI 模型时，提供 API 格式工作流 JSON（workflow path）并用 bindings/static_inputs 声明参数落点即可，无需改代码。",
 
   "comfyui_targets": [
     {
@@ -125,6 +125,7 @@
       "model": "z-image-turbo",
       "alias": null,
       "upstream_id": null,
+      "preset": "z_image_turbo",
       "auto_start": true,
       "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
       "stop_command": null,
@@ -155,6 +156,40 @@
       "image_crop": "center",
       "prompt_timeout_seconds": 600,
       "poll_interval_seconds": 0.5
+    },
+    {
+      "name": "qwen-image-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "qwen-image",
+      "preset": "qwen_image_edit_aio",
+      "auto_start": true,
+      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 180,
+      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "default_steps": 6,
+      "default_cfg": 1.0,
+      "default_sampler_name": "euler_ancestral",
+      "default_scheduler": "beta",
+      "default_denoise": 1.0,
+      "default_edit_denoise": 1.0,
+      "max_batch_size": 2,
+      "output_prefix": "fake_ollama/qwen-image"
+    },
+    {
+      "name": "sensenova-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "sensenova",
+      "preset": "sensenova_u1",
+      "auto_start": true,
+      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 180,
+      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "max_batch_size": 2,
+      "output_prefix": "fake_ollama/sensenova"
     }
   ],
 
@@ -211,6 +246,24 @@
       "estimated_vram_gb": 16.0,
       "thinking_mode": "disabled",
       "show_thinking": false
+    },
+    {
+      "model": "qwen-image",
+      "target": "qwen-image-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 20.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "sensenova",
+      "target": "sensenova-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 20.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
     }
   ],
 
@@ -245,7 +298,9 @@
         {"model": "claude-3-5-sonnet-20241022", "target": "anthropic", "alias": "claude-sonnet"},
         {"model": "deepseek-chat", "target": "deepseek"},
         {"model": "qwen3.6-27b-hauhau-q2kp", "target": "qwen3.6-27b-hauhau-q2kp"},
-        {"model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo"}
+        {"model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo"},
+        {"model": "qwen-image", "target": "qwen-image-comfyui", "alias": "qwen-image"},
+        {"model": "sensenova", "target": "sensenova-comfyui", "alias": "sensenova-z-image"}
       ]
     }
   ]

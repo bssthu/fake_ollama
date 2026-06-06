@@ -1395,11 +1395,13 @@ def _resolve_image_seed(
         cur = counters.get(target.name, base)
         counters[target.name] = cur + max(1, int(count))
         return cur
-    # Keep random seeds within 32 bits (0 .. 2**32-1). ComfyUI accepts up to
-    # 2**64-1, but seeds above 2**53-1 (JS/JSON Number.MAX_SAFE_INTEGER) lose
-    # precision if round-tripped through any float64 consumer (e.g. dropping the
-    # output PNG back into ComfyUI's web UI to reproduce it).
-    return secrets.randbits(32)
+    # Keep random seeds within signed 32-bit range (0 .. 2**31-1). ComfyUI's
+    # KSampler accepts up to 2**64-1, but some custom sampler nodes cap the seed
+    # at INT32_MAX (e.g. SenseNova_SM_Sampler rejects anything larger), and any
+    # float64 consumer loses precision above 2**53-1 (JS Number.MAX_SAFE_INTEGER,
+    # e.g. dropping the output PNG back into ComfyUI's web UI to reproduce it).
+    # 2**31-1 satisfies every backend.
+    return secrets.randbits(31)
 
 
 def _image_request_params(

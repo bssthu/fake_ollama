@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .comfyui_presets import WorkflowSpec, nearest_ratio, resolve_workflows
 from .config import outbound_cycle_headers
 from .process_utils import create_managed_subprocess_shell, terminate_process_tree
 from .request_data_log import (
@@ -35,10 +36,18 @@ from .vram import VRAM_IDLE_RECLAIM_SECONDS, VramCoordinator, VramReleaseCandida
 
 logger = logging.getLogger("fake_ollama")
 
-
-_WORKFLOW_DIR = Path(__file__).resolve().parent / "workflows"
-_DEFAULT_T2I_WORKFLOW = _WORKFLOW_DIR / "z_image_turbo_t2i.json"
-_DEFAULT_I2I_WORKFLOW = _WORKFLOW_DIR / "z_image_turbo_i2i.json"
+# Request parameters that must be coerced to a concrete numeric type before
+# they are dropped into a workflow node (everything else is passed through as
+# the string/value the caller supplied).
+_PARAM_COERCE = {
+    "seed": int,
+    "steps": int,
+    "width": int,
+    "height": int,
+    "batch_size": int,
+    "cfg": float,
+    "denoise": float,
+}
 
 
 @dataclass
@@ -96,6 +105,12 @@ class ComfyUIClient:
         self._cwd = cwd
         self.target_id = f"comfyui:{target_name}"
         self._workflow_config = dict(workflow_config or {})
+        # Resolve the declarative {t2i, i2i} workflow specs once. Reading the
+        # JSON files themselves is deferred to build time so a missing custom
+        # workflow only fails the request that needs it, not construction.
+        self._workflows: Dict[str, Optional[WorkflowSpec]] = resolve_workflows(
+            self._workflow_config
+        )
         self._vram_coordinator = vram_coordinator
         self._client_id = f"fake-ollama-{uuid.uuid4().hex}"
         if client is not None:
@@ -340,22 +355,21 @@ class ComfyUIClient:
         denoise: float,
         estimated_vram_gb: Optional[float] = None,
     ) -> List[ComfyUIImage]:
-        workflow = self._build_workflow(
-            "text_to_image",
-            prompt=prompt,
-            width=width,
-            height=height,
-            batch_size=n,
-            seed=seed,
-            steps=steps,
-            cfg=cfg,
-            sampler_name=sampler_name,
-            scheduler=scheduler,
-            denoise=denoise,
-        )
-        return await self._run_workflow(
-            workflow,
+        return await self._run(
+            mode="t2i",
             model=model,
+            prompt=prompt,
+            n=n,
+            seed=seed,
+            params={
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": sampler_name,
+                "scheduler": scheduler,
+                "denoise": denoise,
+            },
             estimated_vram_gb=estimated_vram_gb,
             operation="generate_image",
         )
@@ -378,55 +392,48 @@ class ComfyUIClient:
         denoise: float,
         estimated_vram_gb: Optional[float] = None,
     ) -> List[ComfyUIImage]:
-        self._begin_request_lifecycle()
-        try:
-            await self._ensure_vram(model, estimated_vram_gb)
-            try:
-                await self._ensure_ready()
-            except BaseException:
-                self._discard_vram_pending(model)
-                raise
-            self._active += 1
-            try:
-                upload_name = await self._upload_image(image_bytes, filename)
-                images: List[ComfyUIImage] = []
-                self._mark_vram_reserved(model, estimated_vram_gb)
-                for idx in range(max(1, n)):
-                    workflow = self._build_workflow(
-                        "image_to_image",
-                        prompt=prompt,
-                        width=width,
-                        height=height,
-                        batch_size=1,
-                        seed=seed + idx,
-                        steps=steps,
-                        cfg=cfg,
-                        sampler_name=sampler_name,
-                        scheduler=scheduler,
-                        denoise=denoise,
-                        image_name=upload_name,
-                    )
-                    images.extend(
-                        await self._submit_and_collect(
-                            workflow,
-                            operation="edit_image",
-                        )
-                    )
-                return images[: max(1, n)]
-            finally:
-                self._active -= 1
-        finally:
-            self._touch_vram_reservation(model)
-            self._end_request_lifecycle()
+        return await self._run(
+            mode="i2i",
+            model=model,
+            prompt=prompt,
+            n=n,
+            seed=seed,
+            params={
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": sampler_name,
+                "scheduler": scheduler,
+                "denoise": denoise,
+            },
+            estimated_vram_gb=estimated_vram_gb,
+            operation="edit_image",
+            image_bytes=image_bytes,
+            filename=filename,
+        )
 
-    async def _run_workflow(
+    async def _run(
         self,
-        workflow: Dict[str, Any],
         *,
+        mode: str,
         model: str,
+        prompt: str,
+        n: int,
+        seed: int,
+        params: Dict[str, Any],
         estimated_vram_gb: Optional[float],
         operation: str,
+        image_bytes: Optional[bytes] = None,
+        filename: Optional[str] = None,
     ) -> List[ComfyUIImage]:
+        spec = self._workflows.get(mode)
+        if spec is None:
+            verb = "text-to-image" if mode == "t2i" else "image-to-image"
+            raise httpx.ProtocolError(
+                f"ComfyUI target {self.target_id} has no {verb} workflow configured"
+            )
+        n = max(1, int(n))
         self._begin_request_lifecycle()
         try:
             await self._ensure_vram(model, estimated_vram_gb)
@@ -438,7 +445,33 @@ class ComfyUIClient:
             self._active += 1
             try:
                 self._mark_vram_reserved(model, estimated_vram_gb)
-                return await self._submit_and_collect(workflow, operation=operation)
+                base: Dict[str, Any] = {**params, "prompt": prompt}
+                if image_bytes is not None:
+                    base["image"] = await self._upload_image(
+                        image_bytes, filename or "input.png"
+                    )
+                images: List[ComfyUIImage] = []
+                if spec.binds("batch_size"):
+                    # The workflow batches natively: one submission yields n.
+                    workflow = self._build_workflow(
+                        spec, {**base, "batch_size": n, "seed": int(seed)}
+                    )
+                    images.extend(
+                        await self._submit_and_collect(workflow, operation=operation)
+                    )
+                else:
+                    # No batch slot (e.g. single-image edit graphs): loop with
+                    # an advancing seed so the n outputs differ.
+                    for idx in range(n):
+                        workflow = self._build_workflow(
+                            spec, {**base, "batch_size": 1, "seed": int(seed) + idx}
+                        )
+                        images.extend(
+                            await self._submit_and_collect(
+                                workflow, operation=operation
+                            )
+                        )
+                return images[:n]
             finally:
                 self._active -= 1
         finally:
@@ -698,66 +731,60 @@ class ComfyUIClient:
         )
         return bytes(resp.content)
 
-    def _build_workflow(self, mode: str, **params: Any) -> Dict[str, Any]:
-        path_key = (
-            "text_to_image_workflow_path"
-            if mode == "text_to_image"
-            else "image_to_image_workflow_path"
-        )
-        default_path = _DEFAULT_T2I_WORKFLOW if mode == "text_to_image" else _DEFAULT_I2I_WORKFLOW
-        workflow = self._load_workflow(self._workflow_config.get(path_key), default_path)
+    def _build_workflow(
+        self, spec: WorkflowSpec, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Materialise an API-format workflow from a spec + request params.
 
-        self._set(workflow, "unet_node_id", "28", "unet_name", self._workflow_config.get("diffusion_model"))
-        self._set(workflow, "unet_node_id", "28", "weight_dtype", self._workflow_config.get("diffusion_weight_dtype"))
-        self._set(workflow, "clip_node_id", "30", "clip_name", self._workflow_config.get("text_encoder_model"))
-        self._set(workflow, "clip_node_id", "30", "type", self._workflow_config.get("text_encoder_type"))
-        self._set(workflow, "clip_node_id", "30", "device", self._workflow_config.get("text_encoder_device"))
-        self._set(workflow, "vae_node_id", "29", "vae_name", self._workflow_config.get("vae_model"))
-        self._set(workflow, "prompt_node_id", "27", "text", params["prompt"])
-        self._set(workflow, "sampling_node_id", "11", "shift", params.get("shift", self._workflow_config.get("default_shift", 3.0)))
-        self._set(workflow, "ksampler_node_id", "3", "seed", int(params["seed"]))
-        self._set(workflow, "ksampler_node_id", "3", "steps", int(params["steps"]))
-        self._set(workflow, "ksampler_node_id", "3", "cfg", float(params["cfg"]))
-        self._set(workflow, "ksampler_node_id", "3", "sampler_name", params["sampler_name"])
-        self._set(workflow, "ksampler_node_id", "3", "scheduler", params["scheduler"])
-        self._set(workflow, "ksampler_node_id", "3", "denoise", float(params["denoise"]))
-        self._set(workflow, "save_image_node_id", "9", "filename_prefix", self._workflow_config.get("output_prefix"))
-
-        if mode == "text_to_image":
-            self._set(workflow, "latent_node_id", "13", "width", int(params["width"]))
-            self._set(workflow, "latent_node_id", "13", "height", int(params["height"]))
-            self._set(workflow, "latent_node_id", "13", "batch_size", int(params["batch_size"]))
-        else:
-            self._set(workflow, "load_image_node_id", "12", "image", params["image_name"])
-            self._set(workflow, "image_scale_node_id", "14", "width", int(params["width"]))
-            self._set(workflow, "image_scale_node_id", "14", "height", int(params["height"]))
-            self._set(workflow, "image_scale_node_id", "14", "upscale_method", self._workflow_config.get("image_upscale_method"))
-            self._set(workflow, "image_scale_node_id", "14", "crop", self._workflow_config.get("image_crop"))
+        ``static_inputs`` are fixed per target (model files, sampler knobs that
+        are not request-driven); ``bindings`` map request params onto node
+        inputs. Params with no binding — or a ``None`` value — are skipped, so
+        a workflow only receives the knobs it actually exposes.
+        """
+        workflow = self._load_workflow(spec.path)
+        for node_id, inputs in spec.static_inputs.items():
+            for input_name, value in inputs.items():
+                if value is not None:
+                    self._set_input(workflow, str(node_id), str(input_name), value)
+        for param, places in spec.bindings.items():
+            if not places:
+                continue
+            if param == "size_ratio":
+                value: Any = nearest_ratio(
+                    int(params.get("width") or 0),
+                    int(params.get("height") or 0),
+                    spec.size_ratio_options,
+                )
+                if not value:
+                    continue
+            else:
+                value = params.get(param)
+            if value is None:
+                continue
+            coerce = _PARAM_COERCE.get(param)
+            if coerce is not None:
+                value = coerce(value)
+            for node_id, input_name in places:
+                self._set_input(workflow, node_id, input_name, value)
         return workflow
 
     @staticmethod
-    def _load_workflow(path: Any, default_path: Path) -> Dict[str, Any]:
-        src = Path(str(path)) if path else default_path
-        raw = src.read_text(encoding="utf-8")
+    def _load_workflow(path: Path) -> Dict[str, Any]:
+        raw = Path(path).read_text(encoding="utf-8")
         data = json.loads(raw)
         if not isinstance(data, dict):
-            raise ValueError(f"ComfyUI workflow {src} must be an API prompt object")
+            raise ValueError(f"ComfyUI workflow {path} must be an API prompt object")
         return copy.deepcopy(data)
 
-    def _set(
-        self,
-        workflow: Dict[str, Any],
-        node_key: str,
-        default_node_id: str,
-        input_name: str,
-        value: Any,
+    @staticmethod
+    def _set_input(
+        workflow: Dict[str, Any], node_id: str, input_name: str, value: Any
     ) -> None:
-        if value is None:
-            return
-        node_id = str(self._workflow_config.get(node_key) or default_node_id)
         node = workflow.get(node_id)
         if not isinstance(node, dict):
-            raise ValueError(f"ComfyUI workflow is missing node {node_id!r}")
+            raise ValueError(
+                f"ComfyUI workflow is missing node {node_id!r} bound by this target"
+            )
         inputs = node.setdefault("inputs", {})
         if not isinstance(inputs, dict):
             raise ValueError(f"ComfyUI workflow node {node_id!r} has invalid inputs")

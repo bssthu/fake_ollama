@@ -887,7 +887,17 @@ class ComfyUITarget(BaseModel):
     health_path: str = "/system_stats"
     cwd: Optional[str] = None
 
-    # Workflow files. When omitted, bundled Z-Image-Turbo API workflows are used.
+    # Declarative workflow preset (see ``comfyui_presets``). The default
+    # ``z_image_turbo`` reproduces the legacy behaviour from the per-field node
+    # ids/model files below; ``qwen_image_edit_aio`` and ``sensenova_u1`` ship
+    # bundled workflows + bindings. Set ``bindings`` / ``static_inputs`` to
+    # override a preset (or describe an arbitrary workflow) without touching the
+    # client; both are keyed by mode, e.g. {"t2i": {...}, "i2i": {...}}.
+    preset: str = "z_image_turbo"
+    bindings: Optional[Dict[str, Any]] = None
+    static_inputs: Optional[Dict[str, Any]] = None
+
+    # Workflow files. When omitted, the preset's bundled API workflows are used.
     text_to_image_workflow_path: Optional[str] = None
     image_to_image_workflow_path: Optional[str] = None
 
@@ -1010,6 +1020,19 @@ class ComfyUITarget(BaseModel):
             raise ValueError("comfyui_targets[*].seed must be >= 0")
         return int(v)
 
+    @field_validator("preset")
+    @classmethod
+    def _valid_preset(cls, v: str) -> str:
+        from .comfyui_presets import is_known_preset, preset_names
+
+        v = (v or "z_image_turbo").strip()
+        if not is_known_preset(v):
+            raise ValueError(
+                f"comfyui_targets[*].preset {v!r} is unknown; "
+                f"known presets: {preset_names()}"
+            )
+        return v
+
     @model_validator(mode="after")
     def _post_init(self) -> "ComfyUITarget":
         if not self.model:
@@ -1056,6 +1079,9 @@ class ComfyUITarget(BaseModel):
 
     def workflow_config(self) -> Dict[str, Any]:
         keys = [
+            "preset",
+            "bindings",
+            "static_inputs",
             "text_to_image_workflow_path",
             "image_to_image_workflow_path",
             "diffusion_model",

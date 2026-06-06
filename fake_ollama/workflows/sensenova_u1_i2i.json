@@ -1,0 +1,51 @@
+{
+  "11": {
+    "class_type": "SenseNova_SM_Model",
+    "inputs": {
+      "diffusion_models": "none",
+      "gguf": "SenseNova-U1-8B-MoT-SFT-fm-Q6_K.gguf",
+      "lora": "SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors",
+      "attn_backend": "auto"
+    }
+  },
+  "12": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": ""
+    }
+  },
+  "10": {
+    "class_type": "SenseNova_SM_Sampler",
+    "inputs": {
+      "model": ["11", 0],
+      "image": ["12", 0],
+      "img_mode": "edit",
+      "prompt": "",
+      "seed": 0,
+      "steps": 8,
+      "target_pixels": "1:1",
+      "cfg": 1.0,
+      "img_cfg": 1.0,
+      "timestep_shift": 3.0,
+      "batch_size": 1,
+      "prefetch_count": 2,
+      "interleave_max": 2,
+      "cfg_norm": "none",
+      "enhance": false,
+      "think_mode": false,
+      "do_sample": true,
+      "max_new_tokens": 1024,
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 0,
+      "repetition_penalty": 0.0
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["10", 0],
+      "filename_prefix": "fake_ollama/sensenova-edit"
+    }
+  }
+}
