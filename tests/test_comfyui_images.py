@@ -152,6 +152,29 @@ def test_openai_image_edits_accepts_multipart_image() -> None:
     assert fake.edit_calls[0]["denoise"] == 0.25
 
 
+def test_openai_image_edits_accepts_bracketed_image_field() -> None:
+    # OpenAI's images/edits multipart convention (and the AI SDK's
+    # OpenAICompatibleImageModel) names the input image field "image[]".
+    fake = _FakeComfyClient()
+    client = _client_with_fake(fake)
+    with client:
+        resp = client.post(
+            "/v1/images/edits",
+            headers={"x-api-key": "tk"},
+            data={
+                "model": "z-image-turbo",
+                "prompt": "make it night",
+                "size": "1024x1024",
+            },
+            files={"image[]": ("input.png", b"input-bytes", "image/png")},
+        )
+
+    assert resp.status_code == 200
+    assert fake.edit_calls[0]["prompt"] == "make it night"
+    assert fake.edit_calls[0]["image_bytes"] == b"input-bytes"
+    assert fake.edit_calls[0]["filename"] == "input.png"
+
+
 @pytest.mark.asyncio
 async def test_comfyui_client_runs_prompt_and_collects_view_image() -> None:
     seen_prompt: Optional[Dict[str, Any]] = None

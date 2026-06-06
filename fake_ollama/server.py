@@ -1247,7 +1247,11 @@ async def _image_payload_from_request(
         for key, value in form.multi_items():
             if hasattr(value, "read") and hasattr(value, "filename"):
                 upload = value
-                if key == "image" and image_bytes is None:
+                # OpenAI's images/edits multipart convention sends the input
+                # image as "image"; with multiple reference images (and what
+                # the AI SDK's OpenAICompatibleImageModel emits) it is "image[]"
+                # / "image[0]". Accept any of those; we only use the first.
+                if (key == "image" or key.startswith("image[")) and image_bytes is None:
                     image_bytes = await upload.read()
                     filename = getattr(upload, "filename", None) or filename
                 continue
