@@ -147,6 +147,8 @@
       "default_denoise": 1.0,
       "default_edit_denoise": 0.25,
       "default_shift": 3.0,
+      "seed_mode": "random",
+      "seed": 0,
       "max_batch_size": 2,
       "output_prefix": "fake_ollama/z-image-turbo",
       "image_upscale_method": "lanczos",

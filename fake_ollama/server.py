@@ -1368,11 +1368,46 @@ def _parse_image_size(payload: Dict[str, Any], target: Any) -> tuple[int, int]:
     return w, h
 
 
+def _resolve_image_seed(
+    payload: Dict[str, Any], target: Any, app: Any, *, count: int
+) -> int:
+    """Pick the KSampler seed for one request.
+
+    An explicit ``seed`` in the request body always wins. Otherwise the
+    per-target ``seed_mode`` decides: ``fixed`` reuses ``target.seed``,
+    ``increment`` advances a per-target counter (by ``count``, the number of
+    images this request consumes) starting from ``target.seed``, and
+    ``random`` (default) draws a fresh random seed.
+    """
+    seed_raw = payload.get("seed")
+    if seed_raw not in (None, "", "random"):
+        return _coerce_int_payload(payload, ("seed",), 0, minimum=0)
+
+    mode = (getattr(target, "seed_mode", "random") or "random").lower()
+    base = int(getattr(target, "seed", 0) or 0)
+    if mode == "fixed":
+        return base
+    if mode == "increment":
+        counters = getattr(app.state, "comfyui_seed_counters", None)
+        if counters is None:
+            counters = {}
+            app.state.comfyui_seed_counters = counters
+        cur = counters.get(target.name, base)
+        counters[target.name] = cur + max(1, int(count))
+        return cur
+    # Keep random seeds within 32 bits (0 .. 2**32-1). ComfyUI accepts up to
+    # 2**64-1, but seeds above 2**53-1 (JS/JSON Number.MAX_SAFE_INTEGER) lose
+    # precision if round-tripped through any float64 consumer (e.g. dropping the
+    # output PNG back into ComfyUI's web UI to reproduce it).
+    return secrets.randbits(32)
+
+
 def _image_request_params(
     payload: Dict[str, Any],
     target: Any,
     *,
     edit: bool,
+    app: Any,
 ) -> Dict[str, Any]:
     width, height = _parse_image_size(payload, target)
     n = _coerce_int_payload(payload, ("n",), 1)
@@ -1381,12 +1416,7 @@ def _image_request_params(
             status_code=400,
             detail=f"n={n} exceeds comfyui target max_batch_size={target.max_batch_size}",
         )
-    seed_raw = payload.get("seed")
-    seed = (
-        secrets.randbits(63)
-        if seed_raw in (None, "", "random")
-        else _coerce_int_payload(payload, ("seed",), 0, minimum=0)
-    )
+    seed = _resolve_image_seed(payload, target, app, count=n)
     return {
         "width": width,
         "height": height,
@@ -1445,7 +1475,7 @@ async def _handle_openai_image_generation(request: Request) -> Any:
         request, settings, payload
     )
     target = backend.source
-    params = _image_request_params(payload, target, edit=False)
+    params = _image_request_params(payload, target, edit=False, app=app)
     client: ComfyUIClient = _backend_client(app, backend)
     profile = settings.profile_for(f"{real_model}@{backend.name}")
     try:
@@ -1477,7 +1507,7 @@ async def _handle_openai_image_edit(request: Request) -> Any:
         request, settings, payload
     )
     target = backend.source
-    params = _image_request_params(payload, target, edit=True)
+    params = _image_request_params(payload, target, edit=True, app=app)
     client: ComfyUIClient = _backend_client(app, backend)
     profile = settings.profile_for(f"{real_model}@{backend.name}")
     try:

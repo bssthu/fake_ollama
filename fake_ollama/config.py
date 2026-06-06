@@ -907,6 +907,13 @@ class ComfyUITarget(BaseModel):
     default_denoise: float = 1.0
     default_edit_denoise: float = 0.25
     default_shift: float = 3.0
+    # Random seed control for the KSampler node. seed_mode:
+    #   "random"    -> a fresh random seed per request (default)
+    #   "fixed"     -> always use `seed`
+    #   "increment" -> start at `seed`, advance by the image count per request
+    # An explicit `seed` in the request body always overrides this.
+    seed_mode: str = "random"
+    seed: int = 0
     max_batch_size: int = 4
     output_prefix: str = "fake_ollama/z-image-turbo"
     image_upscale_method: str = "lanczos"
@@ -985,6 +992,23 @@ class ComfyUITarget(BaseModel):
         if float(v) < 0:
             raise ValueError("ComfyUI numeric workflow settings must be non-negative")
         return float(v)
+
+    @field_validator("seed_mode")
+    @classmethod
+    def _valid_seed_mode(cls, v: str) -> str:
+        v = (v or "random").strip().lower()
+        if v not in ("random", "fixed", "increment"):
+            raise ValueError(
+                "comfyui_targets[*].seed_mode must be one of random|fixed|increment"
+            )
+        return v
+
+    @field_validator("seed")
+    @classmethod
+    def _non_negative_seed(cls, v: int) -> int:
+        if int(v) < 0:
+            raise ValueError("comfyui_targets[*].seed must be >= 0")
+        return int(v)
 
     @model_validator(mode="after")
     def _post_init(self) -> "ComfyUITarget":

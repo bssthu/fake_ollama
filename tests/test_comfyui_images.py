@@ -175,6 +175,59 @@ def test_openai_image_edits_accepts_bracketed_image_field() -> None:
     assert fake.edit_calls[0]["filename"] == "input.png"
 
 
+def _client_with_seed_mode(fake: _FakeComfyClient, *, seed_mode: str, seed: int) -> TestClient:
+    settings = _settings()
+    settings.comfyui_targets[0].seed_mode = seed_mode
+    settings.comfyui_targets[0].seed = seed
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+    return TestClient(app, base_url="http://testserver:21435")
+
+
+def _gen(client: TestClient, **extra: Any) -> None:
+    body = {"prompt": "a cube", "size": "512x512"}
+    body.update(extra)
+    resp = client.post("/v1/images/generations", headers={"x-api-key": "tk"}, json=body)
+    assert resp.status_code == 200, resp.text
+
+
+def test_seed_mode_fixed_reuses_configured_seed() -> None:
+    fake = _FakeComfyClient()
+    with _client_with_seed_mode(fake, seed_mode="fixed", seed=777) as client:
+        _gen(client)
+        _gen(client)
+    assert fake.generate_calls[0]["seed"] == 777
+    assert fake.generate_calls[1]["seed"] == 777
+
+
+def test_seed_mode_increment_advances_per_request() -> None:
+    fake = _FakeComfyClient()
+    with _client_with_seed_mode(fake, seed_mode="increment", seed=100) as client:
+        _gen(client)            # n defaults to 1 -> 100
+        _gen(client)            # -> 101
+        _gen(client, n=2)       # -> 102, then counter jumps by 2
+        _gen(client)            # -> 104
+    assert [c["seed"] for c in fake.generate_calls] == [100, 101, 102, 104]
+
+
+def test_seed_mode_random_differs_and_request_seed_overrides() -> None:
+    fake = _FakeComfyClient()
+    with _client_with_seed_mode(fake, seed_mode="random", seed=0) as client:
+        _gen(client)
+        _gen(client)
+        _gen(client, seed=42)   # explicit request seed wins even in random mode
+    assert fake.generate_calls[2]["seed"] == 42
+    # random mode should not collapse to a constant
+    assert fake.generate_calls[0]["seed"] != fake.generate_calls[1]["seed"]
+
+
+def test_request_seed_overrides_fixed_mode() -> None:
+    fake = _FakeComfyClient()
+    with _client_with_seed_mode(fake, seed_mode="fixed", seed=5) as client:
+        _gen(client, seed=999)
+    assert fake.generate_calls[0]["seed"] == 999
+
+
 @pytest.mark.asyncio
 async def test_comfyui_client_runs_prompt_and_collects_view_image() -> None:
     seen_prompt: Optional[Dict[str, Any]] = None

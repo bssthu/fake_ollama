@@ -288,7 +288,9 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "default_sampler_name": "res_multistep",
       "default_scheduler": "simple",
       "default_denoise": 1.0,
-      "default_edit_denoise": 0.25
+      "default_edit_denoise": 0.25,
+      "seed_mode": "random",
+      "seed": 0
     }
   ],
   "api_interfaces": [
@@ -327,7 +329,9 @@ $body = @{
 Invoke-RestMethod http://127.0.0.1:21435/v1/images/generations -Method Post -Headers $headers -ContentType "application/json" -Body $body
 ```
 
-`POST /v1/images/edits` 接受 OpenAI 风格 `multipart/form-data` 的 `image` 文件字段，也接受 JSON base64 `image`。常用覆盖参数：`size`、`n`、`seed`、`steps`、`cfg`、`sampler_name`、`scheduler`、`denoise`、`response_format`。
+`POST /v1/images/edits` 接受 OpenAI 风格 `multipart/form-data` 的 `image` 文件字段（也兼容 OpenAI 多图约定的 `image[]` / `image[0]` 字段名，只取第一张），也接受 JSON base64 `image`。常用覆盖参数：`size`、`n`、`seed`、`steps`、`cfg`、`sampler_name`、`scheduler`、`denoise`、`response_format`。
+
+**随机种子（`seed_mode` / `seed`）**：请求体显式传 `seed` 时一律以请求为准；否则按 per-target 的 `seed_mode` 决定——`random`（默认，每次随机，取值限定在 0 ～ 2³²−1，以保证落在 JS/JSON 安全整数范围内、便于复现）、`fixed`（固定用 `seed`）、`increment`（从 `seed` 起按本次出图张数 `n` 递增）。`increment` 的计数器是进程内 per-target 状态，重启或 reload 后从 `seed` 重新开始。适合给不发 `seed` 的客户端（如 Cherry Studio 聊天生图）做可复现/递增出图。
 
 #### 排队与超时（避免 502 ReadTimeout）
 
