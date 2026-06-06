@@ -64,6 +64,23 @@ def test_loads_from_json_file(tmp_path, monkeypatch):
     assert iface.public_ids() == ["claude-x@anthropic", "claude-y@anthropic"]
 
 
+def test_top_level_comment_keys_are_ignored():
+    s = Settings.model_validate(
+        {
+            "_": "human-readable note",
+            "_section": "another note",
+            "advertised_version": "test-version",
+        }
+    )
+    assert s.advertised_version == "test-version"
+
+
+def test_config_example_loads():
+    root = Path(__file__).resolve().parents[1]
+    s = load_settings(root / "config.json.example")
+    assert any(t.name == "z-image-turbo-comfyui" for t in s.comfyui_targets)
+
+
 def test_removed_top_level_keys_are_rejected(tmp_path, monkeypatch):
     cfg = tmp_path / "config.json"
     _write(cfg, {"host": "0.0.0.0", "port": 31434})

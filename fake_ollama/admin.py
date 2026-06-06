@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .anthropic_client import AnthropicClient
+from .comfyui_client import ComfyUIClient
 from .config import Settings
 from .llama_cpp_client import LlamaCppClient
 from .ollama_client import OllamaClient
@@ -207,22 +208,98 @@ LLAMA_CPP_DEFAULTS_SCHEMA: List[Dict[str, Any]] = [
      "description": "默认 fake_ollama -> llama.cpp 的 read timeout 覆盖；target 可覆盖。留空沿用全局 timeout_seconds；<=0 = 不超时"},
 ]
 
+COMFYUI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "name", "type": "string", "default": "",
+     "description": "可选：唯一 target 名；不填时默认使用 model / alias。用于内部路由、日志和去重"},
+    {"key": "base_url", "type": "string", "default": "http://127.0.0.1:8188",
+     "description": "ComfyUI server 的 base URL，例如 http://127.0.0.1:21480"},
+    {"key": "auth_token", "type": "string", "default": "", "secret": True,
+     "description": "可选：调用 ComfyUI 时同时以 Authorization: Bearer 和 x-api-key 发送的 token"},
+    {"key": "model", "type": "string", "default": "z-image-turbo", "required": True,
+     "autocomplete": "model_names",
+     "description": "该 ComfyUI workflow target 对外提供的图片模型显示名"},
+    {"key": "alias", "type": "string", "default": None,
+     "description": "可选：source 级别别名；填了会作为默认公开名。不能包含 '@'"},
+    {"key": "upstream_id", "type": "string", "default": None,
+     "description": "可选：内部模型 ID，用于显存占用记录；不填则使用 model"},
+    {"key": "auto_start", "type": "bool", "default": False,
+     "description": "health 检查失败时，是否执行 start_command 启动 ComfyUI"},
+    {"key": "start_command", "type": "string", "default": None,
+     "description": "启动 ComfyUI 的命令"},
+    {"key": "stop_command", "type": "string", "default": None,
+     "description": "可选：停止 ComfyUI 的命令"},
+    {"key": "idle_timeout_seconds", "type": "float", "default": None,
+     "description": "由 fake-ollama 启动的 ComfyUI 空闲超过该秒数后自动停止；留空表示不回收"},
+    {"key": "startup_timeout_seconds", "type": "float", "default": 120.0,
+     "description": "auto_start 后等待 ComfyUI health 变为可用的最长秒数"},
+    {"key": "health_path", "type": "string", "default": "/system_stats",
+     "description": "ComfyUI 健康检查路径；默认 /system_stats"},
+    {"key": "cwd", "type": "string", "default": None,
+     "description": "执行 start_command / stop_command 时使用的工作目录"},
+    {"key": "text_to_image_workflow_path", "type": "string", "default": None,
+     "description": "可选：/v1/images/generations 使用的 ComfyUI API-format workflow JSON；留空使用内置 Z-Image-Turbo text-to-image workflow"},
+    {"key": "image_to_image_workflow_path", "type": "string", "default": None,
+     "description": "可选：/v1/images/edits 使用的 ComfyUI API-format workflow JSON；留空使用内置 Z-Image-Turbo image-to-image workflow"},
+    {"key": "diffusion_model", "type": "string", "default": "z-image-turbo-fp8-e4m3fn.safetensors",
+     "description": "ComfyUI models/diffusion_models 下的 diffusion / UNet 模型文件名"},
+    {"key": "diffusion_weight_dtype", "type": "string", "default": "default",
+     "description": "传给 UNETLoader 的 weight_dtype；通常保持 default"},
+    {"key": "text_encoder_model", "type": "string", "default": "qwen_3_4b_fp4_mixed.safetensors",
+     "description": "ComfyUI models/text_encoders 下的文本编码器文件名"},
+    {"key": "text_encoder_type", "type": "string", "default": "lumina2",
+     "description": "Z-Image Qwen3 文本编码器的 CLIPLoader type；默认 lumina2"},
+    {"key": "text_encoder_device", "type": "string", "default": "default",
+     "description": "CLIPLoader device；default 表示按 ComfyUI 默认策略，cpu 表示放 CPU"},
+    {"key": "vae_model", "type": "string", "default": "ae.safetensors",
+     "description": "ComfyUI models/vae 下的 VAE 文件名"},
+    {"key": "default_width", "type": "int", "default": 1024,
+     "description": "默认图片宽度；客户端可用 size 或 width 覆盖"},
+    {"key": "default_height", "type": "int", "default": 1024,
+     "description": "默认图片高度；客户端可用 size 或 height 覆盖"},
+    {"key": "default_steps", "type": "int", "default": 8,
+     "description": "默认 Z-Image-Turbo 采样步数"},
+    {"key": "default_cfg", "type": "float", "default": 1.0,
+     "description": "默认 CFG；Turbo 模型通常保持 1"},
+    {"key": "default_sampler_name", "type": "string", "default": "res_multistep",
+     "description": "默认 KSampler sampler_name"},
+    {"key": "default_scheduler", "type": "string", "default": "simple",
+     "description": "默认 KSampler scheduler"},
+    {"key": "default_denoise", "type": "float", "default": 1.0,
+     "description": "默认 text-to-image denoise；一般为 1.0"},
+    {"key": "default_edit_denoise", "type": "float", "default": 0.25,
+     "description": "默认 image-to-image / image edit denoise；越高越偏向重绘"},
+    {"key": "default_shift", "type": "float", "default": 3.0,
+     "description": "ModelSamplingAuraFlow shift 参数"},
+    {"key": "max_batch_size", "type": "int", "default": 4,
+     "description": "允许的 OpenAI Images 参数 n 最大值"},
+    {"key": "output_prefix", "type": "string", "default": "fake_ollama/z-image-turbo",
+     "description": "ComfyUI SaveImage 节点使用的 filename_prefix"},
+    {"key": "image_upscale_method", "type": "string", "default": "lanczos",
+     "description": "image edit workflow 中 ImageScale 使用的缩放方法"},
+    {"key": "image_crop", "type": "string", "default": "center",
+     "description": "image edit workflow 中 ImageScale 使用的裁剪模式"},
+    {"key": "prompt_timeout_seconds", "type": "float", "default": 600.0,
+     "description": "等待 ComfyUI 队列中 prompt 完成的最长秒数"},
+    {"key": "poll_interval_seconds", "type": "float", "default": 0.5,
+     "description": "轮询 ComfyUI history 的间隔秒数"},
+]
+
 MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "model", "type": "string", "default": "", "required": True,
      "autocomplete": "model_names",
      "description": "模型名（裸名应用于所有 target；与 target 一起拼出最终 key 'model@target' 仅覆盖该 target）"},
     {"key": "target", "type": "string", "default": "",
      "autocomplete": "source_names",
-     "description": "可选：source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets 中的某个 name）。留空 = 对该 model 名所有 target 生效"},
+     "description": "可选：source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets / comfyui_targets 中的某个 name）。留空 = 对该 model 名所有 target 生效"},
     {"key": "capabilities", "type": "string_list",
      "default": ["completion", "tools", "vision"],
-     "description": "子集自 completion / tools / vision；至少包含 completion"},
+     "description": "模型对外声明的 capability 标签，用于 /api/show、/api/tags、/v1/models 给客户端做功能发现，不会自动给模型增加能力。常用值：completion=文本/聊天补全，tools=支持 tool calling，vision=聊天接口可接收图片输入，image_generation=OpenAI /v1/images/generations 图片生成，image_edit=OpenAI /v1/images/edits image-to-image / edit。聊天模型通常至少含 completion；纯图片 workflow 不需要 completion，可只填 image_generation / image_edit"},
     {"key": "context_length", "type": "int", "default": 200000,
      "description": "上下文 token 上限（输入 + 输出）。① 通过 /api/show、/v1/models 等接口对外报告为模型的 context window；② fake-ollama 在转发前预检：估算 input token + max_tokens 超过此值时返回 400（可用环境变量 FAKE_OLLAMA_ENFORCE_CONTEXT_LIMIT=false 关闭，OpenAI 透传路径不强制）。配置文件中亦可写作 num_ctx。对于 llama.cpp / Ollama 反向代理，建议设为 ≤ 上游 per-slot 实际容量（ctx_size / parallel），否则预检通过但上游会拒"},
     {"key": "max_output_tokens", "type": "int", "default": None,
      "description": "可选：单条响应的输出 token 数；同时作为 max_tokens 的下限与上限——配了之后，无论客户端传什么 max_tokens / num_predict，最终都会被强制设为该值（防止 VS Code Copilot 等客户端的小默认值导致 finish_reason=length 被整段拒）。受 context_length 预检约束"},
     {"key": "estimated_vram_gb", "type": "float", "default": None,
-     "description": "可选：该模型加载后预计占用的 GPU 显存（GB）。仅本地 Ollama / llama.cpp 反向代理会使用，用于启动前预检和空闲模型回收"},
+     "description": "可选：该模型加载后预计占用的 GPU 显存（GB）。本地 Ollama / llama.cpp / ComfyUI target 会使用它做启动前预检、空闲模型回收和 Dashboard 展示"},
     {"key": "thinking_mode", "type": "string", "default": "auto",
      "description": "auto / enabled / disabled；控制是否注入 thinking 字段"},
     {"key": "thinking_budget_tokens", "type": "int", "default": 1024,
@@ -237,7 +314,7 @@ EXPOSURE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "source 中某个模型的公开名（alias 或 name）"},
     {"key": "target", "type": "string", "default": "", "required": True,
      "autocomplete": "source_names",
-     "description": "提供该模型的 source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets 中的某个 name）"},
+     "description": "提供该模型的 source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets / comfyui_targets 中的某个 name）"},
     {"key": "alias", "type": "string", "default": None,
      "description": "可选：该接口上对外公开的 public id。不填则默认为 'model@target'。同一接口内 alias 不可重复"},
 ]
@@ -289,6 +366,11 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "nav_label_keys": ["name", "model"],
     "description": "llama.cpp server（OpenAI 兼容）；一个 target = 一个模型 / 进程 / 端口"},
 
+  {"key": "comfyui_targets", "type": "object_list", "default": [], "group": "model_sources_comfyui",
+   "item_schema": COMFYUI_TARGET_ITEM_SCHEMA,
+   "nav_label_keys": ["name", "model"],
+   "description": "由 ComfyUI workflow 承载的图片模型来源，用于 /v1/images/generations 和 /v1/images/edits"},
+
   # ---- Interfaces ---------------------------------------------------------
   {"key": "advertised_version", "type": "string", "default": "0.6.4", "group": "interface_ollama",
    "description": "仅用于 Ollama 接口的 GET /api/version 返回值"},
@@ -302,7 +384,7 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "api_interfaces", "type": "object_list", "default": [], "group": "interface_api",
    "item_schema": API_INTERFACE_ITEM_SCHEMA,
    "nav_label_keys": ["name"],
-   "description": "API 接口数组（Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/models）。每个 entry 独立的 host/port/access_tokens/exposed_models"},
+   "description": "API 接口数组（Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/images/* + /v1/models）。每个 entry 独立的 host/port/access_tokens/exposed_models"},
 
   # ---- Runtime & profiles --------------------------------------------------
   {"key": "default_max_tokens", "type": "int", "default": 4096, "group": "runtime",
@@ -321,25 +403,25 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "description": "模型 capabilities / 上下文 / 思维链设置。每项写 model（必填）和可选 target，两者拼起来作为最终 key：填 target 时为 'model@target' 仅覆盖该 target；不填 target 时为裸 'model' 适用于所有 target"},
 
   {"key": "dashboard_enabled", "type": "bool", "default": True, "group": "dashboard",
-   "description": "Enable the runtime dashboard mounted at /dashboard on its own listener."},
+   "description": "是否启用 Dashboard；启用后会在独立 listener 上挂载 /dashboard"},
   {"key": "dashboard_host", "type": "string", "default": "127.0.0.1", "group": "dashboard",
-   "description": "Dashboard listener bind address. Keep 127.0.0.1 unless fronted by a trusted proxy."},
+   "description": "Dashboard listener bind address。除非前面有 trusted proxy，否则建议保持 127.0.0.1"},
   {"key": "dashboard_port", "type": "int", "default": 21432, "group": "dashboard",
-   "description": "Dashboard listener port. It must be distinct from internal, external, and admin ports."},
+   "description": "Dashboard listener port；必须与 internal、external 和 admin ports 不同"},
   {"key": "dashboard_sample_interval_seconds", "type": "float", "default": 10.0, "group": "dashboard",
-   "description": "Runtime metric sampling interval in seconds."},
+   "description": "Runtime metrics 采样间隔秒数"},
   {"key": "dashboard_retention_seconds", "type": "float", "default": 604800.0, "group": "dashboard",
-   "description": "Dashboard history retention in seconds."},
+   "description": "Dashboard history 保留秒数"},
   {"key": "dashboard_data_path", "type": "string", "default": "logs/dashboard_history.json", "group": "dashboard",
-   "description": "JSON file used to persist dashboard history. Leave empty to disable file persistence."},
+   "description": "持久化 Dashboard history 的 JSON 文件路径；留空表示不写入文件"},
   {"key": "dashboard_model_reclaim_enabled", "type": "bool", "default": False, "group": "dashboard",
-   "description": "Allow the dashboard Current Models table to request release of eligible idle local models."},
+   "description": "是否允许在 Dashboard 的 Current Models 表中手动释放符合条件的 idle local models"},
   {"key": "dashboard_reclaim_idle_seconds", "type": "float", "default": 20.0, "group": "dashboard",
-   "description": "用户在 dashboard 点击关闭按钮时所需的最小空闲秒数。和自动 LRU 回收的 60s 阈值独立；用户判断更宽松，默认 20s。"},
+   "description": "用户在 Dashboard 点击关闭按钮时所需的最小 idle 秒数。和自动 LRU 回收的 60s 阈值独立；用户判断更宽松，默认 20s。"},
   {"key": "vram_low_free_reclaim_enabled", "type": "bool", "default": True, "group": "dashboard",
-   "description": "Enable periodic low-free-VRAM checks that release eligible idle local models."},
+   "description": "是否启用 periodic low-free-VRAM check，并释放符合条件的 idle local models"},
   {"key": "vram_low_free_threshold_mib", "type": "float", "default": 200.0, "group": "dashboard",
-   "description": "When free GPU VRAM falls below this MiB threshold, eligible idle models may be released."},
+   "description": "当 free GPU VRAM 低于该 MiB threshold 时，可释放符合条件的 idle models"},
 
   {"key": "admin_enabled", "type": "bool", "default": True, "group": "admin",
    "description": "是否启用本 /admin 编辑器（关闭后需手动改 config.json）"},
@@ -350,12 +432,13 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 GROUP_LABELS: List[Dict[str, str]] = [
-  {"key": "model_sources_remote", "label": "Remote Sources", "hint": "远端模型来源：Anthropic / OpenAI 兼容上游", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的所有模型来源（target / API）"},
-  {"key": "model_sources_ollama", "label": "Ollama Sources", "hint": "本机或远端 Ollama 服务", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的所有模型来源（target / API）"},
-  {"key": "model_sources_llama_cpp", "label": "llama.cpp Sources", "hint": "本机 llama.cpp server 进程", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的所有模型来源（target / API）"},
+  {"key": "model_sources_remote", "label": "Remote Sources", "hint": "远端模型来源：Anthropic / OpenAI 兼容上游", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
+  {"key": "model_sources_ollama", "label": "Ollama Sources", "hint": "本机或内网 Ollama 服务", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
+  {"key": "model_sources_llama_cpp", "label": "llama.cpp Sources", "hint": "本机 llama.cpp server 进程", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
+  {"key": "model_sources_comfyui", "label": "ComfyUI Sources", "hint": "本地 ComfyUI image workflow target", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
   {"key": "interface_ollama", "label": "Ollama Interface", "hint": "Ollama 兼容接口（/api/* 与 /v1/chat/completions）。每个 entry 各自选择暴露哪些模型", "section": "interfaces", "section_label": "Interfaces", "section_hint": "对用户暴露的接口；每个 entry 都是独立的 host/port/access_tokens/exposed_models"},
-  {"key": "interface_api", "label": "API Interface", "hint": "Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/models。每个 entry 各自选择暴露哪些模型", "section": "interfaces", "section_label": "Interfaces", "section_hint": "对用户暴露的接口；每个 entry 都是独立的 host/port/access_tokens/exposed_models"},
-  {"key": "runtime", "label": "Runtime & Profiles", "hint": "运行时缺省值、出站网络与每模型 capability/thinking profile", "section": "runtime", "section_label": "Runtime", "section_hint": "跨所有 target / 接口共享的运行时设置"},
+  {"key": "interface_api", "label": "API Interface", "hint": "Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/images/* + /v1/models。每个 entry 各自选择暴露哪些模型", "section": "interfaces", "section_label": "Interfaces", "section_hint": "对用户暴露的接口；每个 entry 都是独立的 host/port/access_tokens/exposed_models"},
+  {"key": "runtime", "label": "Runtime & Profiles", "hint": "运行时缺省值、出站网络与每模型 capability / thinking profile", "section": "runtime", "section_label": "Runtime", "section_hint": "跨所有 target / 接口共享的运行时设置"},
   {"key": "dashboard", "label": "Dashboard", "hint": "Runtime graphs and the low-VRAM safety monitor", "section": "dashboard", "section_label": "Dashboard", "section_hint": "Memory, VRAM, and loaded local model telemetry"},
   {"key": "admin", "label": "Admin UI", "hint": "配置页面自身的开关与监听地址（无内置鉴权）", "section": "admin", "section_label": "Admin UI", "section_hint": "仅影响 /admin 配置页面本身"},
 ]
@@ -1091,7 +1174,7 @@ function collectKnownModelNames() {
     }
   }
   for (const {field, r} of topRenderers) {
-    if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams' || field.key === 'ollama_targets' || field.key === 'llama_cpp_targets') walkList(r);
+    if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams' || field.key === 'ollama_targets' || field.key === 'llama_cpp_targets' || field.key === 'comfyui_targets') walkList(r);
     if (field.key === 'model_profiles' && r && typeof r.read === 'function') {
       const m = r.read();
       if (Array.isArray(m)) {
@@ -1136,7 +1219,7 @@ function collectKnownSourceNames() {
     if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams'
         || field.key === 'ollama_targets') {
       walkList(r);
-    } else if (field.key === 'llama_cpp_targets') {
+    } else if (field.key === 'llama_cpp_targets' || field.key === 'comfyui_targets') {
       walkList(r, 'model');
     }
   }
@@ -1670,6 +1753,23 @@ def _settings_to_dict(s: Settings) -> Dict[str, Any]:
                 target.pop(key, None)
         if target.get("name") == target.get("model"):
             target.pop("name", None)
+    for target in data.get("comfyui_targets", []):
+        if not isinstance(target, dict):
+            continue
+        for key in [
+            "upstream_id",
+            "alias",
+            "start_command",
+            "stop_command",
+            "idle_timeout_seconds",
+            "cwd",
+            "text_to_image_workflow_path",
+            "image_to_image_workflow_path",
+        ]:
+            if target.get(key) is None:
+                target.pop(key, None)
+        if target.get("name") == target.get("model"):
+            target.pop("name", None)
     data["_path"] = s.config_path or ""
     return data
 
@@ -1730,11 +1830,34 @@ def _llama_cpp_client_matches(
     )
 
 
+def _comfyui_client_matches(
+    client: ComfyUIClient,
+    *,
+    settings: Settings,
+    target: Any,
+) -> bool:
+    return (
+        getattr(client, "_base", None) == target.base_url.rstrip("/")
+        and getattr(client, "_auth_token", None) == target.auth_token
+        and getattr(client, "_timeout", None) == settings.timeout_seconds
+        and getattr(client, "_trust_env", None) == settings.use_system_proxy
+        and getattr(client, "_auto_start", None) == target.auto_start
+        and getattr(client, "_start_command", None) == target.start_command
+        and getattr(client, "_stop_command", None) == target.stop_command
+        and getattr(client, "_idle_timeout", None) == target.idle_timeout_seconds
+        and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
+        and getattr(client, "_health_path", None) == target.health_path
+        and getattr(client, "_cwd", None) == target.cwd
+        and getattr(client, "_workflow_config", None) == target.workflow_config()
+    )
+
+
 async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     """Atomically replace app.state.settings and rebuild client pools."""
     old_clients: Dict[str, AnthropicClient] = dict(getattr(app.state, "clients", {}))
     old_ollama: Dict[str, OllamaClient] = dict(getattr(app.state, "ollama_clients", {}))
     old_llama_cpp: Dict[str, LlamaCppClient] = dict(getattr(app.state, "llama_cpp_clients", {}))
+    old_comfyui: Dict[str, ComfyUIClient] = dict(getattr(app.state, "comfyui_clients", {}))
     vram_coordinator = getattr(app.state, "vram_coordinator", None)
 
     new_clients: Dict[str, AnthropicClient] = {}
@@ -1807,11 +1930,42 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             max_concurrent_requests=tgt.effective_max_concurrent_requests,
             request_read_timeout_seconds=tgt.request_read_timeout_seconds,
         )
+    new_comfyui: Dict[str, ComfyUIClient] = {}
+    remaining_comfyui = dict(old_comfyui)
+    for tgt in new_settings.comfyui_targets:
+        existing = remaining_comfyui.pop(tgt.name, None)
+        if existing is not None and _comfyui_client_matches(
+            existing, settings=new_settings, target=tgt
+        ):
+            new_comfyui[tgt.name] = existing
+            continue
+        if existing is not None:
+            try:
+                await existing.aclose()
+            except Exception:  # pragma: no cover
+                pass
+        new_comfyui[tgt.name] = ComfyUIClient(
+            tgt.base_url,
+            auth_token=tgt.auth_token,
+            timeout=new_settings.timeout_seconds,
+            trust_env=new_settings.use_system_proxy,
+            auto_start=tgt.auto_start,
+            start_command=tgt.start_command,
+            stop_command=tgt.stop_command,
+            idle_timeout_seconds=tgt.idle_timeout_seconds,
+            startup_timeout_seconds=tgt.startup_timeout_seconds,
+            health_path=tgt.health_path,
+            cwd=tgt.cwd,
+            target_name=tgt.name,
+            workflow_config=tgt.workflow_config(),
+            vram_coordinator=vram_coordinator,
+        )
 
     app.state.settings = new_settings
     app.state.clients = new_clients
     app.state.ollama_clients = new_ollama
     app.state.llama_cpp_clients = new_llama_cpp
+    app.state.comfyui_clients = new_comfyui
     ensure_idle_monitor = getattr(app.state, "ensure_local_target_idle_monitor", None)
     if ensure_idle_monitor is not None:
         ensure_idle_monitor(app)
@@ -1837,6 +1991,15 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
         if c in new_llama_cpp.values():
             continue
         if c not in remaining_llama_cpp.values():
+            continue
+        try:
+            await c.aclose()
+        except Exception:  # pragma: no cover
+            pass
+    for c in old_comfyui.values():
+        if c in new_comfyui.values():
+            continue
+        if c not in remaining_comfyui.values():
             continue
         try:
             await c.aclose()

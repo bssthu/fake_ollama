@@ -6,6 +6,8 @@ import json
 import logging
 import asyncio
 import time
+import base64
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -16,6 +18,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 from . import __version__
 from .anthropic_client import AnthropicClient
+from .comfyui_client import ComfyUIClient
 from .config import (
     FORWARDED_BY_HEADER,
     INSTANCE_ID,
@@ -132,6 +135,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         owned_target_names: list[str] = []
         owned_llama_cpp_names: list[str] = []
         owned_openai_names: list[str] = []
+        owned_comfyui_names: list[str] = []
         if not getattr(app.state, "clients", None):
             app.state.clients = {}
         if not getattr(app.state, "ollama_clients", None):
@@ -140,6 +144,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.llama_cpp_clients = {}
         if not getattr(app.state, "openai_clients", None):
             app.state.openai_clients = {}
+        if not getattr(app.state, "comfyui_clients", None):
+            app.state.comfyui_clients = {}
         if not getattr(app.state, "vram_coordinator", None):
             app.state.vram_coordinator = VramCoordinator()
         if not getattr(app.state, "dashboard_state", None):
@@ -209,6 +215,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request_read_timeout_seconds=tgt.request_read_timeout_seconds,
             )
             owned_llama_cpp_names.append(tgt.name)
+        for tgt in app.state.settings.comfyui_targets:
+            if tgt.name in app.state.comfyui_clients:
+                continue
+            app.state.comfyui_clients[tgt.name] = ComfyUIClient(
+                tgt.base_url,
+                auth_token=tgt.auth_token,
+                timeout=app.state.settings.timeout_seconds,
+                trust_env=app.state.settings.use_system_proxy,
+                auto_start=tgt.auto_start,
+                start_command=tgt.start_command,
+                stop_command=tgt.stop_command,
+                idle_timeout_seconds=tgt.idle_timeout_seconds,
+                startup_timeout_seconds=tgt.startup_timeout_seconds,
+                health_path=tgt.health_path,
+                cwd=tgt.cwd,
+                target_name=tgt.name,
+                workflow_config=tgt.workflow_config(),
+                vram_coordinator=app.state.vram_coordinator,
+            )
+            owned_comfyui_names.append(tgt.name)
         _sync_local_target_idle_monitor(app)
         _sync_runtime_monitor(app)
         try:
@@ -246,6 +272,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 oc2 = app.state.openai_clients.pop(name, None)
                 if oc2 is not None:
                     await oc2.aclose()
+            for name in owned_comfyui_names:
+                cc = app.state.comfyui_clients.pop(name, None)
+                if cc is not None:
+                    await cc.aclose()
 
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
     app.state.settings = settings
@@ -279,6 +309,7 @@ def request_shutdown(app: FastAPI) -> None:
     for client_group in (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
+        getattr(app.state, "comfyui_clients", {}),
     ):
         for client in list(client_group.values()):
             begin_shutdown = getattr(client, "begin_shutdown", None)
@@ -443,10 +474,39 @@ def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-de
                 detail=f"llama_cpp_target '{backend.name}' is not initialised",
             )
         return client
+    if backend.protocol == "comfyui":
+        client = app.state.comfyui_clients.get(backend.name)
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"comfyui_target '{backend.name}' is not initialised",
+            )
+        return client
     raise HTTPException(
         status_code=500,
         detail=f"no client wiring for backend {backend.name!r} ({backend.protocol}/{backend.kind})",
     )
+
+
+def _profile_for_public_id(settings: Settings, iface: Any, public_id: str) -> Any:
+    entry = iface.exposure_for_public_id(public_id) if iface is not None else None
+    if entry is not None:
+        return settings.profile_for(f"{entry.model}@{entry.target}")
+    return settings.profile_for(public_id)
+
+
+def _openai_model_list_entry(
+    settings: Settings, iface: Any, public_id: str, created: int
+) -> Dict[str, Any]:
+    profile = _profile_for_public_id(settings, iface, public_id)
+    return {
+        "id": public_id,
+        "object": "model",
+        "created": created,
+        "owned_by": "fake-ollama",
+        "context_length": profile.context_length,
+        "capabilities": list(profile.capabilities),
+    }
 
 
 async def _openai_upstream_messages(
@@ -503,6 +563,7 @@ async def _local_target_idle_monitor(app: FastAPI) -> None:
             client_groups = (
                 getattr(app.state, "ollama_clients", {}),
                 getattr(app.state, "llama_cpp_clients", {}),
+                getattr(app.state, "comfyui_clients", {}),
             )
             for clients in client_groups:
                 for client in list(clients.values()):
@@ -526,6 +587,7 @@ def _sync_local_target_idle_monitor(app: FastAPI) -> None:
     client_groups = (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
+        getattr(app.state, "comfyui_clients", {}),
     )
     needs_monitor = any(
         getattr(c, "idle_timeout_seconds", None)
@@ -573,7 +635,7 @@ _ADMIN_ONLY_PATH_PREFIXES = ("/admin",)
 # Path prefixes that are only served by the dashboard listener.
 _DASHBOARD_ONLY_PATH_PREFIXES = ("/dashboard",)
 # Paths only served on api_interfaces (Anthropic + OpenAI public API).
-_API_ONLY_PATH_PREFIXES = ("/v1/messages", "/v1/models")
+_API_ONLY_PATH_PREFIXES = ("/v1/messages", "/v1/models", "/v1/images")
 # Paths served by both ollama_interfaces and api_interfaces.
 _SHARED_V1_PATH_PREFIXES = ("/v1/chat/completions",)
 # Paths only served on ollama_interfaces (Ollama-compatible /api/*).
@@ -615,6 +677,8 @@ def _request_surface(path: str) -> str:
     if path == "/v1/messages/count_tokens" or path.startswith("/v1/messages/count_tokens/"):
         return "anthropic-count-tokens"
     if _has_path_prefix(path, _API_ONLY_PATH_PREFIXES):
+        if path.startswith("/v1/images"):
+            return "images"
         return "anthropic" if path.startswith("/v1/messages") else "models"
     if _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES):
         return "openai"
@@ -868,7 +932,7 @@ def _register_routes(app: FastAPI) -> None:
         iface = _interface_for(request)
         public_ids = iface.public_ids() if iface is not None else []
         for name in public_ids:
-            profile = settings.profile_for(name)
+            profile = _profile_for_public_id(settings, iface, name)
             models.append(
                 {
                     "name": name,
@@ -980,14 +1044,7 @@ def _register_routes(app: FastAPI) -> None:
         return {
             "object": "list",
             "data": [
-                {
-                    "id": name,
-                    "object": "model",
-                    "created": now,
-                    "owned_by": "fake-ollama",
-                    "context_length": settings.profile_for(name).context_length,
-                    "capabilities": list(settings.profile_for(name).capabilities),
-                }
+                _openai_model_list_entry(settings, iface, name, now)
                 for name in names
             ],
         }
@@ -995,6 +1052,14 @@ def _register_routes(app: FastAPI) -> None:
     @app.post("/v1/chat/completions")
     async def openai_chat_completions(request: Request) -> Any:
         return await _handle_openai_chat(request)
+
+    @app.post("/v1/images/generations")
+    async def openai_image_generations(request: Request) -> Any:
+        return await _handle_openai_image_generation(request)
+
+    @app.post("/v1/images/edits")
+    async def openai_image_edits(request: Request) -> Any:
+        return await _handle_openai_image_edit(request)
 
     @app.post("/v1/embeddings")
     async def openai_embeddings(payload: Dict[str, Any]) -> JSONResponse:
@@ -1097,6 +1162,333 @@ def _upstream_error(exc: httpx.HTTPError) -> JSONResponse:
         status_code=_upstream_error_status(exc),
         content={"error": _read_error_text(exc)},
     )
+
+
+def _json_error(status_code: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"error": message})
+
+
+def _authorise_interface(request: Request):
+    iface = _interface_for(request)
+    if iface is None:
+        raise HTTPException(
+            status_code=404,
+            detail="this listener does not serve model traffic",
+        )
+    if iface.auth_required:
+        token = _bearer_or_api_key(request)
+        if not iface.is_valid_token(token):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+    return iface
+
+
+def _default_image_model(request: Request, settings: Settings) -> str:
+    iface = _authorise_interface(request)
+    candidates: List[str] = []
+    for exposure in iface.exposed_models:
+        try:
+            backend, _ = settings.resolve_request(
+                exposure.public_id, interface_name=iface.name
+            )
+        except ValueError:
+            continue
+        if backend.protocol == "comfyui":
+            candidates.append(exposure.public_id)
+    if not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail="no ComfyUI image model is exposed on this interface",
+        )
+    if len(candidates) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "missing 'model'; multiple ComfyUI image models are exposed: "
+                + ", ".join(candidates)
+            ),
+        )
+    return candidates[0]
+
+
+def _dispatch_image_backend(
+    request: Request, settings: Settings, payload: Dict[str, Any]
+):
+    requested_model = str(payload.get("model") or "").strip()
+    if not requested_model:
+        requested_model = _default_image_model(request, settings)
+        payload["model"] = requested_model
+    backend, real_model = _dispatch(request, settings, requested_model)
+    if backend.protocol != "comfyui":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"model {requested_model!r} is not a ComfyUI image model; "
+                "use a model exposed from comfyui_targets"
+            ),
+        )
+    return backend, real_model, requested_model
+
+
+async def _image_payload_from_request(
+    request: Request,
+) -> tuple[Dict[str, Any], Optional[bytes], str]:
+    ctype = (request.headers.get("content-type") or "").lower()
+    if ctype.startswith("multipart/form-data"):
+        form = await request.form()
+        payload: Dict[str, Any] = {}
+        image_bytes: Optional[bytes] = None
+        filename = "input.png"
+        for key, value in form.multi_items():
+            if hasattr(value, "read") and hasattr(value, "filename"):
+                upload = value
+                if key == "image" and image_bytes is None:
+                    image_bytes = await upload.read()
+                    filename = getattr(upload, "filename", None) or filename
+                continue
+            payload[key] = value
+        return payload, image_bytes, filename
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="request body must be an object")
+    image_bytes = None
+    filename = str(payload.get("filename") or "input.png")
+    raw_image = payload.get("image")
+    if isinstance(raw_image, str) and raw_image.strip():
+        image_bytes = _decode_base64_image(raw_image)
+    return payload, image_bytes, filename
+
+
+def _decode_base64_image(raw: str) -> bytes:
+    data = raw.strip()
+    if data.startswith("data:"):
+        _, _, data = data.partition(",")
+    try:
+        return base64.b64decode(data, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid base64 image") from exc
+
+
+def _coerce_int_payload(
+    payload: Dict[str, Any],
+    keys: tuple[str, ...],
+    default: int,
+    *,
+    minimum: int = 1,
+) -> int:
+    value: Any = None
+    for key in keys:
+        if payload.get(key) not in (None, ""):
+            value = payload.get(key)
+            break
+    if value is None:
+        value = default
+    try:
+        out = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"{keys[0]} must be an integer") from exc
+    if out < minimum:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{keys[0]} must be >= {minimum}",
+        )
+    return out
+
+
+def _coerce_float_payload(
+    payload: Dict[str, Any],
+    keys: tuple[str, ...],
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: Optional[float] = None,
+) -> float:
+    value: Any = None
+    for key in keys:
+        if payload.get(key) not in (None, ""):
+            value = payload.get(key)
+            break
+    if value is None:
+        value = default
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"{keys[0]} must be a number") from exc
+    if out < minimum or (maximum is not None and out > maximum):
+        upper = f" and <= {maximum}" if maximum is not None else ""
+        raise HTTPException(
+            status_code=400,
+            detail=f"{keys[0]} must be >= {minimum}{upper}",
+        )
+    return out
+
+
+def _parse_image_size(payload: Dict[str, Any], target: Any) -> tuple[int, int]:
+    width = payload.get("width")
+    height = payload.get("height")
+    size = payload.get("size")
+    if (width in (None, "")) and (height in (None, "")) and isinstance(size, str):
+        if size.lower() not in ("", "auto"):
+            if "x" not in size.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail="size must be 'WIDTHxHEIGHT', for example '1024x1024'",
+                )
+            left, _, right = size.lower().partition("x")
+            width, height = left, right
+    if width in (None, ""):
+        width = target.default_width
+    if height in (None, ""):
+        height = target.default_height
+    try:
+        w = int(width)
+        h = int(height)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="width and height must be integers") from exc
+    if w <= 0 or h <= 0:
+        raise HTTPException(status_code=400, detail="width and height must be positive")
+    if w % 8 or h % 8:
+        raise HTTPException(
+            status_code=400,
+            detail="width and height must be divisible by 8 for the ComfyUI latent workflow",
+        )
+    return w, h
+
+
+def _image_request_params(
+    payload: Dict[str, Any],
+    target: Any,
+    *,
+    edit: bool,
+) -> Dict[str, Any]:
+    width, height = _parse_image_size(payload, target)
+    n = _coerce_int_payload(payload, ("n",), 1)
+    if n > target.max_batch_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"n={n} exceeds comfyui target max_batch_size={target.max_batch_size}",
+        )
+    seed_raw = payload.get("seed")
+    seed = (
+        secrets.randbits(63)
+        if seed_raw in (None, "", "random")
+        else _coerce_int_payload(payload, ("seed",), 0, minimum=0)
+    )
+    return {
+        "width": width,
+        "height": height,
+        "n": n,
+        "seed": seed,
+        "steps": _coerce_int_payload(
+            payload, ("steps", "num_inference_steps"), target.default_steps
+        ),
+        "cfg": _coerce_float_payload(
+            payload, ("cfg", "guidance_scale"), target.default_cfg
+        ),
+        "sampler_name": str(
+            payload.get("sampler_name") or target.default_sampler_name
+        ),
+        "scheduler": str(payload.get("scheduler") or target.default_scheduler),
+        "denoise": _coerce_float_payload(
+            payload,
+            ("denoise",),
+            target.default_edit_denoise if edit else target.default_denoise,
+            minimum=0.0,
+            maximum=1.0,
+        ),
+    }
+
+
+def _image_response(images: List[Any], payload: Dict[str, Any]) -> JSONResponse:
+    response_format = str(payload.get("response_format") or "b64_json")
+    if response_format not in ("b64_json", "url"):
+        raise HTTPException(
+            status_code=400,
+            detail="response_format must be 'b64_json' or 'url'",
+        )
+    data = []
+    for image in images:
+        b64 = image.b64_json
+        if response_format == "url":
+            data.append({"url": f"data:{image.mime_type};base64,{b64}"})
+        else:
+            data.append({"b64_json": b64})
+    return JSONResponse(
+        {
+            "created": int(datetime.now(timezone.utc).timestamp()),
+            "data": data,
+        }
+    )
+
+
+async def _handle_openai_image_generation(request: Request) -> Any:
+    app = request.app
+    settings: Settings = app.state.settings
+    payload, _, _ = await _image_payload_from_request(request)
+    prompt = str(payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="missing 'prompt'")
+    backend, real_model, public_model = _dispatch_image_backend(
+        request, settings, payload
+    )
+    target = backend.source
+    params = _image_request_params(payload, target, edit=False)
+    client: ComfyUIClient = _backend_client(app, backend)
+    profile = settings.profile_for(f"{real_model}@{backend.name}")
+    try:
+        images = await client.generate_image(
+            model=target.resolve_model(real_model),
+            prompt=prompt,
+            estimated_vram_gb=profile.estimated_vram_gb,
+            **params,
+        )
+    except httpx.HTTPError as exc:
+        _log_upstream_error(request, exc, payload)
+        return _upstream_error(exc)
+    return _image_response(images, payload)
+
+
+async def _handle_openai_image_edit(request: Request) -> Any:
+    app = request.app
+    settings: Settings = app.state.settings
+    payload, image_bytes, filename = await _image_payload_from_request(request)
+    prompt = str(payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="missing 'prompt'")
+    if not image_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="missing image; send multipart field 'image' or JSON base64 'image'",
+        )
+    backend, real_model, public_model = _dispatch_image_backend(
+        request, settings, payload
+    )
+    target = backend.source
+    params = _image_request_params(payload, target, edit=True)
+    client: ComfyUIClient = _backend_client(app, backend)
+    profile = settings.profile_for(f"{real_model}@{backend.name}")
+    try:
+        images = await client.edit_image(
+            model=target.resolve_model(real_model),
+            prompt=prompt,
+            image_bytes=image_bytes,
+            filename=filename,
+            estimated_vram_gb=profile.estimated_vram_gb,
+            **params,
+        )
+    except httpx.HTTPError as exc:
+        _log_upstream_error(request, exc, payload)
+        return _upstream_error(exc)
+    return _image_response(images, payload)
 
 
 def _enforce_limits(
@@ -1507,6 +1899,14 @@ async def _handle_openai_chat(request: Request) -> Any:
 
     backend, real_model = _dispatch(request, settings, openai_model)
     profile = settings.profile_for(openai_model)
+    if backend.protocol == "comfyui":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"model {openai_model!r} is a ComfyUI image model; use "
+                "/v1/images/generations or /v1/images/edits"
+            ),
+        )
 
     # Map the resolved backend back onto the four legacy local variables
     # the per-protocol branches below still reference. ``real_model`` is
@@ -1862,6 +2262,14 @@ async def _handle_anthropic_messages(request: Request) -> Any:
     stream = bool(payload.get("stream", False))
 
     backend, real_model = _dispatch(request, settings, anth_model)
+    if backend.protocol == "comfyui":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"model {anth_model!r} is a ComfyUI image model; use "
+                "/v1/images/generations or /v1/images/edits"
+            ),
+        )
     target = backend.source if backend.protocol == "ollama" else None
     llama_target = (
         backend.source

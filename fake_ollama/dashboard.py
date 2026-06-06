@@ -110,6 +110,7 @@ def _collect_model_snapshots(app: FastAPI) -> list[dict[str, object]]:
     for clients in (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
+        getattr(app.state, "comfyui_clients", {}),
     ):
         for client in list(clients.values()):
             getter = getattr(client, "loaded_model_snapshots", None)

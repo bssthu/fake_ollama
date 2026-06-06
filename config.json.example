@@ -1,5 +1,5 @@
 {
-  "_": "fake-ollama configuration. Each model the proxy can route to has a composite source id 'display@source' where 'display' is the source-level alias (or name if no alias) and 'source' is the name of the upstream / target entry. Public ids are decided per-interface in 'exposed_models' (alias if set, otherwise 'model@target'). Clients must request models by their public id; bare model names are rejected with 400.",
+  "_": "fake-ollama 配置。每个可路由模型都有一个复合 source id：'display@source'，其中 display 是 source 级 alias（没有 alias 时用 name），source 是 upstream / target 配置项的 name。客户端可见的 public id 由每个接口的 exposed_models 决定：填 alias 时使用 alias，否则使用 'model@target'。客户端必须按 public id 请求模型；裸模型名会返回 400。",
 
   "advertised_version": "0.6.4",
 
@@ -115,7 +115,48 @@
     }
   ],
 
-  "_profiles": "==== Model profiles ==================================== Array of {model, target?, ...} entries (mirrors exposed_models). 'model' alone matches all targets; 'model'+'target' overrides only that pairing. Lookup is most-specific first: model@target > bare model > tagless base.",
+  "_model_sources_comfyui": "==== ComfyUI image workflow sources =====================",
+
+  "comfyui_targets": [
+    {
+      "name": "z-image-turbo-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "auth_token": "",
+      "model": "z-image-turbo",
+      "alias": null,
+      "upstream_id": null,
+      "auto_start": true,
+      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "stop_command": null,
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 180,
+      "health_path": "/system_stats",
+      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "diffusion_model": "z-image-turbo-fp8-e4m3fn.safetensors",
+      "diffusion_weight_dtype": "default",
+      "text_encoder_model": "qwen_3_4b_fp4_mixed.safetensors",
+      "text_encoder_type": "lumina2",
+      "text_encoder_device": "default",
+      "vae_model": "ae.safetensors",
+      "default_width": 1024,
+      "default_height": 1024,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "default_sampler_name": "res_multistep",
+      "default_scheduler": "simple",
+      "default_denoise": 1.0,
+      "default_edit_denoise": 0.25,
+      "default_shift": 3.0,
+      "max_batch_size": 2,
+      "output_prefix": "fake_ollama/z-image-turbo",
+      "image_upscale_method": "lanczos",
+      "image_crop": "center",
+      "prompt_timeout_seconds": 600,
+      "poll_interval_seconds": 0.5
+    }
+  ],
+
+  "_profiles": "==== Model profiles ==================================== 数组项格式为 {model, target?, ...}，与 exposed_models 对应。只写 model 表示匹配所有 target；同时写 model + target 只覆盖该组合。查找优先级：model@target > bare model > tagless base。capabilities 是对外功能发现标签：completion 文本/聊天补全，tools tool calling，vision 聊天接口可接收图片输入，image_generation /v1/images/generations 图片生成，image_edit /v1/images/edits image-to-image / edit。",
 
   "model_profiles": [
     {
@@ -159,10 +200,19 @@
       "estimated_vram_gb": 18.0,
       "thinking_mode": "disabled",
       "show_thinking": false
+    },
+    {
+      "model": "z-image-turbo",
+      "target": "z-image-turbo-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 16.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
     }
   ],
 
-  "_interfaces": "==== Interfaces ======================================== Each interface array entry is an independent listener (name/host/port/access_tokens/exposed_models). 'ollama_interfaces' = Ollama-compatible /api/* + /v1/chat/completions. 'api_interfaces' = Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/models. Each exposed_models entry is {model, target, alias?}; public id = alias if set, else 'model@target'.",
+  "_interfaces": "==== Interfaces ======================================== 每个数组项都是独立 listener（name/host/port/access_tokens/exposed_models）。ollama_interfaces = Ollama-compatible /api/* + /v1/chat/completions。api_interfaces = Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/images/* + /v1/models。每个 exposed_models 项为 {model, target, alias?}；填 alias 时 public id 使用 alias，否则使用 'model@target'。",
 
   "ollama_interfaces": [
     {
@@ -192,7 +242,8 @@
       "exposed_models": [
         {"model": "claude-3-5-sonnet-20241022", "target": "anthropic", "alias": "claude-sonnet"},
         {"model": "deepseek-chat", "target": "deepseek"},
-        {"model": "qwen3.6-27b-hauhau-q2kp", "target": "qwen3.6-27b-hauhau-q2kp"}
+        {"model": "qwen3.6-27b-hauhau-q2kp", "target": "qwen3.6-27b-hauhau-q2kp"},
+        {"model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo"}
       ]
     }
   ]

@@ -90,11 +90,12 @@ def test_admin_schema(admin_settings):
         "anthropic_upstreams",
         "openai_upstreams",
         "ollama_targets",
-        "llama_cpp_defaults",
-        "llama_cpp_targets",
-        "ollama_interfaces",
-        "api_interfaces",
-        "model_profiles",
+            "llama_cpp_defaults",
+            "llama_cpp_targets",
+            "comfyui_targets",
+            "ollama_interfaces",
+            "api_interfaces",
+            "model_profiles",
         "admin_host",
         "admin_port",
         "dashboard_enabled",
@@ -176,6 +177,20 @@ def test_admin_schema(admin_settings):
         "cwd",
     } <= defaults_keys
 
+    comfyui = next(f for f in fields if f["key"] == "comfyui_targets")
+    comfyui_item_keys = {f["key"] for f in comfyui["item_schema"]}
+    assert {
+        "name",
+        "base_url",
+        "model",
+        "auto_start",
+        "start_command",
+        "default_width",
+        "default_height",
+        "default_steps",
+        "default_edit_denoise",
+    } <= comfyui_item_keys
+
     # Interface arrays: each entry has its own host/port/tokens/exposed_models.
     ollama_iface = next(f for f in fields if f["key"] == "ollama_interfaces")
     assert ollama_iface["type"] == "object_list"
@@ -197,6 +212,7 @@ def test_admin_schema(admin_settings):
         "model_sources_remote",
         "model_sources_ollama",
         "model_sources_llama_cpp",
+        "model_sources_comfyui",
         "interface_ollama",
         "interface_api",
         "runtime",

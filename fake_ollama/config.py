@@ -864,6 +864,202 @@ class LlamaCppTarget(BaseModel):
         return binary_path
 
 
+class ComfyUITarget(BaseModel):
+    """One ComfyUI workflow-backed image model exposed through fake-ollama."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = ""
+    base_url: str = "http://127.0.0.1:8188"
+    auth_token: str = ""
+
+    # Single public source-level model served by this target.
+    model: str = "z-image-turbo"
+    alias: Optional[str] = None
+    upstream_id: Optional[str] = None
+
+    # Optional lifecycle management for the ComfyUI server process.
+    auto_start: bool = False
+    start_command: Optional[str] = None
+    stop_command: Optional[str] = None
+    idle_timeout_seconds: Optional[float] = None
+    startup_timeout_seconds: float = 120.0
+    health_path: str = "/system_stats"
+    cwd: Optional[str] = None
+
+    # Workflow files. When omitted, bundled Z-Image-Turbo API workflows are used.
+    text_to_image_workflow_path: Optional[str] = None
+    image_to_image_workflow_path: Optional[str] = None
+
+    # Z-Image-Turbo default model files and sampling parameters.
+    diffusion_model: str = "z-image-turbo-fp8-e4m3fn.safetensors"
+    diffusion_weight_dtype: str = "default"
+    text_encoder_model: str = "qwen_3_4b_fp4_mixed.safetensors"
+    text_encoder_type: str = "lumina2"
+    text_encoder_device: str = "default"
+    vae_model: str = "ae.safetensors"
+    default_width: int = 1024
+    default_height: int = 1024
+    default_steps: int = 8
+    default_cfg: float = 1.0
+    default_sampler_name: str = "res_multistep"
+    default_scheduler: str = "simple"
+    default_denoise: float = 1.0
+    default_edit_denoise: float = 0.25
+    default_shift: float = 3.0
+    max_batch_size: int = 4
+    output_prefix: str = "fake_ollama/z-image-turbo"
+    image_upscale_method: str = "lanczos"
+    image_crop: str = "center"
+    prompt_timeout_seconds: float = 600.0
+    poll_interval_seconds: float = 0.5
+
+    # Node ids for the bundled workflow shape. Operators can override these
+    # when pointing at a custom API-format workflow that keeps the same inputs.
+    unet_node_id: str = "28"
+    clip_node_id: str = "30"
+    vae_node_id: str = "29"
+    prompt_node_id: str = "27"
+    latent_node_id: str = "13"
+    sampling_node_id: str = "11"
+    ksampler_node_id: str = "3"
+    save_image_node_id: str = "9"
+    load_image_node_id: str = "12"
+    image_scale_node_id: str = "14"
+
+    @field_validator("base_url")
+    @classmethod
+    def _strip_trailing_slash(cls, v: str) -> str:
+        return (v or "").rstrip("/")
+
+    @field_validator("alias")
+    @classmethod
+    def _alias_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if "@" in v:
+            raise ValueError("comfyui_targets[*].alias must not contain '@'")
+        return v
+
+    @field_validator("upstream_id")
+    @classmethod
+    def _upstream_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @field_validator("health_path")
+    @classmethod
+    def _normalise_health_path(cls, v: str) -> str:
+        if not v:
+            return "/system_stats"
+        return v if v.startswith("/") else "/" + v
+
+    @field_validator(
+        "default_width",
+        "default_height",
+        "default_steps",
+        "max_batch_size",
+    )
+    @classmethod
+    def _positive_int(cls, v: int) -> int:
+        if int(v) <= 0:
+            raise ValueError("ComfyUI image dimensions/steps/batch size must be positive")
+        return int(v)
+
+    @field_validator(
+        "default_cfg",
+        "default_denoise",
+        "default_edit_denoise",
+        "default_shift",
+        "startup_timeout_seconds",
+        "prompt_timeout_seconds",
+        "poll_interval_seconds",
+    )
+    @classmethod
+    def _positive_float(cls, v: float) -> float:
+        if float(v) < 0:
+            raise ValueError("ComfyUI numeric workflow settings must be non-negative")
+        return float(v)
+
+    @model_validator(mode="after")
+    def _post_init(self) -> "ComfyUITarget":
+        if not self.model:
+            raise ValueError("Each comfyui_target must declare a non-empty `model`.")
+        if not self.name:
+            object.__setattr__(self, "name", self.alias or self.model)
+        if "@" in self.name:
+            raise ValueError(
+                f"comfyui_target name {self.name!r} contains '@'; reserved separator"
+            )
+        return self
+
+    @property
+    def display(self) -> str:
+        return self.alias or self.model
+
+    @property
+    def models(self) -> List[ModelEntry]:
+        return [ModelEntry(name=self.model, alias=self.alias, upstream_id=self.upstream_id)]
+
+    @property
+    def display_models(self) -> List[str]:
+        return [self.display]
+
+    def entry_for(self, display_name: str) -> Optional[ModelEntry]:
+        for candidate in (self.display, self.model):
+            match = _find_configured_model(display_name, [candidate])
+            if match is not None:
+                return self.models[0]
+        return None
+
+    def matching_model(self, display_name: str) -> Optional[str]:
+        entry = self.entry_for(display_name)
+        return entry.display if entry is not None else None
+
+    def resolve_model(self, display_name: str) -> str:
+        entry = self.entry_for(display_name)
+        if entry is None:
+            return display_name
+        return entry.wire_id
+
+    def serves(self, display_name: str) -> bool:
+        return self.entry_for(display_name) is not None
+
+    def workflow_config(self) -> Dict[str, Any]:
+        keys = [
+            "text_to_image_workflow_path",
+            "image_to_image_workflow_path",
+            "diffusion_model",
+            "diffusion_weight_dtype",
+            "text_encoder_model",
+            "text_encoder_type",
+            "text_encoder_device",
+            "vae_model",
+            "default_shift",
+            "output_prefix",
+            "image_upscale_method",
+            "image_crop",
+            "prompt_timeout_seconds",
+            "poll_interval_seconds",
+            "unet_node_id",
+            "clip_node_id",
+            "vae_node_id",
+            "prompt_node_id",
+            "latent_node_id",
+            "sampling_node_id",
+            "ksampler_node_id",
+            "save_image_node_id",
+            "load_image_node_id",
+            "image_scale_node_id",
+        ]
+        return {key: getattr(self, key) for key in keys}
+
+
 # ---------------------------------------------------------------------------
 # Interfaces
 # ---------------------------------------------------------------------------
@@ -1067,6 +1263,7 @@ class Settings(BaseModel):
     ollama_targets: List[OllamaTarget] = Field(default_factory=list)
     llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
     llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
+    comfyui_targets: List[ComfyUITarget] = Field(default_factory=list)
 
     # -- Interfaces ------------------------------------------------------
     ollama_interfaces: List[OllamaInterface] = Field(
@@ -1181,6 +1378,11 @@ class Settings(BaseModel):
     def _reject_legacy_top_level(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
+        data = {
+            k: v
+            for k, v in data.items()
+            if not (isinstance(k, str) and k.startswith("_"))
+        }
         bad = [k for k in data if k in _REMOVED_TOP_LEVEL_KEYS]
         if bad:
             hints = ", ".join(f"{k} -> {_REMOVED_TOP_LEVEL_KEYS[k]}" for k in bad)
@@ -1199,7 +1401,7 @@ class Settings(BaseModel):
         if dupes:
             raise ValueError(
                 f"Duplicate source names across anthropic_upstreams/openai_upstreams/"
-                f"ollama_targets/llama_cpp_targets: {dupes}. Source names are used as "
+                f"ollama_targets/llama_cpp_targets/comfyui_targets: {dupes}. Source names are used as "
                 f"the right side of composite model ids and must be globally unique."
             )
 
@@ -1291,6 +1493,7 @@ class Settings(BaseModel):
         return [
             *self.ollama_targets,
             *self.llama_cpp_targets,
+            *self.comfyui_targets,
             *self.openai_upstreams,
             *self.anthropic_upstreams,
         ]
@@ -1604,7 +1807,7 @@ class Backend:
     """A protocol-tagged thin façade over one configured source."""
 
     name: str
-    protocol: str  # "anthropic" | "openai" | "ollama"
+    protocol: str  # "anthropic" | "openai" | "ollama" | "comfyui"
     kind: str  # "remote" | "local"
     base_url: str
     auth_token: str
@@ -1649,6 +1852,16 @@ class Backend:
                 base_url=effective.base_url,
                 auth_token=effective.auth_token,
                 source=effective,
+            )
+        if isinstance(src, ComfyUITarget):
+            kind = "local" if (src.auto_start or src.stop_command) else "remote"
+            return cls(
+                name=src.name,
+                protocol="comfyui",
+                kind=kind,
+                base_url=src.base_url,
+                auth_token=src.auth_token,
+                source=src,
             )
         raise TypeError(f"cannot build Backend from {type(src).__name__}")
 

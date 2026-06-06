@@ -3,7 +3,7 @@
 一个轻量的协议适配层，主要做两件事：
 
 1. **正向**（Ollama 兼容入口 → 远端上游）：把 **Anthropic Messages API** 或 **OpenAI Chat Completions API** 兼容的上游（官方 / DeepSeek / Together / Groq / 自建网关 / claude-relay-service）伪装成一台本机 **Ollama** 服务，让只支持 Ollama 协议的客户端（GitHub Copilot 自定义 provider、IDE 插件、桌面 AI 软件）无缝调用 Claude / DeepSeek / GPT 等模型。
-2. **反向**（Anthropic / OpenAI 兼容入口 → 本机模型服务）：把本机的 **Ollama** 或 **llama.cpp server** 包装成 **Anthropic Messages API**（`POST /v1/messages`）和 OpenAI Chat Completions（`POST /v1/chat/completions`），让只支持远端 API 的客户端也能调用本地大模型。
+2. **反向**（Anthropic / OpenAI 兼容入口 → 本机模型服务）：把本机的 **Ollama**、**llama.cpp server** 或 **ComfyUI workflow** 包装成 Anthropic / OpenAI 兼容 API（含 `POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/images/generations`、`POST /v1/images/edits`），让只支持远端 API 的客户端也能调用本地模型。
 
 附带一个零依赖的 Web 配置编辑器（`/admin`），不必再手改 JSON。
 
@@ -27,6 +27,8 @@
 │    /v1/messages      Anthropic 兼容                              │
 │    /v1/messages/count_tokens                                     │
 │    /v1/chat/completions   OpenAI 兼容                            │
+│    /v1/images/generations OpenAI Images 兼容                      │
+│    /v1/images/edits       OpenAI Images 兼容                      │
 │    /v1/embeddings    OpenAI 兼容                                 │
 │    /v1/models                                                    │
 │    每个实例可独立配置 host / port / access_tokens / exposed_models│
@@ -45,9 +47,10 @@
 - **结构化模型标识 `{model, target}`**：每条暴露条目显式声明「上游显示名 + 来源 target 名」，相同名字但来源不同的模型不会再混淆；可选 `alias` 字段在客户端可见的公开 ID 上替换全名
 - **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限——key 支持 `model@target`（最优先）、裸 `model`、tagless base 三级回退
 - **按接口多实例暴露**：`ollama_interfaces[*]` 与 `api_interfaces[*]` 是独立数组，每个实例自带 `host` / `port` / `access_tokens` / `exposed_models`
-- **来源命名清晰区分**：`anthropic_upstreams` / `openai_upstreams`（远端）+ `ollama_targets` / `llama_cpp_targets`（本机）
+- **来源命名清晰区分**：`anthropic_upstreams` / `openai_upstreams`（远端）+ `ollama_targets` / `llama_cpp_targets` / `comfyui_targets`（本机）
 - **循环引用检测**：`anthropic_upstreams[*].base_url` 若指向 fake_ollama 自己的某个监听端口，启动时直接报错，避免转发死循环
-- **本地 target 生命周期接管**：Ollama / llama.cpp 都可配置 health check、按需启动脚本、启动超时、空闲回收
+- **本地 target 生命周期接管**：Ollama / llama.cpp / ComfyUI 都可配置 health check、按需启动脚本、启动超时、空闲回收
+- **ComfyUI 图片后端**：可把 Z-Image-Turbo 等 ComfyUI API workflow 暴露为 OpenAI 兼容图片生成 / 图片编辑接口，支持 per-target 默认分辨率、steps、sampler、denoise、模型文件名与节点 ID 配置。
 - **本地显存预检**：本地模型可在 `model_profiles` 里填 `estimated_vram_gb`；启动前用 `nvidia-smi` 评估可用显存并尝试回收空闲模型
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP）
 - **零依赖 Web 编辑器**：按「Forward / Reverse / Shared / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
@@ -124,6 +127,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
   "ollama_targets":      [ /* … */ ],
   "llama_cpp_defaults":  { /* … */ },
   "llama_cpp_targets":   [ /* … */ ],
+  "comfyui_targets":     [ /* … */ ],
 
   // 对外接口（每项独立监听）
   "ollama_interfaces":   [ /* … */ ],
@@ -162,6 +166,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 | `openai_upstreams`    | OpenAI Chat Completions | 远端 OpenAI 兼容 API（DeepSeek OpenAI 通道、Together、Groq、自建网关等） |
 | `ollama_targets`      | Ollama `/api/chat` | 本机或局域网 Ollama daemon；可生命周期接管 |
 | `llama_cpp_targets`   | OpenAI Chat Completions（llama.cpp server） | 一项 = 一个 llama.cpp server 进程 / 一个模型 / 一个端口 |
+| `comfyui_targets`     | OpenAI Images（ComfyUI workflow） | 一项 = 一个 ComfyUI server / 一个图片模型 workflow target |
 
 #### anthropic_upstreams
 
@@ -250,6 +255,79 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 ```
 
 `LlamaCppTarget.alias` 语义：当 `alias` 非空时，**它就是公开 display name**（替换 `model`），仍然作为模型在白名单里的 display；发给 llama.cpp 的 wire name 始终是 `model` 字段。
+
+#### comfyui_targets
+
+ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名，fake_ollama 通过 ComfyUI HTTP API 提交 workflow、轮询 history、读取 output 图片，并把结果包装成 OpenAI Images 兼容响应。
+
+内置 workflow 面向 Z-Image-Turbo，默认使用 FP8 diffusion + 轻量 text encoder 的 ComfyUI 模型文件：
+
+- `models/diffusion_models/z-image-turbo-fp8-e4m3fn.safetensors`
+- `models/text_encoders/qwen_3_4b_fp4_mixed.safetensors`
+- `models/vae/ae.safetensors`
+
+示例：
+
+```jsonc
+{
+  "comfyui_targets": [
+    {
+      "name": "z-image-turbo-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "z-image-turbo",
+      "auto_start": true,
+      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "diffusion_model": "z-image-turbo-fp8-e4m3fn.safetensors",
+      "text_encoder_model": "qwen_3_4b_fp4_mixed.safetensors",
+      "vae_model": "ae.safetensors",
+      "default_width": 1024,
+      "default_height": 1024,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "default_sampler_name": "res_multistep",
+      "default_scheduler": "simple",
+      "default_denoise": 1.0,
+      "default_edit_denoise": 0.25
+    }
+  ],
+  "api_interfaces": [
+    {
+      "name": "api",
+      "host": "127.0.0.1",
+      "port": 21435,
+      "access_tokens": ["tk-..."],
+      "exposed_models": [
+        { "model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo" }
+      ]
+    }
+  ],
+  "model_profiles": [
+    {
+      "model": "z-image-turbo",
+      "target": "z-image-turbo-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 16
+    }
+  ]
+}
+```
+
+OpenAI 兼容调用：
+
+```powershell
+$headers = @{ Authorization = "Bearer tk-..." }
+$body = @{
+  model = "z-image-turbo"
+  prompt = "a clean product photo of a red cube"
+  size = "512x512"
+  response_format = "b64_json"
+} | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:21435/v1/images/generations -Method Post -Headers $headers -ContentType "application/json" -Body $body
+```
+
+`POST /v1/images/edits` 接受 OpenAI 风格 `multipart/form-data` 的 `image` 文件字段，也接受 JSON base64 `image`。常用覆盖参数：`size`、`n`、`seed`、`steps`、`cfg`、`sampler_name`、`scheduler`、`denoise`、`response_format`。
 
 #### 排队与超时（避免 502 ReadTimeout）
 
@@ -341,6 +419,18 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `advertised_version` | string | `0.6.4` | 仅用于 Ollama 接口的 `/api/version` |
 | `model_profiles` | list | `[]` | 每模型 capabilities / 上下文 / 思维链等。每项写 `model`（必填）+ 可选 `target`，两者拼起来作为最终 key：填 `target` 时为 `model@target` 仅覆盖该 target，不填则裸 `model` 适用于所有 target。查找时三级回退：`model@target` > 裸 `model` > tagless base。旧的 `{ "model@target": {...} }` dict 写法仍兼容 |
 
+`model_profiles[*].capabilities` 是对外声明的功能标签，主要给 `/api/show`、`/api/tags`、`/v1/models` 和客户端做功能发现；它不会自动让底层模型获得该能力。常用值：
+
+| capability | 使用场景 |
+| --- | --- |
+| `completion` | 文本补全 / 聊天模型。Ollama、llama.cpp、Anthropic/OpenAI chat 模型通常需要它。 |
+| `tools` | 工具调用 / function calling。仅在底层模型或上游确实能处理工具调用时声明。 |
+| `vision` | 聊天接口可接收图片输入，例如 `/api/chat` 的 `images` 或 OpenAI/Anthropic 多段图片消息。 |
+| `image_generation` | 图片生成模型，供 OpenAI 兼容 `POST /v1/images/generations` 使用。 |
+| `image_edit` | 图片编辑 / image-to-image 模型，供 OpenAI 兼容 `POST /v1/images/edits` 使用。 |
+
+聊天模型一般至少包含 `completion`；纯 ComfyUI 图片 workflow 可以不填 `completion`，只声明 `image_generation` / `image_edit`。
+
 ### Admin UI / Dashboard
 
 | 字段 | 类型 | 默认 | 说明 |
@@ -365,9 +455,9 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 ```python
 settings.backends
 # -> List[Backend]，每项 (name, protocol, kind, base_url, source)
-#    protocol: "anthropic" | "openai" | "ollama"
+#    protocol: "anthropic" | "openai" | "ollama" | "comfyui"
 #    kind:     "remote" | "local"
-#    source:   底层 AnthropicUpstream / OpenaiUpstream / OllamaTarget / LlamaCppTarget
+#    source:   底层 AnthropicUpstream / OpenaiUpstream / OllamaTarget / LlamaCppTarget / ComfyUITarget
 
 settings.resolve_request("deepseek-r1", interface_name="api")
 # -> 按某个接口的视角解析「客户端请求 model」到 (backend, ModelEntry)
@@ -378,12 +468,13 @@ settings.resolve_request("deepseek-r1", interface_name="api")
 
 ## 反向代理：把本地模型当远端 API 用
 
-适合**只支持 Anthropic 或 OpenAI API** 的客户端调用本机 Ollama / llama.cpp 模型，或把上游 Anthropic 做带鉴权的转发壳。
+适合**只支持 Anthropic 或 OpenAI API** 的客户端调用本机 Ollama / llama.cpp / ComfyUI 模型，或把上游 Anthropic 做带鉴权的转发壳。
 
-只要在某个 `api_interfaces[*].exposed_models` 里勾上对应模型（指向 `ollama_targets` 或 `llama_cpp_targets`），并设置好 `access_tokens`，反向代理 `POST /v1/messages`、`POST /v1/messages/count_tokens` 与 `POST /v1/chat/completions` 就开门工作：
+只要在某个 `api_interfaces[*].exposed_models` 里勾上对应模型（指向 `ollama_targets`、`llama_cpp_targets` 或 `comfyui_targets`），并设置好 `access_tokens`，反向代理就会按模型来源路由：
 
 - 命中 `ollama_targets[*].models[*]` → 转换为 Ollama `/api/chat`，再翻译回 Anthropic / OpenAI 响应。
 - 命中 `llama_cpp_targets[*]` → 调用 llama.cpp `/v1/chat/completions`；Anthropic 入口做格式转换，OpenAI 入口基本直通。
+- 命中 `comfyui_targets[*]` → `POST /v1/images/generations` / `POST /v1/images/edits` 调用 ComfyUI workflow；文本 chat/messages 入口会返回 400 并提示改用图片接口。
 - 命中 anthropic_upstreams / openai_upstreams 提供的模型 → 透传到该上游（带鉴权壳）。
 - 未命中 / 未在白名单 → 404 `model '...' is not exposed on interface 'xxx'`。
 
@@ -409,6 +500,7 @@ claude
 - `/api/chat`、`/api/generate`：消息里传 `images: ["<base64>", ...]`，服务端从 base64 magic bytes 嗅探 PNG / JPEG / GIF / WEBP。
 - `/api/chat` 也兼容 OpenAI 风格多段 `content`：`{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}`。
 - `/v1/chat/completions` 与 `/v1/messages`：参见 OpenAI / Anthropic 官方多段 content 格式。
+- `/v1/images/generations` / `/v1/images/edits`：走 `comfyui_targets`，用于图片生成和 image-to-image 编辑。
 - 上游不支持图片时（如 DeepSeek text-only）会返回错误，fake-ollama 不预拦截。
 
 ## Web 配置编辑器（/admin）
