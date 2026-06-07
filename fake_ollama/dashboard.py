@@ -973,6 +973,57 @@ td.errors { color: var(--danger); white-space: normal; }
   padding: 20px 6px;
   color: var(--muted);
 }
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(23, 32, 51, 0.45);
+  z-index: 1000;
+}
+.modal-overlay.open { display: flex; }
+.modal-box {
+  width: min(420px, 100%);
+  padding: 20px 22px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(23, 32, 51, 0.24);
+}
+.modal-box h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 700;
+}
+.modal-box p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+.modal-actions button {
+  min-width: 84px;
+  padding: 0 14px;
+}
+.modal-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.modal-actions button.primary.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+}
 @media (max-width: 760px) {
   header { align-items: flex-start; flex-direction: column; padding: 16px; }
   main { padding: 12px 12px 24px; }
@@ -1037,6 +1088,16 @@ td.errors { color: var(--danger); white-space: normal; }
     <div id="stderrEvents"></div>
   </section>
 </main>
+<div class="modal-overlay" id="confirmModal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+  <div class="modal-box">
+    <h3 id="confirmTitle">Confirm</h3>
+    <p id="confirmMessage"></p>
+    <div class="modal-actions">
+      <button type="button" id="confirmCancel">Cancel</button>
+      <button type="button" class="primary" id="confirmOk">OK</button>
+    </div>
+  </div>
+</div>
 <script>
 const ranges = [
   {label: '1m', seconds: 60},
@@ -1060,6 +1121,42 @@ function $(id) { return document.getElementById(id); }
 function escapeHtml(value) {
   const escapes = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
   return String(value ?? '').replace(/[&<>"']/g, ch => escapes[ch]);
+}
+function confirmDialog(message, opts = {}) {
+  const modal = $('confirmModal');
+  const okBtn = $('confirmOk');
+  const cancelBtn = $('confirmCancel');
+  $('confirmTitle').textContent = opts.title || 'Confirm';
+  $('confirmMessage').textContent = message;
+  okBtn.textContent = opts.okLabel || 'OK';
+  cancelBtn.textContent = opts.cancelLabel || 'Cancel';
+  okBtn.classList.toggle('danger', !!opts.danger);
+  return new Promise(resolve => {
+    let done = false;
+    function close(result) {
+      if (done) return;
+      done = true;
+      modal.classList.remove('open');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      modal.removeEventListener('mousedown', onBackdrop);
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    }
+    function onOk() { close(true); }
+    function onCancel() { close(false); }
+    function onBackdrop(e) { if (e.target === modal) close(false); }
+    function onKey(e) {
+      if (e.key === 'Escape') { e.preventDefault(); close(false); }
+      else if (e.key === 'Enter') { e.preventDefault(); close(true); }
+    }
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    modal.addEventListener('mousedown', onBackdrop);
+    document.addEventListener('keydown', onKey);
+    modal.classList.add('open');
+    okBtn.focus();
+  });
 }
 function fmtGiB(mib) {
   if (mib === null || mib === undefined || Number.isNaN(Number(mib))) return '-';
@@ -1301,8 +1398,8 @@ async function reclaimModel(key, force = false) {
     if (active) activity.push(`${active} active`);
     if (queued) activity.push(`${queued} queued`);
     const suffix = activity.length ? ` (${activity.join(', ')})` : '';
-    if (!window.confirm(`Force close ${label}${suffix}? This can interrupt in-flight requests.`)) return;
-  } else if (!window.confirm(`Close and reclaim ${label}?`)) {
+    if (!await confirmDialog(`Force close ${label}${suffix}?\nThis can interrupt in-flight requests.`, {title: 'Force close model', okLabel: 'Force close', danger: true})) return;
+  } else if (!await confirmDialog(`Close and reclaim ${label}?`, {title: 'Close model', okLabel: 'Close'})) {
     return;
   }
   $('status').textContent = `${force ? 'force closing' : 'reclaiming'} ${label}...`;
