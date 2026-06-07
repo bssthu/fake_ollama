@@ -36,7 +36,13 @@ from .request_data_log import (
     log_data_event,
     request_data_logging_enabled,
 )
-from .vram import VRAM_IDLE_RECLAIM_SECONDS, VramCoordinator, VramReleaseCandidate
+from .vram import (
+    VRAM_IDLE_RECLAIM_SECONDS,
+    MemoryCoordinator,
+    MemoryReleaseCandidate,
+    VramCoordinator,
+    VramReleaseCandidate,
+)
 
 logger = logging.getLogger("fake_ollama")
 
@@ -95,6 +101,7 @@ class _LoadedModel:
     model: str
     estimated_vram_gb: float
     last_used_monotonic: float
+    estimated_memory_gb: float = 0.0
 
 
 class LlamaCppClient:
@@ -116,6 +123,7 @@ class LlamaCppClient:
         launch_env: Optional[Dict[str, str]] = None,
         target_name: str = "llama.cpp",
         vram_coordinator: Optional[VramCoordinator] = None,
+        memory_coordinator: Optional[MemoryCoordinator] = None,
         client: Optional[httpx.AsyncClient] = None,
         max_concurrent_requests: Optional[int] = None,
         request_read_timeout_seconds: Optional[float] = None,
@@ -140,6 +148,7 @@ class LlamaCppClient:
         self._launch_env = launch_env
         self.target_id = f"llama.cpp:{target_name}"
         self._vram_coordinator = vram_coordinator
+        self._memory_coordinator = memory_coordinator
         if client is not None:
             self._client = client
             self._owns_client = False
@@ -202,6 +211,8 @@ class LlamaCppClient:
         self._shutdown_event: Optional[asyncio.Event] = None
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.register(self)
 
     @property
     def idle_timeout_seconds(self) -> Optional[float]:
@@ -357,6 +368,9 @@ class LlamaCppClient:
     def has_vram_reservation(self, model: str) -> bool:
         return self._loaded_model is not None
 
+    def has_memory_reservation(self, model: str) -> bool:
+        return self._loaded_model is not None
+
     def _begin_request_lifecycle(self) -> None:
         self._request_refs += 1
 
@@ -402,6 +416,46 @@ class LlamaCppClient:
             )
         ]
 
+    def memory_release_candidates(
+        self, *, now: float, idle_seconds: float
+    ) -> list[MemoryReleaseCandidate]:
+        if self._active or self._request_refs or self._loaded_model is None:
+            return []
+        if self._loaded_model.estimated_memory_gb <= 0:
+            return []
+        if now - self._loaded_model.last_used_monotonic < idle_seconds:
+            return []
+        if not (self._started_by_us or self._stop_command):
+            return []
+        loaded = self._loaded_model
+        return [
+            MemoryReleaseCandidate(
+                owner_id=self.target_id,
+                model=loaded.model,
+                estimated_memory_gb=loaded.estimated_memory_gb,
+                last_used_monotonic=loaded.last_used_monotonic,
+                release=self._release_server_for_vram,
+            )
+        ]
+
+    def memory_force_release_candidates(
+        self, *, now: float
+    ) -> list[MemoryReleaseCandidate]:
+        if self._loaded_model is None or self._loaded_model.estimated_memory_gb <= 0:
+            return []
+        if not (self._started_by_us or self._stop_command):
+            return []
+        loaded = self._loaded_model
+        return [
+            MemoryReleaseCandidate(
+                owner_id=self.target_id,
+                model=loaded.model,
+                estimated_memory_gb=loaded.estimated_memory_gb,
+                last_used_monotonic=loaded.last_used_monotonic,
+                release=lambda: self._release_server_for_vram(force=True),
+            )
+        ]
+
     def loaded_model_snapshots(
         self,
         *,
@@ -430,6 +484,8 @@ class LlamaCppClient:
                 "model": loaded.model,
                 "estimated_vram_gb": loaded.estimated_vram_gb,
                 "estimated_vram_mib": loaded.estimated_vram_gb * 1024.0,
+                "estimated_memory_gb": loaded.estimated_memory_gb,
+                "estimated_memory_mib": loaded.estimated_memory_gb * 1024.0,
                 "active_requests": self._active,
                 "queued_requests": self._queued,
                 "request_refs": self._request_refs,
@@ -468,6 +524,8 @@ class LlamaCppClient:
     async def aclose(self) -> None:
         if self._vram_coordinator is not None:
             self._vram_coordinator.unregister(self)
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.unregister(self)
         if self._owns_client:
             await self._client.aclose()
         await self.stop_if_owned()
@@ -483,18 +541,52 @@ class LlamaCppClient:
             estimated_vram_gb=estimated_vram_gb,
         )
 
+    async def _ensure_memory(
+        self, model: Optional[str], estimated_memory_gb: Optional[float]
+    ) -> None:
+        if self._memory_coordinator is None or estimated_memory_gb is None:
+            return
+        await self._memory_coordinator.ensure_available(
+            self,
+            model=model or "",
+            estimated_memory_gb=estimated_memory_gb,
+        )
+
     def _mark_vram_reserved(
         self, model: Optional[str], estimated_vram_gb: Optional[float]
     ) -> None:
         if not model or estimated_vram_gb is None:
             return
+        existing = self._loaded_model
         self._loaded_model = _LoadedModel(
             model=model,
             estimated_vram_gb=estimated_vram_gb,
             last_used_monotonic=time.monotonic(),
+            estimated_memory_gb=(
+                existing.estimated_memory_gb
+                if existing is not None and existing.model == model
+                else 0.0
+            ),
         )
         if self._vram_coordinator is not None:
             self._vram_coordinator.confirm_loaded(self.target_id, model)
+
+    def _mark_memory_reserved(
+        self, model: Optional[str], estimated_memory_gb: Optional[float]
+    ) -> None:
+        if not model or estimated_memory_gb is None:
+            return
+        loaded = self._loaded_model
+        if loaded is None or loaded.model != model:
+            loaded = _LoadedModel(
+                model=model,
+                estimated_vram_gb=0.0,
+                last_used_monotonic=time.monotonic(),
+            )
+            self._loaded_model = loaded
+        loaded.estimated_memory_gb = estimated_memory_gb
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.confirm_loaded(self.target_id, model)
 
     def _touch_vram_reservation(self, model: Optional[str]) -> None:
         if not model or self._loaded_model is None:
@@ -507,11 +599,19 @@ class LlamaCppClient:
             return
         self._vram_coordinator.discard_pending(self.target_id, model)
 
+    def _discard_memory_pending(self, model: Optional[str]) -> None:
+        if not model or self._memory_coordinator is None:
+            return
+        self._memory_coordinator.discard_pending(self.target_id, model)
+
     def _clear_all_vram_state(self) -> None:
         loaded = self._loaded_model
         self._loaded_model = None
-        if loaded is not None and self._vram_coordinator is not None:
-            self._vram_coordinator.discard_pending(self.target_id, loaded.model)
+        if loaded is not None:
+            if self._vram_coordinator is not None:
+                self._vram_coordinator.discard_pending(self.target_id, loaded.model)
+            if self._memory_coordinator is not None:
+                self._memory_coordinator.discard_pending(self.target_id, loaded.model)
 
     def _stderr_log_path(self) -> Optional[Path]:
         """Derive a per-target stderr log file for the spawned llama-server.
@@ -632,6 +732,7 @@ class LlamaCppClient:
         payload: Dict[str, Any],
         *,
         estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> Dict[str, Any]:
         body = dict(payload)
         body["stream"] = False
@@ -640,9 +741,11 @@ class LlamaCppClient:
         try:
             await self._ensure_vram(model, estimated_vram_gb)
             try:
+                await self._ensure_memory(model, estimated_memory_gb)
                 await self._ensure_ready()
             except BaseException:
                 self._discard_vram_pending(model)
+                self._discard_memory_pending(model)
                 raise
             async with self._concurrency_slot():
                 self._active += 1
@@ -658,6 +761,7 @@ class LlamaCppClient:
                 # mark-after-status-code scheme stays invisible the whole
                 # time.
                 self._mark_vram_reserved(model, estimated_vram_gb)
+                self._mark_memory_reserved(model, estimated_memory_gb)
                 try:
                     try:
                         url = f"{self._base}/v1/chat/completions"
@@ -732,6 +836,7 @@ class LlamaCppClient:
         payload: Dict[str, Any],
         *,
         estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> AsyncIterator[str]:
         body = dict(payload)
         body["stream"] = True
@@ -740,9 +845,11 @@ class LlamaCppClient:
         try:
             await self._ensure_vram(model, estimated_vram_gb)
             try:
+                await self._ensure_memory(model, estimated_memory_gb)
                 await self._ensure_ready()
             except BaseException:
                 self._discard_vram_pending(model)
+                self._discard_memory_pending(model)
                 raise
             async with self._concurrency_slot():
                 self._active += 1
@@ -810,6 +917,7 @@ class LlamaCppClient:
                                 )
                                 resp.raise_for_status()
                             self._mark_vram_reserved(model, estimated_vram_gb)
+                            self._mark_memory_reserved(model, estimated_memory_gb)
                             marked = True
                             try:
                                 async for raw_line in resp.aiter_lines():
@@ -869,6 +977,7 @@ class LlamaCppClient:
                             )
                         if not marked:
                             self._discard_vram_pending(model)
+                            self._discard_memory_pending(model)
                         raise
                 finally:
                     self._active -= 1

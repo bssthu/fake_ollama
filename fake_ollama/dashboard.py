@@ -7,7 +7,6 @@ import bisect
 import json
 import logging
 import math
-import os
 import tempfile
 import time
 from collections import deque
@@ -18,77 +17,16 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .vram import VramCoordinator
+from .vram import (
+    MemoryCoordinator,
+    VramCoordinator,
+    system_memory_status_mib as _memory_status_mib,
+)
 
 
 _LOG = logging.getLogger("fake_ollama")
 _DASHBOARD_DATA_VERSION = 1
 _DASHBOARD_REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4)
-
-
-def _memory_status_mib() -> tuple[Optional[float], Optional[float]]:
-    if os.name == "nt":
-        return _windows_memory_status_mib()
-    proc = _proc_meminfo_status_mib()
-    if proc != (None, None):
-        return proc
-    return _posix_memory_status_mib()
-
-
-def _windows_memory_status_mib() -> tuple[Optional[float], Optional[float]]:
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class MEMORYSTATUSEX(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", wintypes.DWORD),
-                ("dwMemoryLoad", wintypes.DWORD),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
-        stat = MEMORYSTATUSEX()
-        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-        if not ok:
-            return None, None
-        return stat.ullAvailPhys / 1048576.0, stat.ullTotalPhys / 1048576.0
-    except Exception:
-        return None, None
-
-
-def _proc_meminfo_status_mib() -> tuple[Optional[float], Optional[float]]:
-    try:
-        values: dict[str, float] = {}
-        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
-            for line in fh:
-                key, _, rest = line.partition(":")
-                if key not in ("MemAvailable", "MemFree", "MemTotal"):
-                    continue
-                raw = rest.strip().split()
-                if raw:
-                    values[key] = float(raw[0]) / 1024.0
-        available = values.get("MemAvailable", values.get("MemFree"))
-        total = values.get("MemTotal")
-        return available, total
-    except (OSError, ValueError):
-        return None, None
-
-
-def _posix_memory_status_mib() -> tuple[Optional[float], Optional[float]]:
-    try:
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        total = (pages * page_size) / 1048576.0
-        return None, total
-    except (OSError, ValueError, AttributeError):
-        return None, None
 
 
 def _model_key(snapshot: dict[str, object]) -> str:
@@ -280,6 +218,7 @@ def _normalise_sample(
         "vram_free_mib": _optional_float(raw.get("vram_free_mib")),
         "vram_total_mib": _optional_float(raw.get("vram_total_mib")),
         "models": _normalise_models(raw.get("models")),
+        "models_memory": _normalise_models(raw.get("models_memory")),
     }
 
 
@@ -305,6 +244,7 @@ def _normalise_samples(
 def _clone_sample(sample: dict[str, Any]) -> dict[str, Any]:
     out = dict(sample)
     out["models"] = dict(sample.get("models") or {})
+    out["models_memory"] = dict(sample.get("models_memory") or {})
     return out
 
 
@@ -641,6 +581,10 @@ class DashboardState:
                 str(model["key"]): model.get("estimated_vram_mib")
                 for model in current_models
             },
+            "models_memory": {
+                str(model["key"]): model.get("estimated_memory_mib")
+                for model in current_models
+            },
         }
         retention = _dashboard_retention_seconds(settings)
         path = _dashboard_data_path(settings)
@@ -728,6 +672,12 @@ async def run_runtime_monitor(app: FastAPI) -> None:
                 if coordinator is not None:
                     await coordinator.reclaim_if_below(
                         threshold_mib=settings.vram_low_free_threshold_mib
+                    )
+            if getattr(settings, "memory_low_free_reclaim_enabled", False):
+                mem_coordinator = getattr(app.state, "memory_coordinator", None)
+                if mem_coordinator is not None:
+                    await mem_coordinator.reclaim_if_below(
+                        threshold_mib=settings.memory_low_free_threshold_mib
                     )
         except asyncio.CancelledError:
             raise
@@ -1061,6 +1011,10 @@ td.errors { color: var(--danger); white-space: normal; }
     <div class="legend" id="modelLegend"></div>
   </section>
   <section class="panel">
+    <div class="panel-head"><h2>Model Estimated Memory</h2></div>
+    <canvas id="modelMemoryChart"></canvas>
+  </section>
+  <section class="panel">
     <div class="panel-head"><h2>Current Models</h2></div>
     <div id="modelTable"></div>
   </section>
@@ -1367,6 +1321,7 @@ function renderTable(models) {
       <td>${escapeHtml(m.backend)}</td>
       <td>${escapeHtml(m.target_id)}</td>
       <td>${fmtGiB(m.estimated_vram_mib)}</td>
+      <td>${fmtGiB(m.estimated_memory_mib)}</td>
       <td>${m.active_requests || 0}</td>
       <td>${m.queued_requests || 0}</td>
       <td>${fmtAge(m.idle_seconds)}</td>
@@ -1375,7 +1330,7 @@ function renderTable(models) {
     </tr>`;
   }).join('');
   $('modelTable').innerHTML = `<table>
-    <thead><tr><th>Model</th><th>Backend</th><th>Target</th><th>Est. VRAM</th><th>Active</th><th>Queued</th><th>Idle</th><th>Reclaimable</th><th>Action</th></tr></thead>
+    <thead><tr><th>Model</th><th>Backend</th><th>Target</th><th>Est. VRAM</th><th>Est. Memory</th><th>Active</th><th>Queued</th><th>Idle</th><th>Reclaimable</th><th>Action</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
   for (const btn of $('modelTable').querySelectorAll('button[data-reclaim-key]')) {
@@ -1653,6 +1608,12 @@ function render() {
     color: colorFor(i),
     hidden: hiddenModels.has(m.key),
     value: s => (s.models && s.models[m.key] !== undefined) ? s.models[m.key] : 0,
+  })), {stepped: true});
+  drawChart($('modelMemoryChart'), samples, models.map((m, i) => ({
+    key: m.key,
+    color: colorFor(i),
+    hidden: hiddenModels.has(m.key),
+    value: s => (s.models_memory && s.models_memory[m.key] !== undefined) ? s.models_memory[m.key] : 0,
   })), {stepped: true});
 
   renderInflight();

@@ -194,6 +194,7 @@ class ModelProfile:
     thinking_budget_tokens: int = DEFAULT_THINKING_BUDGET_TOKENS
     show_thinking: bool = True
     estimated_vram_gb: Optional[float] = None
+    estimated_memory_gb: Optional[float] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelProfile":
@@ -220,6 +221,15 @@ class ModelProfile:
                     estimated_vram_gb = parsed
             except (TypeError, ValueError):
                 estimated_vram_gb = None
+        raw_memory = data.get("estimated_memory_gb")
+        estimated_memory_gb: Optional[float] = None
+        if raw_memory not in (None, ""):
+            try:
+                parsed_mem = float(raw_memory)
+                if parsed_mem > 0:
+                    estimated_memory_gb = parsed_mem
+            except (TypeError, ValueError):
+                estimated_memory_gb = None
         return cls(
             capabilities=[str(c) for c in caps],
             context_length=int(ctx),
@@ -228,6 +238,7 @@ class ModelProfile:
             thinking_budget_tokens=int(budget),
             show_thinking=True if show is None else bool(show),
             estimated_vram_gb=estimated_vram_gb,
+            estimated_memory_gb=estimated_memory_gb,
         )
 
 
@@ -1383,6 +1394,8 @@ class Settings(BaseModel):
     dashboard_reclaim_idle_seconds: float = 20.0
     vram_low_free_reclaim_enabled: bool = True
     vram_low_free_threshold_mib: float = 200.0
+    memory_low_free_reclaim_enabled: bool = True
+    memory_low_free_threshold_mib: float = 2048.0
 
     # -- Meta ------------------------------------------------------------
     config_path: str = ""

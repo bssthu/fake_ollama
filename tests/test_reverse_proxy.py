@@ -35,19 +35,30 @@ class _FakeOllamaClient:
         self.last_chat_payload: Optional[Dict[str, Any]] = None
         self.last_stream_payload: Optional[Dict[str, Any]] = None
         self.last_estimated_vram_gb: Optional[float] = None
+        self.last_estimated_memory_gb: Optional[float] = None
 
     async def chat(
-        self, payload: Dict[str, Any], *, estimated_vram_gb: Optional[float] = None
+        self,
+        payload: Dict[str, Any],
+        *,
+        estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> Dict[str, Any]:
         self.last_chat_payload = payload
         self.last_estimated_vram_gb = estimated_vram_gb
+        self.last_estimated_memory_gb = estimated_memory_gb
         return self.chat_response
 
     def stream_chat(
-        self, payload: Dict[str, Any], *, estimated_vram_gb: Optional[float] = None
+        self,
+        payload: Dict[str, Any],
+        *,
+        estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> AsyncIterator[bytes]:
         self.last_stream_payload = payload
         self.last_estimated_vram_gb = estimated_vram_gb
+        self.last_estimated_memory_gb = estimated_memory_gb
         lines = self.stream_lines
 
         async def gen() -> AsyncIterator[bytes]:
@@ -73,19 +84,30 @@ class _FakeLlamaCppClient:
         self.last_chat_payload: Optional[Dict[str, Any]] = None
         self.last_stream_payload: Optional[Dict[str, Any]] = None
         self.last_estimated_vram_gb: Optional[float] = None
+        self.last_estimated_memory_gb: Optional[float] = None
 
     async def chat(
-        self, payload: Dict[str, Any], *, estimated_vram_gb: Optional[float] = None
+        self,
+        payload: Dict[str, Any],
+        *,
+        estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> Dict[str, Any]:
         self.last_chat_payload = payload
         self.last_estimated_vram_gb = estimated_vram_gb
+        self.last_estimated_memory_gb = estimated_memory_gb
         return self.chat_response
 
     async def stream_chat(
-        self, payload: Dict[str, Any], *, estimated_vram_gb: Optional[float] = None
+        self,
+        payload: Dict[str, Any],
+        *,
+        estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> AsyncIterator[str]:
         self.last_stream_payload = payload
         self.last_estimated_vram_gb = estimated_vram_gb
+        self.last_estimated_memory_gb = estimated_memory_gb
         for chunk in self.stream_chunks:
             yield "data: " + json.dumps(chunk)
         yield "data: [DONE]"
@@ -345,6 +367,7 @@ def test_reverse_messages_returns_anthropic_error_for_insufficient_vram(reverse_
             payload: Dict[str, Any],
             *,
             estimated_vram_gb: Optional[float] = None,
+            estimated_memory_gb: Optional[float] = None,
         ) -> Dict[str, Any]:
             raise LocalTargetResourceError(
                 "Insufficient GPU VRAM to start local model 'llama3.1'."

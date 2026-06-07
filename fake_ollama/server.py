@@ -43,7 +43,7 @@ from .llama_cpp_client import LlamaCppClient
 from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
 from .request_data_log import RequestDataLogMiddleware
-from .vram import LocalTargetResourceError, VramCoordinator
+from .vram import LocalTargetResourceError, MemoryCoordinator, VramCoordinator
 from .dashboard import DashboardState, RequestMetrics, run_runtime_monitor
 from .reverse_converters import (
     anthropic_to_ollama_chat as anthropic_to_ollama_chat_payload,
@@ -148,6 +148,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.comfyui_clients = {}
         if not getattr(app.state, "vram_coordinator", None):
             app.state.vram_coordinator = VramCoordinator()
+        if not getattr(app.state, "memory_coordinator", None):
+            app.state.memory_coordinator = MemoryCoordinator()
         if not getattr(app.state, "dashboard_state", None):
             app.state.dashboard_state = DashboardState()
         if not getattr(app.state, "request_metrics", None):
@@ -189,6 +191,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 cwd=tgt.cwd,
                 target_name=tgt.name,
                 vram_coordinator=app.state.vram_coordinator,
+                memory_coordinator=app.state.memory_coordinator,
             )
             owned_target_names.append(tgt.name)
         for raw_tgt in app.state.settings.llama_cpp_targets:
@@ -211,6 +214,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 launch_env=tgt.effective_env(),
                 target_name=tgt.name,
                 vram_coordinator=app.state.vram_coordinator,
+                memory_coordinator=app.state.memory_coordinator,
                 max_concurrent_requests=tgt.effective_max_concurrent_requests,
                 request_read_timeout_seconds=tgt.request_read_timeout_seconds,
             )
@@ -233,6 +237,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 target_name=tgt.name,
                 workflow_config=tgt.workflow_config(),
                 vram_coordinator=app.state.vram_coordinator,
+                memory_coordinator=app.state.memory_coordinator,
             )
             owned_comfyui_names.append(tgt.name)
         _sync_local_target_idle_monitor(app)
@@ -281,6 +286,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.shutdown_requested = False
     app.state.vram_coordinator = VramCoordinator()
+    app.state.memory_coordinator = MemoryCoordinator()
     app.state.dashboard_state = DashboardState()
     app.state.request_metrics = RequestMetrics()
     app.state.ensure_local_target_idle_monitor = _sync_local_target_idle_monitor
@@ -1528,6 +1534,7 @@ async def _handle_openai_image_generation(request: Request) -> Any:
             model=target.resolve_model(real_model),
             prompt=prompt,
             estimated_vram_gb=profile.estimated_vram_gb,
+            estimated_memory_gb=profile.estimated_memory_gb,
             **params,
         )
     except httpx.HTTPError as exc:
@@ -1564,6 +1571,7 @@ async def _handle_openai_image_edit(request: Request) -> Any:
             filename=filename,
             image_inputs=image_inputs,
             estimated_vram_gb=profile.estimated_vram_gb,
+            estimated_memory_gb=profile.estimated_memory_gb,
             **params,
         )
     except httpx.HTTPError as exc:
@@ -1642,6 +1650,7 @@ async def _handle_openai_video_generation(request: Request) -> Any:
             filename=filename,
             image_inputs=image_inputs or None,
             estimated_vram_gb=profile.estimated_vram_gb,
+            estimated_memory_gb=profile.estimated_memory_gb,
             **params,
         )
     except httpx.HTTPError as exc:
@@ -2111,6 +2120,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                 resp = await oc.chat(
                     ollama_payload,
                     estimated_vram_gb=profile.estimated_vram_gb,
+                    estimated_memory_gb=profile.estimated_memory_gb,
                 )
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, ollama_payload)
@@ -2134,6 +2144,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                 lines = oc.stream_chat(
                     ollama_payload,
                     estimated_vram_gb=profile.estimated_vram_gb,
+                    estimated_memory_gb=profile.estimated_memory_gb,
                 )
                 async for event_type, data in ollama_stream_to_anthropic_events(
                     lines, anthropic_model=openai_model
@@ -2181,11 +2192,13 @@ async def _handle_openai_chat(request: Request) -> Any:
             settings, openai_model, payload, llama_payload
         )
         estimated_vram_gb = profile.estimated_vram_gb
+        estimated_memory_gb = profile.estimated_memory_gb
         if not stream:
             try:
                 resp = await lc.chat(
                     llama_payload,
                     estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
                 )
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, llama_payload)
@@ -2200,6 +2213,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                 async for line in lc.stream_chat(
                     llama_payload,
                     estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
                 ):
                     if line.startswith("data:"):
                         yield (line + "\n\n").encode("utf-8")
@@ -2454,12 +2468,15 @@ async def _handle_anthropic_messages(request: Request) -> Any:
         )
         _apply_ollama_thinking_config(settings, anth_model, payload, ollama_payload)
         _apply_reverse_output_limits(settings, anth_model, ollama_payload)
-        estimated_vram_gb = settings.profile_for(anth_model).estimated_vram_gb
+        _anth_ollama_profile = settings.profile_for(anth_model)
+        estimated_vram_gb = _anth_ollama_profile.estimated_vram_gb
+        estimated_memory_gb = _anth_ollama_profile.estimated_memory_gb
         if not stream:
             try:
                 resp = await oc.chat(
                     ollama_payload,
                     estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
                 )
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, ollama_payload)
@@ -2473,6 +2490,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                 lines = oc.stream_chat(
                     ollama_payload,
                     estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
                 )
                 async for chunk in ollama_stream_to_anthropic_sse(
                     lines, anthropic_model=anth_model
@@ -2515,11 +2533,13 @@ async def _handle_anthropic_messages(request: Request) -> Any:
         _apply_llama_cpp_thinking_config(settings, anth_model, payload, llama_payload)
         profile = settings.profile_for(anth_model)
         estimated_vram_gb = profile.estimated_vram_gb
+        estimated_memory_gb = profile.estimated_memory_gb
         if not stream:
             try:
                 resp = await lc.chat(
                     llama_payload,
                     estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
                 )
             except httpx.HTTPError as exc:
                 _log_upstream_error(request, exc, llama_payload)
@@ -2537,6 +2557,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                 lines = lc.stream_chat(
                     llama_payload,
                     estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
                 )
                 async for chunk in openai_stream_to_anthropic_sse(
                     lines,

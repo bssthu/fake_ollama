@@ -521,7 +521,7 @@ async def test_ollama_client_rechecks_vram_after_release_before_forwarding(
     old_client._loaded_models["old-model"].last_used_monotonic = time.monotonic() - 61.0
 
     try:
-        with pytest.raises(LocalTargetResourceError, match="rechecked current free VRAM"):
+        with pytest.raises(LocalTargetResourceError, match="rechecked current free resource"):
             await new_client.chat(
                 {"model": "new-model", "messages": []}, estimated_vram_gb=2
             )

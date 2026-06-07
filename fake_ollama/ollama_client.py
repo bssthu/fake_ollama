@@ -24,7 +24,13 @@ from .request_data_log import (
     log_data_event,
     request_data_logging_enabled,
 )
-from .vram import VRAM_IDLE_RECLAIM_SECONDS, VramCoordinator, VramReleaseCandidate
+from .vram import (
+    VRAM_IDLE_RECLAIM_SECONDS,
+    MemoryCoordinator,
+    MemoryReleaseCandidate,
+    VramCoordinator,
+    VramReleaseCandidate,
+)
 
 
 logger = logging.getLogger("fake_ollama")
@@ -34,6 +40,7 @@ logger = logging.getLogger("fake_ollama")
 class _LoadedModel:
     estimated_vram_gb: float
     last_used_monotonic: float
+    estimated_memory_gb: float = 0.0
 
 
 class OllamaClient:
@@ -54,6 +61,7 @@ class OllamaClient:
         cwd: Optional[str] = None,
         target_name: str = "ollama",
         vram_coordinator: Optional[VramCoordinator] = None,
+        memory_coordinator: Optional[MemoryCoordinator] = None,
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self._base = base_url.rstrip("/")
@@ -68,6 +76,7 @@ class OllamaClient:
         self._cwd = cwd
         self.target_id = f"ollama:{target_name}"
         self._vram_coordinator = vram_coordinator
+        self._memory_coordinator = memory_coordinator
         if client is not None:
             self._client = client
             self._owns_client = False
@@ -84,6 +93,8 @@ class OllamaClient:
         self._shutdown_requested = False
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.register(self)
 
     @property
     def idle_timeout_seconds(self) -> Optional[float]:
@@ -98,6 +109,9 @@ class OllamaClient:
         return self._last_used
 
     def has_vram_reservation(self, model: str) -> bool:
+        return bool(model and model in self._loaded_models)
+
+    def has_memory_reservation(self, model: str) -> bool:
         return bool(model and model in self._loaded_models)
 
     def _begin_request_lifecycle(self) -> None:
@@ -145,6 +159,48 @@ class OllamaClient:
             )
         return candidates
 
+    def memory_release_candidates(
+        self, *, now: float, idle_seconds: float
+    ) -> list[MemoryReleaseCandidate]:
+        if self._active or self._request_refs:
+            return []
+        candidates: list[MemoryReleaseCandidate] = []
+        for model, loaded in self._loaded_models.items():
+            if loaded.estimated_memory_gb <= 0:
+                continue
+            if now - loaded.last_used_monotonic < idle_seconds:
+                continue
+            candidates.append(
+                MemoryReleaseCandidate(
+                    owner_id=self.target_id,
+                    model=model,
+                    estimated_memory_gb=loaded.estimated_memory_gb,
+                    last_used_monotonic=loaded.last_used_monotonic,
+                    release=lambda model=model: self._release_model_for_vram(model),
+                )
+            )
+        return candidates
+
+    def memory_force_release_candidates(
+        self, *, now: float
+    ) -> list[MemoryReleaseCandidate]:
+        candidates: list[MemoryReleaseCandidate] = []
+        for model, loaded in self._loaded_models.items():
+            if loaded.estimated_memory_gb <= 0:
+                continue
+            candidates.append(
+                MemoryReleaseCandidate(
+                    owner_id=self.target_id,
+                    model=model,
+                    estimated_memory_gb=loaded.estimated_memory_gb,
+                    last_used_monotonic=loaded.last_used_monotonic,
+                    release=lambda model=model: self._release_model_for_vram(
+                        model, force=True
+                    ),
+                )
+            )
+        return candidates
+
     def loaded_model_snapshots(
         self,
         *,
@@ -163,6 +219,8 @@ class OllamaClient:
                     "model": model,
                     "estimated_vram_gb": loaded.estimated_vram_gb,
                     "estimated_vram_mib": loaded.estimated_vram_gb * 1024.0,
+                    "estimated_memory_gb": loaded.estimated_memory_gb,
+                    "estimated_memory_mib": loaded.estimated_memory_gb * 1024.0,
                     "active_requests": self._active,
                     "request_refs": self._request_refs,
                     "idle_seconds": idle_seconds,
@@ -179,6 +237,8 @@ class OllamaClient:
     async def aclose(self) -> None:
         if self._vram_coordinator is not None:
             self._vram_coordinator.unregister(self)
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.unregister(self)
         if self._owns_client:
             await self._client.aclose()
         await self.stop_if_owned()
@@ -194,6 +254,17 @@ class OllamaClient:
             estimated_vram_gb=estimated_vram_gb,
         )
 
+    async def _ensure_memory(
+        self, model: Optional[str], estimated_memory_gb: Optional[float]
+    ) -> None:
+        if self._memory_coordinator is None or estimated_memory_gb is None:
+            return
+        await self._memory_coordinator.ensure_available(
+            self,
+            model=model or "",
+            estimated_memory_gb=estimated_memory_gb,
+        )
+
     def _mark_vram_reserved(
         self, model: Optional[str], estimated_vram_gb: Optional[float]
     ) -> None:
@@ -205,6 +276,22 @@ class OllamaClient:
         )
         if self._vram_coordinator is not None:
             self._vram_coordinator.confirm_loaded(self.target_id, model)
+
+    def _mark_memory_reserved(
+        self, model: Optional[str], estimated_memory_gb: Optional[float]
+    ) -> None:
+        if not model or estimated_memory_gb is None:
+            return
+        loaded = self._loaded_models.get(model)
+        if loaded is None:
+            loaded = _LoadedModel(
+                estimated_vram_gb=0.0,
+                last_used_monotonic=time.monotonic(),
+            )
+            self._loaded_models[model] = loaded
+        loaded.estimated_memory_gb = estimated_memory_gb
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.confirm_loaded(self.target_id, model)
 
     def _touch_vram_reservation(self, model: Optional[str]) -> None:
         if not model:
@@ -218,12 +305,19 @@ class OllamaClient:
             return
         self._vram_coordinator.discard_pending(self.target_id, model)
 
+    def _discard_memory_pending(self, model: Optional[str]) -> None:
+        if not model or self._memory_coordinator is None:
+            return
+        self._memory_coordinator.discard_pending(self.target_id, model)
+
     def _clear_all_vram_state(self) -> None:
         models = list(self._loaded_models.keys())
         self._loaded_models.clear()
-        if self._vram_coordinator is not None:
-            for m in models:
+        for m in models:
+            if self._vram_coordinator is not None:
                 self._vram_coordinator.discard_pending(self.target_id, m)
+            if self._memory_coordinator is not None:
+                self._memory_coordinator.discard_pending(self.target_id, m)
 
     async def _healthy(self) -> bool:
         try:
@@ -286,6 +380,7 @@ class OllamaClient:
         payload: Dict[str, Any],
         *,
         estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Non-stream chat: POST /api/chat with stream=false."""
         body = dict(payload)
@@ -295,9 +390,11 @@ class OllamaClient:
         try:
             await self._ensure_vram(model, estimated_vram_gb)
             try:
+                await self._ensure_memory(model, estimated_memory_gb)
                 await self._ensure_ready()
             except BaseException:
                 self._discard_vram_pending(model)
+                self._discard_memory_pending(model)
                 raise
             self._active += 1
             # Promote the pending reservation to "loaded" *before* the
@@ -307,6 +404,7 @@ class OllamaClient:
             # invisible to the dashboard for the full duration of a long
             # generation — which can run for minutes on large prompts.
             self._mark_vram_reserved(model, estimated_vram_gb)
+            self._mark_memory_reserved(model, estimated_memory_gb)
             try:
                 try:
                     url = f"{self._base}/api/chat"
@@ -379,6 +477,7 @@ class OllamaClient:
         payload: Dict[str, Any],
         *,
         estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> AsyncIterator[bytes]:
         """Stream chat: POST /api/chat with stream=true; yield raw NDJSON lines."""
         body = dict(payload)
@@ -388,9 +487,11 @@ class OllamaClient:
         try:
             await self._ensure_vram(model, estimated_vram_gb)
             try:
+                await self._ensure_memory(model, estimated_memory_gb)
                 await self._ensure_ready()
             except BaseException:
                 self._discard_vram_pending(model)
+                self._discard_memory_pending(model)
                 raise
             self._active += 1
             marked = False
@@ -455,6 +556,7 @@ class OllamaClient:
                             # type-checkers see it as used.
                             _ = err_body
                         self._mark_vram_reserved(model, estimated_vram_gb)
+                        self._mark_memory_reserved(model, estimated_memory_gb)
                         marked = True
                         try:
                             async for raw_line in resp.aiter_lines():
@@ -515,6 +617,7 @@ class OllamaClient:
                         )
                     if not marked:
                         self._discard_vram_pending(model)
+                        self._discard_memory_pending(model)
                     raise
             finally:
                 self._active -= 1
@@ -552,6 +655,7 @@ class OllamaClient:
         if await self._unload_model(model):
             self._loaded_models.pop(model, None)
             self._discard_vram_pending(model)
+            self._discard_memory_pending(model)
             return True
         if self._started_by_us or self._stop_command:
             return await self.stop_if_owned()

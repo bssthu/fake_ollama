@@ -316,6 +316,8 @@ MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选：单条响应的输出 token 数；同时作为 max_tokens 的下限与上限——配了之后，无论客户端传什么 max_tokens / num_predict，最终都会被强制设为该值（防止 VS Code Copilot 等客户端的小默认值导致 finish_reason=length 被整段拒）。受 context_length 预检约束"},
     {"key": "estimated_vram_gb", "type": "float", "default": None,
      "description": "可选：该模型加载后预计占用的 GPU 显存（GB）。本地 Ollama / llama.cpp / ComfyUI target 会使用它做启动前预检、空闲模型回收和 Dashboard 展示"},
+    {"key": "estimated_memory_gb", "type": "float", "default": None,
+     "description": "可选：该模型加载后预计占用的系统内存 / RAM（GB）。部分模型（如 SenseNova、JoyAI 这类会把一部分计算 offload 到内存的 workflow）除显存外还需占用大量主机内存。本地 Ollama / llama.cpp / ComfyUI target 会使用它做启动前预检、空闲模型回收和 Dashboard 展示，逻辑与 estimated_vram_gb 一致"},
     {"key": "thinking_mode", "type": "string", "default": "auto",
      "description": "auto / enabled / disabled；控制是否注入 thinking 字段"},
     {"key": "thinking_budget_tokens", "type": "int", "default": 1024,
@@ -438,6 +440,10 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "description": "是否启用 periodic low-free-VRAM check，并释放符合条件的 idle local models"},
   {"key": "vram_low_free_threshold_mib", "type": "float", "default": 200.0, "group": "dashboard",
    "description": "当 free GPU VRAM 低于该 MiB threshold 时，可释放符合条件的 idle models"},
+  {"key": "memory_low_free_reclaim_enabled", "type": "bool", "default": True, "group": "dashboard",
+   "description": "是否启用 periodic low-free-RAM check，并释放声明了 estimated_memory_gb 的 idle local models"},
+  {"key": "memory_low_free_threshold_mib", "type": "float", "default": 2048.0, "group": "dashboard",
+   "description": "当可用系统内存低于该 MiB threshold 时，可释放符合条件的 idle models（仅释放声明了 estimated_memory_gb 的模型）"},
 
   {"key": "admin_enabled", "type": "bool", "default": True, "group": "admin",
    "description": "是否启用本 /admin 编辑器（关闭后需手动改 config.json）"},
@@ -1898,6 +1904,7 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     old_llama_cpp: Dict[str, LlamaCppClient] = dict(getattr(app.state, "llama_cpp_clients", {}))
     old_comfyui: Dict[str, ComfyUIClient] = dict(getattr(app.state, "comfyui_clients", {}))
     vram_coordinator = getattr(app.state, "vram_coordinator", None)
+    memory_coordinator = getattr(app.state, "memory_coordinator", None)
 
     new_clients: Dict[str, AnthropicClient] = {}
     for up in new_settings.anthropic_upstreams:
@@ -1934,6 +1941,7 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             cwd=tgt.cwd,
             target_name=tgt.name,
             vram_coordinator=vram_coordinator,
+            memory_coordinator=memory_coordinator,
         )
     new_llama_cpp: Dict[str, LlamaCppClient] = {}
     remaining_llama_cpp = dict(old_llama_cpp)
@@ -1966,6 +1974,7 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             launch_env=tgt.effective_env(),
             target_name=tgt.name,
             vram_coordinator=vram_coordinator,
+            memory_coordinator=memory_coordinator,
             max_concurrent_requests=tgt.effective_max_concurrent_requests,
             request_read_timeout_seconds=tgt.request_read_timeout_seconds,
         )
@@ -1998,6 +2007,7 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             target_name=tgt.name,
             workflow_config=tgt.workflow_config(),
             vram_coordinator=vram_coordinator,
+            memory_coordinator=memory_coordinator,
         )
 
     app.state.settings = new_settings

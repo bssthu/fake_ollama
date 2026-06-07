@@ -52,6 +52,7 @@
 - **本地 target 生命周期接管**：Ollama / llama.cpp / ComfyUI 都可配置 health check、按需启动脚本、启动超时、空闲回收
 - **ComfyUI 图片后端**：可把 Z-Image-Turbo / Qwen-Image-Edit / SenseNova-U1 等 ComfyUI API workflow 暴露为 OpenAI 兼容图片生成 / 图片编辑接口。采用声明式 `preset` + bindings 结构，接入新模型只改配置 + JSON；多个图片模型可共用一个 ComfyUI 实例并由 VRAM 协调器互斥换出，避免爆显存。
 - **本地显存预检**：本地模型可在 `model_profiles` 里填 `estimated_vram_gb`；启动前用 `nvidia-smi` 评估可用显存并尝试回收空闲模型
+- **本地内存预检**：部分模型（如 SenseNova / JoyAI 这类会把一部分计算 offload 到内存的 workflow）除显存外还需占用大量主机内存，可在 `model_profiles` 里填 `estimated_memory_gb`；逻辑与显存预检一致，启动前评估可用系统内存并尝试回收空闲模型
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP）
 - **零依赖 Web 编辑器**：按「Forward / Reverse / Shared / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
 - **网络错误安全降级**：上游连接断开 / 超时统一返回 502 / 流式错误帧
@@ -219,6 +220,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 - `auto_start: true`：health check 失败时执行 `start_command`；`stop_command` / `idle_timeout_seconds` 控制空闲回收。
 - 模型名匹配按 Ollama 规则：`foo` 与 `foo:latest` 等价；省略 tag 只代表 `latest`。
 - 每个本地模型的显存估算在 `model_profiles[*].estimated_vram_gb` 里配置。请求触发模型加载前，fake-ollama 调用 `nvidia-smi` 检查可用显存；不足时按 LRU 卸载其他空闲超过 60 秒的本地模型，每轮重新读真实 free VRAM。
+- 主机内存估算在 `model_profiles[*].estimated_memory_gb` 里配置，由独立的内存协调器按同样逻辑准入与回收：加载前读取系统可用内存，不足时卸载其他声明了 `estimated_memory_gb` 的空闲模型。Dashboard 的「Model Estimated Memory」面板与 Current Models 表里的 Est. Memory 列展示该维度。
 
 #### llama_cpp_targets
 
@@ -384,7 +386,8 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "target": "sensenova-comfyui",
       "capabilities": ["image_generation", "image_edit"],
       "context_length": 4096,
-      "estimated_vram_gb": 13
+      "estimated_vram_gb": 13,
+      "estimated_memory_gb": 30
     }
   ]
 }
@@ -525,6 +528,8 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `dashboard_reclaim_idle_seconds` | float | `20.0` | dashboard 关闭按钮所需的最小空闲秒数。和自动 LRU 回收的 60s 阈值独立——用户手动判断更宽松 |
 | `vram_low_free_reclaim_enabled` | bool | `true` | 检测显存低水位时主动回收 |
 | `vram_low_free_threshold_mib` | float | `200.0` | 低水位阈值（MiB） |
+| `memory_low_free_reclaim_enabled` | bool | `true` | 检测系统内存低水位时主动回收（仅回收声明了 `estimated_memory_gb` 的模型） |
+| `memory_low_free_threshold_mib` | float | `2048.0` | 内存低水位阈值（MiB） |
 
 ## 内部 backends 视图
 
@@ -670,6 +675,7 @@ python -m fake_ollama --no-request-data-log
 - **找不到日志文件**：默认相对 CWD：`logs/fake_ollama.log` 与 `logs/fake_ollama.requests.jsonl`。在项目根目录启动，或显式 `--log-file` / `--request-data-log-file`。
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`。
 - **503 `Insufficient GPU VRAM`**：某个本地模型在 `model_profiles` 里配了 `estimated_vram_gb`，但 `nvidia-smi` 显示当前可用显存不足；fake-ollama 已尝试回收空闲超过 60 秒的模型仍不够。降低估算、等模型空闲、配 `stop_command`，或手动释放显存。
+- **503 `Insufficient system RAM`**：某个本地模型配了 `estimated_memory_gb`，但当前可用系统内存不足；处理方式同上（降低估算、等模型空闲、释放内存）。
 - **400 thinking content must be passed back**（DeepSeek）：某轮启用 thinking 但下一轮历史没把 `thinking` 块带回。fake-ollama 已做缓存回查 + auto+show_thinking=false 时注入 disabled；要 thinking 请显式 `"thinking_mode": "enabled"`。
 
 ## 参考文档

@@ -1,17 +1,26 @@
-"""Shared GPU VRAM admission control for local model targets.
+"""Shared admission control for local model targets.
 
-The coordinator tracks two things:
+Two resources are gated the same way:
 
-1. **Reservations** — recorded by participants once nvidia-smi has actually
-   observed the loaded model's VRAM use. These are persistent and used purely
-   to decide which models are reclaimable when a new request would otherwise
-   exceed the budget.
+* **GPU VRAM** — observed via ``nvidia-smi`` (:class:`VramCoordinator`).
+* **System RAM** — observed via the OS (:class:`MemoryCoordinator`). Some
+  local models (e.g. ComfyUI workflows that offload part of the graph to the
+  CPU) need a large chunk of host memory in addition to VRAM, so host memory
+  has to be admission-controlled too.
+
+Both coordinators share the same algorithm (:class:`_ResourceCoordinator`),
+which tracks two things:
+
+1. **Reservations** — recorded by participants once the resource use has
+   actually been observed. These are persistent and used purely to decide
+   which models are reclaimable when a new request would otherwise exceed the
+   budget.
 2. **Pending acquisitions** — recorded by ``ensure_available`` *before* the
-   model starts loading. Pending entries are subtracted from the live
-   ``nvidia-smi`` reading so two concurrent requests for two different models
-   cannot both pass admission against the same headroom. After
-   ``confirm_loaded`` the entry is kept for a short grace window (until
-   ``nvidia-smi`` catches up) and then dropped.
+   model starts loading. Pending entries are subtracted from the live reading
+   so two concurrent requests for two different models cannot both pass
+   admission against the same headroom. After ``confirm_loaded`` the entry is
+   kept for a short grace window (until the live reading catches up) and then
+   dropped.
 
 The coordinator's lock also serialises start-up admission: while the very
 first request for ``(target, model)`` is between ``ensure_available`` and
@@ -26,9 +35,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 import httpx
 
@@ -36,10 +46,10 @@ logger = logging.getLogger("fake_ollama")
 
 VRAM_IDLE_RECLAIM_SECONDS = 60.0
 # Pending bookkeeping is meant to absorb the brief gap between
-# ``confirm_loaded`` and nvidia-smi reflecting the new allocation
+# ``confirm_loaded`` and the live reading reflecting the new allocation
 # (typically well under a second on Windows). Anything longer
-# double-counts the model — once nvidia-smi has caught up, the
-# pending entry would subtract VRAM the live reading already accounts
+# double-counts the model — once the live reading has caught up, the
+# pending entry would subtract resource the live reading already accounts
 # for, falsely reporting "0 GiB available" to the next admission.
 PENDING_LOADED_GRACE_SECONDS = 2.0
 _NVIDIA_SMI_TIMEOUT_SECONDS = 3.0
@@ -72,6 +82,23 @@ class VramReleaseCandidate:
     last_used_monotonic: float
     release: ReleaseCallback
 
+    @property
+    def estimated_gb(self) -> float:
+        return self.estimated_vram_gb
+
+
+@dataclass
+class MemoryReleaseCandidate:
+    owner_id: str
+    model: str
+    estimated_memory_gb: float
+    last_used_monotonic: float
+    release: ReleaseCallback
+
+    @property
+    def estimated_gb(self) -> float:
+        return self.estimated_memory_gb
+
 
 class VramParticipant(Protocol):
     target_id: str
@@ -86,7 +113,22 @@ class VramParticipant(Protocol):
     ) -> list[VramReleaseCandidate]: ...
 
 
-VramProvider = Callable[[], Awaitable[Optional[float]]]
+class MemoryParticipant(Protocol):
+    target_id: str
+
+    @property
+    def active_requests(self) -> int: ...
+
+    def has_memory_reservation(self, model: str) -> bool: ...
+
+    def memory_release_candidates(
+        self, *, now: float, idle_seconds: float
+    ) -> list[MemoryReleaseCandidate]: ...
+
+
+ResourceProvider = Callable[[], Awaitable[Optional[float]]]
+# Backwards-compatible alias (the original name predates host-memory support).
+VramProvider = ResourceProvider
 
 
 def _gb_to_mib(value: float) -> float:
@@ -101,9 +143,14 @@ def _fmt_gib(mib: float) -> str:
 
 @dataclass
 class _PendingEntry:
-    estimated_vram_gb: float
+    estimated_gb: float
     acquired_at: float
     confirmed_loaded_at: Optional[float] = None
+
+
+# ---------------------------------------------------------------------------
+# Live readings
+# ---------------------------------------------------------------------------
 
 
 async def nvidia_smi_free_vram_mib() -> Optional[float]:
@@ -153,34 +200,165 @@ async def _nvidia_smi_query(field_name: str) -> Optional[float]:
     return total if found else None
 
 
-class VramCoordinator:
-    """Coordinate VRAM checks, startup queueing, and idle local-target eviction."""
+def system_memory_status_mib() -> tuple[Optional[float], Optional[float]]:
+    """Return ``(available, total)`` host RAM in MiB, or ``(None, None)``."""
+    if os.name == "nt":
+        return _windows_memory_status_mib()
+    proc = _proc_meminfo_status_mib()
+    if proc != (None, None):
+        return proc
+    return _posix_memory_status_mib()
+
+
+def _windows_memory_status_mib() -> tuple[Optional[float], Optional[float]]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        if not ok:
+            return None, None
+        return stat.ullAvailPhys / 1048576.0, stat.ullTotalPhys / 1048576.0
+    except Exception:
+        return None, None
+
+
+def _proc_meminfo_status_mib() -> tuple[Optional[float], Optional[float]]:
+    try:
+        values: dict[str, float] = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if key not in ("MemAvailable", "MemFree", "MemTotal"):
+                    continue
+                raw = rest.strip().split()
+                if raw:
+                    values[key] = float(raw[0]) / 1024.0
+        available = values.get("MemAvailable", values.get("MemFree"))
+        total = values.get("MemTotal")
+        return available, total
+    except (OSError, ValueError):
+        return None, None
+
+
+def _posix_memory_status_mib() -> tuple[Optional[float], Optional[float]]:
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        total = (pages * page_size) / 1048576.0
+        return None, total
+    except (OSError, ValueError, AttributeError):
+        return None, None
+
+
+async def system_free_memory_mib() -> Optional[float]:
+    """Return available host RAM in MiB, or None if it cannot be read."""
+    return system_memory_status_mib()[0]
+
+
+async def system_total_memory_mib() -> Optional[float]:
+    """Return total host RAM (capacity) in MiB, or None if it cannot be read."""
+    return system_memory_status_mib()[1]
+
+
+# ---------------------------------------------------------------------------
+# Resource specs: the per-resource bits the generic algorithm needs
+# ---------------------------------------------------------------------------
+
+
+def _vram_force_candidates(participant: Any, now: float) -> list:
+    getter = getattr(participant, "vram_force_release_candidates", None)
+    if callable(getter):
+        return getter(now=now)
+    return participant.vram_release_candidates(now=now, idle_seconds=0.0)
+
+
+def _memory_force_candidates(participant: Any, now: float) -> list:
+    getter = getattr(participant, "memory_force_release_candidates", None)
+    if callable(getter):
+        return getter(now=now)
+    return participant.memory_release_candidates(now=now, idle_seconds=0.0)
+
+
+@dataclass(frozen=True)
+class _ResourceSpec:
+    label: str  # human label for log/error messages, e.g. "GPU VRAM"
+    amount_key: str  # result-dict key, e.g. "estimated_vram_gb"
+    unavailable_hint: str  # remediation hint when the live reading is missing
+    reservation: Callable[[Any, str], bool]
+    release_candidates: Callable[[Any, float, float], list]
+    force_candidates: Callable[[Any, float], list]
+
+
+_VRAM_SPEC = _ResourceSpec(
+    label="GPU VRAM",
+    amount_key="estimated_vram_gb",
+    unavailable_hint=(
+        "Install nvidia-smi or unset model_profiles.<model>.estimated_vram_gb."
+    ),
+    reservation=lambda p, model: p.has_vram_reservation(model),
+    release_candidates=lambda p, now, idle: p.vram_release_candidates(
+        now=now, idle_seconds=idle
+    ),
+    force_candidates=_vram_force_candidates,
+)
+
+
+_MEMORY_SPEC = _ResourceSpec(
+    label="system RAM",
+    amount_key="estimated_memory_gb",
+    unavailable_hint="Unset model_profiles.<model>.estimated_memory_gb.",
+    reservation=lambda p, model: p.has_memory_reservation(model),
+    release_candidates=lambda p, now, idle: p.memory_release_candidates(
+        now=now, idle_seconds=idle
+    ),
+    force_candidates=_memory_force_candidates,
+)
+
+
+class _ResourceCoordinator:
+    """Coordinate resource checks, startup queueing, and idle eviction."""
 
     def __init__(
         self,
-        provider: VramProvider = nvidia_smi_free_vram_mib,
+        provider: ResourceProvider,
         *,
-        total_provider: Optional[VramProvider] = None,
+        total_provider: ResourceProvider,
+        spec: _ResourceSpec,
     ) -> None:
         self._provider = provider
-        self._total_provider = (
-            total_provider if total_provider is not None else nvidia_smi_total_vram_mib
-        )
+        self._total_provider = total_provider
+        self._spec = spec
         self._cached_total_mib: Optional[float] = None
-        self._participants: dict[str, VramParticipant] = {}
+        self._participants: dict[str, Any] = {}
         self._pending: dict[tuple[str, str], _PendingEntry] = {}
         self._lock = asyncio.Lock()
 
-    def register(self, participant: VramParticipant) -> None:
+    def register(self, participant: Any) -> None:
         self._participants[participant.target_id] = participant
 
-    def unregister(self, participant: VramParticipant) -> None:
+    def unregister(self, participant: Any) -> None:
         self._participants.pop(participant.target_id, None)
 
-    async def free_vram_mib(self) -> Optional[float]:
+    async def _free_mib(self) -> Optional[float]:
         return await self._provider()
 
-    async def total_vram_mib(self) -> Optional[float]:
+    async def _total_mib(self) -> Optional[float]:
         if self._cached_total_mib is not None:
             return self._cached_total_mib
         total = await self._total_provider()
@@ -200,8 +378,8 @@ class VramCoordinator:
         """Mark a pending reservation as actually loaded.
 
         The entry is kept for a short grace window so concurrent admissions
-        keep subtracting it from ``nvidia-smi`` until the live reading
-        catches up to the new allocation.
+        keep subtracting it from the live reading until it catches up to the
+        new allocation.
         """
         entry = self._pending.get((target_id, model))
         if entry is None:
@@ -209,42 +387,42 @@ class VramCoordinator:
         if entry.confirmed_loaded_at is None:
             entry.confirmed_loaded_at = time.monotonic()
 
-    async def ensure_available(
+    async def _ensure_available(
         self,
-        requester: VramParticipant,
+        requester: Any,
         *,
         model: str = "",
-        estimated_vram_gb: Optional[float] = None,
+        estimated_gb: Optional[float] = None,
     ) -> None:
-        if estimated_vram_gb is None:
+        if estimated_gb is None:
             return
         key = (requester.target_id, model)
-        required_mib = _gb_to_mib(estimated_vram_gb)
+        required_mib = _gb_to_mib(estimated_gb)
         async with self._lock:
             # Idempotent: same target+model already pending or already loaded.
             if key in self._pending:
                 return
-            if requester.has_vram_reservation(model):
+            if self._spec.reservation(requester, model):
                 return
 
             available_mib = await self._provider()
             if available_mib is None:
                 raise LocalTargetResourceError(
-                    "Unable to determine available GPU VRAM for local model "
-                    f"'{model or requester.target_id}'. Install nvidia-smi or unset "
-                    "model_profiles.<model>.estimated_vram_gb."
+                    f"Unable to determine available {self._spec.label} for local "
+                    f"model '{model or requester.target_id}'. "
+                    f"{self._spec.unavailable_hint}"
                 )
             effective_free = self._effective_free_mib(available_mib, exclude_key=key)
             if effective_free >= required_mib:
-                self._record_pending(key, estimated_vram_gb)
+                self._record_pending(key, estimated_gb)
                 return
 
             candidates = self._eligible_candidates(model)
             total_reclaimable_mib = sum(
-                _gb_to_mib(candidate.estimated_vram_gb) for candidate in candidates
+                _gb_to_mib(candidate.estimated_gb) for candidate in candidates
             )
             if effective_free + total_reclaimable_mib < required_mib:
-                total_mib = await self.total_vram_mib()
+                total_mib = await self._total_mib()
                 if (
                     total_mib is None
                     or total_mib < required_mib
@@ -259,11 +437,12 @@ class VramCoordinator:
                     )
                 logger.info(
                     "local model %s needs %s; current effective free plus estimated "
-                    "idle reclaim is only %s, but total GPU VRAM is %s, so trying "
+                    "idle reclaim is only %s, but total %s is %s, so trying "
                     "best-effort idle model release before failing admission",
                     model or requester.target_id,
                     _fmt_gib(required_mib),
                     _fmt_gib(effective_free + total_reclaimable_mib),
+                    self._spec.label,
                     _fmt_gib(total_mib),
                 )
 
@@ -272,7 +451,7 @@ class VramCoordinator:
             remaining_reclaimable_mib = total_reclaimable_mib
             for candidate in candidates:
                 released = await candidate.release()
-                candidate_mib = _gb_to_mib(candidate.estimated_vram_gb)
+                candidate_mib = _gb_to_mib(candidate.estimated_gb)
                 remaining_reclaimable_mib = max(
                     0.0, remaining_reclaimable_mib - candidate_mib
                 )
@@ -284,10 +463,11 @@ class VramCoordinator:
                     )
                     attempted_release_mib += candidate_mib
                     logger.info(
-                        "requested release of idle local model %s on %s; estimated VRAM %.2f GiB",
+                        "requested release of idle local model %s on %s; estimated %s %.2f GiB",
                         candidate.model,
                         candidate.owner_id,
-                        candidate.estimated_vram_gb,
+                        self._spec.label,
+                        candidate.estimated_gb,
                     )
                     refreshed_mib = await self._wait_for_available_after_release(
                         required_mib, exclude_key=key
@@ -298,11 +478,12 @@ class VramCoordinator:
                         )
                     if current_effective_free >= required_mib:
                         logger.info(
-                            "current effective free GPU VRAM after release is %s; proceeding with local model %s",
+                            "current effective free %s after release is %s; proceeding with local model %s",
+                            self._spec.label,
                             _fmt_gib(current_effective_free),
                             model or requester.target_id,
                         )
-                        self._record_pending(key, estimated_vram_gb)
+                        self._record_pending(key, estimated_gb)
                         return
                 else:
                     logger.warning(
@@ -317,7 +498,7 @@ class VramCoordinator:
                         refreshed_mib, exclude_key=key
                     )
                 if current_effective_free >= required_mib:
-                    self._record_pending(key, estimated_vram_gb)
+                    self._record_pending(key, estimated_gb)
                     return
 
             raise self._insufficient_error(
@@ -335,7 +516,7 @@ class VramCoordinator:
         threshold_mib: float,
         idle_seconds: float = VRAM_IDLE_RECLAIM_SECONDS,
     ) -> dict[str, object]:
-        """Release eligible idle local models when free VRAM is critically low."""
+        """Release eligible idle local models when free resource is critically low."""
         threshold_mib = max(0.0, float(threshold_mib))
         async with self._lock:
             available_mib = await self._provider()
@@ -367,11 +548,12 @@ class VramCoordinator:
                         {
                             "owner_id": candidate.owner_id,
                             "model": candidate.model,
-                            "estimated_vram_gb": candidate.estimated_vram_gb,
+                            self._spec.amount_key: candidate.estimated_gb,
                         }
                     )
                     logger.info(
-                        "low free GPU VRAM (%s below threshold %s); requested release of idle local model %s on %s",
+                        "low free %s (%s below threshold %s); requested release of idle local model %s on %s",
+                        self._spec.label,
                         _fmt_gib(current_mib),
                         _fmt_gib(threshold_mib),
                         candidate.model,
@@ -386,7 +568,7 @@ class VramCoordinator:
                         break
                 else:
                     logger.warning(
-                        "failed to release idle local model %s on %s during low-VRAM check",
+                        "failed to release idle local model %s on %s during low-resource check",
                         candidate.model,
                         candidate.owner_id,
                     )
@@ -414,7 +596,7 @@ class VramCoordinator:
         """Release one local model by target/model identity.
 
         Normal dashboard reclaim uses the same idle eligibility as automatic
-        VRAM reclaim. Force mode is user-confirmed and asks participants for
+        reclaim. Force mode is user-confirmed and asks participants for
         a stronger release path that may interrupt in-flight work.
         """
         async with self._lock:
@@ -434,17 +616,19 @@ class VramCoordinator:
                     self._pending.pop((candidate.owner_id, candidate.model), None)
                     if force:
                         logger.info(
-                            "dashboard force-closed local model %s on %s; estimated VRAM %.2f GiB",
+                            "dashboard force-closed local model %s on %s; estimated %s %.2f GiB",
                             candidate.model,
                             candidate.owner_id,
-                            candidate.estimated_vram_gb,
+                            self._spec.label,
+                            candidate.estimated_gb,
                         )
                     else:
                         logger.info(
-                            "dashboard requested release of idle local model %s on %s; estimated VRAM %.2f GiB",
+                            "dashboard requested release of idle local model %s on %s; estimated %s %.2f GiB",
                             candidate.model,
                             candidate.owner_id,
-                            candidate.estimated_vram_gb,
+                            self._spec.label,
+                            candidate.estimated_gb,
                         )
                     reason = None
                 else:
@@ -458,7 +642,7 @@ class VramCoordinator:
                 result: dict[str, object] = {
                     "target_id": candidate.owner_id,
                     "model": candidate.model,
-                    "estimated_vram_gb": candidate.estimated_vram_gb,
+                    self._spec.amount_key: candidate.estimated_gb,
                     "released": released,
                     "reason": reason,
                 }
@@ -479,10 +663,10 @@ class VramCoordinator:
     # -- Internals -----------------------------------------------------
 
     def _record_pending(
-        self, key: tuple[str, str], estimated_vram_gb: float
+        self, key: tuple[str, str], estimated_gb: float
     ) -> None:
         self._pending[key] = _PendingEntry(
-            estimated_vram_gb=estimated_vram_gb,
+            estimated_gb=estimated_gb,
             acquired_at=time.monotonic(),
         )
 
@@ -497,10 +681,10 @@ class VramCoordinator:
                 entry.confirmed_loaded_at is not None
                 and now - entry.confirmed_loaded_at > PENDING_LOADED_GRACE_SECONDS
             ):
-                # nvidia-smi should have caught up; drop the bookkeeping.
+                # The live reading should have caught up; drop the bookkeeping.
                 stale.append(k)
                 continue
-            total += _gb_to_mib(entry.estimated_vram_gb)
+            total += _gb_to_mib(entry.estimated_gb)
         for k in stale:
             self._pending.pop(k, None)
         return total
@@ -547,14 +731,14 @@ class VramCoordinator:
         *,
         idle_seconds: float = VRAM_IDLE_RECLAIM_SECONDS,
         include_same_model: bool = False,
-    ) -> list[VramReleaseCandidate]:
+    ) -> list:
         now = time.monotonic()
-        candidates: list[VramReleaseCandidate] = []
+        candidates: list = []
         for participant in self._participants.values():
             if participant.active_requests:
                 continue
-            for candidate in participant.vram_release_candidates(
-                now=now, idle_seconds=idle_seconds
+            for candidate in self._spec.release_candidates(
+                participant, now, idle_seconds
             ):
                 if not include_same_model and candidate.model == requested_model:
                     continue
@@ -564,17 +748,11 @@ class VramCoordinator:
         )
         return candidates
 
-    def _force_candidates(self) -> list[VramReleaseCandidate]:
+    def _force_candidates(self) -> list:
         now = time.monotonic()
-        candidates: list[VramReleaseCandidate] = []
+        candidates: list = []
         for participant in self._participants.values():
-            getter = getattr(participant, "vram_force_release_candidates", None)
-            if callable(getter):
-                candidates.extend(getter(now=now))
-                continue
-            candidates.extend(
-                participant.vram_release_candidates(now=now, idle_seconds=0.0)
-            )
+            candidates.extend(self._spec.force_candidates(participant, now))
         candidates.sort(
             key=lambda item: (item.last_used_monotonic, item.owner_id, item.model)
         )
@@ -582,7 +760,7 @@ class VramCoordinator:
 
     def _insufficient_error(
         self,
-        requester: VramParticipant,
+        requester: Any,
         *,
         model: str,
         required_mib: float,
@@ -591,7 +769,7 @@ class VramCoordinator:
         attempted_release_mib: float = 0.0,
     ) -> LocalTargetResourceError:
         message = (
-            "Insufficient GPU VRAM to start local model "
+            f"Insufficient {self._spec.label} to start local model "
             f"'{model or requester.target_id}': requires about {_fmt_gib(required_mib)}, "
             f"but only {_fmt_gib(available_mib)} is currently available. "
             f"Remaining eligible idle local models can free about {_fmt_gib(reclaimable_mib)}."
@@ -599,6 +777,80 @@ class VramCoordinator:
         if attempted_release_mib > 0:
             message += (
                 f" Already requested release for about {_fmt_gib(attempted_release_mib)} "
-                "and rechecked current free VRAM."
+                "and rechecked current free resource."
             )
         return LocalTargetResourceError(message)
+
+
+class VramCoordinator(_ResourceCoordinator):
+    """Coordinate GPU VRAM checks, startup queueing, and idle eviction."""
+
+    def __init__(
+        self,
+        provider: ResourceProvider = nvidia_smi_free_vram_mib,
+        *,
+        total_provider: Optional[ResourceProvider] = None,
+    ) -> None:
+        super().__init__(
+            provider,
+            total_provider=(
+                total_provider
+                if total_provider is not None
+                else nvidia_smi_total_vram_mib
+            ),
+            spec=_VRAM_SPEC,
+        )
+
+    async def free_vram_mib(self) -> Optional[float]:
+        return await self._free_mib()
+
+    async def total_vram_mib(self) -> Optional[float]:
+        return await self._total_mib()
+
+    async def ensure_available(
+        self,
+        requester: VramParticipant,
+        *,
+        model: str = "",
+        estimated_vram_gb: Optional[float] = None,
+    ) -> None:
+        await self._ensure_available(
+            requester, model=model, estimated_gb=estimated_vram_gb
+        )
+
+
+class MemoryCoordinator(_ResourceCoordinator):
+    """Coordinate host RAM checks, startup queueing, and idle eviction."""
+
+    def __init__(
+        self,
+        provider: ResourceProvider = system_free_memory_mib,
+        *,
+        total_provider: Optional[ResourceProvider] = None,
+    ) -> None:
+        super().__init__(
+            provider,
+            total_provider=(
+                total_provider
+                if total_provider is not None
+                else system_total_memory_mib
+            ),
+            spec=_MEMORY_SPEC,
+        )
+
+    async def free_memory_mib(self) -> Optional[float]:
+        return await self._free_mib()
+
+    async def total_memory_mib(self) -> Optional[float]:
+        return await self._total_mib()
+
+    async def ensure_available(
+        self,
+        requester: MemoryParticipant,
+        *,
+        model: str = "",
+        estimated_memory_gb: Optional[float] = None,
+    ) -> None:
+        await self._ensure_available(
+            requester, model=model, estimated_gb=estimated_memory_gb
+        )

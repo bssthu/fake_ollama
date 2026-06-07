@@ -32,7 +32,13 @@ from .request_data_log import (
     log_data_event,
     request_data_logging_enabled,
 )
-from .vram import VRAM_IDLE_RECLAIM_SECONDS, VramCoordinator, VramReleaseCandidate
+from .vram import (
+    VRAM_IDLE_RECLAIM_SECONDS,
+    MemoryCoordinator,
+    MemoryReleaseCandidate,
+    VramCoordinator,
+    VramReleaseCandidate,
+)
 
 logger = logging.getLogger("fake_ollama")
 
@@ -59,6 +65,7 @@ class _LoadedModel:
     model: str
     estimated_vram_gb: float
     last_used_monotonic: float
+    estimated_memory_gb: float = 0.0
 
 
 @dataclass
@@ -94,6 +101,7 @@ class ComfyUIClient:
         target_name: str = "comfyui",
         workflow_config: Optional[Dict[str, Any]] = None,
         vram_coordinator: Optional[VramCoordinator] = None,
+        memory_coordinator: Optional[MemoryCoordinator] = None,
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self._base = base_url.rstrip("/")
@@ -116,6 +124,7 @@ class ComfyUIClient:
             self._workflow_config
         )
         self._vram_coordinator = vram_coordinator
+        self._memory_coordinator = memory_coordinator
         self._client_id = f"fake-ollama-{uuid.uuid4().hex}"
         if client is not None:
             self._client = client
@@ -133,6 +142,8 @@ class ComfyUIClient:
         self._shutdown_requested = False
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.register(self)
 
     @property
     def idle_timeout_seconds(self) -> Optional[float]:
@@ -152,11 +163,16 @@ class ComfyUIClient:
     async def aclose(self) -> None:
         if self._vram_coordinator is not None:
             self._vram_coordinator.unregister(self)
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.unregister(self)
         if self._owns_client:
             await self._client.aclose()
         await self.stop_if_owned()
 
     def has_vram_reservation(self, model: str) -> bool:
+        return self._loaded_model is not None
+
+    def has_memory_reservation(self, model: str) -> bool:
         return self._loaded_model is not None
 
     def _begin_request_lifecycle(self) -> None:
@@ -177,18 +193,52 @@ class ComfyUIClient:
             estimated_vram_gb=estimated_vram_gb,
         )
 
+    async def _ensure_memory(
+        self, model: Optional[str], estimated_memory_gb: Optional[float]
+    ) -> None:
+        if self._memory_coordinator is None or estimated_memory_gb is None:
+            return
+        await self._memory_coordinator.ensure_available(
+            self,
+            model=model or "",
+            estimated_memory_gb=estimated_memory_gb,
+        )
+
     def _mark_vram_reserved(
         self, model: Optional[str], estimated_vram_gb: Optional[float]
     ) -> None:
         if not model or estimated_vram_gb is None:
             return
+        existing = self._loaded_model
         self._loaded_model = _LoadedModel(
             model=model,
             estimated_vram_gb=estimated_vram_gb,
             last_used_monotonic=time.monotonic(),
+            estimated_memory_gb=(
+                existing.estimated_memory_gb
+                if existing is not None and existing.model == model
+                else 0.0
+            ),
         )
         if self._vram_coordinator is not None:
             self._vram_coordinator.confirm_loaded(self.target_id, model)
+
+    def _mark_memory_reserved(
+        self, model: Optional[str], estimated_memory_gb: Optional[float]
+    ) -> None:
+        if not model or estimated_memory_gb is None:
+            return
+        loaded = self._loaded_model
+        if loaded is None or loaded.model != model:
+            loaded = _LoadedModel(
+                model=model,
+                estimated_vram_gb=0.0,
+                last_used_monotonic=time.monotonic(),
+            )
+            self._loaded_model = loaded
+        loaded.estimated_memory_gb = estimated_memory_gb
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.confirm_loaded(self.target_id, model)
 
     def _touch_vram_reservation(self, model: Optional[str]) -> None:
         if self._loaded_model is not None:
@@ -199,11 +249,19 @@ class ComfyUIClient:
             return
         self._vram_coordinator.discard_pending(self.target_id, model)
 
+    def _discard_memory_pending(self, model: Optional[str]) -> None:
+        if not model or self._memory_coordinator is None:
+            return
+        self._memory_coordinator.discard_pending(self.target_id, model)
+
     def _clear_all_vram_state(self) -> None:
         loaded = self._loaded_model
         self._loaded_model = None
-        if loaded is not None and self._vram_coordinator is not None:
-            self._vram_coordinator.discard_pending(self.target_id, loaded.model)
+        if loaded is not None:
+            if self._vram_coordinator is not None:
+                self._vram_coordinator.discard_pending(self.target_id, loaded.model)
+            if self._memory_coordinator is not None:
+                self._memory_coordinator.discard_pending(self.target_id, loaded.model)
 
     def vram_release_candidates(
         self, *, now: float, idle_seconds: float
@@ -239,6 +297,42 @@ class ComfyUIClient:
             )
         ]
 
+    def memory_release_candidates(
+        self, *, now: float, idle_seconds: float
+    ) -> list[MemoryReleaseCandidate]:
+        if self._active or self._request_refs or self._loaded_model is None:
+            return []
+        loaded = self._loaded_model
+        if loaded.estimated_memory_gb <= 0:
+            return []
+        if now - loaded.last_used_monotonic < idle_seconds:
+            return []
+        return [
+            MemoryReleaseCandidate(
+                owner_id=self.target_id,
+                model=loaded.model,
+                estimated_memory_gb=loaded.estimated_memory_gb,
+                last_used_monotonic=loaded.last_used_monotonic,
+                release=self._release_for_vram,
+            )
+        ]
+
+    def memory_force_release_candidates(
+        self, *, now: float
+    ) -> list[MemoryReleaseCandidate]:
+        if self._loaded_model is None or self._loaded_model.estimated_memory_gb <= 0:
+            return []
+        loaded = self._loaded_model
+        return [
+            MemoryReleaseCandidate(
+                owner_id=self.target_id,
+                model=loaded.model,
+                estimated_memory_gb=loaded.estimated_memory_gb,
+                last_used_monotonic=loaded.last_used_monotonic,
+                release=lambda: self._release_for_vram(force=True),
+            )
+        ]
+
     def loaded_model_snapshots(
         self,
         *,
@@ -258,6 +352,8 @@ class ComfyUIClient:
                 "model": loaded.model,
                 "estimated_vram_gb": loaded.estimated_vram_gb,
                 "estimated_vram_mib": loaded.estimated_vram_gb * 1024.0,
+                "estimated_memory_gb": loaded.estimated_memory_gb,
+                "estimated_memory_mib": loaded.estimated_memory_gb * 1024.0,
                 "active_requests": self._active,
                 "request_refs": self._request_refs,
                 "idle_seconds": idle_seconds,
@@ -358,6 +454,7 @@ class ComfyUIClient:
         scheduler: str,
         denoise: float,
         estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> List[ComfyUIImage]:
         return await self._run(
             mode="t2i",
@@ -375,6 +472,7 @@ class ComfyUIClient:
                 "denoise": denoise,
             },
             estimated_vram_gb=estimated_vram_gb,
+            estimated_memory_gb=estimated_memory_gb,
             operation="generate_image",
         )
 
@@ -396,6 +494,7 @@ class ComfyUIClient:
         scheduler: str,
         denoise: float,
         estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
     ) -> List[ComfyUIImage]:
         return await self._run(
             mode="i2i",
@@ -413,6 +512,7 @@ class ComfyUIClient:
                 "denoise": denoise,
             },
             estimated_vram_gb=estimated_vram_gb,
+            estimated_memory_gb=estimated_memory_gb,
             operation="edit_image",
             image_bytes=image_bytes,
             filename=filename,
@@ -437,6 +537,7 @@ class ComfyUIClient:
         frame_rate: float,
         prefetch_count: int,
         estimated_vram_gb: Optional[float] = None,
+        estimated_memory_gb: Optional[float] = None,
         image_bytes: Optional[bytes] = None,
         filename: Optional[str] = None,
         image_inputs: Optional[List[Tuple[bytes, str]]] = None,
@@ -466,6 +567,7 @@ class ComfyUIClient:
                 "prefetch_count": prefetch_count,
             },
             estimated_vram_gb=estimated_vram_gb,
+            estimated_memory_gb=estimated_memory_gb,
             operation="generate_video",
             image_bytes=image_bytes,
             filename=filename,
@@ -482,6 +584,7 @@ class ComfyUIClient:
         seed: int,
         params: Dict[str, Any],
         estimated_vram_gb: Optional[float],
+        estimated_memory_gb: Optional[float] = None,
         operation: str,
         image_bytes: Optional[bytes] = None,
         filename: Optional[str] = None,
@@ -503,13 +606,16 @@ class ComfyUIClient:
         try:
             await self._ensure_vram(model, estimated_vram_gb)
             try:
+                await self._ensure_memory(model, estimated_memory_gb)
                 await self._ensure_ready()
             except BaseException:
                 self._discard_vram_pending(model)
+                self._discard_memory_pending(model)
                 raise
             self._active += 1
             try:
                 self._mark_vram_reserved(model, estimated_vram_gb)
+                self._mark_memory_reserved(model, estimated_memory_gb)
                 base: Dict[str, Any] = {**params, "prompt": prompt}
                 uploads: List[str] = []
                 refs = list(image_inputs or [])
