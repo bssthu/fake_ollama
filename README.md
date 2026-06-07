@@ -258,6 +258,14 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 
 #### comfyui_targets
 
+Video workflows are supported for `preset: "custom"` / `"comfyui_api"` targets
+with `video_workflow_path` and optional `image_to_video_workflow_path`. Bind
+request fields under `bindings.video` for text-to-video and `bindings.i2v` for
+image-to-video; image references can bind to `image`, `images`, or
+`image_1`...`image_4`. When `/v1/videos/generations` receives an image and an
+I2V workflow is configured, fake_ollama uses the I2V workflow; otherwise it
+keeps the existing T2V workflow.
+
 ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名，fake_ollama 通过 ComfyUI HTTP API 提交 workflow、轮询 history、读取 output 图片，并把结果包装成 OpenAI Images 兼容响应。
 
 每个 target 用 **`preset`** 选择工作流形态（声明式绑定，新增模型只改配置 + JSON、不动代码）：
@@ -564,6 +572,7 @@ claude
 - `/api/chat` 也兼容 OpenAI 风格多段 `content`：`{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}`。
 - `/v1/chat/completions` 与 `/v1/messages`：参见 OpenAI / Anthropic 官方多段 content 格式。
 - `/v1/images/generations` / `/v1/images/edits`：走 `comfyui_targets`，用于图片生成和 image-to-image 编辑。
+- `/v1/videos/generations`：走 `comfyui_targets`，用于 text-to-video；请求里带 `image` / `images` 且 target 配了 `image_to_video_workflow_path` 时走 image-to-video。
 - 上游不支持图片时（如 DeepSeek text-only）会返回错误，fake-ollama 不预拦截。
 
 ## Web 配置编辑器（/admin）

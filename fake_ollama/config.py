@@ -901,6 +901,7 @@ class ComfyUITarget(BaseModel):
     text_to_image_workflow_path: Optional[str] = None
     image_to_image_workflow_path: Optional[str] = None
     video_workflow_path: Optional[str] = None
+    image_to_video_workflow_path: Optional[str] = None
 
     # Z-Image-Turbo default model files and sampling parameters.
     diffusion_model: str = "z-image-turbo-fp8-e4m3fn.safetensors"
@@ -1104,6 +1105,7 @@ class ComfyUITarget(BaseModel):
             "text_to_image_workflow_path",
             "image_to_image_workflow_path",
             "video_workflow_path",
+            "image_to_video_workflow_path",
             "diffusion_model",
             "diffusion_weight_dtype",
             "text_encoder_model",

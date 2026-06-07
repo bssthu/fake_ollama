@@ -250,6 +250,30 @@ def test_openai_video_generations_routes_to_comfyui() -> None:
     assert call["estimated_vram_gb"] == 16.0
 
 
+def test_openai_video_generations_accepts_json_base64_image() -> None:
+    fake = _FakeComfyClient()
+    client = _client_with_fake(fake)
+    with client:
+        resp = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "z-image-turbo",
+                "prompt": "animate the reference",
+                "size": "512x512",
+                "image": "aW1nLWJ5dGVz",
+                "filename": "reference.png",
+            },
+        )
+
+    assert resp.status_code == 200
+    call = fake.video_calls[0]
+    assert call["prompt"] == "animate the reference"
+    assert call["image_bytes"] == b"img-bytes"
+    assert call["filename"] == "reference.png"
+    assert call["image_inputs"] == [(b"img-bytes", "reference.png")]
+
+
 def _client_with_seed_mode(fake: _FakeComfyClient, *, seed_mode: str, seed: int) -> TestClient:
     settings = _settings()
     settings.comfyui_targets[0].seed_mode = seed_mode
@@ -559,3 +583,117 @@ async def test_comfyui_client_collects_video_helper_outputs(tmp_path) -> None:
     assert prompt["1"]["inputs"]["text"] == "a slow dolly shot"
     assert prompt["9"]["inputs"]["frame_count"] == 81
     assert prompt["9"]["inputs"]["fps"] == 16.0
+
+
+@pytest.mark.asyncio
+async def test_comfyui_client_image_to_video_workflow_uploads_and_binds_ref(
+    tmp_path,
+) -> None:
+    workflow_path = tmp_path / "image-to-video.json"
+    workflow_path.write_text(
+        json.dumps(
+            {
+                "1": {"class_type": "LoadImage", "inputs": {"image": ""}},
+                "2": {
+                    "class_type": "VideoSampler",
+                    "inputs": {"text": "", "frames": 0, "fps": 0},
+                },
+                "9": {"class_type": "SaveVideo", "inputs": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    upload_count = 0
+    seen_prompt: Optional[Dict[str, Any]] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upload_count, seen_prompt
+        if request.method == "GET" and request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {}})
+        if request.method == "POST" and request.url.path == "/upload/image":
+            request.read()
+            upload_count += 1
+            return httpx.Response(200, json={"name": f"uploaded-{upload_count}.png"})
+        if request.method == "POST" and request.url.path == "/prompt":
+            seen_prompt = json.loads(request.read())
+            return httpx.Response(200, json={"prompt_id": "pid-1"})
+        if request.method == "GET" and request.url.path == "/history/pid-1":
+            return httpx.Response(
+                200,
+                json={
+                    "pid-1": {
+                        "outputs": {
+                            "9": {
+                                "videos": [
+                                    {
+                                        "filename": "i2v.mp4",
+                                        "subfolder": "",
+                                        "type": "output",
+                                        "format": "video/h264-mp4",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {"status_str": "success"},
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/view":
+            return httpx.Response(200, content=b"i2v-bytes")
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    client = ComfyUIClient(
+        "http://comfy.test",
+        client=httpx.AsyncClient(transport=transport),
+        workflow_config={
+            "preset": "custom",
+            "image_to_video_workflow_path": str(workflow_path),
+            "bindings": {
+                "i2v": {
+                    "prompt": [("2", "text")],
+                    "image": [("1", "image")],
+                    "num_frames": [("2", "frames")],
+                    "frame_rate": [("2", "fps")],
+                }
+            },
+            "poll_interval_seconds": 0.01,
+            "save_video_node_id": "9",
+        },
+    )
+
+    try:
+        videos = await client.generate_video(
+            model="joyai-echo",
+            prompt="animate the first reference",
+            width=512,
+            height=512,
+            n=1,
+            seed=7,
+            steps=8,
+            cfg=1.0,
+            sampler_name="euler",
+            scheduler="simple",
+            denoise=1.0,
+            num_frames=17,
+            frame_rate=8.0,
+            prefetch_count=1,
+            image_bytes=b"first-bytes",
+            filename="first.png",
+            image_inputs=[
+                (b"first-bytes", "first.png"),
+                (b"second-bytes", "second.png"),
+            ],
+        )
+    finally:
+        await client.aclose()
+
+    assert videos[0].data == b"i2v-bytes"
+    assert videos[0].mime_type == "video/mp4"
+    assert upload_count == 1
+    assert seen_prompt is not None
+    prompt = seen_prompt["prompt"]
+    assert prompt["1"]["inputs"]["image"] == "uploaded-1.png"
+    assert prompt["2"]["inputs"]["text"] == "animate the first reference"
+    assert prompt["2"]["inputs"]["frames"] == 17
+    assert prompt["2"]["inputs"]["fps"] == 8.0

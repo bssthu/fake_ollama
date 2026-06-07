@@ -1619,7 +1619,7 @@ def _video_request_params(
 async def _handle_openai_video_generation(request: Request) -> Any:
     app = request.app
     settings: Settings = app.state.settings
-    payload, _ = await _image_payload_from_request(request)
+    payload, image_inputs = await _image_payload_from_request(request)
     prompt = str(payload.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="missing 'prompt'")
@@ -1630,10 +1630,17 @@ async def _handle_openai_video_generation(request: Request) -> Any:
     params = _video_request_params(payload, target, app=app)
     client: ComfyUIClient = _backend_client(app, backend)
     profile = settings.profile_for(f"{real_model}@{backend.name}")
+    image_bytes = None
+    filename = None
+    if image_inputs:
+        image_bytes, filename = image_inputs[0]
     try:
         videos = await client.generate_video(
             model=target.resolve_model(real_model),
             prompt=prompt,
+            image_bytes=image_bytes,
+            filename=filename,
+            image_inputs=image_inputs or None,
             estimated_vram_gb=profile.estimated_vram_gb,
             **params,
         )

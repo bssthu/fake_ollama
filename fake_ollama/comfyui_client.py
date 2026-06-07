@@ -437,9 +437,18 @@ class ComfyUIClient:
         frame_rate: float,
         prefetch_count: int,
         estimated_vram_gb: Optional[float] = None,
+        image_bytes: Optional[bytes] = None,
+        filename: Optional[str] = None,
+        image_inputs: Optional[List[Tuple[bytes, str]]] = None,
     ) -> List[ComfyUIImage]:
+        has_refs = bool(image_inputs) or image_bytes is not None
+        mode = (
+            "i2v"
+            if has_refs and self._workflows.get("i2v") is not None
+            else "video"
+        )
         return await self._run(
-            mode="video",
+            mode=mode,
             model=model,
             prompt=prompt,
             n=n,
@@ -458,6 +467,9 @@ class ComfyUIClient:
             },
             estimated_vram_gb=estimated_vram_gb,
             operation="generate_video",
+            image_bytes=image_bytes,
+            filename=filename,
+            image_inputs=image_inputs,
         )
 
     async def _run(
@@ -481,6 +493,7 @@ class ComfyUIClient:
                 "t2i": "text-to-image",
                 "i2i": "image-to-image",
                 "video": "text-to-video",
+                "i2v": "image-to-video",
             }.get(mode, mode)
             raise httpx.ProtocolError(
                 f"ComfyUI target {self.target_id} has no {verb} workflow configured"

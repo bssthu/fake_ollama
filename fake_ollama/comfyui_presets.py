@@ -336,6 +336,7 @@ def resolve_workflows(
     t2i_path = fields.get("text_to_image_workflow_path")
     i2i_path = fields.get("image_to_image_workflow_path")
     video_path = fields.get("video_workflow_path")
+    i2v_path = fields.get("image_to_video_workflow_path")
 
     if preset_name in _FIELD_PRESETS:
         base = z_image_workflows(fields)
@@ -362,6 +363,11 @@ def resolve_workflows(
                 if video_path
                 else None
             ),
+            "i2v": (
+                WorkflowSpec(path=Path(i2v_path), bindings={}, static_inputs={})
+                if i2v_path
+                else None
+            ),
         }
     else:
         raise ValueError(
@@ -369,7 +375,7 @@ def resolve_workflows(
         )
 
     resolved: Dict[str, Optional[WorkflowSpec]] = {}
-    for mode in ("t2i", "i2i", "video"):
+    for mode in ("t2i", "i2i", "video", "i2v"):
         spec = base.get(mode)
         if spec is None:
             resolved[mode] = None
@@ -381,6 +387,8 @@ def resolve_workflows(
             path = Path(i2i_path)
         if mode == "video" and video_path:
             path = Path(video_path)
+        if mode == "i2v" and i2v_path:
+            path = Path(i2v_path)
         static_inputs = _merge_static(spec.static_inputs, override_static.get(mode))
         # Output filename prefix is a per-target, non-request value; route it
         # to the SaveImage node uniformly across presets.
