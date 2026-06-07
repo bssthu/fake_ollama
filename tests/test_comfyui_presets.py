@@ -115,7 +115,7 @@ def test_presets_have_expected_modes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_joyai_echo_i2v_builtin_workflow_binds_reference_image() -> None:
+async def test_joyai_echo_i2v_builtin_workflow_batches_reference_images() -> None:
     root = Path(__file__).resolve().parents[1]
     target = ComfyUITarget(
         name="joyai",
@@ -126,10 +126,11 @@ async def test_joyai_echo_i2v_builtin_workflow_binds_reference_image() -> None:
         ),
         output_prefix="fake_ollama/joyai-echo",
         save_video_node_id="9",
+        max_reference_images=5,
         bindings={
             "i2v": {
                 "prompt": [["3", "prompt"]],
-                "image": [["12", "image"]],
+                "images": [["19", "image"]],
                 "width": [["19", "width"]],
                 "height": [["19", "height"]],
                 "seed": [["19", "seed"]],
@@ -147,7 +148,7 @@ async def test_joyai_echo_i2v_builtin_workflow_binds_reference_image() -> None:
             spec,
             {
                 "prompt": "animate the reference image",
-                "image": "uploaded.png",
+                "images": ["uploaded-1.png", "uploaded-2.png"],
                 "width": 512,
                 "height": 384,
                 "seed": 42,
@@ -159,8 +160,12 @@ async def test_joyai_echo_i2v_builtin_workflow_binds_reference_image() -> None:
     finally:
         await client.aclose()
 
-    assert _node_inputs(workflow, "12")["image"] == "uploaded.png"
-    assert _node_inputs(workflow, "19")["image"] == ["12", 0]
+    assert _node_inputs(workflow, "12")["image"] == "uploaded-1.png"
+    assert _node_inputs(workflow, "20")["image"] == "uploaded-2.png"
+    assert workflow["21"]["class_type"] == "ImageBatch"
+    assert _node_inputs(workflow, "21")["image1"] == ["12", 0]
+    assert _node_inputs(workflow, "21")["image2"] == ["20", 0]
+    assert _node_inputs(workflow, "19")["image"] == ["21", 0]
     assert _node_inputs(workflow, "3")["prompt"] == "animate the reference image"
     assert _node_inputs(workflow, "19")["width"] == 512
     assert _node_inputs(workflow, "19")["height"] == 384

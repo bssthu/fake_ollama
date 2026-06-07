@@ -276,6 +276,8 @@ COMFYUI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "seed_mode=fixed/increment 时的基准种子；random 模式下忽略"},
     {"key": "max_batch_size", "type": "int", "default": 4,
      "description": "允许的 OpenAI Images 参数 n 最大值"},
+    {"key": "max_reference_images", "type": "int", "default": None,
+     "description": "可选：单次 ComfyUI 请求允许上传的参考图最大张数；适用于 bindings 中用 images 绑定 IMAGE batch 输入的工作流"},
     {"key": "output_prefix", "type": "string", "default": "fake_ollama/z-image-turbo",
      "description": "ComfyUI SaveImage 节点使用的 filename_prefix"},
     {"key": "image_upscale_method", "type": "string", "default": "lanczos",

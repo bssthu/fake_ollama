@@ -925,6 +925,7 @@ class ComfyUITarget(BaseModel):
     max_num_frames: int = 241
     num_frames_offset: int = 0
     num_frames_modulo: int = 1
+    max_reference_images: Optional[int] = None
     # Random seed control for the KSampler node. seed_mode:
     #   "random"    -> a fresh random seed per request (default)
     #   "fixed"     -> always use `seed`
@@ -1005,6 +1006,15 @@ class ComfyUITarget(BaseModel):
     def _non_negative_int(cls, v: int) -> int:
         if int(v) < 0:
             raise ValueError("ComfyUI numeric workflow settings must be non-negative")
+        return int(v)
+
+    @field_validator("max_reference_images")
+    @classmethod
+    def _optional_positive_int(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if int(v) <= 0:
+            raise ValueError("comfyui_targets[*].max_reference_images must be positive")
         return int(v)
 
     @field_validator(
@@ -1129,6 +1139,7 @@ class ComfyUITarget(BaseModel):
             "save_video_node_id",
             "load_image_node_id",
             "image_scale_node_id",
+            "max_reference_images",
         ]
         return {key: getattr(self, key) for key in keys}
 

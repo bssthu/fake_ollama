@@ -266,6 +266,13 @@ image-to-video; image references can bind to `image`, `images`, or
 I2V workflow is configured, fake_ollama uses the I2V workflow; otherwise it
 keeps the existing T2V workflow.
 
+For ComfyUI nodes that accept multiple references as one `IMAGE` batch (for
+example JoyAI Echo's local ComfyUI node), bind `images` to the consumer IMAGE
+input that is already connected to a `LoadImage` node. fake_ollama will upload
+all reference files, clone the `LoadImage` node as needed, insert core
+`ImageBatch` nodes, and feed the resulting batch into that input. Use
+`max_reference_images` to cap the number of uploaded references for a target.
+
 ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名，fake_ollama 通过 ComfyUI HTTP API 提交 workflow、轮询 history、读取 output 图片，并把结果包装成 OpenAI Images 兼容响应。
 
 每个 target 用 **`preset`** 选择工作流形态（声明式绑定，新增模型只改配置 + JSON、不动代码）：
@@ -396,7 +403,7 @@ $body = @{
 Invoke-RestMethod http://127.0.0.1:21435/v1/images/generations -Method Post -Headers $headers -ContentType "application/json" -Body $body
 ```
 
-`POST /v1/images/edits` 接受 OpenAI 风格 `multipart/form-data` 的 `image` 文件字段（也兼容 OpenAI 多图约定的 `image[]` / `image[0]` 字段名，只取第一张），也接受 JSON base64 `image`。常用覆盖参数：`size`、`n`、`seed`、`steps`、`cfg`、`sampler_name`、`scheduler`、`denoise`、`response_format`。
+`POST /v1/images/edits` 接受 OpenAI 风格 `multipart/form-data` 的 `image` 文件字段（也兼容 OpenAI 多图约定的 `image[]` / `image[0]` 字段名，并保留所有参考图），也接受 JSON base64 `image` 或 `images` 数组。常用覆盖参数：`size`、`n`、`seed`、`steps`、`cfg`、`sampler_name`、`scheduler`、`denoise`、`response_format`。
 
 **随机种子（`seed_mode` / `seed`）**：请求体显式传 `seed` 时一律以请求为准；否则按 per-target 的 `seed_mode` 决定——`random`（默认，每次随机，取值限定在 0 ～ 2³²−1，以保证落在 JS/JSON 安全整数范围内、便于复现）、`fixed`（固定用 `seed`）、`increment`（从 `seed` 起按本次出图张数 `n` 递增）。`increment` 的计数器是进程内 per-target 状态，重启或 reload 后从 `seed` 重新开始。适合给不发 `seed` 的客户端（如 Cherry Studio 聊天生图）做可复现/递增出图。
 

@@ -560,6 +560,8 @@ class ComfyUIClient:
 
     @staticmethod
     def _image_ref_limit(spec: WorkflowSpec) -> Optional[int]:
+        if spec.max_image_refs is not None:
+            return max(0, int(spec.max_image_refs))
         if spec.binds("images"):
             return None
         limit = 0
@@ -873,8 +875,115 @@ class ComfyUIClient:
             if coerce is not None:
                 value = coerce(value)
             for node_id, input_name in places:
-                self._set_input(workflow, node_id, input_name, value)
+                if param == "images" and isinstance(value, list):
+                    self._set_image_batch_input(
+                        workflow, node_id, input_name, value
+                    )
+                else:
+                    self._set_input(workflow, node_id, input_name, value)
         return workflow
+
+    def _set_image_batch_input(
+        self,
+        workflow: Dict[str, Any],
+        node_id: str,
+        input_name: str,
+        image_names: List[Any],
+    ) -> None:
+        """Bind multiple uploaded images to one ComfyUI IMAGE input.
+
+        The target input must already be connected to a LoadImage node in the
+        workflow. That node is used as the first reference and as the template
+        for clones; extra references are combined with core ImageBatch nodes.
+        If the input is not a LoadImage link, fall back to assigning the raw
+        filename list so custom workflows that expect a list-valued widget keep
+        working.
+        """
+        names = [str(name) for name in image_names if str(name or "").strip()]
+        if not names:
+            return
+
+        target = workflow.get(str(node_id))
+        if not isinstance(target, dict):
+            raise ValueError(
+                f"ComfyUI workflow is missing node {node_id!r} bound by this target"
+            )
+        target_inputs = target.setdefault("inputs", {})
+        if not isinstance(target_inputs, dict):
+            raise ValueError(f"ComfyUI workflow node {node_id!r} has invalid inputs")
+
+        current = target_inputs.get(str(input_name))
+        link = self._comfy_link(current)
+        if link is None:
+            target_inputs[str(input_name)] = names
+            return
+
+        load_node_id, load_output_idx = link
+        load_node = workflow.get(load_node_id)
+        if not self._is_load_image_node(load_node):
+            target_inputs[str(input_name)] = names
+            return
+
+        self._set_input(workflow, load_node_id, "image", names[0])
+        if len(names) == 1:
+            target_inputs[str(input_name)] = [load_node_id, load_output_idx]
+            return
+
+        next_id = self._next_workflow_node_id(workflow)
+        last_link: List[Any] = [load_node_id, load_output_idx]
+        for ref_name in names[1:]:
+            clone_id = str(next_id)
+            next_id += 1
+            clone = copy.deepcopy(load_node)
+            clone_inputs = clone.setdefault("inputs", {})
+            if not isinstance(clone_inputs, dict):
+                clone_inputs = {}
+                clone["inputs"] = clone_inputs
+            clone_inputs["image"] = ref_name
+            workflow[clone_id] = clone
+
+            batch_id = str(next_id)
+            next_id += 1
+            workflow[batch_id] = {
+                "class_type": "ImageBatch",
+                "inputs": {
+                    "image1": list(last_link),
+                    "image2": [clone_id, load_output_idx],
+                },
+            }
+            last_link = [batch_id, 0]
+
+        target_inputs[str(input_name)] = last_link
+
+    @staticmethod
+    def _comfy_link(value: Any) -> Optional[Tuple[str, int]]:
+        if not isinstance(value, list) or len(value) != 2:
+            return None
+        node_id, output_idx = value
+        if not isinstance(node_id, (str, int)) or not isinstance(output_idx, int):
+            return None
+        return str(node_id), int(output_idx)
+
+    @staticmethod
+    def _is_load_image_node(node: Any) -> bool:
+        if not isinstance(node, dict):
+            return False
+        if str(node.get("class_type") or "") != "LoadImage":
+            return False
+        inputs = node.get("inputs")
+        return isinstance(inputs, dict) and "image" in inputs
+
+    @staticmethod
+    def _next_workflow_node_id(workflow: Dict[str, Any]) -> int:
+        next_id = 1
+        for key in workflow:
+            try:
+                next_id = max(next_id, int(str(key)) + 1)
+            except ValueError:
+                continue
+        while str(next_id) in workflow:
+            next_id += 1
+        return next_id
 
     @staticmethod
     def _load_workflow(path: Path) -> Dict[str, Any]:

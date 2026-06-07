@@ -697,3 +697,121 @@ async def test_comfyui_client_image_to_video_workflow_uploads_and_binds_ref(
     assert prompt["2"]["inputs"]["text"] == "animate the first reference"
     assert prompt["2"]["inputs"]["frames"] == 17
     assert prompt["2"]["inputs"]["fps"] == 8.0
+
+
+@pytest.mark.asyncio
+async def test_comfyui_client_image_to_video_workflow_batches_multi_refs(
+    tmp_path,
+) -> None:
+    workflow_path = tmp_path / "image-to-video-batch.json"
+    workflow_path.write_text(
+        json.dumps(
+            {
+                "1": {"class_type": "LoadImage", "inputs": {"image": ""}},
+                "2": {
+                    "class_type": "JoyAI_Echo_SM_KSampler",
+                    "inputs": {"text": "", "image": ["1", 0]},
+                },
+                "9": {"class_type": "SaveVideo", "inputs": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    upload_count = 0
+    seen_prompt: Optional[Dict[str, Any]] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upload_count, seen_prompt
+        if request.method == "GET" and request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {}})
+        if request.method == "POST" and request.url.path == "/upload/image":
+            request.read()
+            upload_count += 1
+            return httpx.Response(200, json={"name": f"uploaded-{upload_count}.png"})
+        if request.method == "POST" and request.url.path == "/prompt":
+            seen_prompt = json.loads(request.read())
+            return httpx.Response(200, json={"prompt_id": "pid-1"})
+        if request.method == "GET" and request.url.path == "/history/pid-1":
+            return httpx.Response(
+                200,
+                json={
+                    "pid-1": {
+                        "outputs": {
+                            "9": {
+                                "videos": [
+                                    {
+                                        "filename": "i2v.mp4",
+                                        "subfolder": "",
+                                        "type": "output",
+                                        "format": "video/h264-mp4",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {"status_str": "success"},
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/view":
+            return httpx.Response(200, content=b"i2v-bytes")
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    client = ComfyUIClient(
+        "http://comfy.test",
+        client=httpx.AsyncClient(transport=transport),
+        workflow_config={
+            "preset": "custom",
+            "image_to_video_workflow_path": str(workflow_path),
+            "max_reference_images": 5,
+            "bindings": {
+                "i2v": {
+                    "prompt": [("2", "text")],
+                    "images": [("2", "image")],
+                }
+            },
+            "poll_interval_seconds": 0.01,
+            "save_video_node_id": "9",
+        },
+    )
+
+    try:
+        videos = await client.generate_video(
+            model="joyai-echo",
+            prompt="animate all references",
+            width=512,
+            height=512,
+            n=1,
+            seed=7,
+            steps=8,
+            cfg=1.0,
+            sampler_name="euler",
+            scheduler="simple",
+            denoise=1.0,
+            num_frames=17,
+            frame_rate=8.0,
+            prefetch_count=1,
+            image_inputs=[
+                (b"first-bytes", "first.png"),
+                (b"second-bytes", "second.png"),
+                (b"third-bytes", "third.png"),
+            ],
+        )
+    finally:
+        await client.aclose()
+
+    assert videos[0].data == b"i2v-bytes"
+    assert upload_count == 3
+    assert seen_prompt is not None
+    prompt = seen_prompt["prompt"]
+    assert prompt["1"]["inputs"]["image"] == "uploaded-1.png"
+    assert prompt["10"]["inputs"]["image"] == "uploaded-2.png"
+    assert prompt["12"]["inputs"]["image"] == "uploaded-3.png"
+    assert prompt["11"]["class_type"] == "ImageBatch"
+    assert prompt["13"]["class_type"] == "ImageBatch"
+    assert prompt["11"]["inputs"]["image1"] == ["1", 0]
+    assert prompt["11"]["inputs"]["image2"] == ["10", 0]
+    assert prompt["13"]["inputs"]["image1"] == ["11", 0]
+    assert prompt["13"]["inputs"]["image2"] == ["12", 0]
+    assert prompt["2"]["inputs"]["image"] == ["13", 0]
+    assert prompt["2"]["inputs"]["text"] == "animate all references"

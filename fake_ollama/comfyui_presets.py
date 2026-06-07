@@ -27,10 +27,13 @@ from typing import Any, Dict, List, Optional, Tuple
 WORKFLOW_DIR = Path(__file__).resolve().parent / "workflows"
 
 # Logical, request-driven parameters a binding table may reference. ``image``
-# carries the uploaded reference filename (image-to-image only); ``image_1`` /
-# ``image_2`` ... are populated when a client sends multiple reference images.
-# ``size_ratio`` is the nearest aspect-ratio bucket for models that pick
-# resolution from a combo (e.g. SenseNova) instead of explicit width/height.
+# carries the first uploaded reference filename; ``images`` carries all
+# uploaded reference filenames and can be bound to an IMAGE input that is
+# already connected to a LoadImage node, so the client can build a runtime
+# ImageBatch chain. ``image_1`` / ``image_2`` ... are populated when a workflow
+# exposes separate filename slots. ``size_ratio`` is the nearest aspect-ratio
+# bucket for models that pick resolution from a combo (e.g. SenseNova) instead
+# of explicit width/height.
 DYNAMIC_PARAMS: Tuple[str, ...] = (
     "prompt",
     "seed",
@@ -65,6 +68,7 @@ class WorkflowSpec:
     path: Path
     bindings: Dict[str, List[Placement]]
     static_inputs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    max_image_refs: Optional[int] = None
     # Aspect-ratio buckets for ``size_ratio`` (empty when the model takes
     # explicit width/height instead of a ratio combo).
     size_ratio_options: Tuple[str, ...] = ()
@@ -337,6 +341,7 @@ def resolve_workflows(
     i2i_path = fields.get("image_to_image_workflow_path")
     video_path = fields.get("video_workflow_path")
     i2v_path = fields.get("image_to_video_workflow_path")
+    max_image_refs = fields.get("max_reference_images")
 
     if preset_name in _FIELD_PRESETS:
         base = z_image_workflows(fields)
@@ -397,10 +402,14 @@ def resolve_workflows(
                 static_inputs, {save_node: {"filename_prefix": output_prefix}}
             )
         bindings = _merge_bindings(spec.bindings, override_bindings.get(mode))
+        mode_max_image_refs = spec.max_image_refs
+        if max_image_refs not in (None, ""):
+            mode_max_image_refs = int(max_image_refs)
         resolved[mode] = WorkflowSpec(
             path=path,
             bindings=bindings,
             static_inputs=static_inputs,
+            max_image_refs=mode_max_image_refs,
             size_ratio_options=spec.size_ratio_options,
         )
     return resolved
