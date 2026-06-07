@@ -43,7 +43,7 @@ from .ollama_client import OllamaClient
 # ---------------------------------------------------------------------------
 #
 # Field types understood by the front-end:
-#   string, int, float, bool, string_list, string_map,
+#   string, int, float, bool, string_list, string_map, json,
 #   object, object_list, object_map
 #
 # - ``required`` fields cannot be omitted (no delete checkbox).
@@ -236,10 +236,20 @@ COMFYUI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "ComfyUI 健康检查路径；默认 /system_stats"},
     {"key": "cwd", "type": "string", "default": None,
      "description": "执行 start_command / stop_command 时使用的工作目录"},
+    {"key": "preset", "type": "string", "default": "z_image_turbo",
+     "description": "Declarative workflow preset. Use custom/comfyui_api when supplying explicit workflow paths and bindings."},
+    {"key": "bindings", "type": "json", "default": None,
+     "description": "Optional JSON mapping of request fields to workflow node inputs, keyed by mode: t2i, i2i, video, i2v."},
+    {"key": "static_inputs", "type": "json", "default": None,
+     "description": "Optional JSON mapping of fixed workflow node inputs, keyed by mode: t2i, i2i, video, i2v."},
     {"key": "text_to_image_workflow_path", "type": "string", "default": None,
      "description": "可选：/v1/images/generations 使用的 ComfyUI API-format workflow JSON；留空使用内置 Z-Image-Turbo text-to-image workflow"},
     {"key": "image_to_image_workflow_path", "type": "string", "default": None,
      "description": "可选：/v1/images/edits 使用的 ComfyUI API-format workflow JSON；留空使用内置 Z-Image-Turbo image-to-image workflow"},
+    {"key": "video_workflow_path", "type": "string", "default": None,
+     "description": "Optional ComfyUI API-format workflow JSON for /v1/videos/generations text-to-video."},
+    {"key": "image_to_video_workflow_path", "type": "string", "default": None,
+     "description": "Optional ComfyUI API-format workflow JSON for /v1/videos/generations image-to-video."},
     {"key": "diffusion_model", "type": "string", "default": "z-image-turbo-fp8-e4m3fn.safetensors",
      "description": "ComfyUI models/diffusion_models 下的 diffusion / UNet 模型文件名"},
     {"key": "diffusion_weight_dtype", "type": "string", "default": "default",
@@ -919,6 +929,24 @@ function makeStringMap(field, value) {
   };
 }
 
+function makeJson(field, value) {
+  const ta = el('textarea');
+  ta.value = value == null ? '' : JSON.stringify(value, null, 2);
+  ta.placeholder = 'null';
+  return {
+    node: ta,
+    read() {
+      const raw = ta.value.trim();
+      if (!raw) return null;
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        throw new Error(`${field.key}: invalid JSON: ${e.message}`);
+      }
+    },
+  };
+}
+
 function makeObjectGroup(itemSchema, value) {
   const wrap = el('div');
   const renderers = [];
@@ -1259,6 +1287,8 @@ function renderField(field, value, ctx) {
       inner = makeStringListSubsetOf(field, present ? value : field.default, ctx); break;
     case 'string_map':
       inner = makeStringMap(field, present ? value : field.default); break;
+    case 'json':
+      inner = makeJson(field, present ? value : field.default); break;
     case 'object':
       inner = makeObject(field, present ? value : field.default); break;
     case 'object_list':
@@ -1678,7 +1708,8 @@ async function save() {
     try { payload = JSON.parse($raw.value); }
     catch (e) { return setStatus('invalid JSON: ' + e.message, 'err'); }
   } else {
-    payload = readForm();
+    try { payload = readForm(); }
+    catch (e) { return setStatus('invalid form value: ' + e.message, 'err'); }
   }
   try {
     const r = await fetch(ADMIN_BASE + '/config', {
@@ -1771,6 +1802,8 @@ def _settings_to_dict(s: Settings) -> Dict[str, Any]:
             "cwd",
             "text_to_image_workflow_path",
             "image_to_image_workflow_path",
+            "video_workflow_path",
+            "image_to_video_workflow_path",
         ]:
             if target.get(key) is None:
                 target.pop(key, None)

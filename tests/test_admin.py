@@ -185,11 +185,21 @@ def test_admin_schema(admin_settings):
         "model",
         "auto_start",
         "start_command",
+        "preset",
+        "bindings",
+        "static_inputs",
+        "text_to_image_workflow_path",
+        "image_to_image_workflow_path",
+        "video_workflow_path",
+        "image_to_video_workflow_path",
         "default_width",
         "default_height",
         "default_steps",
         "default_edit_denoise",
     } <= comfyui_item_keys
+    comfyui_item_by_key = {f["key"]: f for f in comfyui["item_schema"]}
+    assert comfyui_item_by_key["bindings"]["type"] == "json"
+    assert comfyui_item_by_key["static_inputs"]["type"] == "json"
 
     # Interface arrays: each entry has its own host/port/tokens/exposed_models.
     ollama_iface = next(f for f in fields if f["key"] == "ollama_interfaces")
