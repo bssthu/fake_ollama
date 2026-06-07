@@ -261,7 +261,7 @@
       "target": "sensenova-comfyui",
       "capabilities": ["image_generation", "image_edit"],
       "context_length": 4096,
-      "estimated_vram_gb": 20.0,
+      "estimated_vram_gb": 13.0,
       "thinking_mode": "disabled",
       "show_thinking": false
     }

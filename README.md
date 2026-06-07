@@ -276,7 +276,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 
 > **24GB 卡（RTX 4090）实测性能与显存提示**：
 > - **Qwen-Image-Edit AIO（fp8 28GB）**：显存**腾干净**时 DiT 完全驻留（文本编码器一次性放 CPU），文生图 ~5s/张（冷加载 ~25s）、图生图 ~15s/张；但若显存被占（DiT 放不下）会退化为**逐步从内存流式加载，单步从 ~0.7s 涨到 ~18s（约 110s/张），非常卡**。所以把它的 `estimated_vram_gb` 设得较高（20），让协调器先把 GPU 腾出来，确保驻留跑得快。本地只有 28GB fp8 整合检查点；想更省显存需另找更小的量化版本（如 Q4 GGUF 的 DiT ~12GB）。
-> - **SenseNova-U1-8B**：原生只在 ~4MP（如 1:1=2048²）出图，**激活就占满 ~20GB+ 显存**。整模驻留（`prefetch_count=0`）会 **OOM**，故 `fake_ollama/workflows/sensenova_u1_*.json` 里设 `prefetch_count=2`（层流式：仅 3 层驻留、其余固定在内存异步预取），避免 OOM；代价是较慢（~100s/张）。显存更紧可调小、更宽裕想快一点可调大。`estimated_vram_gb` 要按**实际峰值**填（这里设 20，不是模型权重大小），否则协调器以为只占十几 GB 而放行其它模型同时驻留，运行到 2048² 激活峰值时仍会 OOM。
+> - **SenseNova-U1-8B**：原生只在 ~4MP（如 1:1=2048²）出图。GGUF 加载时会**反量化成 bf16（~16GB）**。`prefetch_count=0`（整模常驻）实测峰值约 24GB、刚好顶满 24GB 卡 → 触发 WDDM 往内存分页，单张 >400s 奇慢，**等同不可用**。故工作流用 `prefetch_count>=1` 的层流式（一次仅驻留 1 层，峰值仅 ~8-9GB，其中 ~6GB 是 2048² 激活），不占满显存；代价是每步都要把 ~16GB 主干从内存经 PCIe 搬一遍，较慢（~100s/张）。**注意**：当前节点实际用的 `SimpleLayerStreamingWrapper` 会**忽略 `prefetch_count` 的具体数值**（同步逐层加载、无异步预取），所以填 1 / 2 / 5 没有任何区别。`estimated_vram_gb` 按层流式实际峰值填（~13 留足余量即可），别按模型大小填——填高了只会让协调器无谓地挤出其它模型。
 
 内置 Z-Image-Turbo workflow 默认使用 FP8 diffusion + 轻量 text encoder 的 ComfyUI 模型文件：
 
@@ -369,7 +369,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "target": "sensenova-comfyui",
       "capabilities": ["image_generation", "image_edit"],
       "context_length": 4096,
-      "estimated_vram_gb": 20
+      "estimated_vram_gb": 13
     }
   ]
 }
