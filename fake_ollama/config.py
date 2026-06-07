@@ -900,6 +900,7 @@ class ComfyUITarget(BaseModel):
     # Workflow files. When omitted, the preset's bundled API workflows are used.
     text_to_image_workflow_path: Optional[str] = None
     image_to_image_workflow_path: Optional[str] = None
+    video_workflow_path: Optional[str] = None
 
     # Z-Image-Turbo default model files and sampling parameters.
     diffusion_model: str = "z-image-turbo-fp8-e4m3fn.safetensors"
@@ -917,6 +918,12 @@ class ComfyUITarget(BaseModel):
     default_denoise: float = 1.0
     default_edit_denoise: float = 0.25
     default_shift: float = 3.0
+    default_num_frames: int = 121
+    default_frame_rate: float = 24.0
+    default_prefetch_count: int = 1
+    max_num_frames: int = 241
+    num_frames_offset: int = 0
+    num_frames_modulo: int = 1
     # Random seed control for the KSampler node. seed_mode:
     #   "random"    -> a fresh random seed per request (default)
     #   "fixed"     -> always use `seed`
@@ -941,6 +948,7 @@ class ComfyUITarget(BaseModel):
     sampling_node_id: str = "11"
     ksampler_node_id: str = "3"
     save_image_node_id: str = "9"
+    save_video_node_id: str = "9"
     load_image_node_id: str = "12"
     image_scale_node_id: str = "14"
 
@@ -981,6 +989,9 @@ class ComfyUITarget(BaseModel):
         "default_height",
         "default_steps",
         "max_batch_size",
+        "default_num_frames",
+        "max_num_frames",
+        "num_frames_modulo",
     )
     @classmethod
     def _positive_int(cls, v: int) -> int:
@@ -988,11 +999,19 @@ class ComfyUITarget(BaseModel):
             raise ValueError("ComfyUI image dimensions/steps/batch size must be positive")
         return int(v)
 
+    @field_validator("default_prefetch_count", "num_frames_offset")
+    @classmethod
+    def _non_negative_int(cls, v: int) -> int:
+        if int(v) < 0:
+            raise ValueError("ComfyUI numeric workflow settings must be non-negative")
+        return int(v)
+
     @field_validator(
         "default_cfg",
         "default_denoise",
         "default_edit_denoise",
         "default_shift",
+        "default_frame_rate",
         "startup_timeout_seconds",
         "prompt_timeout_seconds",
         "poll_interval_seconds",
@@ -1084,6 +1103,7 @@ class ComfyUITarget(BaseModel):
             "static_inputs",
             "text_to_image_workflow_path",
             "image_to_image_workflow_path",
+            "video_workflow_path",
             "diffusion_model",
             "diffusion_weight_dtype",
             "text_encoder_model",
@@ -1104,6 +1124,7 @@ class ComfyUITarget(BaseModel):
             "sampling_node_id",
             "ksampler_node_id",
             "save_image_node_id",
+            "save_video_node_id",
             "load_image_node_id",
             "image_scale_node_id",
         ]

@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -45,8 +45,12 @@ _PARAM_COERCE = {
     "width": int,
     "height": int,
     "batch_size": int,
+    "num_frames": int,
+    "prefetch_count": int,
+    "image_count": int,
     "cfg": float,
     "denoise": float,
+    "frame_rate": float,
 }
 
 
@@ -381,6 +385,7 @@ class ComfyUIClient:
         prompt: str,
         image_bytes: bytes,
         filename: str,
+        image_inputs: Optional[List[Tuple[bytes, str]]] = None,
         width: int,
         height: int,
         n: int,
@@ -411,6 +416,48 @@ class ComfyUIClient:
             operation="edit_image",
             image_bytes=image_bytes,
             filename=filename,
+            image_inputs=image_inputs,
+        )
+
+    async def generate_video(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        width: int,
+        height: int,
+        n: int,
+        seed: int,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
+        num_frames: int,
+        frame_rate: float,
+        prefetch_count: int,
+        estimated_vram_gb: Optional[float] = None,
+    ) -> List[ComfyUIImage]:
+        return await self._run(
+            mode="video",
+            model=model,
+            prompt=prompt,
+            n=n,
+            seed=seed,
+            params={
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": sampler_name,
+                "scheduler": scheduler,
+                "denoise": denoise,
+                "num_frames": num_frames,
+                "frame_rate": frame_rate,
+                "prefetch_count": prefetch_count,
+            },
+            estimated_vram_gb=estimated_vram_gb,
+            operation="generate_video",
         )
 
     async def _run(
@@ -426,10 +473,15 @@ class ComfyUIClient:
         operation: str,
         image_bytes: Optional[bytes] = None,
         filename: Optional[str] = None,
+        image_inputs: Optional[List[Tuple[bytes, str]]] = None,
     ) -> List[ComfyUIImage]:
         spec = self._workflows.get(mode)
         if spec is None:
-            verb = "text-to-image" if mode == "t2i" else "image-to-image"
+            verb = {
+                "t2i": "text-to-image",
+                "i2i": "image-to-image",
+                "video": "text-to-video",
+            }.get(mode, mode)
             raise httpx.ProtocolError(
                 f"ComfyUI target {self.target_id} has no {verb} workflow configured"
             )
@@ -446,10 +498,25 @@ class ComfyUIClient:
             try:
                 self._mark_vram_reserved(model, estimated_vram_gb)
                 base: Dict[str, Any] = {**params, "prompt": prompt}
-                if image_bytes is not None:
-                    base["image"] = await self._upload_image(
-                        image_bytes, filename or "input.png"
+                uploads: List[str] = []
+                refs = list(image_inputs or [])
+                if not refs and image_bytes is not None:
+                    refs = [(image_bytes, filename or "input.png")]
+                ref_limit = self._image_ref_limit(spec)
+                if ref_limit is not None:
+                    refs = refs[:ref_limit]
+                for idx, (ref_bytes, ref_name) in enumerate(refs, start=1):
+                    uploads.append(
+                        await self._upload_image(
+                            ref_bytes, ref_name or f"input-{idx}.png"
+                        )
                     )
+                if uploads:
+                    base["image"] = uploads[0]
+                    base["images"] = uploads
+                    base["image_count"] = len(uploads)
+                    for idx, uploaded in enumerate(uploads, start=1):
+                        base[f"image_{idx}"] = uploaded
                 images: List[ComfyUIImage] = []
                 if spec.binds("batch_size"):
                     # The workflow batches natively: one submission yields n.
@@ -477,6 +544,18 @@ class ComfyUIClient:
         finally:
             self._touch_vram_reservation(model)
             self._end_request_lifecycle()
+
+    @staticmethod
+    def _image_ref_limit(spec: WorkflowSpec) -> Optional[int]:
+        if spec.binds("images"):
+            return None
+        limit = 0
+        if spec.binds("image"):
+            limit = 1
+        for idx in range(1, 5):
+            if spec.binds(f"image_{idx}"):
+                limit = max(limit, idx)
+        return limit
 
     async def _upload_image(self, image_bytes: bytes, filename: str) -> str:
         safe_name = Path(filename or "input.png").name or "input.png"
@@ -557,7 +636,7 @@ class ComfyUIClient:
     ) -> List[ComfyUIImage]:
         prompt_id = await self._queue_prompt(workflow, operation=operation)
         history = await self._wait_for_history(prompt_id, operation=operation)
-        return await self._collect_images(history, operation=operation)
+        return await self._collect_outputs(history, operation=operation)
 
     async def _queue_prompt(self, workflow: Dict[str, Any], *, operation: str) -> str:
         url = f"{self._base}/prompt"
@@ -661,11 +740,12 @@ class ComfyUIClient:
             f"ComfyUI prompt {prompt_id} did not finish within {prompt_timeout}s"
         )
 
-    async def _collect_images(
+    async def _collect_outputs(
         self, history_entry: Dict[str, Any], *, operation: str
     ) -> List[ComfyUIImage]:
         outputs = history_entry.get("outputs") or {}
-        save_node_id = str(self._workflow_config.get("save_image_node_id", "9"))
+        save_key = "save_video_node_id" if "video" in operation else "save_image_node_id"
+        save_node_id = str(self._workflow_config.get(save_key) or "9")
         ordered_nodes: List[Any] = []
         if save_node_id in outputs:
             ordered_nodes.append(outputs[save_node_id])
@@ -675,33 +755,48 @@ class ComfyUIClient:
         for node in ordered_nodes:
             if not isinstance(node, dict):
                 continue
-            for item in node.get("images") or []:
-                if not isinstance(item, dict):
-                    continue
-                filename = str(item.get("filename") or "")
-                if not filename:
-                    continue
-                subfolder = str(item.get("subfolder") or "")
-                image_type = str(item.get("type") or "output")
-                data = await self._view_image(
-                    filename=filename,
-                    subfolder=subfolder,
-                    image_type=image_type,
-                    operation=operation,
-                )
-                mime_type = mimetypes.guess_type(filename)[0] or "image/png"
-                images.append(
-                    ComfyUIImage(
-                        data=data,
+            for field in ("images", "gifs", "videos"):
+                for item in node.get(field) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    filename = str(item.get("filename") or "")
+                    if not filename:
+                        continue
+                    subfolder = str(item.get("subfolder") or "")
+                    image_type = str(item.get("type") or "output")
+                    data = await self._view_image(
                         filename=filename,
                         subfolder=subfolder,
                         image_type=image_type,
-                        mime_type=mime_type,
+                        operation=operation,
                     )
-                )
+                    mime_type = self._mime_type(
+                        filename, str(item.get("format") or "")
+                    )
+                    images.append(
+                        ComfyUIImage(
+                            data=data,
+                            filename=filename,
+                            subfolder=subfolder,
+                            image_type=image_type,
+                            mime_type=mime_type,
+                        )
+                    )
         if not images:
-            raise httpx.ProtocolError("ComfyUI history did not contain output images")
+            raise httpx.ProtocolError("ComfyUI history did not contain output media")
         return images
+
+    @staticmethod
+    def _mime_type(filename: str, format_hint: str = "") -> str:
+        hint = (format_hint or "").strip().lower()
+        if hint:
+            if hint == "video/h264-mp4" or (hint.startswith("video/") and "mp4" in hint):
+                return "video/mp4"
+            if hint == "video/webm" or (hint.startswith("video/") and "webm" in hint):
+                return "video/webm"
+            if hint.startswith("image/") or hint.startswith("audio/") or hint.startswith("video/"):
+                return hint
+        return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
     async def _view_image(
         self,

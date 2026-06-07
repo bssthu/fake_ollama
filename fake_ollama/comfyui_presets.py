@@ -27,9 +27,10 @@ from typing import Any, Dict, List, Optional, Tuple
 WORKFLOW_DIR = Path(__file__).resolve().parent / "workflows"
 
 # Logical, request-driven parameters a binding table may reference. ``image``
-# carries the uploaded reference filename (image-to-image only); ``size_ratio``
-# is the nearest aspect-ratio bucket for models that pick resolution from a
-# combo (e.g. SenseNova) instead of explicit width/height.
+# carries the uploaded reference filename (image-to-image only); ``image_1`` /
+# ``image_2`` ... are populated when a client sends multiple reference images.
+# ``size_ratio`` is the nearest aspect-ratio bucket for models that pick
+# resolution from a combo (e.g. SenseNova) instead of explicit width/height.
 DYNAMIC_PARAMS: Tuple[str, ...] = (
     "prompt",
     "seed",
@@ -42,7 +43,16 @@ DYNAMIC_PARAMS: Tuple[str, ...] = (
     "height",
     "batch_size",
     "image",
+    "images",
+    "image_1",
+    "image_2",
+    "image_3",
+    "image_4",
+    "image_count",
     "size_ratio",
+    "num_frames",
+    "frame_rate",
+    "prefetch_count",
 )
 
 Placement = Tuple[str, str]  # (node_id, input_name)
@@ -180,14 +190,15 @@ PRESETS: Dict[str, Preset] = {
 
 # Presets resolved entirely from config (z_image) rather than the table above.
 _FIELD_PRESETS = frozenset({"z_image_turbo"})
+_CUSTOM_PRESETS = frozenset({"custom", "comfyui_api"})
 
 
 def preset_names() -> List[str]:
-    return ["z_image_turbo", *PRESETS.keys()]
+    return ["z_image_turbo", *PRESETS.keys(), *_CUSTOM_PRESETS]
 
 
 def is_known_preset(name: str) -> bool:
-    return name in _FIELD_PRESETS or name in PRESETS
+    return name in _FIELD_PRESETS or name in PRESETS or name in _CUSTOM_PRESETS
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +335,7 @@ def resolve_workflows(
     override_static = fields.get("static_inputs") or {}
     t2i_path = fields.get("text_to_image_workflow_path")
     i2i_path = fields.get("image_to_image_workflow_path")
+    video_path = fields.get("video_workflow_path")
 
     if preset_name in _FIELD_PRESETS:
         base = z_image_workflows(fields)
@@ -333,13 +345,31 @@ def resolve_workflows(
             "t2i": preset.t2i,
             "i2i": preset.i2i,
         }
+    elif preset_name in _CUSTOM_PRESETS:
+        base = {
+            "t2i": (
+                WorkflowSpec(path=Path(t2i_path), bindings={}, static_inputs={})
+                if t2i_path
+                else None
+            ),
+            "i2i": (
+                WorkflowSpec(path=Path(i2i_path), bindings={}, static_inputs={})
+                if i2i_path
+                else None
+            ),
+            "video": (
+                WorkflowSpec(path=Path(video_path), bindings={}, static_inputs={})
+                if video_path
+                else None
+            ),
+        }
     else:
         raise ValueError(
             f"unknown comfyui preset {preset_name!r}; known presets: {preset_names()}"
         )
 
     resolved: Dict[str, Optional[WorkflowSpec]] = {}
-    for mode in ("t2i", "i2i"):
+    for mode in ("t2i", "i2i", "video"):
         spec = base.get(mode)
         if spec is None:
             resolved[mode] = None
@@ -349,6 +379,8 @@ def resolve_workflows(
             path = Path(t2i_path)
         if mode == "i2i" and i2i_path:
             path = Path(i2i_path)
+        if mode == "video" and video_path:
+            path = Path(video_path)
         static_inputs = _merge_static(spec.static_inputs, override_static.get(mode))
         # Output filename prefix is a per-target, non-request value; route it
         # to the SaveImage node uniformly across presets.

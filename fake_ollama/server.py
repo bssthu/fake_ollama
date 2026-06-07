@@ -10,7 +10,7 @@ import base64
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -635,7 +635,12 @@ _ADMIN_ONLY_PATH_PREFIXES = ("/admin",)
 # Path prefixes that are only served by the dashboard listener.
 _DASHBOARD_ONLY_PATH_PREFIXES = ("/dashboard",)
 # Paths only served on api_interfaces (Anthropic + OpenAI public API).
-_API_ONLY_PATH_PREFIXES = ("/v1/messages", "/v1/models", "/v1/images")
+_API_ONLY_PATH_PREFIXES = (
+    "/v1/messages",
+    "/v1/models",
+    "/v1/images",
+    "/v1/videos",
+)
 # Paths served by both ollama_interfaces and api_interfaces.
 _SHARED_V1_PATH_PREFIXES = ("/v1/chat/completions",)
 # Paths only served on ollama_interfaces (Ollama-compatible /api/*).
@@ -679,6 +684,8 @@ def _request_surface(path: str) -> str:
     if _has_path_prefix(path, _API_ONLY_PATH_PREFIXES):
         if path.startswith("/v1/images"):
             return "images"
+        if path.startswith("/v1/videos"):
+            return "videos"
         return "anthropic" if path.startswith("/v1/messages") else "models"
     if _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES):
         return "openai"
@@ -749,7 +756,8 @@ def _install_port_router(app: FastAPI) -> None:
     * admin port → only ``/admin/*``
     * dashboard port → only ``/dashboard/*`` (``/`` redirects to ``/dashboard/``)
     * ``ollama_interfaces[*].port`` → ``/`` plus ``/api/*`` plus ``/v1/chat/completions``
-    * ``api_interfaces[*].port`` → ``/v1/messages*``, ``/v1/models``, ``/v1/chat/completions``
+    * ``api_interfaces[*].port`` → ``/v1/messages*``, ``/v1/models``, ``/v1/images*``,
+      ``/v1/videos*``, ``/v1/chat/completions``
     * any other port → 404
     """
 
@@ -1061,6 +1069,10 @@ def _register_routes(app: FastAPI) -> None:
     async def openai_image_edits(request: Request) -> Any:
         return await _handle_openai_image_edit(request)
 
+    @app.post("/v1/videos/generations")
+    async def openai_video_generations(request: Request) -> Any:
+        return await _handle_openai_video_generation(request)
+
     @app.post("/v1/embeddings")
     async def openai_embeddings(payload: Dict[str, Any]) -> JSONResponse:
         raise HTTPException(
@@ -1237,26 +1249,26 @@ def _dispatch_image_backend(
 
 async def _image_payload_from_request(
     request: Request,
-) -> tuple[Dict[str, Any], Optional[bytes], str]:
+) -> tuple[Dict[str, Any], List[Tuple[bytes, str]]]:
     ctype = (request.headers.get("content-type") or "").lower()
     if ctype.startswith("multipart/form-data"):
         form = await request.form()
         payload: Dict[str, Any] = {}
-        image_bytes: Optional[bytes] = None
-        filename = "input.png"
+        image_inputs: List[Tuple[bytes, str]] = []
         for key, value in form.multi_items():
             if hasattr(value, "read") and hasattr(value, "filename"):
                 upload = value
                 # OpenAI's images/edits multipart convention sends the input
                 # image as "image"; with multiple reference images (and what
                 # the AI SDK's OpenAICompatibleImageModel emits) it is "image[]"
-                # / "image[0]". Accept any of those; we only use the first.
-                if (key == "image" or key.startswith("image[")) and image_bytes is None:
-                    image_bytes = await upload.read()
-                    filename = getattr(upload, "filename", None) or filename
+                # / "image[0]". Preserve all of them in request order so
+                # multi-reference ComfyUI graphs can bind image_1/image_2/...
+                if key == "image" or key.startswith("image["):
+                    filename = getattr(upload, "filename", None) or "input.png"
+                    image_inputs.append((await upload.read(), filename))
                 continue
             payload[key] = value
-        return payload, image_bytes, filename
+        return payload, image_inputs
 
     try:
         payload = await request.json()
@@ -1264,12 +1276,35 @@ async def _image_payload_from_request(
         raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="request body must be an object")
-    image_bytes = None
-    filename = str(payload.get("filename") or "input.png")
+    filenames = payload.get("filenames")
+    fallback_filename = payload.get("filename")
+
+    def filename_for(idx: int) -> str:
+        if isinstance(filenames, list) and idx < len(filenames):
+            return str(filenames[idx] or f"input-{idx + 1}.png")
+        if isinstance(fallback_filename, list) and idx < len(fallback_filename):
+            return str(fallback_filename[idx] or f"input-{idx + 1}.png")
+        if isinstance(fallback_filename, str) and fallback_filename:
+            return fallback_filename if idx == 0 else f"input-{idx + 1}.png"
+        return "input.png" if idx == 0 else f"input-{idx + 1}.png"
+
+    raw_values: List[Any] = []
     raw_image = payload.get("image")
-    if isinstance(raw_image, str) and raw_image.strip():
-        image_bytes = _decode_base64_image(raw_image)
-    return payload, image_bytes, filename
+    if isinstance(raw_image, list):
+        raw_values.extend(raw_image)
+    elif isinstance(raw_image, str) and raw_image.strip():
+        raw_values.append(raw_image)
+    raw_images = payload.get("images")
+    if isinstance(raw_images, list):
+        raw_values.extend(raw_images)
+    elif isinstance(raw_images, str) and raw_images.strip():
+        raw_values.append(raw_images)
+
+    image_inputs: List[Tuple[bytes, str]] = []
+    for idx, raw in enumerate(raw_values):
+        if isinstance(raw, str) and raw.strip():
+            image_inputs.append((_decode_base64_image(raw), filename_for(idx)))
+    return payload, image_inputs
 
 
 def _decode_base64_image(raw: str) -> bytes:
@@ -1455,9 +1490,17 @@ def _image_response(images: List[Any], payload: Dict[str, Any]) -> JSONResponse:
     for image in images:
         b64 = image.b64_json
         if response_format == "url":
-            data.append({"url": f"data:{image.mime_type};base64,{b64}"})
+            data.append({
+                "url": f"data:{image.mime_type};base64,{b64}",
+                "mime_type": image.mime_type,
+                "filename": image.filename,
+            })
         else:
-            data.append({"b64_json": b64})
+            data.append({
+                "b64_json": b64,
+                "mime_type": image.mime_type,
+                "filename": image.filename,
+            })
     return JSONResponse(
         {
             "created": int(datetime.now(timezone.utc).timestamp()),
@@ -1469,7 +1512,7 @@ def _image_response(images: List[Any], payload: Dict[str, Any]) -> JSONResponse:
 async def _handle_openai_image_generation(request: Request) -> Any:
     app = request.app
     settings: Settings = app.state.settings
-    payload, _, _ = await _image_payload_from_request(request)
+    payload, _ = await _image_payload_from_request(request)
     prompt = str(payload.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="missing 'prompt'")
@@ -1496,11 +1539,11 @@ async def _handle_openai_image_generation(request: Request) -> Any:
 async def _handle_openai_image_edit(request: Request) -> Any:
     app = request.app
     settings: Settings = app.state.settings
-    payload, image_bytes, filename = await _image_payload_from_request(request)
+    payload, image_inputs = await _image_payload_from_request(request)
     prompt = str(payload.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="missing 'prompt'")
-    if not image_bytes:
+    if not image_inputs:
         raise HTTPException(
             status_code=400,
             detail="missing image; send multipart field 'image' or JSON base64 'image'",
@@ -1512,12 +1555,14 @@ async def _handle_openai_image_edit(request: Request) -> Any:
     params = _image_request_params(payload, target, edit=True, app=app)
     client: ComfyUIClient = _backend_client(app, backend)
     profile = settings.profile_for(f"{real_model}@{backend.name}")
+    image_bytes, filename = image_inputs[0]
     try:
         images = await client.edit_image(
             model=target.resolve_model(real_model),
             prompt=prompt,
             image_bytes=image_bytes,
             filename=filename,
+            image_inputs=image_inputs,
             estimated_vram_gb=profile.estimated_vram_gb,
             **params,
         )
@@ -1525,6 +1570,77 @@ async def _handle_openai_image_edit(request: Request) -> Any:
         _log_upstream_error(request, exc, payload)
         return _upstream_error(exc)
     return _image_response(images, payload)
+
+
+def _video_request_params(
+    payload: Dict[str, Any],
+    target: Any,
+    *,
+    app: Any,
+) -> Dict[str, Any]:
+    params = _image_request_params(payload, target, edit=False, app=app)
+    params["num_frames"] = _coerce_int_payload(
+        payload,
+        ("num_frames", "frames"),
+        getattr(target, "default_num_frames", 121),
+    )
+    max_num_frames = int(getattr(target, "max_num_frames", 241) or 241)
+    if params["num_frames"] > max_num_frames:
+        raise HTTPException(
+            status_code=400,
+            detail=f"num_frames={params['num_frames']} exceeds comfyui target max_num_frames={max_num_frames}",
+        )
+    num_frames_modulo = int(getattr(target, "num_frames_modulo", 1) or 1)
+    num_frames_offset = int(getattr(target, "num_frames_offset", 0) or 0)
+    if (params["num_frames"] - num_frames_offset) % num_frames_modulo != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"num_frames must satisfy "
+                f"(num_frames - {num_frames_offset}) % {num_frames_modulo} == 0 "
+                f"for comfyui target {getattr(target, 'name', '')!r}"
+            ),
+        )
+    params["frame_rate"] = _coerce_float_payload(
+        payload,
+        ("frame_rate", "fps"),
+        getattr(target, "default_frame_rate", 24.0),
+        minimum=1.0,
+    )
+    params["prefetch_count"] = _coerce_int_payload(
+        payload,
+        ("prefetch_count",),
+        getattr(target, "default_prefetch_count", 1),
+        minimum=0,
+    )
+    return params
+
+
+async def _handle_openai_video_generation(request: Request) -> Any:
+    app = request.app
+    settings: Settings = app.state.settings
+    payload, _ = await _image_payload_from_request(request)
+    prompt = str(payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="missing 'prompt'")
+    backend, real_model, public_model = _dispatch_image_backend(
+        request, settings, payload
+    )
+    target = backend.source
+    params = _video_request_params(payload, target, app=app)
+    client: ComfyUIClient = _backend_client(app, backend)
+    profile = settings.profile_for(f"{real_model}@{backend.name}")
+    try:
+        videos = await client.generate_video(
+            model=target.resolve_model(real_model),
+            prompt=prompt,
+            estimated_vram_gb=profile.estimated_vram_gb,
+            **params,
+        )
+    except httpx.HTTPError as exc:
+        _log_upstream_error(request, exc, payload)
+        return _upstream_error(exc)
+    return _image_response(videos, payload)
 
 
 def _enforce_limits(
