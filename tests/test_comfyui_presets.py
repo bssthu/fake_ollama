@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
@@ -111,6 +112,62 @@ def test_resolve_workflows_unknown_preset_raises() -> None:
 def test_presets_have_expected_modes() -> None:
     assert PRESETS["qwen_image_edit_aio"].i2i is not None
     assert PRESETS["sensenova_u1"].i2i is not None
+
+
+@pytest.mark.asyncio
+async def test_joyai_echo_i2v_builtin_workflow_binds_reference_image() -> None:
+    root = Path(__file__).resolve().parents[1]
+    target = ComfyUITarget(
+        name="joyai",
+        model="joyai-echo",
+        preset="custom",
+        image_to_video_workflow_path=str(
+            root / "fake_ollama" / "workflows" / "joyai_echo_i2v.json"
+        ),
+        output_prefix="fake_ollama/joyai-echo",
+        save_video_node_id="9",
+        bindings={
+            "i2v": {
+                "prompt": [["3", "prompt"]],
+                "image": [["12", "image"]],
+                "width": [["19", "width"]],
+                "height": [["19", "height"]],
+                "seed": [["19", "seed"]],
+                "num_frames": [["19", "num_frames"]],
+                "frame_rate": [["19", "frame_rate"], ["10", "fps"]],
+                "prefetch_count": [["3", "prefetch_count"], ["19", "prefetch_count"]],
+            }
+        },
+    )
+    client = ComfyUIClient("http://comfy.test", workflow_config=target.workflow_config())
+    try:
+        spec = client._workflows["i2v"]
+        assert spec is not None
+        workflow = client._build_workflow(
+            spec,
+            {
+                "prompt": "animate the reference image",
+                "image": "uploaded.png",
+                "width": 512,
+                "height": 384,
+                "seed": 42,
+                "num_frames": 33,
+                "frame_rate": 12.0,
+                "prefetch_count": 1,
+            },
+        )
+    finally:
+        await client.aclose()
+
+    assert _node_inputs(workflow, "12")["image"] == "uploaded.png"
+    assert _node_inputs(workflow, "19")["image"] == ["12", 0]
+    assert _node_inputs(workflow, "3")["prompt"] == "animate the reference image"
+    assert _node_inputs(workflow, "19")["width"] == 512
+    assert _node_inputs(workflow, "19")["height"] == 384
+    assert _node_inputs(workflow, "19")["seed"] == 42
+    assert _node_inputs(workflow, "19")["num_frames"] == 33
+    assert _node_inputs(workflow, "10")["fps"] == 12.0
+    assert _node_inputs(workflow, "9")["filename_prefix"] == "fake_ollama/joyai-echo"
 
 
 # ---------------------------------------------------------------------------

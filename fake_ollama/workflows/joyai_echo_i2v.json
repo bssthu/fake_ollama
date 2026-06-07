@@ -1,0 +1,69 @@
+{
+  "1": {
+    "class_type": "JoyAI_Echo_SM_Clip",
+    "inputs": {
+      "clip": "none",
+      "gguf": "gemma-3-12b-it-qat-Q4_0.gguf",
+      "connector": "connector.safetensors",
+      "infer_device": "cpu"
+    }
+  },
+  "3": {
+    "class_type": "JoyAI_Echo_SM_Encoder",
+    "inputs": {
+      "clip": ["1", 0],
+      "prefetch_count": 1,
+      "enable_streaming": false,
+      "prompt": "",
+      "prompt_files": ""
+    }
+  },
+  "4": {
+    "class_type": "JoyAI_Echo_SM_Model",
+    "inputs": {
+      "dit": "none",
+      "gguf": "JoyAI-Echo-Q8_0.gguf",
+      "vae": "ltx-2.3-22b-distilled_video_vae.safetensors",
+      "audio_vae": "ltx-2.3-22b-distilled_audio_vae.safetensors"
+    }
+  },
+  "12": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "input.png"
+    }
+  },
+  "19": {
+    "class_type": "JoyAI_Echo_SM_KSampler",
+    "inputs": {
+      "model": ["4", 0],
+      "width": 768,
+      "height": 512,
+      "seed": 0,
+      "num_frames": 121,
+      "frame_rate": 24.0,
+      "prefetch_count": 1,
+      "enable_tile": true,
+      "enable_streaming": false,
+      "te_cond": ["3", 0],
+      "image": ["12", 0]
+    }
+  },
+  "10": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": ["19", 0],
+      "fps": 24.0,
+      "audio": ["19", 1]
+    }
+  },
+  "9": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["10", 0],
+      "filename_prefix": "fake_ollama/joyai-echo",
+      "format": "auto",
+      "codec": "auto"
+    }
+  }
+}
