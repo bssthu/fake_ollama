@@ -122,6 +122,7 @@ class LlamaCppClient:
         cwd: Optional[str] = None,
         launch_env: Optional[Dict[str, str]] = None,
         target_name: str = "llama.cpp",
+        target_prefix: str = "llama.cpp",
         vram_coordinator: Optional[VramCoordinator] = None,
         memory_coordinator: Optional[MemoryCoordinator] = None,
         client: Optional[httpx.AsyncClient] = None,
@@ -146,7 +147,7 @@ class LlamaCppClient:
         self._health_path = health_path if health_path.startswith("/") else "/" + health_path
         self._cwd = cwd
         self._launch_env = launch_env
-        self.target_id = f"llama.cpp:{target_name}"
+        self.target_id = f"{target_prefix}:{target_name}"
         self._vram_coordinator = vram_coordinator
         self._memory_coordinator = memory_coordinator
         if client is not None:

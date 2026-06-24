@@ -202,6 +202,114 @@ def test_duplicate_alias_in_same_source_rejected():
         )
 
 
+def test_generic_openai_target_lifecycle_fields_and_routing():
+    s = Settings(
+        generic_openai_targets=[
+            {
+                "name": "vllm",
+                "base_url": "http://127.0.0.1:8062/",
+                "auth_token": "tok",
+                "models": [
+                    {
+                        "name": "/models/Qwen2.5-0.5B-Instruct",
+                        "alias": "qwen-small",
+                        "upstream_id": "qwen-wire",
+                    }
+                ],
+                "auto_start": True,
+                "start_command": "start-vllm",
+                "stop_command": "stop-vllm",
+                "idle_timeout_seconds": 30,
+                "startup_timeout_seconds": 240,
+                "health_path": "health",
+                "cwd": "I:\\Projects\\vllm",
+                "max_concurrent_requests": 1,
+                "request_read_timeout_seconds": 0,
+            }
+        ],
+        ollama_interfaces=[
+            {
+                "name": "ollama",
+                "port": 21434,
+                "exposed_models": [{"model": "qwen-small", "target": "vllm"}],
+            }
+        ],
+    )
+    tgt = s.generic_openai_targets[0]
+    assert tgt.base_url == "http://127.0.0.1:8062"
+    assert tgt.health_path == "/health"
+    assert tgt.resolve_model("qwen-small") == "qwen-wire"
+    assert s.all_source_composite_ids() == ["qwen-small@vllm"]
+    backend, real = s.resolve_request("qwen-small@vllm", interface_name="ollama")
+    assert backend.protocol == "openai"
+    assert backend.kind == "local"
+    assert real == "qwen-small"
+
+
+def test_legacy_local_openai_targets_migrate_to_generic_openai_targets():
+    s = Settings(
+        local_openai_targets=[
+            {
+                "name": "legacy-vllm",
+                "base_url": "http://127.0.0.1:8062",
+                "models": [{"name": "qwen-small"}],
+            }
+        ],
+        ollama_interfaces=[],
+    )
+    assert [t.name for t in s.generic_openai_targets] == ["legacy-vllm"]
+
+
+def test_legacy_and_new_generic_openai_targets_cannot_both_be_set():
+    with pytest.raises(ValueError, match="local_openai_targets.*generic_openai_targets"):
+        Settings(
+            local_openai_targets=[
+                {
+                    "name": "legacy-vllm",
+                    "base_url": "http://127.0.0.1:8062",
+                    "models": [{"name": "qwen-small"}],
+                }
+            ],
+            generic_openai_targets=[
+                {
+                    "name": "new-vllm",
+                    "base_url": "http://127.0.0.1:8063",
+                    "models": [{"name": "qwen-small"}],
+                }
+            ],
+            ollama_interfaces=[],
+        )
+
+
+def test_generic_openai_target_requires_models():
+    with pytest.raises(ValueError, match="generic_openai_target.*model"):
+        Settings(
+            generic_openai_targets=[
+                {"name": "vllm", "base_url": "http://127.0.0.1:8062"}
+            ],
+            ollama_interfaces=[],
+        )
+
+
+def test_generic_openai_duplicate_base_url_rejected():
+    with pytest.raises(ValueError, match="generic_openai_target.*same base_url"):
+        Settings(
+            generic_openai_targets=[
+                {
+                    "name": "a",
+                    "base_url": "http://127.0.0.1:8062",
+                    "models": [{"name": "a"}],
+                },
+                {
+                    "name": "b",
+                    "base_url": "http://127.0.0.1:8062/",
+                    "models": [{"name": "b"}],
+                },
+            ],
+            ollama_interfaces=[],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Interface exposure
 # ---------------------------------------------------------------------------

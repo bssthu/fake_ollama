@@ -4,10 +4,10 @@ This module models the new configuration layout used since the
 "multi-interface + per-source aliases" refactor:
 
 * Sources (``anthropic_upstreams``, ``openai_upstreams``, ``ollama_targets``,
-  ``llama_cpp_targets``) declare models as objects: ``{name, alias?,
-  upstream_id?}``. ``alias`` is the source-level display name; ``upstream_id``
-  is the wire-side identifier sent to the backend. The composite source id
-  is ``<alias_or_name>@<source_name>``.
+  ``generic_openai_targets``, ``llama_cpp_targets``) declare models as objects:
+  ``{name, alias?, upstream_id?}``. ``alias`` is the source-level display name;
+  ``upstream_id`` is the wire-side identifier sent to the backend. The
+  composite source id is ``<alias_or_name>@<source_name>``.
 
 * Interfaces (``ollama_interfaces`` for /api/*, ``api_interfaces`` for
   /v1/messages + /v1/chat/completions + /v1/models) are arrays. Each
@@ -440,6 +440,39 @@ Upstream = AnthropicUpstream
 
 class OpenAIUpstream(_SourceBase):
     """An OpenAI Chat Completions-compatible upstream endpoint."""
+
+
+class GenericOpenAITarget(_SourceBase):
+    """A lifecycle-managed generic OpenAI Chat Completions-compatible server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = "http://127.0.0.1:8000"
+    auth_token: str = ""
+    auto_start: bool = False
+    start_command: Optional[str] = None
+    stop_command: Optional[str] = None
+    idle_timeout_seconds: Optional[float] = None
+    startup_timeout_seconds: float = 120.0
+    health_path: str = "/health"
+    cwd: Optional[str] = None
+    max_concurrent_requests: Optional[int] = None
+    request_read_timeout_seconds: Optional[float] = None
+
+    @field_validator("health_path")
+    @classmethod
+    def _normalise_health_path(cls, v: str) -> str:
+        if not v:
+            return "/health"
+        return v if v.startswith("/") else "/" + v
+
+    @model_validator(mode="after")
+    def _check_models(self) -> "GenericOpenAITarget":
+        if not self.models:
+            raise ValueError(
+                "Each generic_openai_target must declare at least one model."
+            )
+        return self
 
 
 class OllamaTarget(_SourceBase):
@@ -1356,6 +1389,7 @@ class Settings(BaseModel):
     anthropic_upstreams: List[AnthropicUpstream] = Field(default_factory=list)
     openai_upstreams: List[OpenAIUpstream] = Field(default_factory=list)
     ollama_targets: List[OllamaTarget] = Field(default_factory=list)
+    generic_openai_targets: List[GenericOpenAITarget] = Field(default_factory=list)
     llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
     llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
     comfyui_targets: List[ComfyUITarget] = Field(default_factory=list)
@@ -1480,6 +1514,13 @@ class Settings(BaseModel):
             for k, v in data.items()
             if not (isinstance(k, str) and k.startswith("_"))
         }
+        if "local_openai_targets" in data:
+            if "generic_openai_targets" in data:
+                raise ValueError(
+                    "config contains both 'local_openai_targets' and "
+                    "'generic_openai_targets'; use only 'generic_openai_targets'"
+                )
+            data["generic_openai_targets"] = data.pop("local_openai_targets")
         bad = [k for k in data if k in _REMOVED_TOP_LEVEL_KEYS]
         if bad:
             hints = ", ".join(f"{k} -> {_REMOVED_TOP_LEVEL_KEYS[k]}" for k in bad)
@@ -1498,7 +1539,8 @@ class Settings(BaseModel):
         if dupes:
             raise ValueError(
                 f"Duplicate source names across anthropic_upstreams/openai_upstreams/"
-                f"ollama_targets/llama_cpp_targets/comfyui_targets: {dupes}. Source names are used as "
+                f"ollama_targets/generic_openai_targets/llama_cpp_targets/"
+                f"comfyui_targets: {dupes}. Source names are used as "
                 f"the right side of composite model ids and must be globally unique."
             )
 
@@ -1557,6 +1599,20 @@ class Settings(BaseModel):
                 )
             seen_lc_urls[url] = tgt.name
 
+        # 4a. Duplicate base_url within generic OpenAI targets; each
+        # lifecycle-managed process must listen on a distinct address.
+        seen_generic_openai_urls: Dict[str, str] = {}
+        for tgt in self.generic_openai_targets:
+            url = tgt.base_url.rstrip("/")
+            if url in seen_generic_openai_urls:
+                raise ValueError(
+                    f"generic_openai_target {tgt.name!r} has the same base_url "
+                    f"{url!r} as {seen_generic_openai_urls[url]!r}. Each generic "
+                    f"OpenAI-compatible server process must listen on a distinct "
+                    f"address."
+                )
+            seen_generic_openai_urls[url] = tgt.name
+
         # 4b. KV-cache / flash-attention consistency, evaluated after
         # ``llama_cpp_defaults`` is folded in so a target that inherits
         # ``flash_attn`` from defaults is accepted.
@@ -1590,6 +1646,7 @@ class Settings(BaseModel):
         return [
             *self.ollama_targets,
             *self.llama_cpp_targets,
+            *self.generic_openai_targets,
             *self.comfyui_targets,
             *self.openai_upstreams,
             *self.anthropic_upstreams,
@@ -1926,6 +1983,15 @@ class Backend:
                 name=src.name,
                 protocol="openai",
                 kind="remote",
+                base_url=src.base_url,
+                auth_token=src.auth_token,
+                source=src,
+            )
+        if isinstance(src, GenericOpenAITarget):
+            return cls(
+                name=src.name,
+                protocol="openai",
+                kind="local",
                 base_url=src.base_url,
                 auth_token=src.auth_token,
                 source=src,

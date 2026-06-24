@@ -89,6 +89,7 @@ def test_admin_schema(admin_settings):
     assert {
         "anthropic_upstreams",
         "openai_upstreams",
+        "generic_openai_targets",
         "ollama_targets",
             "llama_cpp_defaults",
             "llama_cpp_targets",
@@ -134,6 +135,26 @@ def test_admin_schema(admin_settings):
     assert openai_ups["detect_models"] == "openai"
     openai_item_keys = {f["key"] for f in openai_ups["item_schema"]}
     assert {"name", "base_url", "auth_token", "models"} <= openai_item_keys
+
+    generic_openai = next(f for f in fields if f["key"] == "generic_openai_targets")
+    assert generic_openai["type"] == "object_list"
+    assert generic_openai["detect_models"] == "openai"
+    generic_openai_item_keys = {f["key"] for f in generic_openai["item_schema"]}
+    assert {
+        "name",
+        "base_url",
+        "auth_token",
+        "models",
+        "auto_start",
+        "start_command",
+        "stop_command",
+        "idle_timeout_seconds",
+        "startup_timeout_seconds",
+        "health_path",
+        "cwd",
+        "max_concurrent_requests",
+        "request_read_timeout_seconds",
+    } <= generic_openai_item_keys
 
     ollama = next(f for f in fields if f["key"] == "ollama_targets")
     ollama_item_keys = {f["key"] for f in ollama["item_schema"]}
@@ -220,6 +241,7 @@ def test_admin_schema(admin_settings):
     group_order = [g["key"] for g in schema["groups"]]
     assert group_order == [
         "model_sources_remote",
+        "model_sources_generic_openai",
         "model_sources_ollama",
         "model_sources_llama_cpp",
         "model_sources_comfyui",
@@ -281,6 +303,15 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
             {"name": "qwen36", "base_url": "http://127.0.0.1:21436",
              "model": "qwen3.6", "auto_start": False}
         ],
+        "generic_openai_targets": [
+            {
+                "name": "vllm",
+                "base_url": "http://127.0.0.1:8062",
+                "models": [{"name": "qwen-small"}],
+                "auto_start": True,
+                "start_command": "run-vllm",
+            }
+        ],
         "ollama_interfaces": [
             {
                 "name": "ollama",
@@ -291,6 +322,7 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
                     {"model": "another-model", "target": "newup"},
                     {"model": "llama3.1", "target": "local"},
                     {"model": "qwen3.6", "target": "qwen36"},
+                    {"model": "qwen-small", "target": "vllm"},
                 ],
             }
         ],
@@ -305,6 +337,7 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
         assert "newup" in app.state.clients
         assert "local" in app.state.ollama_clients
         assert "qwen36" in app.state.llama_cpp_clients
+        assert "vllm" in app.state.generic_openai_clients
         # File on disk reflects the change.
         cfg_path = Path(admin_settings.config_path)
         on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -370,11 +403,20 @@ def test_admin_hot_reload_reuses_unchanged_local_clients(tmp_path: Path):
                 "start_command": "run-qwen",
             }
         ],
+        generic_openai_targets=[
+            {
+                "name": "vllm",
+                "base_url": "http://127.0.0.1:8062",
+                "models": [{"name": "qwen-small"}],
+                "start_command": "run-vllm",
+            }
+        ],
         ollama_interfaces=[
             {"name": "ollama", "port": 21434, "exposed_models": [
                 {"model": "remote", "target": "u"},
                 {"model": "local-ollama", "target": "local"},
                 {"model": "qwen", "target": "qwen"},
+                {"model": "qwen-small", "target": "vllm"},
             ]}
         ],
     )
@@ -384,9 +426,11 @@ def test_admin_hot_reload_reuses_unchanged_local_clients(tmp_path: Path):
     with client:
         old_ollama = app.state.ollama_clients["local"]
         old_llama = app.state.llama_cpp_clients["qwen"]
+        old_generic_openai = app.state.generic_openai_clients["vllm"]
         coord = app.state.vram_coordinator
         assert coord._participants[old_ollama.target_id] is old_ollama
         assert coord._participants[old_llama.target_id] is old_llama
+        assert coord._participants[old_generic_openai.target_id] is old_generic_openai
 
         new_cfg = settings.model_dump()
         # Mutate one model on the unrelated remote upstream.
@@ -396,8 +440,10 @@ def test_admin_hot_reload_reuses_unchanged_local_clients(tmp_path: Path):
         assert resp.status_code == 200, resp.text
         assert app.state.ollama_clients["local"] is old_ollama
         assert app.state.llama_cpp_clients["qwen"] is old_llama
+        assert app.state.generic_openai_clients["vllm"] is old_generic_openai
         assert coord._participants[old_ollama.target_id] is old_ollama
         assert coord._participants[old_llama.target_id] is old_llama
+        assert coord._participants[old_generic_openai.target_id] is old_generic_openai
 
 
 # ---------------------------------------------------------------------------

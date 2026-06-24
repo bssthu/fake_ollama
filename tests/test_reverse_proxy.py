@@ -189,7 +189,12 @@ def _expose_all(data: Dict[str, Any]) -> Dict[str, Any]:
             return entry.get("alias") or entry["name"]
         return str(entry)
 
-    for section in ("anthropic_upstreams", "openai_upstreams", "ollama_targets"):
+    for section in (
+        "anthropic_upstreams",
+        "openai_upstreams",
+        "generic_openai_targets",
+        "ollama_targets",
+    ):
         for src in data.get(section, []) or []:
             name = src["name"]
             for m in src.get("models", []) or []:
@@ -232,6 +237,7 @@ def _build_client(
     *,
     fake_ollama: Optional[_FakeOllamaClient] = None,
     fake_llama_cpp: Optional[_FakeLlamaCppClient] = None,
+    fake_generic_openai: Optional[_FakeLlamaCppClient] = None,
     upstream_transport: Optional[httpx.MockTransport] = None,
     base_url: str = "http://testserver:21435",
 ) -> TestClient:
@@ -246,6 +252,11 @@ def _build_client(
     app.state.llama_cpp_clients = (
         {tgt.name: fake_llama_cpp for tgt in settings.llama_cpp_targets}
         if fake_llama_cpp is not None
+        else {}
+    )
+    app.state.generic_openai_clients = (
+        {tgt.name: fake_generic_openai for tgt in settings.generic_openai_targets}
+        if fake_generic_openai is not None
         else {}
     )
     if upstream_transport is not None:
@@ -803,6 +814,68 @@ def test_reverse_non_stream_routes_to_llama_cpp_target(reverse_settings):
     assert sent["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+def test_reverse_non_stream_routes_to_generic_openai_target(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["generic_openai_targets"] = [
+        {
+            "name": "vllm",
+            "base_url": "http://127.0.0.1:8062",
+            "models": [
+                {
+                    "name": "/models/Qwen2.5-0.5B-Instruct",
+                    "alias": "qwen-small",
+                    "upstream_id": "qwen-wire",
+                }
+            ],
+        }
+    ]
+    data["model_profiles"] = {
+        "qwen-small@vllm": {
+            "estimated_vram_gb": 1.25,
+            "estimated_memory_gb": 2.5,
+            "show_thinking": False,
+        }
+    }
+    settings = Settings(**_expose_all(data))
+    fake = _FakeLlamaCppClient(
+        chat_response={
+            "id": "chatcmpl_local",
+            "object": "chat.completion",
+            "model": "qwen-wire",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi from vllm"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 6, "completion_tokens": 3, "total_tokens": 9},
+        }
+    )
+    client = _build_client(settings, fake_generic_openai=fake)
+    with client:
+        resp = client.post(
+            "/v1/messages",
+            headers=_AUTH,
+            json={
+                "model": "qwen-small@vllm",
+                "max_tokens": 100,
+                "thinking": {"type": "enabled", "budget_tokens": 99},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model"] == "qwen-small@vllm"
+    assert body["content"] == [{"type": "text", "text": "hi from vllm"}]
+    sent = fake.last_chat_payload
+    assert sent["model"] == "qwen-wire"
+    assert "chat_template_kwargs" not in sent
+    assert fake.last_estimated_vram_gb == 1.25
+    assert fake.last_estimated_memory_gb == 2.5
+
+
 def test_reverse_llama_cpp_profile_disabled_overrides_client_thinking_enabled(
     reverse_settings,
 ):
@@ -1052,6 +1125,52 @@ def test_openai_chat_routes_to_llama_cpp_target(reverse_settings):
     assert resp.json()["model"] == "qwen3.6@qwen36"
     assert resp.json()["choices"][0]["message"]["content"] == "direct openai"
     assert fake.last_chat_payload["model"] == "qwen3.6"
+
+
+def test_openai_chat_routes_to_generic_openai_target(reverse_settings):
+    data = reverse_settings.model_dump()
+    data["generic_openai_targets"] = [
+        {
+            "name": "vllm",
+            "base_url": "http://127.0.0.1:8062",
+            "models": [{"name": "qwen-small", "upstream_id": "qwen-wire"}],
+        }
+    ]
+    data["model_profiles"] = {
+        "qwen-small@vllm": {"estimated_vram_gb": 1.25}
+    }
+    settings = Settings(**_expose_all(data))
+    fake = _FakeLlamaCppClient(
+        chat_response={
+            "id": "chatcmpl_local",
+            "object": "chat.completion",
+            "model": "qwen-wire",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "direct vllm"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+    client = _build_client(settings, fake_generic_openai=fake)
+    with client:
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=_AUTH,
+            json={
+                "model": "qwen-small@vllm",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "qwen-small@vllm"
+    assert resp.json()["choices"][0]["message"]["content"] == "direct vllm"
+    assert fake.last_chat_payload["model"] == "qwen-wire"
+    assert fake.last_estimated_vram_gb == 1.25
 
 
 def test_reverse_streaming_routes_to_llama_cpp_target(reverse_settings):

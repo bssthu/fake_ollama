@@ -11,6 +11,7 @@ from fake_ollama.config import (
     ExposureEntry,
     LlamaCppDefaults,
     LlamaCppTarget,
+    GenericOpenAITarget,
     ModelEntry,
     OllamaInterface,
     OllamaTarget,
@@ -78,7 +79,7 @@ def test_backend_from_ollama_target_local_when_auto_start() -> None:
     assert b.auto_start is True
 
 
-def test_backend_from_llama_cpp_target_is_always_local_openai() -> None:
+def test_backend_from_llama_cpp_target_uses_openai_local_protocol() -> None:
     tgt = LlamaCppTarget(
         base_url="http://127.0.0.1:8080",
         auth_token="tok",
@@ -91,6 +92,25 @@ def test_backend_from_llama_cpp_target_is_always_local_openai() -> None:
     assert b.kind == "local"
     assert b.auth_token == "tok"
     assert b.models == ["qwen3"]
+
+
+def test_backend_from_generic_openai_target_is_generic_openai() -> None:
+    tgt = GenericOpenAITarget(
+        name="vllm",
+        base_url="http://127.0.0.1:8062",
+        auth_token="tok",
+        models=[ModelEntry(name="qwen2.5-0.5b")],
+        auto_start=True,
+    )
+    s = _settings_with(generic_openai_targets=[tgt])
+    b = Backend.from_source(tgt, s)
+    assert b.name == "vllm"
+    assert b.protocol == "openai"
+    assert b.kind == "local"
+    assert b.auth_token == "tok"
+    assert b.models == ["qwen2.5-0.5b"]
+    assert b.supports_lifecycle is True
+    assert b.auto_start is True
 
 
 def test_backend_serves_checks_display_name() -> None:
@@ -136,10 +156,19 @@ def test_backend_by_name_finds_each_kind() -> None:
         llama_cpp_targets=[
             LlamaCppTarget(base_url="http://lc", model="lcm"),
         ],
+        generic_openai_targets=[
+            GenericOpenAITarget(
+                name="vllm",
+                base_url="http://vllm",
+                models=[ModelEntry(name="vm")],
+            ),
+        ],
     )
     assert settings.backend_by_name("up").protocol == "anthropic"
     assert settings.backend_by_name("ot").protocol == "ollama"
     assert settings.backend_by_name("lcm").protocol == "openai"
+    assert settings.backend_by_name("vllm").protocol == "openai"
+    assert settings.backend_by_name("vllm").kind == "local"
     assert settings.backend_by_name("nope") is None
 
 

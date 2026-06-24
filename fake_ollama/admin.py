@@ -35,6 +35,7 @@ from .anthropic_client import AnthropicClient
 from .comfyui_client import ComfyUIClient
 from .config import Settings
 from .llama_cpp_client import LlamaCppClient
+from .generic_openai_client import GenericOpenAIClient
 from .ollama_client import OllamaClient
 
 
@@ -82,6 +83,37 @@ OPENAI_UPSTREAM_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "item_schema": MODEL_ENTRY_ITEM_SCHEMA,
      "nav_label_keys": ["alias", "name"],
      "description": "该 OpenAI upstream 提供的模型列表。复合 source id = alias_or_name@source_name"},
+]
+
+LOCAL_OPENAI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    {"key": "name", "type": "string", "default": "", "required": True,
+     "description": "Unique source name for this generic OpenAI-compatible target."},
+    {"key": "base_url", "type": "string", "default": "http://127.0.0.1:8000",
+     "description": "Generic OpenAI-compatible server URL, for example vLLM, SGLang, TGI, or an adapter."},
+    {"key": "auth_token", "type": "string", "default": "", "secret": True,
+     "description": "Optional token sent as Bearer and x-api-key when calling this target."},
+    {"key": "models", "type": "object_list", "default": [], "required": True,
+     "item_schema": MODEL_ENTRY_ITEM_SCHEMA,
+     "nav_label_keys": ["alias", "name"],
+     "description": "Models served by this generic OpenAI-compatible target."},
+    {"key": "auto_start", "type": "bool", "default": False,
+     "description": "Run start_command when a request arrives and health check is not ready."},
+    {"key": "start_command", "type": "string", "default": None,
+     "description": "Command that starts the generic OpenAI-compatible server."},
+    {"key": "stop_command", "type": "string", "default": None,
+     "description": "Optional command used to stop the server."},
+    {"key": "idle_timeout_seconds", "type": "float", "default": None,
+     "description": "Stop the server after this many idle seconds."},
+    {"key": "startup_timeout_seconds", "type": "float", "default": 120.0,
+     "description": "Maximum seconds to wait for health after auto-start."},
+    {"key": "health_path", "type": "string", "default": "/health",
+     "description": "Health-check path on the generic OpenAI-compatible server."},
+    {"key": "cwd", "type": "string", "default": None,
+     "description": "Working directory for start_command and stop_command."},
+    {"key": "max_concurrent_requests", "type": "int", "default": None,
+     "description": "Optional fake_ollama-side concurrency cap for this target."},
+    {"key": "request_read_timeout_seconds", "type": "float", "default": None,
+     "description": "Optional read-timeout override; <=0 disables read timeout."},
 ]
 
 OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
@@ -369,6 +401,12 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "nav_label_keys": ["name"],
    "description": "OpenAI 兼容远端上游（OpenAI / DeepSeek / Together / Groq 等）"},
 
+  {"key": "generic_openai_targets", "type": "object_list", "default": [], "group": "model_sources_generic_openai",
+   "item_schema": LOCAL_OPENAI_TARGET_ITEM_SCHEMA,
+   "detect_models": "openai",
+   "nav_label_keys": ["name"],
+   "description": "Lifecycle-managed generic OpenAI-compatible servers such as vLLM, SGLang, TGI, or adapters."},
+
   {"key": "ollama_targets", "type": "object_list", "default": [], "group": "model_sources_ollama",
    "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
    "detect_models": "ollama",
@@ -455,6 +493,7 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
 
 GROUP_LABELS: List[Dict[str, str]] = [
   {"key": "model_sources_remote", "label": "Remote Sources", "hint": "远端模型来源：Anthropic / OpenAI 兼容上游", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
+  {"key": "model_sources_generic_openai", "label": "Generic OpenAI Sources", "hint": "Lifecycle-managed generic OpenAI-compatible servers such as vLLM, SGLang, TGI, or adapters", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
   {"key": "model_sources_ollama", "label": "Ollama Sources", "hint": "本机或内网 Ollama 服务", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
   {"key": "model_sources_llama_cpp", "label": "llama.cpp Sources", "hint": "本机 llama.cpp server 进程", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
   {"key": "model_sources_comfyui", "label": "ComfyUI Sources", "hint": "本地 ComfyUI image workflow target", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
@@ -1214,7 +1253,7 @@ function collectKnownModelNames() {
     }
   }
   for (const {field, r} of topRenderers) {
-    if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams' || field.key === 'ollama_targets' || field.key === 'llama_cpp_targets' || field.key === 'comfyui_targets') walkList(r);
+    if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams' || field.key === 'generic_openai_targets' || field.key === 'ollama_targets' || field.key === 'llama_cpp_targets' || field.key === 'comfyui_targets') walkList(r);
     if (field.key === 'model_profiles' && r && typeof r.read === 'function') {
       const m = r.read();
       if (Array.isArray(m)) {
@@ -1257,6 +1296,7 @@ function collectKnownSourceNames() {
   }
   for (const {field, r} of topRenderers) {
     if (field.key === 'anthropic_upstreams' || field.key === 'openai_upstreams'
+        || field.key === 'generic_openai_targets'
         || field.key === 'ollama_targets') {
       walkList(r);
     } else if (field.key === 'llama_cpp_targets' || field.key === 'comfyui_targets') {
@@ -1765,6 +1805,19 @@ def _settings_to_dict(s: Settings) -> Dict[str, Any]:
         for key in list(defaults.keys()):
             if defaults[key] is None:
                 defaults.pop(key)
+    for target in data.get("generic_openai_targets", []):
+        if not isinstance(target, dict):
+            continue
+        for key in [
+            "start_command",
+            "stop_command",
+            "idle_timeout_seconds",
+            "cwd",
+            "max_concurrent_requests",
+            "request_read_timeout_seconds",
+        ]:
+            if target.get(key) is None:
+                target.pop(key, None)
     for target in data.get("llama_cpp_targets", []):
         if not isinstance(target, dict):
             continue
@@ -1875,6 +1928,33 @@ def _llama_cpp_client_matches(
     )
 
 
+def _generic_openai_client_matches(
+    client: GenericOpenAIClient,
+    *,
+    settings: Settings,
+    target: Any,
+) -> bool:
+    return (
+        getattr(client, "_base", None) == target.base_url.rstrip("/")
+        and getattr(client, "_auth_token", None) == target.auth_token
+        and getattr(client, "_timeout", None) == settings.timeout_seconds
+        and getattr(client, "_trust_env", None) == settings.use_system_proxy
+        and getattr(client, "_auto_start", None) == target.auto_start
+        and getattr(client, "_start_command", None) == target.start_command
+        and getattr(client, "_start_argv", None) is None
+        and getattr(client, "_stop_command", None) == target.stop_command
+        and getattr(client, "_idle_timeout", None) == target.idle_timeout_seconds
+        and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
+        and getattr(client, "_health_path", None) == target.health_path
+        and getattr(client, "_cwd", None) == target.cwd
+        and getattr(client, "_launch_env", None) is None
+        and getattr(client, "_max_concurrent_requests", None)
+            == target.max_concurrent_requests
+        and getattr(client, "_request_read_timeout_seconds", None)
+            == target.request_read_timeout_seconds
+    )
+
+
 def _comfyui_client_matches(
     client: ComfyUIClient,
     *,
@@ -1902,6 +1982,9 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     old_clients: Dict[str, AnthropicClient] = dict(getattr(app.state, "clients", {}))
     old_ollama: Dict[str, OllamaClient] = dict(getattr(app.state, "ollama_clients", {}))
     old_llama_cpp: Dict[str, LlamaCppClient] = dict(getattr(app.state, "llama_cpp_clients", {}))
+    old_generic_openai: Dict[str, GenericOpenAIClient] = dict(
+        getattr(app.state, "generic_openai_clients", {})
+    )
     old_comfyui: Dict[str, ComfyUIClient] = dict(getattr(app.state, "comfyui_clients", {}))
     vram_coordinator = getattr(app.state, "vram_coordinator", None)
     memory_coordinator = getattr(app.state, "memory_coordinator", None)
@@ -1978,6 +2061,38 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             max_concurrent_requests=tgt.effective_max_concurrent_requests,
             request_read_timeout_seconds=tgt.request_read_timeout_seconds,
         )
+    new_generic_openai: Dict[str, GenericOpenAIClient] = {}
+    remaining_generic_openai = dict(old_generic_openai)
+    for tgt in new_settings.generic_openai_targets:
+        existing = remaining_generic_openai.pop(tgt.name, None)
+        if existing is not None and _generic_openai_client_matches(
+            existing, settings=new_settings, target=tgt
+        ):
+            new_generic_openai[tgt.name] = existing
+            continue
+        if existing is not None:
+            try:
+                await existing.aclose()
+            except Exception:  # pragma: no cover
+                pass
+        new_generic_openai[tgt.name] = GenericOpenAIClient(
+            tgt.base_url,
+            auth_token=tgt.auth_token,
+            timeout=new_settings.timeout_seconds,
+            trust_env=new_settings.use_system_proxy,
+            auto_start=tgt.auto_start,
+            start_command=tgt.start_command,
+            stop_command=tgt.stop_command,
+            idle_timeout_seconds=tgt.idle_timeout_seconds,
+            startup_timeout_seconds=tgt.startup_timeout_seconds,
+            health_path=tgt.health_path,
+            cwd=tgt.cwd,
+            target_name=tgt.name,
+            vram_coordinator=vram_coordinator,
+            memory_coordinator=memory_coordinator,
+            max_concurrent_requests=tgt.max_concurrent_requests,
+            request_read_timeout_seconds=tgt.request_read_timeout_seconds,
+        )
     new_comfyui: Dict[str, ComfyUIClient] = {}
     remaining_comfyui = dict(old_comfyui)
     for tgt in new_settings.comfyui_targets:
@@ -2014,6 +2129,7 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
     app.state.clients = new_clients
     app.state.ollama_clients = new_ollama
     app.state.llama_cpp_clients = new_llama_cpp
+    app.state.generic_openai_clients = new_generic_openai
     app.state.comfyui_clients = new_comfyui
     ensure_idle_monitor = getattr(app.state, "ensure_local_target_idle_monitor", None)
     if ensure_idle_monitor is not None:
@@ -2040,6 +2156,15 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
         if c in new_llama_cpp.values():
             continue
         if c not in remaining_llama_cpp.values():
+            continue
+        try:
+            await c.aclose()
+        except Exception:  # pragma: no cover
+            pass
+    for c in old_generic_openai.values():
+        if c in new_generic_openai.values():
+            continue
+        if c not in remaining_generic_openai.values():
             continue
         try:
             await c.aclose()

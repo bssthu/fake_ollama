@@ -22,6 +22,8 @@ from .comfyui_client import ComfyUIClient
 from .config import (
     FORWARDED_BY_HEADER,
     INSTANCE_ID,
+    LlamaCppTarget,
+    GenericOpenAITarget,
     Settings,
     estimate_tokens_from_anthropic_payload,
     get_settings,
@@ -40,6 +42,7 @@ from .converters import (
     openai_chat_to_anthropic,
 )
 from .llama_cpp_client import LlamaCppClient
+from .generic_openai_client import GenericOpenAIClient
 from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
 from .request_data_log import RequestDataLogMiddleware
@@ -134,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         owned_names: list[str] = []
         owned_target_names: list[str] = []
         owned_llama_cpp_names: list[str] = []
+        owned_generic_openai_names: list[str] = []
         owned_openai_names: list[str] = []
         owned_comfyui_names: list[str] = []
         if not getattr(app.state, "clients", None):
@@ -142,6 +146,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.ollama_clients = {}
         if not getattr(app.state, "llama_cpp_clients", None):
             app.state.llama_cpp_clients = {}
+        if not getattr(app.state, "generic_openai_clients", None):
+            app.state.generic_openai_clients = {}
         if not getattr(app.state, "openai_clients", None):
             app.state.openai_clients = {}
         if not getattr(app.state, "comfyui_clients", None):
@@ -219,6 +225,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request_read_timeout_seconds=tgt.request_read_timeout_seconds,
             )
             owned_llama_cpp_names.append(tgt.name)
+        for tgt in app.state.settings.generic_openai_targets:
+            if tgt.name in app.state.generic_openai_clients:
+                continue
+            app.state.generic_openai_clients[tgt.name] = GenericOpenAIClient(
+                tgt.base_url,
+                auth_token=tgt.auth_token,
+                timeout=app.state.settings.timeout_seconds,
+                trust_env=app.state.settings.use_system_proxy,
+                auto_start=tgt.auto_start,
+                start_command=tgt.start_command,
+                stop_command=tgt.stop_command,
+                idle_timeout_seconds=tgt.idle_timeout_seconds,
+                startup_timeout_seconds=tgt.startup_timeout_seconds,
+                health_path=tgt.health_path,
+                cwd=tgt.cwd,
+                target_name=tgt.name,
+                vram_coordinator=app.state.vram_coordinator,
+                memory_coordinator=app.state.memory_coordinator,
+                max_concurrent_requests=tgt.max_concurrent_requests,
+                request_read_timeout_seconds=tgt.request_read_timeout_seconds,
+            )
+            owned_generic_openai_names.append(tgt.name)
         for tgt in app.state.settings.comfyui_targets:
             if tgt.name in app.state.comfyui_clients:
                 continue
@@ -273,6 +301,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 lc = app.state.llama_cpp_clients.pop(name, None)
                 if lc is not None:
                     await lc.aclose()
+            for name in owned_generic_openai_names:
+                lc2 = app.state.generic_openai_clients.pop(name, None)
+                if lc2 is not None:
+                    await lc2.aclose()
             for name in owned_openai_names:
                 oc2 = app.state.openai_clients.pop(name, None)
                 if oc2 is not None:
@@ -315,6 +347,7 @@ def request_shutdown(app: FastAPI) -> None:
     for client_group in (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
+        getattr(app.state, "generic_openai_clients", {}),
         getattr(app.state, "comfyui_clients", {}),
     ):
         for client in list(client_group.values()):
@@ -473,11 +506,16 @@ def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-de
             )
         return client
     if backend.protocol == "openai" and backend.kind == "local":
-        client = app.state.llama_cpp_clients.get(backend.name)
+        if isinstance(backend.source, GenericOpenAITarget):
+            client = app.state.generic_openai_clients.get(backend.name)
+            label = "generic_openai_target"
+        else:
+            client = app.state.llama_cpp_clients.get(backend.name)
+            label = "llama_cpp_target"
         if client is None:
             raise HTTPException(
                 status_code=503,
-                detail=f"llama_cpp_target '{backend.name}' is not initialised",
+                detail=f"{label} '{backend.name}' is not initialised",
             )
         return client
     if backend.protocol == "comfyui":
@@ -569,6 +607,7 @@ async def _local_target_idle_monitor(app: FastAPI) -> None:
             client_groups = (
                 getattr(app.state, "ollama_clients", {}),
                 getattr(app.state, "llama_cpp_clients", {}),
+                getattr(app.state, "generic_openai_clients", {}),
                 getattr(app.state, "comfyui_clients", {}),
             )
             for clients in client_groups:
@@ -593,6 +632,7 @@ def _sync_local_target_idle_monitor(app: FastAPI) -> None:
     client_groups = (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
+        getattr(app.state, "generic_openai_clients", {}),
         getattr(app.state, "comfyui_clients", {}),
     )
     needs_monitor = any(
@@ -2084,7 +2124,12 @@ async def _handle_openai_chat(request: Request) -> Any:
     target = backend.source if (backend.protocol == "ollama") else None
     llama_target = (
         backend.source
-        if (backend.protocol == "openai" and backend.kind == "local")
+        if isinstance(backend.source, LlamaCppTarget)
+        else None
+    )
+    generic_openai_target = (
+        backend.source
+        if isinstance(backend.source, GenericOpenAITarget)
         else None
     )
     openai_up_backend = (
@@ -2242,6 +2287,74 @@ async def _handle_openai_chat(request: Request) -> Any:
                 yield b"data: [DONE]\n\n"
 
         return StreamingResponse(body_llama_openai(), media_type="text/event-stream")
+
+    if generic_openai_target is not None:
+        loc: GenericOpenAIClient = app.state.generic_openai_clients.get(
+            generic_openai_target.name
+        )
+        if loc is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"generic_openai_target '{generic_openai_target.name}' is not "
+                    "initialised"
+                ),
+            )
+        forward_payload = dict(payload)
+        forward_payload["model"] = generic_openai_target.resolve_model(real_model)
+        stream = bool(payload.get("stream", False))
+        forward_payload["stream"] = stream
+        estimated_vram_gb = profile.estimated_vram_gb
+        estimated_memory_gb = profile.estimated_memory_gb
+        if not stream:
+            try:
+                resp = await loc.chat(
+                    forward_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
+                )
+            except httpx.HTTPError as exc:
+                _log_upstream_error(request, exc, forward_payload)
+                return _upstream_error(exc)
+            if isinstance(resp, dict):
+                resp = dict(resp)
+                resp["model"] = openai_model
+            return JSONResponse(resp)
+
+        async def body_generic_openai() -> AsyncIterator[bytes]:
+            try:
+                async for line in loc.stream_chat(
+                    forward_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
+                ):
+                    if line.startswith("data:"):
+                        yield (line + "\n\n").encode("utf-8")
+                    else:
+                        yield ("data: " + line + "\n\n").encode("utf-8")
+            except httpx.HTTPError as exc:
+                _log_upstream_error(request, exc, forward_payload)
+                err_frame = {
+                    "id": "chatcmpl-fake",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now(timezone.utc).timestamp()),
+                    "model": openai_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": f"[upstream error: {_read_error_text(exc)}]"
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                yield (
+                    "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
+                ).encode("utf-8")
+                yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(body_generic_openai(), media_type="text/event-stream")
 
     if openai_up_backend is not None:
         oc_remote = _backend_client(app, openai_up_backend)
@@ -2446,7 +2559,12 @@ async def _handle_anthropic_messages(request: Request) -> Any:
     target = backend.source if backend.protocol == "ollama" else None
     llama_target = (
         backend.source
-        if (backend.protocol == "openai" and backend.kind == "local")
+        if isinstance(backend.source, LlamaCppTarget)
+        else None
+    )
+    generic_openai_target = (
+        backend.source
+        if isinstance(backend.source, GenericOpenAITarget)
         else None
     )
     openai_up_backend = (
@@ -2586,6 +2704,81 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                 ).encode("utf-8")
 
         return StreamingResponse(body_llama_anthropic(), media_type="text/event-stream")
+
+    if generic_openai_target is not None:
+        loc: GenericOpenAIClient = app.state.generic_openai_clients.get(
+            generic_openai_target.name
+        )
+        if loc is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"generic_openai_target '{generic_openai_target.name}' is not "
+                    "initialised"
+                ),
+            )
+        local_payload = anthropic_to_openai_chat_payload(
+            payload,
+            target_model=generic_openai_target.resolve_model(real_model),
+            default_max_tokens=settings.default_max_tokens,
+        )
+        profile = settings.profile_for(anth_model)
+        estimated_vram_gb = profile.estimated_vram_gb
+        estimated_memory_gb = profile.estimated_memory_gb
+        if not stream:
+            try:
+                resp = await loc.chat(
+                    local_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
+                )
+            except httpx.HTTPError as exc:
+                _log_upstream_error(request, exc, local_payload)
+                return _anthropic_error_response(exc)
+            return JSONResponse(
+                openai_chat_to_anthropic_response(
+                    resp,
+                    anthropic_model=anth_model,
+                    show_thinking=profile.show_thinking,
+                )
+            )
+
+        async def body_generic_openai_anthropic() -> AsyncIterator[bytes]:
+            try:
+                lines = loc.stream_chat(
+                    local_payload,
+                    estimated_vram_gb=estimated_vram_gb,
+                    estimated_memory_gb=estimated_memory_gb,
+                )
+                async for chunk in openai_stream_to_anthropic_sse(
+                    lines,
+                    anthropic_model=anth_model,
+                    show_thinking=profile.show_thinking,
+                ):
+                    yield chunk
+            except httpx.HTTPError as exc:
+                _log_upstream_error(request, exc, local_payload)
+                error_type = (
+                    exc.error_type
+                    if isinstance(exc, LocalTargetResourceError)
+                    else "upstream_error"
+                )
+                err = {
+                    "type": "error",
+                    "error": {
+                        "type": error_type,
+                        "message": _read_error_text(exc),
+                    },
+                }
+                yield (
+                    "event: error\ndata: "
+                    + json.dumps(err, ensure_ascii=False)
+                    + "\n\n"
+                ).encode("utf-8")
+
+        return StreamingResponse(
+            body_generic_openai_anthropic(), media_type="text/event-stream"
+        )
 
     if openai_up_backend is not None:
         oc_remote = _backend_client(app, openai_up_backend)

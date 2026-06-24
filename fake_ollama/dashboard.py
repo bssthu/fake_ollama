@@ -48,6 +48,7 @@ def _collect_model_snapshots(app: FastAPI) -> list[dict[str, object]]:
     for clients in (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
+        getattr(app.state, "generic_openai_clients", {}),
         getattr(app.state, "comfyui_clients", {}),
     ):
         for client in list(clients.values()):
@@ -75,7 +76,10 @@ async def _collect_target_telemetry(app: FastAPI) -> List[Dict[str, Any]]:
     dashboard data endpoint. Anything that fails to respond in time is
     surfaced as an error string instead of being silently dropped.
     """
-    clients = getattr(app.state, "llama_cpp_clients", None) or {}
+    clients = {
+        **(getattr(app.state, "llama_cpp_clients", None) or {}),
+        **(getattr(app.state, "generic_openai_clients", None) or {}),
+    }
     if not clients:
         return []
 
