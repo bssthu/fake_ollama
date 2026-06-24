@@ -28,6 +28,7 @@ class GenericOpenAIClient(LlamaCppClient):
             *args,
             target_name=target_name,
             target_prefix="generic_openai",
+            target_log_label="generic OpenAI",
             **kwargs,
         )
 

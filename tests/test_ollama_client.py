@@ -389,6 +389,39 @@ async def test_llama_cpp_client_stops_owned_process_tree(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_llama_cpp_idle_stop_command_does_not_repeat_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+
+    async def fake_create_subprocess_shell(command: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(command)
+        proc = _FakeProcess()
+        proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    client = LlamaCppClient(
+        "http://127.0.0.1:21436",
+        stop_command="stop-vllm",
+        idle_timeout_seconds=1.0,
+    )
+    client._mark_vram_reserved("qwen", 4.0)
+    assert client._loaded_model is not None
+    client._loaded_model.last_used_monotonic = time.monotonic() - 60.0
+
+    try:
+        await client.stop_if_idle()
+        assert calls == ["stop-vllm"]
+        assert client._loaded_model is None
+
+        await client.stop_if_idle()
+        assert calls == ["stop-vllm"]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_llama_cpp_client_keeps_vram_reservation_when_process_tree_stop_fails(
     monkeypatch: pytest.MonkeyPatch,
 ):

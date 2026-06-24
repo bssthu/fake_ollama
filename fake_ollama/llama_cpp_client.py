@@ -123,6 +123,7 @@ class LlamaCppClient:
         launch_env: Optional[Dict[str, str]] = None,
         target_name: str = "llama.cpp",
         target_prefix: str = "llama.cpp",
+        target_log_label: str = "llama.cpp",
         vram_coordinator: Optional[VramCoordinator] = None,
         memory_coordinator: Optional[MemoryCoordinator] = None,
         client: Optional[httpx.AsyncClient] = None,
@@ -147,6 +148,7 @@ class LlamaCppClient:
         self._health_path = health_path if health_path.startswith("/") else "/" + health_path
         self._cwd = cwd
         self._launch_env = launch_env
+        self._target_log_label = target_log_label
         self.target_id = f"{target_prefix}:{target_name}"
         self._vram_coordinator = vram_coordinator
         self._memory_coordinator = memory_coordinator
@@ -989,13 +991,24 @@ class LlamaCppClient:
     async def stop_if_idle(self) -> None:
         if not self._idle_timeout or self._active or self._request_refs:
             return
-        idle_for = time.monotonic() - self._last_used
+        # A successful stop_command clears _loaded_model and sets
+        # _started_by_us=False. Do not keep re-running stop_command forever
+        # just because it is configured on the target.
+        if self._loaded_model is None and not self._started_by_us:
+            return
+        last_used = (
+            self._loaded_model.last_used_monotonic
+            if self._loaded_model is not None
+            else self._last_used
+        )
+        idle_for = time.monotonic() - last_used
         if idle_for < self._idle_timeout:
             return
         if not (self._started_by_us or self._stop_command):
             return
         logger.info(
-            "stopping idle llama.cpp target %s after %.1fs idle",
+            "stopping idle %s target %s after %.1fs idle",
+            self._target_log_label,
             self.target_id,
             idle_for,
         )
@@ -1013,7 +1026,7 @@ class LlamaCppClient:
 
     async def stop_if_owned(self) -> bool:
         if self._stop_command:
-            logger.info("stopping llama.cpp target with stop_command")
+            logger.info("stopping %s target with stop_command", self._target_log_label)
             proc = await asyncio.create_subprocess_shell(
                 self._stop_command,
                 cwd=self._cwd,
@@ -1026,15 +1039,23 @@ class LlamaCppClient:
                 self._clear_all_vram_state()
                 return True
             logger.warning(
-                "llama.cpp target stop_command exited with status %s", returncode
+                "%s target stop_command exited with status %s",
+                self._target_log_label,
+                returncode,
             )
             return False
 
         if self._process is not None and self._started_by_us:
             if self._process.returncode is None:
-                logger.info("terminating owned llama.cpp target process tree")
+                logger.info(
+                    "terminating owned %s target process tree",
+                    self._target_log_label,
+                )
                 if not await terminate_process_tree(self._process, timeout=10.0):
-                    logger.warning("failed to terminate owned llama.cpp target process tree")
+                    logger.warning(
+                        "failed to terminate owned %s target process tree",
+                        self._target_log_label,
+                    )
                     return False
                 self._started_by_us = False
                 self._clear_all_vram_state()
