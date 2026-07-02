@@ -138,6 +138,63 @@ def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
     )
 
 
+async def test_client_disconnect_is_logged_as_499(
+    settings, caplog: pytest.LogCaptureFixture
+):
+    app = create_app(settings)
+    caplog.set_level(logging.INFO, logger="fake_ollama")
+
+    messages = [
+        {"type": "http.request", "body": b'{"model"', "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():  # type: ignore[no-untyped-def]
+        return messages.pop(0)
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message):  # type: ignore[no-untyped-def]
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"content-length", b"100"),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+
+    await app(scope, receive, send)
+
+    access_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "fake_ollama" and record.getMessage().startswith("access ")
+    ]
+    assert any(
+        "path=/v1/messages" in msg and "status=499" in msg
+        for msg in access_messages
+    )
+    assert not any(
+        "path=/v1/messages" in msg and "status=500" in msg
+        for msg in access_messages
+    )
+    assert any(
+        message["type"] == "http.response.start" and message["status"] == 499
+        for message in sent
+    )
+
+
 def test_show_advertises_capabilities(settings):
     client = _make_client(settings, httpx.MockTransport(lambda req: httpx.Response(404)))
     with client:

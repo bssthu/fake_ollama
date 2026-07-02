@@ -14,7 +14,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from . import __version__
 from .anthropic_client import AnthropicClient
@@ -946,7 +947,7 @@ def _install_port_router(app: FastAPI) -> None:
             # client disconnects or the request is cancelled upstream.
             if not finalized:
                 elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-                if isinstance(exc, asyncio.CancelledError):
+                if isinstance(exc, (asyncio.CancelledError, ClientDisconnect)):
                     # 499 = "client closed request" (nginx convention) —
                     # distinguishes cancellation from a real 5xx in stats.
                     status_code = 499
@@ -956,6 +957,8 @@ def _install_port_router(app: FastAPI) -> None:
                     _log_request_exception(request, elapsed_ms)
                 if rid is not None and metrics is not None:
                     metrics.end(rid, status=status_code)
+                if isinstance(exc, ClientDisconnect):
+                    return Response(status_code=status_code)
             raise
 
 

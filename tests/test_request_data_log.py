@@ -5,11 +5,16 @@ from pathlib import Path
 from typing import Any, Dict
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect, Request
 
 from fake_ollama.anthropic_client import AnthropicClient
 from fake_ollama.llama_cpp_client import LlamaCppClient
-from fake_ollama.request_data_log import configure_request_data_logging
+from fake_ollama.request_data_log import (
+    RequestDataLogMiddleware,
+    configure_request_data_logging,
+)
 from fake_ollama.server import create_app
 
 
@@ -85,6 +90,116 @@ def test_request_data_log_records_http_and_backend_payloads(settings, tmp_path):
         record for record in records if record["event"] == "http_response_body"
     )
     assert "pong" in response_body["body"]["text"]
+
+
+async def test_request_data_log_marks_client_disconnect_cancelled(tmp_path):
+    log_file = tmp_path / "fake_ollama.requests.jsonl"
+    configure_request_data_logging(str(log_file))
+
+    async def app(scope, receive, send):  # type: ignore[no-untyped-def]
+        request = Request(scope, receive)
+        await request.json()
+
+    middleware = RequestDataLogMiddleware(app)
+    messages = [
+        {"type": "http.request", "body": b'{"model"', "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():  # type: ignore[no-untyped-def]
+        return messages.pop(0)
+
+    async def send(message):  # type: ignore[no-untyped-def]
+        raise AssertionError(f"unexpected response: {message!r}")
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", b"100"),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+
+    try:
+        with pytest.raises(ClientDisconnect):
+            await middleware(scope, receive, send)
+    finally:
+        configure_request_data_logging(None)
+
+    records = _records(log_file)
+    body = next(record for record in records if record["event"] == "http_request_body")
+    assert body["disconnected"] is True
+    assert body["body"]["bytes"] == len(b'{"model"')
+
+    error = next(
+        record for record in records if record["event"] == "http_request_error"
+    )
+    assert error["outcome"] == "cancelled"
+    assert error["error"].startswith("starlette.requests.ClientDisconnect")
+
+    end = next(record for record in records if record["event"] == "http_request_end")
+    assert end["outcome"] == "cancelled"
+    assert end["status"] == 499
+    assert end["request_bytes"] == len(b'{"model"')
+
+
+async def test_request_data_log_marks_routed_disconnect_499_cancelled(
+    settings, tmp_path
+):
+    log_file = tmp_path / "fake_ollama.requests.jsonl"
+    configure_request_data_logging(str(log_file))
+    app = create_app(settings)
+    messages = [
+        {"type": "http.request", "body": b'{"model"', "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():  # type: ignore[no-untyped-def]
+        return messages.pop(0)
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message):  # type: ignore[no-untyped-def]
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"content-length", b"100"),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+
+    try:
+        await app(scope, receive, send)
+    finally:
+        configure_request_data_logging(None)
+
+    assert any(
+        message["type"] == "http.response.start" and message["status"] == 499
+        for message in sent
+    )
+    records = _records(log_file)
+    assert not any(record["event"] == "http_request_error" for record in records)
+    body = next(record for record in records if record["event"] == "http_request_body")
+    assert body["disconnected"] is True
+    end = next(record for record in records if record["event"] == "http_request_end")
+    assert end["outcome"] == "cancelled"
+    assert end["status"] == 499
 
 
 async def test_request_data_log_treats_close_after_done_as_complete(tmp_path):

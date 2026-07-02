@@ -42,6 +42,7 @@ _configured_path: Optional[str] = None
 _current_request_id: ContextVar[Optional[str]] = ContextVar(
     "fake_ollama_request_data_id", default=None
 )
+_CLIENT_CLOSED_EXCEPTION_NAMES = {"CancelledError", "ClientDisconnect"}
 
 
 def configure_request_data_logging(log_file: Optional[str]) -> None:
@@ -292,7 +293,13 @@ class RequestDataLogMiddleware:
         try:
             await self.app(scope, replay_receive, logging_send)
         except BaseException as exc:
-            outcome = "cancelled" if exc.__class__.__name__ == "CancelledError" else "exception"
+            outcome = (
+                "cancelled"
+                if exc.__class__.__name__ in _CLIENT_CLOSED_EXCEPTION_NAMES
+                else "exception"
+            )
+            if outcome == "cancelled" and response_status is None:
+                response_status = 499
             error = f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}"
             log_data_event(
                 "http_request_error",
@@ -303,10 +310,15 @@ class RequestDataLogMiddleware:
             raise
         finally:
             duration_ms = (time.perf_counter() - started_at) * 1000.0
+            end_outcome = (
+                "cancelled"
+                if outcome == "complete" and disconnected and response_status == 499
+                else outcome
+            )
             log_data_event(
                 "http_request_end",
                 request_id=request_id,
-                outcome=outcome,
+                outcome=end_outcome,
                 status=response_status,
                 duration_ms=round(duration_ms, 2),
                 request_bytes=len(request_body),
