@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
+from fake_ollama.generic_openai_client import GenericOpenAIClient
 from fake_ollama.ollama_client import OllamaClient
 from fake_ollama.llama_cpp_client import LlamaCppClient
 from fake_ollama.vram import LocalTargetResourceError, VramCoordinator
@@ -389,6 +390,28 @@ async def test_llama_cpp_client_stops_owned_process_tree(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_unused_generic_openai_target_does_not_run_stop_command_on_close(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+
+    async def fake_create_subprocess_shell(command: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    client = GenericOpenAIClient(
+        "http://127.0.0.1:8062",
+        target_name="unused-wsl-target",
+        stop_command="wsl -d Ubuntu-24.04 -- bash stop.sh",
+    )
+
+    await client.aclose()
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_llama_cpp_idle_stop_command_does_not_repeat_after_success(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -419,6 +442,47 @@ async def test_llama_cpp_idle_stop_command_does_not_repeat_after_success(
         assert calls == ["stop-vllm"]
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stop_command_is_not_repeated_by_concurrent_close(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+    stop_waiting = asyncio.Event()
+    finish_stop = asyncio.Event()
+
+    class _FailingStopProcess:
+        returncode = 1
+
+        async def wait(self) -> int:
+            stop_waiting.set()
+            await finish_stop.wait()
+            return self.returncode
+
+    async def fake_create_subprocess_shell(command: str, **kwargs: Any) -> _FailingStopProcess:
+        calls.append(command)
+        return _FailingStopProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    client = GenericOpenAIClient(
+        "http://127.0.0.1:8062",
+        target_name="used-wsl-target",
+        stop_command="wsl -d Ubuntu-24.04 -- bash stop.sh",
+    )
+    client._begin_request_lifecycle()
+    client._end_request_lifecycle()
+    client.begin_shutdown()
+
+    signal_stop = asyncio.create_task(client.stop_if_owned())
+    await stop_waiting.wait()
+    lifespan_close = asyncio.create_task(client.aclose())
+    await asyncio.sleep(0)
+    finish_stop.set()
+
+    assert await signal_stop is False
+    await lifespan_close
+    assert calls == ["wsl -d Ubuntu-24.04 -- bash stop.sh"]
 
 
 @pytest.mark.asyncio

@@ -200,6 +200,18 @@ class LlamaCppClient:
         self._process: Optional[asyncio.subprocess.Process] = None
         self._started_by_us = False
         self._start_lock = asyncio.Lock()
+        self._stop_lock = asyncio.Lock()
+        # A configured stop_command is allowed to manage a target that was
+        # already running before fake-ollama started, but only after this
+        # client has actually sent work to it.  Without this marker, shutting
+        # down after using an unrelated target stops every configured local
+        # backend (including WSL-backed targets that were never touched).
+        self._used_since_last_stop = False
+        # request_shutdown() and FastAPI lifespan cleanup can converge on the
+        # same client.  During shutdown, remember the first completed stop
+        # attempt so aclose() does not execute the command a second time.
+        self._shutdown_stop_attempted = False
+        self._shutdown_stop_result = False
         self._active = 0
         self._request_refs = 0
         self._last_used = time.monotonic()
@@ -375,6 +387,7 @@ class LlamaCppClient:
         return self._loaded_model is not None
 
     def _begin_request_lifecycle(self) -> None:
+        self._used_since_last_stop = True
         self._request_refs += 1
 
     def _end_request_lifecycle(self) -> None:
@@ -560,6 +573,7 @@ class LlamaCppClient:
     ) -> None:
         if not model or estimated_vram_gb is None:
             return
+        self._used_since_last_stop = True
         existing = self._loaded_model
         self._loaded_model = _LoadedModel(
             model=model,
@@ -1025,47 +1039,85 @@ class LlamaCppClient:
         return await self.stop_if_owned()
 
     async def stop_if_owned(self) -> bool:
-        if self._stop_command:
-            logger.info("stopping %s target with stop_command", self._target_log_label)
-            proc = await asyncio.create_subprocess_shell(
-                self._stop_command,
-                cwd=self._cwd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            returncode = await proc.wait()
-            if returncode == 0:
-                self._started_by_us = False
-                self._clear_all_vram_state()
-                return True
-            logger.warning(
-                "%s target stop_command exited with status %s",
-                self._target_log_label,
-                returncode,
-            )
-            return False
+        async with self._stop_lock:
+            if self._shutdown_requested and self._shutdown_stop_attempted:
+                return self._shutdown_stop_result
 
-        if self._process is not None and self._started_by_us:
-            if self._process.returncode is None:
-                logger.info(
-                    "terminating owned %s target process tree",
-                    self._target_log_label,
-                )
-                if not await terminate_process_tree(self._process, timeout=10.0):
-                    logger.warning(
-                        "failed to terminate owned %s target process tree",
-                        self._target_log_label,
-                    )
-                    return False
-                self._started_by_us = False
-                self._clear_all_vram_state()
-                return True
-            logger.warning(
-                "owned llama.cpp target launcher process already exited; cannot stop "
-                "remaining detached server process without stop_command"
+            # A stop_command makes an already-running target manageable for
+            # idle/VRAM reclaim after use; it must not make an untouched target
+            # owned merely because fake-ollama is exiting.
+            can_stop = self._started_by_us or bool(
+                self._stop_command and self._used_since_last_stop
             )
-            return False
-        return False
+            if not can_stop:
+                return False
+
+            shutdown_attempt = self._shutdown_requested
+            if shutdown_attempt:
+                self._shutdown_stop_attempted = True
+
+            try:
+                if self._stop_command:
+                    logger.info(
+                        "stopping %s target %s with stop_command",
+                        self._target_log_label,
+                        self.target_id,
+                    )
+                    proc = await asyncio.create_subprocess_shell(
+                        self._stop_command,
+                        cwd=self._cwd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    returncode = await proc.wait()
+                    if returncode == 0:
+                        self._started_by_us = False
+                        self._used_since_last_stop = False
+                        self._clear_all_vram_state()
+                        result = True
+                    else:
+                        logger.warning(
+                            "%s target %s stop_command exited with status %s",
+                            self._target_log_label,
+                            self.target_id,
+                            returncode,
+                        )
+                        result = False
+                elif self._process is not None and self._started_by_us:
+                    if self._process.returncode is None:
+                        logger.info(
+                            "terminating owned %s target process tree",
+                            self._target_log_label,
+                        )
+                        if not await terminate_process_tree(self._process, timeout=10.0):
+                            logger.warning(
+                                "failed to terminate owned %s target process tree",
+                                self._target_log_label,
+                            )
+                            result = False
+                        else:
+                            self._started_by_us = False
+                            self._used_since_last_stop = False
+                            self._clear_all_vram_state()
+                            result = True
+                    else:
+                        logger.warning(
+                            "owned llama.cpp target launcher process already exited; cannot stop "
+                            "remaining detached server process without stop_command"
+                        )
+                        result = False
+                else:
+                    result = False
+            except BaseException:
+                # If cancellation interrupted the stop itself, allow lifespan
+                # cleanup to make one replacement attempt.
+                if shutdown_attempt:
+                    self._shutdown_stop_attempted = False
+                raise
+
+            if shutdown_attempt:
+                self._shutdown_stop_result = result
+            return result
 
     # ------------------------------------------------------------------
     # Dashboard telemetry
