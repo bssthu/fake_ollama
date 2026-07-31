@@ -63,6 +63,12 @@ def test_admin_index_html(admin_settings):
         resp = client.get("/admin/")
     assert resp.status_code == 200
     assert "fake-ollama config editor" in resp.text
+    # The read-only schema contains long lines. Keep them inside the content
+    # column and wrap them instead of expanding the page horizontally.
+    assert "grid-template-columns: 220px minmax(0, 1fr)" in resp.text
+    assert ".content { min-width: 0; }" in resp.text
+    assert "overflow-x: hidden; overflow-y: auto" in resp.text
+    assert "white-space: pre-wrap; overflow-wrap: anywhere" in resp.text
 
 
 def test_admin_index_no_trailing_slash(admin_settings):

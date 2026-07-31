@@ -521,8 +521,9 @@ _INDEX_HTML = r"""<!doctype html>
  .topbar h1 { margin: 0 0 0.4rem 0; font-size: 1.4rem; }
  .sub { color: #888; margin-bottom: 0.5rem; font-size: 0.9rem; }
  .warn { background: rgba(255, 200, 0, 0.15); padding: 0.5rem 0.8rem; border-left: 3px solid orange; border-radius: 3px; margin-bottom: 1rem; font-size: 0.88rem; }
- .layout { display: grid; grid-template-columns: 220px 1fr; gap: 1.2rem; align-items: start; }
- @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } .sidenav { position: static !important; max-height: none !important; } }
+ .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 1.2rem; align-items: start; }
+ @media (max-width: 760px) { .layout { grid-template-columns: minmax(0, 1fr); } .sidenav { position: static !important; max-height: none !important; } }
+ .content { min-width: 0; }
  .sidenav { position: sticky; top: 5.5rem; max-height: calc(100vh - 6rem); overflow-y: auto;
    border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0; background: rgba(127,127,127,0.04); }
  .sidenav h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888;
@@ -601,7 +602,8 @@ _INDEX_HTML = r"""<!doctype html>
  #status.ok { color: #2a8a2a; }
  #status.err { color: #c0392b; white-space: pre-wrap; }
  details > summary { cursor: pointer; }
- details pre { overflow: auto; max-height: 50vh; background: rgba(127,127,127,0.08); padding: 0.5rem; border-radius: 4px; }
+ details pre { overflow-x: hidden; overflow-y: auto; max-height: 50vh; box-sizing: border-box;
+   white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(127,127,127,0.08); padding: 0.5rem; border-radius: 4px; }
  .field-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
 </style>
 </head>
