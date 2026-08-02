@@ -32,6 +32,9 @@ python scripts\call_video_generation.py `
 - `--size`：默认 `256x256`
 - `--num-frames`：默认 `17`
 - `--fps`：默认 `8.0`
+- `--prefetch-count`：默认 `1`
+- `--enable-tile` / `--no-enable-tile`：默认启用分块 VAE 解码，降低峰值显存
+- `--enable-streaming` / `--no-enable-streaming`：模型内部权重流式加载，默认关闭；不是 HTTP streaming
 - `--seed`：默认 `123`
 - `--timeout`：默认 `7200`
 - `--output`：输出 mp4 路径

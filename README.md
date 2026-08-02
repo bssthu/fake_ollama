@@ -266,13 +266,17 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 
 #### comfyui_targets
 
-Video workflows are supported for `preset: "custom"` / `"comfyui_api"` targets
-with `video_workflow_path` and optional `image_to_video_workflow_path`. Bind
-request fields under `bindings.video` for text-to-video and `bindings.i2v` for
-image-to-video; image references can bind to `image`, `images`, or
-`image_1`...`image_4`. When `/v1/videos/generations` receives an image and an
-I2V workflow is configured, fake_ollama uses the I2V workflow; otherwise it
-keeps the existing T2V workflow.
+视频 workflow 既可以使用内置 `joyai_echo` preset，也可以使用
+`custom` / `comfyui_api` + `video_workflow_path` / `image_to_video_workflow_path`。
+请求字段分别绑定在 `bindings.video`（文生视频）和 `bindings.i2v`（图生视频）；
+图片可绑定到 `image`、`images` 或 `image_1`...`image_4`。请求附带图片且存在
+I2V workflow 时自动走 I2V，否则走 T2V。
+
+参数发现不另建一套容易漂移的模型配置：`WorkflowSpec.bindings` 仍是执行的事实来源，
+服务端据此生成 `/v1/models[*].operations[*].parameters`、默认值、范围、参考图上限和
+可选 presets。Playground 动态渲染这些描述，因此 workflow 未绑定的参数不会显示，
+也不会出现界面填写了 Steps/CFG、实际节点却没有收到的情况。JoyAI 的
+`enable_tile` / `enable_streaming` 这类非 OpenAI 标准字段也沿同一条链路校验并写入节点。
 
 For ComfyUI nodes that accept multiple references as one `IMAGE` batch (for
 example JoyAI Echo's local ComfyUI node), bind `images` to the consumer IMAGE
@@ -290,8 +294,25 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 | `z_image_turbo`（默认） | Z-Image-Turbo | 独立 UNET/CLIP/VAE + KSampler；沿用 `diffusion_model` / `text_encoder_model` / `vae_model` / 各 `*_node_id` 字段 |
 | `qwen_image_edit_aio` | Qwen-Image-Edit 整合检查点（如 Qwen-Rapid-AIO） | `CheckpointLoaderSimple` 一次加载 UNet+CLIP+VAE；文生图用 `CLIPTextEncode`，图生图用 `TextEncodeQwenImageEditPlus`（参考图经 conditioning 注入，编辑 `denoise=1.0`） |
 | `sensenova_u1` | SenseNova-U1-8B（自定义节点 `ComfyUI_SenseNova_U1`） | 融合模型节点 + 融合采样节点；分辨率走 `target_pixels` 比例桶（请求 `size` 映射到最近比例，实际输出为该桶原生尺寸） |
+| `joyai_echo` | JoyAI Echo（自定义节点 `ComfyUI_JoyAI_Echo`） | 内置 T2V + 多参考图 I2V；公开尺寸、seed、帧数、FPS、prefetch、分块解码与模型流式加载；默认使用 256² / 17 帧安全调试预设 |
 
-每个 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` 与 `<preset>_i2i.json`。要接入**其它** ComfyUI 模型，提供 API 格式工作流 JSON（`text_to_image_workflow_path` / `image_to_image_workflow_path`），再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可，两者按 `{"t2i": {...}, "i2i": {...}}` 分模式书写。
+当前内置模型的推荐公开参数如下；表中默认值来自对应 target 配置，因而 API 缺省行为、
+`/v1/models` 和 Playground 使用同一个值：
+
+| 模型 | Playground / API 公开参数 | 推荐默认值 |
+|---|---|---|
+| Z-Image-Turbo | `size`、`n`、`seed`、`steps`、`cfg`、`sampler_name`、`scheduler`；编辑另有 `denoise` | 1024²、8 steps、CFG 1、`res_multistep` / `simple`；编辑 denoise 0.25 |
+| Qwen-Image-Edit AIO | 同 Z-Image；编辑只接收 1 张参考图 | 1024²、6 steps、CFG 1、`euler_ancestral` / `beta`；编辑 denoise 1.0 |
+| SenseNova-U1 | 原生宽高比桶、`n`、`seed`、`steps`、`cfg`；不显示 workflow 没有输入的 sampler/scheduler/denoise | 1:1、8 steps、CFG 1；实际像素由模型的原生比例桶决定 |
+| JoyAI Echo | `size`、`seed`、`num_frames`、`fps`、`prefetch_count`、`enable_tile`、`enable_streaming` | 安全调试：256²、17 帧、8 FPS、prefetch 1、分块解码开；帧数必须为 `8k+1`，尺寸至少 256 且为 32 的倍数 |
+
+> **JoyAI Echo 节点兼容性**：已在本机验证的 `ComfyUI_JoyAI_Echo` 版本要求节点把
+> `enable_tile` 写入模型实际读取的 `enable_tiles` 属性，并要求 VAE wrapper 将
+> `tiled_decode()` 返回的分块迭代器沿时间维拼接后再进入后处理。旧版节点若未包含这两项
+> 修复，会分别表现为勾选分块解码仍发生显存不足，或报
+> `unsupported operand type(s) for +: 'generator' and 'int'`。
+
+图片 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` / `<preset>_i2i.json`，视频则对应 T2V / I2V workflow。要接入**其它** ComfyUI 模型，提供 API 格式 workflow JSON，再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可；支持 `t2i`、`i2i`、`video`、`i2v` 四种模式。
 
 > **客户端可能按模型名判断是否图片模型**：部分客户端（如 CherryStudio）靠模型 id 的正则/子串匹配来决定走聊天接口还是 `/v1/images/*`——只认 `z-image*` / `qwen-image*` / `flux*` / `sd*` 等已知图片模型名。若把图片模型暴露成它不认识的名字（如 `sensenova`），它会当普通聊天模型发到 `/v1/chat/completions`，被 fake_ollama 以 400「use /v1/images/...」拒绝。对策：在 `exposed_models[*].alias` 里给这类模型起一个**包含已知图片模型关键词的别名**（例如 `sensenova-z-image`）；这只改客户端看到的 id，后端 target 与 `model_profiles` 仍按真实模型名匹配，不受影响。
 
@@ -357,6 +378,34 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "default_steps": 8,
       "default_cfg": 1.0,
       "output_prefix": "fake_ollama/sensenova"
+    },
+    {
+      "name": "joyai-echo-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "joyai-echo",
+      "preset": "joyai_echo",
+      "auto_start": true,
+      "start_command": "set \"PATH=I:\\Projects\\Tools\\ffmpeg;%PATH%\" && \"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "min_width": 256,
+      "default_width": 256,
+      "width_modulo": 32,
+      "min_height": 256,
+      "default_height": 256,
+      "height_modulo": 32,
+      "min_num_frames": 17,
+      "default_num_frames": 17,
+      "num_frames_offset": 1,
+      "num_frames_modulo": 8,
+      "min_frame_rate": 8,
+      "default_frame_rate": 8,
+      "default_prefetch_count": 1,
+      "default_enable_tile": true,
+      "default_enable_streaming": false,
+      "max_reference_images": 5,
+      "max_batch_size": 1,
+      "prompt_timeout_seconds": 7200,
+      "output_prefix": "fake_ollama/joyai-echo"
     }
   ],
   "api_interfaces": [
@@ -368,7 +417,8 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "exposed_models": [
         { "model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo" },
         { "model": "qwen-image", "target": "qwen-image-comfyui", "alias": "qwen-image" },
-        { "model": "sensenova", "target": "sensenova-comfyui", "alias": "sensenova-z-image" }
+        { "model": "sensenova", "target": "sensenova-comfyui", "alias": "sensenova-z-image" },
+        { "model": "joyai-echo", "target": "joyai-echo-comfyui", "alias": "joyai-echo" }
       ]
     }
   ],
@@ -393,6 +443,14 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "capabilities": ["image_generation", "image_edit"],
       "context_length": 4096,
       "estimated_vram_gb": 13,
+      "estimated_memory_gb": 30
+    },
+    {
+      "model": "joyai-echo",
+      "target": "joyai-echo-comfyui",
+      "capabilities": ["video_generation"],
+      "context_length": 4096,
+      "estimated_vram_gb": 12,
       "estimated_memory_gb": 30
     }
   ]
@@ -517,7 +575,7 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `image_edit` | 图片编辑 / image-to-image 模型，供 OpenAI 兼容 `POST /v1/images/edits` 使用。 |
 | `video_generation` | 视频生成 / image-to-video 模型，供扩展接口 `POST /v1/videos/generations` 使用。 |
 
-聊天模型一般至少包含 `completion`；纯 ComfyUI 媒体 workflow 可以不填 `completion`，只声明 `image_generation` / `image_edit` / `video_generation`。`/v1/models` 除原始 `capabilities` 外还会返回结构化 `operations`，包含应调用的 endpoint、是否流式、是否接受/要求图片，以及 ComfyUI 媒体参数的默认值和限制，并返回 `estimated_vram_gb` 供调试界面展示；Playground 使用这些字段驱动界面。
+聊天模型一般至少包含 `completion`；纯 ComfyUI 媒体 workflow 可以不填 `completion`，只声明 `image_generation` / `image_edit` / `video_generation`。`/v1/models` 除原始 `capabilities` 外还会返回结构化 `operations`，包含 endpoint、是否流式、图片输入约束、实际绑定的参数 schema、默认值/范围及推荐 preset，并返回 `estimated_vram_gb` 供调试界面展示；Playground 完全由这些字段驱动。
 
 ### Admin UI / Dashboard / Model Playground
 
@@ -540,7 +598,7 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `playground_enabled` | bool | `false` | 是否启用轻量流式模型调试页；页面不保存历史记录或会话 |
 | `playground_host` / `playground_port` | | `127.0.0.1` / `21431` | Playground 独立 listener；修改后需重启进程 |
 
-启用后打开 `http://127.0.0.1:21431/playground/`，输入某个 interface 的 `access_tokens`，即可加载该 interface 暴露的模型。页面会读取模型的 capabilities/operations，自动提供聊天、视觉输入、图片生成、图片编辑或视频生成模式；图片可粘贴、拖放或从文件选择。若 interface 不要求鉴权，API key 可以留空。
+启用后打开 `http://127.0.0.1:21431/playground/`，输入某个 interface 的 `access_tokens`，即可加载该 interface 暴露的模型。页面会读取模型的 capabilities/operations，自动提供聊天、视觉输入、图片生成、图片编辑或视频生成模式，并按 workflow 动态显示真正生效的参数与推荐 preset；图片可粘贴、拖放或从文件选择。若 interface 不要求鉴权，API key 可以留空。
 
 ## 内部 backends 视图
 

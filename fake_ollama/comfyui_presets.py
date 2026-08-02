@@ -56,9 +56,27 @@ DYNAMIC_PARAMS: Tuple[str, ...] = (
     "num_frames",
     "frame_rate",
     "prefetch_count",
+    "enable_tile",
+    "enable_streaming",
 )
 
 Placement = Tuple[str, str]  # (node_id, input_name)
+
+
+@dataclass(frozen=True)
+class OperationPreset:
+    """A named set of public API values suitable for one workflow.
+
+    Presets live beside workflow bindings so UI recommendations cannot drift
+    away from the graph that accepts them. ``values`` use public endpoint
+    names (for example ``size`` and ``fps``), not ComfyUI node input names.
+    """
+
+    id: str
+    label: str
+    values: Dict[str, Any]
+    description: str = ""
+    recommended: bool = False
 
 
 @dataclass(frozen=True)
@@ -72,6 +90,7 @@ class WorkflowSpec:
     # Aspect-ratio buckets for ``size_ratio`` (empty when the model takes
     # explicit width/height instead of a ratio combo).
     size_ratio_options: Tuple[str, ...] = ()
+    operation_presets: Tuple[OperationPreset, ...] = ()
 
     def binds(self, param: str) -> bool:
         return bool(self.bindings.get(param))
@@ -80,8 +99,10 @@ class WorkflowSpec:
 @dataclass(frozen=True)
 class Preset:
     name: str
-    t2i: WorkflowSpec
+    t2i: Optional[WorkflowSpec] = None
     i2i: Optional[WorkflowSpec] = None
+    video: Optional[WorkflowSpec] = None
+    i2v: Optional[WorkflowSpec] = None
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +172,7 @@ _QWEN_I2I = WorkflowSpec(
         "height": [("13", "height")],
         "batch_size": [("13", "batch_size")],
     },
+    max_image_refs=1,
 )
 
 # SenseNova-U1: one fused model node + one fused sampler node (custom node pack
@@ -180,7 +202,70 @@ _SENSENOVA_I2I = WorkflowSpec(
         "size_ratio": [("10", "target_pixels")],
         "batch_size": [("10", "batch_size")],
     },
+    max_image_refs=1,
     size_ratio_options=SENSENOVA_RATIOS,
+)
+
+# JoyAI-Echo: the bundled graph supports both text-to-video and image-to-video.
+# Its upstream node defaults (768x512, 121 frames) exceed a 24 GiB card during
+# non-trivial VAE decode on some versions of the custom node.  Keep a small,
+# proven request preset beside the bindings so interactive clients start with a
+# useful smoke-test workload and can deliberately opt into the heavier graph.
+_JOYAI_OPERATION_PRESETS = (
+    OperationPreset(
+        id="safe_debug",
+        label="安全调试",
+        description="低显存快速验证：256x256、17 帧、8 FPS，并启用分块解码。",
+        recommended=True,
+        values={
+            "size": "256x256",
+            "num_frames": 17,
+            "fps": 8.0,
+            "prefetch_count": 1,
+            "enable_tile": True,
+            "enable_streaming": False,
+        },
+    ),
+    OperationPreset(
+        id="quality_24gb_risky",
+        label="高负载（24GB 可能 OOM）",
+        description="原始 workflow 负载：768x512、121 帧、24 FPS。",
+        values={
+            "size": "768x512",
+            "num_frames": 121,
+            "fps": 24.0,
+            "prefetch_count": 1,
+            "enable_tile": True,
+            "enable_streaming": False,
+        },
+    ),
+)
+
+_JOYAI_COMMON_BINDINGS: Dict[str, List[Placement]] = {
+    "prompt": [("3", "prompt")],
+    "width": [("19", "width")],
+    "height": [("19", "height")],
+    "seed": [("19", "seed")],
+    "num_frames": [("19", "num_frames")],
+    "frame_rate": [("19", "frame_rate"), ("10", "fps")],
+    "prefetch_count": [("3", "prefetch_count"), ("19", "prefetch_count")],
+    "enable_tile": [("19", "enable_tile")],
+    "enable_streaming": [
+        ("3", "enable_streaming"),
+        ("19", "enable_streaming"),
+    ],
+}
+
+_JOYAI_VIDEO = WorkflowSpec(
+    path=WORKFLOW_DIR / "joyai_echo_t2v.json",
+    bindings=dict(_JOYAI_COMMON_BINDINGS),
+    operation_presets=_JOYAI_OPERATION_PRESETS,
+)
+_JOYAI_I2V = WorkflowSpec(
+    path=WORKFLOW_DIR / "joyai_echo_i2v.json",
+    bindings={**_JOYAI_COMMON_BINDINGS, "images": [("19", "image")]},
+    max_image_refs=5,
+    operation_presets=_JOYAI_OPERATION_PRESETS,
 )
 
 PRESETS: Dict[str, Preset] = {
@@ -189,6 +274,9 @@ PRESETS: Dict[str, Preset] = {
     ),
     "sensenova_u1": Preset(
         name="sensenova_u1", t2i=_SENSENOVA_T2I, i2i=_SENSENOVA_I2I
+    ),
+    "joyai_echo": Preset(
+        name="joyai_echo", video=_JOYAI_VIDEO, i2v=_JOYAI_I2V
     ),
 }
 
@@ -288,6 +376,7 @@ def z_image_workflows(fields: Dict[str, Any]) -> Dict[str, Optional[WorkflowSpec
             "height": [(image_scale, "height")],
         },
         static_inputs=i2i_static,
+        max_image_refs=1,
     )
     return {"t2i": t2i, "i2i": i2i}
 
@@ -350,6 +439,8 @@ def resolve_workflows(
         base = {
             "t2i": preset.t2i,
             "i2i": preset.i2i,
+            "video": preset.video,
+            "i2v": preset.i2v,
         }
     elif preset_name in _CUSTOM_PRESETS:
         base = {
@@ -404,12 +495,18 @@ def resolve_workflows(
         bindings = _merge_bindings(spec.bindings, override_bindings.get(mode))
         mode_max_image_refs = spec.max_image_refs
         if max_image_refs not in (None, ""):
-            mode_max_image_refs = int(max_image_refs)
+            configured_limit = int(max_image_refs)
+            mode_max_image_refs = (
+                configured_limit
+                if mode_max_image_refs is None
+                else min(mode_max_image_refs, configured_limit)
+            )
         resolved[mode] = WorkflowSpec(
             path=path,
             bindings=bindings,
             static_inputs=static_inputs,
             max_image_refs=mode_max_image_refs,
             size_ratio_options=spec.size_ratio_options,
+            operation_presets=spec.operation_presets,
         )
     return resolved

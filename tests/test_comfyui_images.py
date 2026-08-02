@@ -206,7 +206,7 @@ def test_openai_image_edits_accepts_bracketed_image_field() -> None:
     assert fake.edit_calls[0]["filename"] == "input.png"
 
 
-def test_openai_image_edits_preserves_multi_reference_images() -> None:
+def test_openai_image_edits_rejects_more_references_than_workflow_accepts() -> None:
     fake = _FakeComfyClient()
     client = _client_with_fake(fake)
     with client:
@@ -224,14 +224,9 @@ def test_openai_image_edits_preserves_multi_reference_images() -> None:
             ],
         )
 
-    assert resp.status_code == 200
-    call = fake.edit_calls[0]
-    assert call["image_bytes"] == b"first-bytes"
-    assert call["filename"] == "first.png"
-    assert call["image_inputs"] == [
-        (b"first-bytes", "first.png"),
-        (b"second-bytes", "second.png"),
-    ]
+    assert resp.status_code == 400
+    assert "at most 1 reference image" in resp.json()["detail"]
+    assert fake.edit_calls == []
 
 
 def test_openai_video_generations_routes_to_comfyui() -> None:
@@ -248,6 +243,8 @@ def test_openai_video_generations_routes_to_comfyui() -> None:
                 "num_frames": 81,
                 "fps": 16,
                 "prefetch_count": 5,
+                "enable_tile": True,
+                "enable_streaming": False,
                 "seed": 123,
             },
         )
@@ -264,7 +261,55 @@ def test_openai_video_generations_routes_to_comfyui() -> None:
     assert call["num_frames"] == 81
     assert call["frame_rate"] == 16.0
     assert call["prefetch_count"] == 5
+    assert call["enable_tile"] is True
+    assert call["enable_streaming"] is False
     assert call["estimated_vram_gb"] == 16.0
+
+
+def test_video_generation_enforces_workflow_frame_alignment() -> None:
+    fake = _FakeComfyClient()
+    settings = _settings()
+    target = settings.comfyui_targets[0]
+    target.min_width = 256
+    target.min_height = 256
+    target.width_modulo = 32
+    target.height_modulo = 32
+    target.min_num_frames = 17
+    target.default_num_frames = 17
+    target.num_frames_offset = 1
+    target.num_frames_modulo = 8
+    target.min_frame_rate = 8.0
+    target.default_frame_rate = 8.0
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+
+    with TestClient(app, base_url="http://testserver:21435") as client:
+        bad_frames = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={"model": "z-image-turbo", "prompt": "move", "num_frames": 18},
+        )
+        bad_fps = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={"model": "z-image-turbo", "prompt": "move", "fps": 4},
+        )
+        bad_size = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "z-image-turbo",
+                "prompt": "move",
+                "size": "264x256",
+            },
+        )
+
+    assert bad_frames.status_code == 400
+    assert "(num_frames - 1) % 8 == 0" in bad_frames.json()["detail"]
+    assert bad_fps.status_code == 400
+    assert "frame_rate must be >= 8.0" in bad_fps.json()["detail"]
+    assert bad_size.status_code == 400
+    assert "width must be divisible by 32" in bad_size.json()["detail"]
 
 
 def test_openai_video_generations_accepts_json_base64_image() -> None:

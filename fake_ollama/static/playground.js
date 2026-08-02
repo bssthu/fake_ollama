@@ -18,20 +18,13 @@
     attachmentList: $('attachmentList'),
     chatParams: $('chatParams'),
     mediaParams: $('mediaParams'),
-    denoiseField: $('denoiseField'),
-    videoParams: $('videoParams'),
+    operationPresetField: $('operationPresetField'),
+    operationPreset: $('operationPreset'),
+    operationPresetHint: $('operationPresetHint'),
+    operationParameterList: $('operationParameterList'),
     systemPrompt: $('systemPrompt'),
     temperature: $('temperature'),
     maxTokens: $('maxTokens'),
-    mediaSize: $('mediaSize'),
-    mediaCount: $('mediaCount'),
-    mediaSeed: $('mediaSeed'),
-    mediaSteps: $('mediaSteps'),
-    mediaCfg: $('mediaCfg'),
-    mediaDenoise: $('mediaDenoise'),
-    videoFrames: $('videoFrames'),
-    videoFps: $('videoFps'),
-    videoPrefetch: $('videoPrefetch'),
     resultTitle: $('resultTitle'),
     modelChip: $('modelChip'),
     modelVram: $('modelVram'),
@@ -68,6 +61,7 @@
     startedAt: 0,
     firstTokenAt: 0,
     timer: null,
+    parameterInputs: new Map(),
   };
 
   function authHeaders(includeJson = false) {
@@ -202,8 +196,6 @@
     els.uploadRequirement.textContent = op && op.requires_images ? '至少需要 1 张' : '可选';
     els.chatParams.hidden = !isChat;
     els.mediaParams.hidden = !isMedia;
-    els.denoiseField.hidden = !isImageEdit;
-    els.videoParams.hidden = !isVideo;
     els.ttftMetric.hidden = !isChat;
     els.resultTitle.textContent = isChat ? '流式输出' : '生成结果';
 
@@ -219,6 +211,7 @@
         : '';
       const limits = op.limits || {};
       const limitHints = [];
+      if (op.configured === false) limitHints.push('工作流尚未配置');
       if (limits.max_batch_size) limitHints.push(`最多 ${limits.max_batch_size} 个结果`);
       if (limits.max_reference_images) limitHints.push(`最多 ${limits.max_reference_images} 张参考图`);
       if (limits.max_num_frames) limitHints.push(`最多 ${limits.max_num_frames} 帧`);
@@ -231,30 +224,177 @@
         : (isVideo ? '描述要生成的视频…' : (isImageEdit ? '描述希望怎样编辑图片…' : '描述要生成的图片…'));
       els.send.textContent = isChat ? '发送请求 →' : (isVideo ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →'));
     }
-    applyOperationDefaults(op);
+    renderOperationParameters(op);
     syncSendState();
   }
 
-  function applyOperationDefaults(op) {
-    if (!op || op.id === 'chat') return;
+  function operationParameters(op) {
+    if (!op || op.id === 'chat') return [];
+    if (Array.isArray(op.parameters)) return op.parameters;
+
+    // Compatibility with servers that predate the workflow-derived schema.
     const defaults = op.defaults || {};
-    els.mediaSize.value = defaults.size == null ? '' : String(defaults.size);
-    els.mediaCount.value = defaults.n == null ? '1' : String(defaults.n);
-    els.mediaSeed.value = defaults.seed == null ? '' : String(defaults.seed);
-    els.mediaSteps.value = defaults.steps == null ? '' : String(defaults.steps);
-    els.mediaCfg.value = defaults.cfg == null ? '' : String(defaults.cfg);
-    els.mediaDenoise.value = defaults.denoise == null ? '' : String(defaults.denoise);
-    els.videoFrames.value = defaults.num_frames == null ? '' : String(defaults.num_frames);
-    els.videoFps.value = defaults.fps == null ? '' : String(defaults.fps);
-    els.videoPrefetch.value = defaults.prefetch_count == null
-      ? '' : String(defaults.prefetch_count);
+    const legacy = [
+      ['size', '尺寸', 'resolution'],
+      ['n', '数量', 'integer'],
+      ['seed', 'Seed', 'integer'],
+      ['steps', 'Steps', 'integer'],
+      ['cfg', 'CFG', 'number'],
+      ['denoise', 'Denoise', 'number'],
+      ['num_frames', '帧数', 'integer'],
+      ['fps', 'FPS', 'number'],
+      ['prefetch_count', 'Prefetch count', 'integer'],
+      ['enable_tile', '分块解码', 'boolean'],
+      ['enable_streaming', '模型流式加载', 'boolean'],
+    ];
+    return legacy
+      .filter(([name]) => Object.prototype.hasOwnProperty.call(defaults, name))
+      .map(([name, label, type]) => ({name, label, type, default: defaults[name]}));
+  }
+
+  function setParameterValue(entry, value) {
+    if (entry.spec.type === 'boolean') {
+      entry.input.checked = Boolean(value);
+      const status = entry.field.querySelector('.boolean-status');
+      if (status) status.textContent = entry.input.checked ? '开启' : '关闭';
+    } else {
+      entry.input.value = value == null ? '' : String(value);
+    }
+  }
+
+  function presetMatches(preset) {
+    return Object.entries(preset.values || {}).every(([name, expected]) => {
+      const entry = state.parameterInputs.get(name);
+      if (!entry) return true;
+      const actual = readParameterValue(entry.spec, entry.input, false);
+      return entry.spec.type === 'number'
+        ? Number(actual) === Number(expected)
+        : actual === expected;
+    });
+  }
+
+  function syncPresetSelection() {
+    const op = selectedOperation();
+    if (!op || !Array.isArray(op.presets) || !op.presets.length) return;
+    const match = op.presets.find(presetMatches);
+    els.operationPreset.value = match ? match.id : '';
+    els.operationPresetHint.textContent = match
+      ? (match.description || '')
+      : '参数已调整为自定义值。';
+  }
+
+  function applyOperationPreset(op, presetId) {
+    const preset = (op.presets || []).find((item) => item.id === presetId);
+    if (!preset) {
+      els.operationPresetHint.textContent = '参数已调整为自定义值。';
+      return;
+    }
+    for (const [name, value] of Object.entries(preset.values || {})) {
+      const entry = state.parameterInputs.get(name);
+      if (entry) setParameterValue(entry, value);
+    }
+    els.operationPresetHint.textContent = preset.description || '';
+  }
+
+  function renderOperationPresets(op) {
+    const presets = op && Array.isArray(op.presets) ? op.presets : [];
+    els.operationPreset.replaceChildren();
+    els.operationPresetHint.textContent = '';
+    els.operationPresetField.hidden = !presets.length;
+    if (!presets.length) return;
+
+    els.operationPreset.append(new Option('自定义', ''));
+    for (const preset of presets) {
+      const suffix = preset.recommended ? '（推荐）' : '';
+      els.operationPreset.append(new Option(`${preset.label}${suffix}`, preset.id));
+    }
+    const selected = op.default_preset || '';
+    els.operationPreset.value = selected;
+    if (selected) applyOperationPreset(op, selected);
+    else syncPresetSelection();
+  }
+
+  function renderOperationParameters(op) {
+    state.parameterInputs.clear();
+    els.operationParameterList.replaceChildren();
+    if (!op || op.id === 'chat') {
+      els.operationPresetField.hidden = true;
+      return;
+    }
+
+    const parameters = operationParameters(op);
+    if (!parameters.length) {
+      const empty = document.createElement('div');
+      empty.className = 'help empty-parameters';
+      empty.textContent = '该工作流没有可调整的公开参数。';
+      els.operationParameterList.append(empty);
+      renderOperationPresets(op);
+      return;
+    }
+
+    for (const spec of parameters) {
+      const field = document.createElement('div');
+      field.className = `field operation-parameter${spec.advanced ? ' advanced-parameter' : ''}`;
+      const id = `operation-param-${String(spec.name).replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+      const label = document.createElement('label');
+      label.htmlFor = id;
+      label.textContent = spec.label || spec.name;
+      let input;
+
+      if (spec.type === 'select') {
+        input = document.createElement('select');
+        for (const choice of spec.choices || []) {
+          input.append(new Option(choice.label == null ? choice.value : choice.label, choice.value));
+        }
+      } else {
+        input = document.createElement('input');
+        input.className = 'control';
+        if (spec.type === 'boolean') {
+          input.type = 'checkbox';
+          input.className = 'boolean-input';
+          const toggle = document.createElement('label');
+          toggle.className = 'boolean-control';
+          toggle.htmlFor = id;
+          const status = document.createElement('span');
+          status.className = 'boolean-status';
+          toggle.append(input, status);
+          field.append(label, toggle);
+        } else {
+          input.type = ['integer', 'number'].includes(spec.type) ? 'number' : 'text';
+          if (spec.type === 'resolution') input.placeholder = '例如 1024x1024';
+          for (const attribute of ['min', 'max', 'step']) {
+            if (spec[attribute] != null) input.setAttribute(attribute, String(spec[attribute]));
+          }
+        }
+      }
+
+      input.id = id;
+      input.dataset.parameter = spec.name;
+      if (spec.type !== 'boolean') field.append(label, input);
+      if (spec.description) {
+        const help = document.createElement('div');
+        help.className = 'help';
+        help.textContent = spec.description;
+        field.append(help);
+      }
+      const entry = {spec, input, field};
+      state.parameterInputs.set(spec.name, entry);
+      setParameterValue(entry, spec.default);
+      input.addEventListener('input', () => {
+        if (spec.type === 'boolean') setParameterValue(entry, input.checked);
+        syncPresetSelection();
+      });
+      input.addEventListener('change', syncPresetSelection);
+      els.operationParameterList.append(field);
+    }
+    renderOperationPresets(op);
   }
 
   function syncSendState() {
     const op = selectedOperation();
     const missingRequiredImage = Boolean(op && op.requires_images && !state.attachments.length);
     els.send.disabled = Boolean(state.controller) || !selectedModel() || !op
-      || !els.prompt.value.trim() || missingRequiredImage;
+      || op.configured === false || !els.prompt.value.trim() || missingRequiredImage;
   }
 
   function showError(message) {
@@ -516,10 +656,58 @@
     }
   }
 
-  function optionalNumber(input, integer = false) {
-    if (!input.value.trim()) return null;
-    const value = integer ? Number.parseInt(input.value, 10) : Number(input.value);
-    return Number.isFinite(value) ? value : null;
+  function readParameterValue(spec, input, validate = true) {
+    if (spec.type === 'boolean') return input.checked;
+    const raw = input.value.trim();
+    if (!raw) return null;
+    if (spec.type === 'resolution') {
+      const match = raw.match(/^(\d+)\s*x\s*(\d+)$/i);
+      if (!match) {
+        if (!validate) return raw;
+        throw new Error(`${spec.label || spec.name} 必须使用 WIDTHxHEIGHT 格式。`);
+      }
+      const width = Number(match[1]);
+      const height = Number(match[2]);
+      const constraints = [
+        ['宽度', width, spec.min_width, spec.max_width, spec.width_modulo],
+        ['高度', height, spec.min_height, spec.max_height, spec.height_modulo],
+      ];
+      if (validate) {
+        for (const [label, value, minimum, maximum, modulo] of constraints) {
+          if (minimum != null && value < Number(minimum)) {
+            throw new Error(`${label}不能小于 ${minimum}。`);
+          }
+          if (maximum != null && value > Number(maximum)) {
+            throw new Error(`${label}不能大于 ${maximum}。`);
+          }
+          if (modulo != null && value % Number(modulo) !== 0) {
+            throw new Error(`${label}必须是 ${modulo} 的倍数。`);
+          }
+        }
+      }
+      return `${width}x${height}`;
+    }
+    if (!['integer', 'number'].includes(spec.type)) return raw;
+
+    const value = Number(raw);
+    const invalidInteger = spec.type === 'integer' && !Number.isInteger(value);
+    if (!Number.isFinite(value) || invalidInteger) {
+      if (!validate) return raw;
+      throw new Error(`${spec.label || spec.name} 必须是${spec.type === 'integer' ? '整数' : '数字'}。`);
+    }
+    if (validate && spec.min != null && value < Number(spec.min)) {
+      throw new Error(`${spec.label || spec.name} 不能小于 ${spec.min}。`);
+    }
+    if (validate && spec.max != null && value > Number(spec.max)) {
+      throw new Error(`${spec.label || spec.name} 不能大于 ${spec.max}。`);
+    }
+    if (validate && spec.modulo != null
+        && (value - Number(spec.offset || 0)) % Number(spec.modulo) !== 0) {
+      throw new Error(
+        `${spec.label || spec.name} 必须满足 (值 - ${spec.offset || 0}) % ${spec.modulo} = 0。`,
+      );
+    }
+    return value;
   }
 
   function mediaPayload(op) {
@@ -527,27 +715,12 @@
       model: els.model.value,
       prompt: els.prompt.value.trim(),
       response_format: 'b64_json',
-      n: optionalNumber(els.mediaCount, true) || 1,
     };
-    if (els.mediaSize.value.trim()) payload.size = els.mediaSize.value.trim();
-    const optional = [
-      ['seed', optionalNumber(els.mediaSeed, true)],
-      ['steps', optionalNumber(els.mediaSteps, true)],
-      ['cfg', optionalNumber(els.mediaCfg, false)],
-    ];
-    if (op.id === 'image_edit') {
-      optional.push(['denoise', optionalNumber(els.mediaDenoise, false)]);
+    for (const [name, entry] of state.parameterInputs.entries()) {
+      const value = readParameterValue(entry.spec, entry.input);
+      if (value !== null) payload[name] = value;
     }
-    if (op.id === 'video_generation') {
-      optional.push(
-        ['num_frames', optionalNumber(els.videoFrames, true)],
-        ['fps', optionalNumber(els.videoFps, false)],
-        ['prefetch_count', optionalNumber(els.videoPrefetch, true)],
-      );
-    }
-    for (const [key, value] of optional) {
-      if (value !== null) payload[key] = value;
-    }
+    if (!Object.prototype.hasOwnProperty.call(payload, 'n')) payload.n = 1;
     return payload;
   }
 
@@ -623,6 +796,11 @@
       showError('当前能力至少需要一张参考图片。');
       return;
     }
+    const maxReferences = op.limits && op.limits.max_reference_images;
+    if (maxReferences && state.attachments.length > Number(maxReferences)) {
+      showError(`当前能力最多接收 ${maxReferences} 张参考图片，请先移除多余图片。`);
+      return;
+    }
 
     state.controller = new AbortController();
     state.startedAt = performance.now();
@@ -653,6 +831,10 @@
   els.loadModels.addEventListener('click', loadModelList);
   els.model.addEventListener('change', syncModel);
   els.operation.addEventListener('change', syncOperation);
+  els.operationPreset.addEventListener('change', () => {
+    const op = selectedOperation();
+    if (op) applyOperationPreset(op, els.operationPreset.value);
+  });
   els.prompt.addEventListener('input', syncSendState);
   els.prompt.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {

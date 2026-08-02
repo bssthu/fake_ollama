@@ -241,10 +241,19 @@ def test_admin_schema(admin_settings):
         "image_to_image_workflow_path",
         "video_workflow_path",
         "image_to_video_workflow_path",
+        "min_width",
         "default_width",
+        "width_modulo",
+        "min_height",
         "default_height",
+        "height_modulo",
         "default_steps",
         "default_edit_denoise",
+        "min_num_frames",
+        "default_num_frames",
+        "num_frames_modulo",
+        "default_enable_tile",
+        "default_enable_streaming",
     } <= comfyui_item_keys
     comfyui_item_by_key = {f["key"]: f for f in comfyui["item_schema"]}
     assert comfyui_item_by_key["bindings"]["type"] == "json"

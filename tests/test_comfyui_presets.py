@@ -112,33 +112,53 @@ def test_resolve_workflows_unknown_preset_raises() -> None:
 def test_presets_have_expected_modes() -> None:
     assert PRESETS["qwen_image_edit_aio"].i2i is not None
     assert PRESETS["sensenova_u1"].i2i is not None
+    assert PRESETS["joyai_echo"].video is not None
+    assert PRESETS["joyai_echo"].i2v is not None
+
+
+def test_all_builtin_bindings_point_at_existing_workflow_inputs() -> None:
+    targets = [
+        ComfyUITarget(name="z", model="z-image"),
+        ComfyUITarget(
+            name="qwen", model="qwen-image", preset="qwen_image_edit_aio"
+        ),
+        ComfyUITarget(
+            name="sense", model="sensenova", preset="sensenova_u1"
+        ),
+        ComfyUITarget(
+            name="joy", model="joyai-echo", preset="joyai_echo"
+        ),
+    ]
+    for target in targets:
+        for spec in resolve_workflows(target.workflow_config()).values():
+            if spec is None:
+                continue
+            workflow = json.loads(spec.path.read_text(encoding="utf-8"))
+            for placements in spec.bindings.values():
+                for node_id, input_name in placements:
+                    assert node_id in workflow, (spec.path.name, node_id)
+                    assert input_name in workflow[node_id]["inputs"], (
+                        spec.path.name,
+                        node_id,
+                        input_name,
+                    )
+            for node_id, inputs in spec.static_inputs.items():
+                assert node_id in workflow, (spec.path.name, node_id)
+                assert set(inputs) <= set(workflow[node_id]["inputs"]), (
+                    spec.path.name,
+                    node_id,
+                )
 
 
 @pytest.mark.asyncio
 async def test_joyai_echo_i2v_builtin_workflow_batches_reference_images() -> None:
-    root = Path(__file__).resolve().parents[1]
     target = ComfyUITarget(
         name="joyai",
         model="joyai-echo",
-        preset="custom",
-        image_to_video_workflow_path=str(
-            root / "fake_ollama" / "workflows" / "joyai_echo_i2v.json"
-        ),
+        preset="joyai_echo",
         output_prefix="fake_ollama/joyai-echo",
         save_video_node_id="9",
         max_reference_images=5,
-        bindings={
-            "i2v": {
-                "prompt": [["3", "prompt"]],
-                "images": [["19", "image"]],
-                "width": [["19", "width"]],
-                "height": [["19", "height"]],
-                "seed": [["19", "seed"]],
-                "num_frames": [["19", "num_frames"]],
-                "frame_rate": [["19", "frame_rate"], ["10", "fps"]],
-                "prefetch_count": [["3", "prefetch_count"], ["19", "prefetch_count"]],
-            }
-        },
     )
     client = ComfyUIClient("http://comfy.test", workflow_config=target.workflow_config())
     try:
@@ -155,6 +175,8 @@ async def test_joyai_echo_i2v_builtin_workflow_batches_reference_images() -> Non
                 "num_frames": 33,
                 "frame_rate": 12.0,
                 "prefetch_count": 1,
+                "enable_tile": True,
+                "enable_streaming": False,
             },
         )
     finally:
@@ -172,6 +194,9 @@ async def test_joyai_echo_i2v_builtin_workflow_batches_reference_images() -> Non
     assert _node_inputs(workflow, "19")["seed"] == 42
     assert _node_inputs(workflow, "19")["num_frames"] == 33
     assert _node_inputs(workflow, "10")["fps"] == 12.0
+    assert _node_inputs(workflow, "19")["enable_tile"] is True
+    assert _node_inputs(workflow, "19")["enable_streaming"] is False
+    assert _node_inputs(workflow, "3")["enable_streaming"] is False
     assert _node_inputs(workflow, "9")["filename_prefix"] == "fake_ollama/joyai-echo"
 
 

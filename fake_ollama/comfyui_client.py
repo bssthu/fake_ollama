@@ -42,6 +42,13 @@ from .vram import (
 
 logger = logging.getLogger("fake_ollama")
 
+
+def _workflow_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 # Request parameters that must be coerced to a concrete numeric type before
 # they are dropped into a workflow node (everything else is passed through as
 # the string/value the caller supplied).
@@ -57,6 +64,8 @@ _PARAM_COERCE = {
     "cfg": float,
     "denoise": float,
     "frame_rate": float,
+    "enable_tile": _workflow_bool,
+    "enable_streaming": _workflow_bool,
 }
 
 
@@ -536,6 +545,8 @@ class ComfyUIClient:
         num_frames: int,
         frame_rate: float,
         prefetch_count: int,
+        enable_tile: bool = False,
+        enable_streaming: bool = False,
         estimated_vram_gb: Optional[float] = None,
         estimated_memory_gb: Optional[float] = None,
         image_bytes: Optional[bytes] = None,
@@ -565,6 +576,8 @@ class ComfyUIClient:
                 "num_frames": num_frames,
                 "frame_rate": frame_rate,
                 "prefetch_count": prefetch_count,
+                "enable_tile": enable_tile,
+                "enable_streaming": enable_streaming,
             },
             estimated_vram_gb=estimated_vram_gb,
             estimated_memory_gb=estimated_memory_gb,

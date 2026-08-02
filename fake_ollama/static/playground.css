@@ -256,6 +256,51 @@ details.advanced { border-top: 1px solid var(--line); padding-top: 14px; }
 details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 700; }
 .advanced-body { display: grid; gap: 13px; padding-top: 14px; }
 #chatParams > .field { margin-bottom: 10px; }
+#operationPresetField { margin-bottom: 12px; }
+.operation-parameters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 10px;
+}
+.operation-parameter { min-width: 0; align-content: start; }
+.operation-parameter .help { font-size: 10px; }
+.empty-parameters { grid-column: 1 / -1; }
+.boolean-control {
+  min-height: 42px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+}
+.boolean-input {
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  appearance: none;
+  border: 1px solid #aaa69d;
+  border-radius: 999px;
+  background: #d9d6cf;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.boolean-input::after {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  margin: 2px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.24);
+  transition: transform 140ms ease;
+}
+.boolean-input:checked { border-color: var(--accent); background: var(--accent); }
+.boolean-input:checked::after { transform: translateX(14px); }
+.boolean-status { color: var(--muted); font-size: 11px; font-weight: 600; }
 
 .result {
   min-height: calc(100vh - 108px);
@@ -396,6 +441,7 @@ details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px
   .workspace { gap: 12px; }
   .settings { padding: 16px; }
   .row { grid-template-columns: 1fr; }
+  .operation-parameters { grid-template-columns: 1fr; }
   .result-head { padding: 14px 15px; }
   .answer-wrap { padding: 21px 17px; }
   .composer { padding: 12px; }

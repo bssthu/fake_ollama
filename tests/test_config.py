@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fake_ollama.anthropic_client import AnthropicClient
-from fake_ollama.config import Settings, load_settings
+from fake_ollama.config import ComfyUITarget, Settings, load_settings
 from fake_ollama.server import create_app
 
 
@@ -79,6 +79,19 @@ def test_config_example_loads():
     root = Path(__file__).resolve().parents[1]
     s = load_settings(root / "config.json.example")
     assert any(t.name == "z-image-turbo-comfyui" for t in s.comfyui_targets)
+
+
+def test_comfyui_default_frames_must_match_workflow_formula():
+    with pytest.raises(ValueError, match="default_num_frames"):
+        ComfyUITarget(
+            name="joy",
+            model="joyai-echo",
+            min_num_frames=17,
+            default_num_frames=18,
+            max_num_frames=241,
+            num_frames_offset=1,
+            num_frames_modulo=8,
+        )
 
 
 def test_removed_top_level_keys_are_rejected(tmp_path, monkeypatch):

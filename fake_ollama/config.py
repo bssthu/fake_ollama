@@ -933,8 +933,8 @@ class ComfyUITarget(BaseModel):
 
     # Declarative workflow preset (see ``comfyui_presets``). The default
     # ``z_image_turbo`` reproduces the legacy behaviour from the per-field node
-    # ids/model files below; ``qwen_image_edit_aio`` and ``sensenova_u1`` ship
-    # bundled workflows + bindings. Set ``bindings`` / ``static_inputs`` to
+    # ids/model files below; ``qwen_image_edit_aio``, ``sensenova_u1`` and
+    # ``joyai_echo`` ship bundled workflows + bindings. Set ``bindings`` / ``static_inputs`` to
     # override a preset (or describe an arbitrary workflow) without touching the
     # client; both are keyed by mode, e.g. {"t2i": {...}, "i2i": {...}}.
     preset: str = "z_image_turbo"
@@ -954,8 +954,14 @@ class ComfyUITarget(BaseModel):
     text_encoder_type: str = "lumina2"
     text_encoder_device: str = "default"
     vae_model: str = "ae.safetensors"
+    min_width: int = 8
     default_width: int = 1024
+    max_width: Optional[int] = None
+    width_modulo: int = 8
+    min_height: int = 8
     default_height: int = 1024
+    max_height: Optional[int] = None
+    height_modulo: int = 8
     default_steps: int = 8
     default_cfg: float = 1.0
     default_sampler_name: str = "res_multistep"
@@ -963,12 +969,18 @@ class ComfyUITarget(BaseModel):
     default_denoise: float = 1.0
     default_edit_denoise: float = 0.25
     default_shift: float = 3.0
+    min_num_frames: int = 1
     default_num_frames: int = 121
     default_frame_rate: float = 24.0
     default_prefetch_count: int = 1
     max_num_frames: int = 241
+    min_frame_rate: float = 1.0
+    max_frame_rate: float = 120.0
+    max_prefetch_count: int = 48
     num_frames_offset: int = 0
     num_frames_modulo: int = 1
+    default_enable_tile: bool = False
+    default_enable_streaming: bool = False
     max_reference_images: Optional[int] = None
     # Random seed control for the KSampler node. seed_mode:
     #   "random"    -> a fresh random seed per request (default)
@@ -1033,16 +1045,31 @@ class ComfyUITarget(BaseModel):
     @field_validator(
         "default_width",
         "default_height",
+        "min_width",
+        "width_modulo",
+        "min_height",
+        "height_modulo",
         "default_steps",
         "max_batch_size",
+        "min_num_frames",
         "default_num_frames",
         "max_num_frames",
+        "max_prefetch_count",
         "num_frames_modulo",
     )
     @classmethod
     def _positive_int(cls, v: int) -> int:
         if int(v) <= 0:
             raise ValueError("ComfyUI image dimensions/steps/batch size must be positive")
+        return int(v)
+
+    @field_validator("max_width", "max_height")
+    @classmethod
+    def _optional_positive_dimension(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if int(v) <= 0:
+            raise ValueError("ComfyUI maximum dimensions must be positive")
         return int(v)
 
     @field_validator("default_prefetch_count", "num_frames_offset")
@@ -1066,7 +1093,9 @@ class ComfyUITarget(BaseModel):
         "default_denoise",
         "default_edit_denoise",
         "default_shift",
+        "min_frame_rate",
         "default_frame_rate",
+        "max_frame_rate",
         "startup_timeout_seconds",
         "prompt_timeout_seconds",
         "poll_interval_seconds",
@@ -1116,6 +1145,41 @@ class ComfyUITarget(BaseModel):
         if "@" in self.name:
             raise ValueError(
                 f"comfyui_target name {self.name!r} contains '@'; reserved separator"
+            )
+        if not self.min_num_frames <= self.default_num_frames <= self.max_num_frames:
+            raise ValueError(
+                "comfyui target num-frame defaults must satisfy "
+                "min_num_frames <= default_num_frames <= max_num_frames"
+            )
+        if (
+            self.default_num_frames - self.num_frames_offset
+        ) % self.num_frames_modulo:
+            raise ValueError(
+                "comfyui target default_num_frames must satisfy "
+                "(default_num_frames - num_frames_offset) % "
+                "num_frames_modulo == 0"
+            )
+        for axis in ("width", "height"):
+            minimum = int(getattr(self, f"min_{axis}"))
+            default = int(getattr(self, f"default_{axis}"))
+            maximum = getattr(self, f"max_{axis}")
+            modulo = int(getattr(self, f"{axis}_modulo"))
+            if default < minimum or (maximum is not None and default > maximum):
+                raise ValueError(
+                    f"comfyui target default_{axis} must be within its min/max bounds"
+                )
+            if default % modulo:
+                raise ValueError(
+                    f"comfyui target default_{axis} must be divisible by {axis}_modulo"
+                )
+        if not self.min_frame_rate <= self.default_frame_rate <= self.max_frame_rate:
+            raise ValueError(
+                "comfyui target frame-rate defaults must satisfy "
+                "min_frame_rate <= default_frame_rate <= max_frame_rate"
+            )
+        if self.default_prefetch_count > self.max_prefetch_count:
+            raise ValueError(
+                "comfyui target default_prefetch_count must be <= max_prefetch_count"
             )
         return self
 

@@ -59,6 +59,8 @@ def test_playground_static_page_and_security_headers():
     assert 'id="model"' in response.text
     assert 'id="fileInput"' in response.text
     assert 'id="operation"' in response.text
+    assert 'id="operationPreset"' in response.text
+    assert 'id="operationParameterList"' in response.text
     assert css.status_code == 200
     assert css.headers["content-type"].startswith("text/css")
     assert js.status_code == 200
@@ -68,6 +70,8 @@ def test_playground_static_page_and_security_headers():
     assert "new FormData()" in js.text
     assert "stream: true" in js.text
     assert "estimated_vram_gb" in js.text
+    assert "renderOperationParameters" in js.text
+    assert "state.parameterInputs" in js.text
     assert "showRequestError" in js.text
     assert response.headers["cache-control"] == "no-store"
     assert "connect-src 'self'" in response.headers["content-security-policy"]

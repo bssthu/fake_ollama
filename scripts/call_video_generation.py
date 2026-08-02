@@ -58,6 +58,8 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "num_frames": args.num_frames,
         "fps": args.fps,
         "prefetch_count": args.prefetch_count,
+        "enable_tile": args.enable_tile,
+        "enable_streaming": args.enable_streaming,
         "response_format": "b64_json",
     }
     if args.seed is not None:
@@ -96,8 +98,12 @@ def post_http(
         },
         method="POST",
     )
+    # This script always targets the explicitly selected fake-ollama endpoint,
+    # which is normally loopback.  Do not let Windows/system proxy settings
+    # intercept a large local base64 media request.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
             return int(response.status), json.loads(raw)
     except urllib.error.HTTPError as exc:
@@ -145,6 +151,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=17)
     parser.add_argument("--fps", type=float, default=8.0)
     parser.add_argument("--prefetch-count", type=int, default=1)
+    parser.add_argument(
+        "--enable-tile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable tiled VAE decode (default: enabled).",
+    )
+    parser.add_argument(
+        "--enable-streaming",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable model-internal streaming/offload (default: disabled).",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--image",

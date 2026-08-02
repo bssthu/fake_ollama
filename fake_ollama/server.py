@@ -44,6 +44,7 @@ from .converters import (
     openai_chat_to_anthropic,
 )
 from .llama_cpp_client import LlamaCppClient
+from .media_operations import describe_comfyui_operation
 from .generic_openai_client import GenericOpenAIClient
 from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
@@ -597,43 +598,12 @@ def _openai_model_list_entry(
             }
         )
     if isinstance(source, ComfyUITarget):
-        common_defaults = {
-            "size": f"{source.default_width}x{source.default_height}",
-            "n": 1,
-            "steps": source.default_steps,
-            "cfg": source.default_cfg,
-            "seed": None,
-        }
-        common_limits = {
-            "max_batch_size": source.max_batch_size,
-            "max_reference_images": source.max_reference_images,
-        }
         for operation in operations:
             if operation["id"] not in {
                 "image_generation", "image_edit", "video_generation"
             }:
                 continue
-            defaults = dict(common_defaults)
-            limits = dict(common_limits)
-            if operation["id"] == "image_edit":
-                defaults["denoise"] = source.default_edit_denoise
-            if operation["id"] == "video_generation":
-                defaults.update(
-                    {
-                        "num_frames": source.default_num_frames,
-                        "fps": source.default_frame_rate,
-                        "prefetch_count": source.default_prefetch_count,
-                    }
-                )
-                limits.update(
-                    {
-                        "max_num_frames": source.max_num_frames,
-                        "num_frames_offset": source.num_frames_offset,
-                        "num_frames_modulo": source.num_frames_modulo,
-                    }
-                )
-            operation["defaults"] = defaults
-            operation["limits"] = limits
+            operation.update(describe_comfyui_operation(source, operation["id"]))
     return {
         "id": public_id,
         "object": "model",
@@ -1520,6 +1490,7 @@ def _coerce_int_payload(
     default: int,
     *,
     minimum: int = 1,
+    maximum: Optional[int] = None,
 ) -> int:
     value: Any = None
     for key in keys:
@@ -1532,10 +1503,11 @@ def _coerce_int_payload(
         out = int(value)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"{keys[0]} must be an integer") from exc
-    if out < minimum:
+    if out < minimum or (maximum is not None and out > maximum):
+        upper = f" and <= {maximum}" if maximum is not None else ""
         raise HTTPException(
             status_code=400,
-            detail=f"{keys[0]} must be >= {minimum}",
+            detail=f"{keys[0]} must be >= {minimum}{upper}",
         )
     return out
 
@@ -1568,6 +1540,29 @@ def _coerce_float_payload(
     return out
 
 
+def _coerce_bool_payload(
+    payload: Dict[str, Any], keys: tuple[str, ...], default: bool
+) -> bool:
+    value: Any = None
+    for key in keys:
+        if payload.get(key) not in (None, ""):
+            value = payload.get(key)
+            break
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalised = value.strip().lower()
+        if normalised in {"1", "true", "yes", "on"}:
+            return True
+        if normalised in {"0", "false", "no", "off"}:
+            return False
+    raise HTTPException(status_code=400, detail=f"{keys[0]} must be a boolean")
+
+
 def _parse_image_size(payload: Dict[str, Any], target: Any) -> tuple[int, int]:
     width = payload.get("width")
     height = payload.get("height")
@@ -1590,13 +1585,25 @@ def _parse_image_size(payload: Dict[str, Any], target: Any) -> tuple[int, int]:
         h = int(height)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="width and height must be integers") from exc
-    if w <= 0 or h <= 0:
-        raise HTTPException(status_code=400, detail="width and height must be positive")
-    if w % 8 or h % 8:
-        raise HTTPException(
-            status_code=400,
-            detail="width and height must be divisible by 8 for the ComfyUI latent workflow",
-        )
+    for axis, value in (("width", w), ("height", h)):
+        minimum = int(getattr(target, f"min_{axis}", 8) or 8)
+        maximum = getattr(target, f"max_{axis}", None)
+        modulo = int(getattr(target, f"{axis}_modulo", 8) or 8)
+        if value < minimum:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{axis} must be >= {minimum} for this ComfyUI workflow",
+            )
+        if maximum is not None and value > int(maximum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{axis} must be <= {maximum} for this ComfyUI workflow",
+            )
+        if value % modulo:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{axis} must be divisible by {modulo} for this ComfyUI workflow",
+            )
     return w, h
 
 
@@ -1706,6 +1713,26 @@ def _image_response(images: List[Any], payload: Dict[str, Any]) -> JSONResponse:
     )
 
 
+def _enforce_reference_image_limit(
+    target: Any,
+    operation_id: str,
+    image_inputs: List[Tuple[bytes, str]],
+) -> None:
+    """Reject public requests that exceed the workflow's advertised capacity."""
+
+    operation = describe_comfyui_operation(target, operation_id)
+    maximum = operation.get("limits", {}).get("max_reference_images")
+    if maximum is not None and len(image_inputs) > int(maximum):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{operation_id} accepts at most {maximum} reference image(s) "
+                f"for comfyui target {getattr(target, 'name', '')!r}; "
+                f"received {len(image_inputs)}"
+            ),
+        )
+
+
 async def _handle_openai_image_generation(request: Request) -> Any:
     app = request.app
     settings: Settings = app.state.settings
@@ -1750,6 +1777,7 @@ async def _handle_openai_image_edit(request: Request) -> Any:
         request, settings, payload
     )
     target = backend.source
+    _enforce_reference_image_limit(target, "image_edit", image_inputs)
     params = _image_request_params(payload, target, edit=True, app=app)
     client: ComfyUIClient = _backend_client(app, backend)
     profile = settings.profile_for(f"{real_model}@{backend.name}")
@@ -1778,17 +1806,15 @@ def _video_request_params(
     app: Any,
 ) -> Dict[str, Any]:
     params = _image_request_params(payload, target, edit=False, app=app)
+    min_num_frames = int(getattr(target, "min_num_frames", 1) or 1)
+    max_num_frames = int(getattr(target, "max_num_frames", 241) or 241)
     params["num_frames"] = _coerce_int_payload(
         payload,
         ("num_frames", "frames"),
         getattr(target, "default_num_frames", 121),
+        minimum=min_num_frames,
+        maximum=max_num_frames,
     )
-    max_num_frames = int(getattr(target, "max_num_frames", 241) or 241)
-    if params["num_frames"] > max_num_frames:
-        raise HTTPException(
-            status_code=400,
-            detail=f"num_frames={params['num_frames']} exceeds comfyui target max_num_frames={max_num_frames}",
-        )
     num_frames_modulo = int(getattr(target, "num_frames_modulo", 1) or 1)
     num_frames_offset = int(getattr(target, "num_frames_offset", 0) or 0)
     if (params["num_frames"] - num_frames_offset) % num_frames_modulo != 0:
@@ -1804,13 +1830,25 @@ def _video_request_params(
         payload,
         ("frame_rate", "fps"),
         getattr(target, "default_frame_rate", 24.0),
-        minimum=1.0,
+        minimum=float(getattr(target, "min_frame_rate", 1.0) or 1.0),
+        maximum=float(getattr(target, "max_frame_rate", 120.0) or 120.0),
     )
     params["prefetch_count"] = _coerce_int_payload(
         payload,
         ("prefetch_count",),
         getattr(target, "default_prefetch_count", 1),
         minimum=0,
+        maximum=int(getattr(target, "max_prefetch_count", 48) or 48),
+    )
+    params["enable_tile"] = _coerce_bool_payload(
+        payload,
+        ("enable_tile",),
+        getattr(target, "default_enable_tile", False),
+    )
+    params["enable_streaming"] = _coerce_bool_payload(
+        payload,
+        ("enable_streaming",),
+        getattr(target, "default_enable_streaming", False),
     )
     return params
 
@@ -1826,6 +1864,7 @@ async def _handle_openai_video_generation(request: Request) -> Any:
         request, settings, payload
     )
     target = backend.source
+    _enforce_reference_image_limit(target, "video_generation", image_inputs)
     params = _video_request_params(payload, target, app=app)
     client: ComfyUIClient = _backend_client(app, backend)
     profile = settings.profile_for(f"{real_model}@{backend.name}")

@@ -95,62 +95,12 @@
             </div>
 
             <div id="mediaParams" hidden>
-              <div class="row parameter-row">
-                <div class="field">
-                  <label for="mediaSize">尺寸</label>
-                  <input id="mediaSize" class="control" type="text"
-                         placeholder="使用模型默认值">
-                </div>
-                <div class="field">
-                  <label for="mediaCount">数量</label>
-                  <input id="mediaCount" class="control" type="number"
-                         min="1" step="1" value="1">
-                </div>
+              <div id="operationPresetField" class="field" hidden>
+                <label for="operationPreset">参数预设</label>
+                <select id="operationPreset"></select>
+                <div id="operationPresetHint" class="help"></div>
               </div>
-              <div class="row parameter-row">
-                <div class="field">
-                  <label for="mediaSeed">Seed（留空随机）</label>
-                  <input id="mediaSeed" class="control" type="number"
-                         min="0" step="1" placeholder="random">
-                </div>
-                <div class="field">
-                  <label for="mediaSteps">Steps（留空用模型默认）</label>
-                  <input id="mediaSteps" class="control" type="number"
-                         min="1" step="1" placeholder="default">
-                </div>
-              </div>
-              <div class="row parameter-row">
-                <div class="field">
-                  <label for="mediaCfg">CFG（可选）</label>
-                  <input id="mediaCfg" class="control" type="number"
-                         min="0" step="0.1" placeholder="default">
-                </div>
-                <div id="denoiseField" class="field" hidden>
-                  <label for="mediaDenoise">Denoise（可选）</label>
-                  <input id="mediaDenoise" class="control" type="number"
-                         min="0" max="1" step="0.05" placeholder="default">
-                </div>
-              </div>
-            </div>
-
-            <div id="videoParams" hidden>
-              <div class="row parameter-row">
-                <div class="field">
-                  <label for="videoFrames">帧数</label>
-                  <input id="videoFrames" class="control" type="number"
-                         min="1" step="1" placeholder="使用模型默认值">
-                </div>
-                <div class="field">
-                  <label for="videoFps">FPS</label>
-                  <input id="videoFps" class="control" type="number"
-                         min="1" step="1" placeholder="使用模型默认值">
-                </div>
-              </div>
-              <div class="field">
-                <label for="videoPrefetch">Prefetch count</label>
-                <input id="videoPrefetch" class="control" type="number"
-                       min="0" step="1" placeholder="使用模型默认值">
-              </div>
+              <div id="operationParameterList" class="operation-parameters"></div>
             </div>
           </div>
         </details>
