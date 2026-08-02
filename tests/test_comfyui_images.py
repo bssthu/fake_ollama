@@ -140,7 +140,24 @@ def test_openai_models_uses_comfyui_target_profile() -> None:
     assert resp.status_code == 200
     model = next(item for item in resp.json()["data"] if item["id"] == "z-image-turbo")
     assert model["context_length"] == 4096
+    assert model["estimated_vram_gb"] == 16.0
     assert model["capabilities"] == ["image_generation", "image_edit"]
+    assert [operation["id"] for operation in model["operations"]] == [
+        "image_generation",
+        "image_edit",
+    ]
+    assert all(
+        operation["endpoint"] != "/v1/chat/completions"
+        for operation in model["operations"]
+    )
+    generation = model["operations"][0]
+    assert generation["endpoint"] == "/v1/images/generations"
+    assert generation["defaults"]["size"] == "1024x1024"
+    assert generation["defaults"]["steps"] == 8
+    assert generation["limits"]["max_batch_size"] == 2
+    edit = model["operations"][1]
+    assert edit["requires_images"] is True
+    assert edit["defaults"]["denoise"] == 0.25
 
 
 def test_openai_image_edits_accepts_multipart_image() -> None:
@@ -272,6 +289,31 @@ def test_openai_video_generations_accepts_json_base64_image() -> None:
     assert call["image_bytes"] == b"img-bytes"
     assert call["filename"] == "reference.png"
     assert call["image_inputs"] == [(b"img-bytes", "reference.png")]
+
+
+def test_playground_listener_routes_image_generation_to_comfyui() -> None:
+    fake = _FakeComfyClient()
+    settings = _settings().model_copy(
+        update={"playground_enabled": True, "playground_port": 21431}
+    )
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+    with TestClient(app, base_url="http://testserver:21431") as client:
+        models = client.get("/v1/models", headers={"x-api-key": "tk"})
+        generated = client.post(
+            "/v1/images/generations",
+            headers={"x-api-key": "tk"},
+            json={"model": "z-image-turbo", "prompt": "a red cube"},
+        )
+
+    assert models.status_code == 200
+    model = models.json()["data"][0]
+    assert [op["id"] for op in model["operations"]] == [
+        "image_generation",
+        "image_edit",
+    ]
+    assert generated.status_code == 200
+    assert fake.generate_calls[0]["prompt"] == "a red cube"
 
 
 def _client_with_seed_mode(fake: _FakeComfyClient, *, seed_mode: str, seed: int) -> TestClient:

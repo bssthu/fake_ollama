@@ -48,3 +48,5 @@ def test_cli_help_mentions_separate_request_data_log():
 
     assert "--request-data-log-file" in completed.stdout
     assert "--no-request-data-log" in completed.stdout
+    assert "--playground-host" in completed.stdout
+    assert "--playground-port" in completed.stdout

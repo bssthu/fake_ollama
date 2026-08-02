@@ -105,6 +105,10 @@ def test_admin_dashboard_defaults():
     assert s.dashboard_host == "127.0.0.1"
     assert s.dashboard_port == 21432
     assert s.dashboard_listener_enabled is True
+    assert s.playground_enabled is False
+    assert s.playground_host == "127.0.0.1"
+    assert s.playground_port == 21431
+    assert s.playground_listener_enabled is False
 
 
 def test_admin_port_null_disables_admin_listener():
@@ -198,6 +202,17 @@ def test_duplicate_alias_in_same_source_rejected():
                      {"name": "a", "alias": "x"},
                      {"name": "b", "alias": "x"},
                  ]},
+            ],
+        )
+
+
+def test_playground_port_must_differ_from_other_listener_ports():
+    with pytest.raises(ValueError, match="playground_port.*conflicts"):
+        Settings(
+            playground_enabled=True,
+            playground_port=21434,
+            ollama_interfaces=[
+                {"name": "ollama", "port": 21434, "exposed_models": []}
             ],
         )
 

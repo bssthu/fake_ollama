@@ -24,6 +24,7 @@ reachable from anything untrusted.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -33,7 +34,20 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .anthropic_client import AnthropicClient
 from .comfyui_client import ComfyUIClient
-from .config import Settings
+from .config import (
+    ApiInterface,
+    AnthropicUpstream,
+    ComfyUITarget,
+    ExposureEntry,
+    GenericOpenAITarget,
+    LlamaCppDefaults,
+    LlamaCppTarget,
+    ModelEntry,
+    OllamaInterface,
+    OllamaTarget,
+    OpenAIUpstream,
+    Settings,
+)
 from .llama_cpp_client import LlamaCppClient
 from .generic_openai_client import GenericOpenAIClient
 from .ollama_client import OllamaClient
@@ -341,7 +355,7 @@ MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选：source 名字（anthropic_upstreams / openai_upstreams / ollama_targets / llama_cpp_targets / comfyui_targets 中的某个 name）。留空 = 对该 model 名所有 target 生效"},
     {"key": "capabilities", "type": "string_list",
      "default": ["completion", "tools", "vision"],
-     "description": "模型对外声明的 capability 标签，用于 /api/show、/api/tags、/v1/models 给客户端做功能发现，不会自动给模型增加能力。常用值：completion=文本/聊天补全，tools=支持 tool calling，vision=聊天接口可接收图片输入，image_generation=OpenAI /v1/images/generations 图片生成，image_edit=OpenAI /v1/images/edits image-to-image / edit。聊天模型通常至少含 completion；纯图片 workflow 不需要 completion，可只填 image_generation / image_edit"},
+     "description": "模型对外声明的 capability 标签，用于 /api/show、/api/tags、/v1/models 给客户端做功能发现，不会自动给模型增加能力。常用值：completion=文本/聊天补全，tools=支持 tool calling，vision=聊天接口可接收图片输入，image_generation=/v1/images/generations 图片生成，image_edit=/v1/images/edits 图片编辑，video_generation=/v1/videos/generations 视频或图生视频。聊天模型通常至少含 completion；纯媒体 workflow 不需要 completion"},
     {"key": "context_length", "type": "int", "default": 200000,
      "description": "上下文 token 上限（输入 + 输出）。① 通过 /api/show、/v1/models 等接口对外报告为模型的 context window；② fake-ollama 在转发前预检：估算 input token + max_tokens 超过此值时返回 400（可用环境变量 FAKE_OLLAMA_ENFORCE_CONTEXT_LIMIT=false 关闭，OpenAI 透传路径不强制）。配置文件中亦可写作 num_ctx。对于 llama.cpp / Ollama 反向代理，建议设为 ≤ 上游 per-slot 实际容量（ctx_size / parallel），否则预检通过但上游会拒"},
     {"key": "max_output_tokens", "type": "int", "default": None,
@@ -385,7 +399,10 @@ OLLAMA_INTERFACE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "该 interface 外露的模型。需明确填写 model + target；可选 alias 改变公开 id"},
 ]
 
-API_INTERFACE_ITEM_SCHEMA: List[Dict[str, Any]] = OLLAMA_INTERFACE_ITEM_SCHEMA
+# Keep the two schemas independent: their actual default ports differ.
+API_INTERFACE_ITEM_SCHEMA: List[Dict[str, Any]] = deepcopy(
+    OLLAMA_INTERFACE_ITEM_SCHEMA
+)
 
 CONFIG_SCHEMA: List[Dict[str, Any]] = [
   # ---- Model sources (远端 + 本机) -----------------------------------------
@@ -483,6 +500,13 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "memory_low_free_threshold_mib", "type": "float", "default": 2048.0, "group": "dashboard",
    "description": "当可用系统内存低于该 MiB threshold 时，可释放符合条件的 idle models（仅释放声明了 estimated_memory_gb 的模型）"},
 
+  {"key": "playground_enabled", "type": "bool", "default": False, "group": "playground",
+   "description": "模型调试页的实际启用开关。修改后请点击顶部 Save & Reload，再重启 fake-ollama"},
+  {"key": "playground_host", "type": "string", "default": "127.0.0.1", "group": "playground",
+   "description": "模型调试页监听地址。API key 会由浏览器发送到该地址，建议保持 127.0.0.1"},
+  {"key": "playground_port", "type": "int", "default": 21431, "group": "playground",
+   "description": "模型调试页独立监听端口；必须与所有 interface、admin 和 dashboard 端口不同。启用后访问 /playground/"},
+
   {"key": "admin_enabled", "type": "bool", "default": True, "group": "admin",
    "description": "是否启用本 /admin 编辑器（关闭后需手动改 config.json）"},
   {"key": "admin_host", "type": "string", "default": "127.0.0.1", "group": "admin",
@@ -490,6 +514,46 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "admin_port", "type": "int", "default": 21433, "group": "admin",
    "description": "Admin UI 独立监听端口。设为 null 才会把 /admin 挂回 internal 端口（旧行为，不推荐）"},
 ]
+
+
+def _sync_ui_schema_defaults() -> None:
+    """Use the validated config models as the single source of defaults.
+
+    The form schema still owns labels, descriptions and widget types, but it
+    must not maintain a second hand-written set of values that can drift from
+    Pydantic. Required model fields have no runtime default and keep their UI
+    placeholder (usually an empty string).
+    """
+
+    item_schemas = (
+        (MODEL_ENTRY_ITEM_SCHEMA, ModelEntry),
+        (UPSTREAM_ITEM_SCHEMA, AnthropicUpstream),
+        (OPENAI_UPSTREAM_ITEM_SCHEMA, OpenAIUpstream),
+        (LOCAL_OPENAI_TARGET_ITEM_SCHEMA, GenericOpenAITarget),
+        (OLLAMA_TARGET_ITEM_SCHEMA, OllamaTarget),
+        (LLAMA_CPP_TARGET_ITEM_SCHEMA, LlamaCppTarget),
+        (LLAMA_CPP_DEFAULTS_SCHEMA, LlamaCppDefaults),
+        (COMFYUI_TARGET_ITEM_SCHEMA, ComfyUITarget),
+        (EXPOSURE_ITEM_SCHEMA, ExposureEntry),
+        (OLLAMA_INTERFACE_ITEM_SCHEMA, OllamaInterface),
+        (API_INTERFACE_ITEM_SCHEMA, ApiInterface),
+    )
+    for schema, model_type in item_schemas:
+        for spec in schema:
+            model_field = model_type.model_fields.get(spec["key"])
+            if model_field is None or model_field.is_required():
+                continue
+            spec["default"] = deepcopy(
+                model_field.get_default(call_default_factory=True)
+            )
+
+    settings_defaults = Settings().model_dump()
+    for spec in CONFIG_SCHEMA:
+        if spec["key"] in settings_defaults:
+            spec["default"] = deepcopy(settings_defaults[spec["key"]])
+
+
+_sync_ui_schema_defaults()
 
 GROUP_LABELS: List[Dict[str, str]] = [
   {"key": "model_sources_remote", "label": "Remote Sources", "hint": "远端模型来源：Anthropic / OpenAI 兼容上游", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
@@ -501,6 +565,7 @@ GROUP_LABELS: List[Dict[str, str]] = [
   {"key": "interface_api", "label": "API Interface", "hint": "Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/images/* + /v1/models。每个 entry 各自选择暴露哪些模型", "section": "interfaces", "section_label": "Interfaces", "section_hint": "对用户暴露的接口；每个 entry 都是独立的 host/port/access_tokens/exposed_models"},
   {"key": "runtime", "label": "Runtime & Profiles", "hint": "运行时缺省值、出站网络与每模型 capability / thinking profile", "section": "runtime", "section_label": "Runtime", "section_hint": "跨所有 target / 接口共享的运行时设置"},
   {"key": "dashboard", "label": "Dashboard", "hint": "Runtime graphs and the low-VRAM safety monitor", "section": "dashboard", "section_label": "Dashboard", "section_hint": "Memory, VRAM, and loaded local model telemetry"},
+  {"key": "playground", "label": "Model Playground", "hint": "轻量流式模型调试页（不保存历史记录或会话）", "section": "playground", "section_label": "Model Playground", "section_hint": "修改监听开关或端口后，请保存配置并重启进程"},
   {"key": "admin", "label": "Admin UI", "hint": "配置页面自身的开关与监听地址（无内置鉴权）", "section": "admin", "section_label": "Admin UI", "section_hint": "仅影响 /admin 配置页面本身"},
 ]
 
@@ -1322,6 +1387,7 @@ function refreshSourceDatalist() {
 // renderField returns {node, read, isPresent}
 function renderField(field, value, ctx) {
   const present = value !== undefined;
+  const topLevel = !!(ctx && ctx.topLevel);
   let inner;
   switch (field.type) {
     case 'string':
@@ -1351,7 +1417,11 @@ function renderField(field, value, ctx) {
   fieldBox.id = 'field-' + slug(field.key);
   const labelChildren = [];
   let presentBox = null;
-  if (!field.required) {
+  // Top-level Settings fields always have a real Pydantic default and the
+  // config endpoint returns their effective value. A second "include field"
+  // checkbox there is both meaningless and easy to mistake for a boolean
+  // value. Nested optional fields retain it because omission can mean inherit.
+  if (!field.required && !topLevel) {
     presentBox = el('input', {type: 'checkbox'});
     presentBox.checked = present;
     presentBox.title = '勾选以包含此字段；取消则使用默认值';
@@ -1384,7 +1454,7 @@ function renderField(field, value, ctx) {
 
   return {
     node: fieldBox,
-    isPresent: () => field.required || (presentBox && presentBox.checked),
+    isPresent: () => !presentBox || presentBox.checked,
     read: () => inner.read(),
     get: inner.get ? (...a) => inner.get(...a) : undefined,
     set: inner.set ? (...a) => { setPresent(true); return inner.set(...a); } : undefined,
@@ -1508,7 +1578,7 @@ function renderForm(config) {
     // Track top renderers in this section so sub-nav builders can hook them.
     const sectionRenderers = [];
     for (const field of fields) {
-      const r = renderField(field, config[field.key]);
+      const r = renderField(field, config[field.key], {topLevel: true});
       topRenderers.push({field, r});
       sectionRenderers.push({field, r});
       section.append(r.node);

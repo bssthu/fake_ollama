@@ -5,7 +5,7 @@
 1. **正向**（Ollama 兼容入口 → 远端上游）：把 **Anthropic Messages API** 或 **OpenAI Chat Completions API** 兼容的上游（官方 / DeepSeek / Together / Groq / 自建网关 / claude-relay-service）伪装成一台本机 **Ollama** 服务，让只支持 Ollama 协议的客户端（GitHub Copilot 自定义 provider、IDE 插件、桌面 AI 软件）无缝调用 Claude / DeepSeek / GPT 等模型。
 2. **反向**（Anthropic / OpenAI 兼容入口 → 本机模型服务）：把本机的 **Ollama**、**llama.cpp server** 或 **ComfyUI workflow** 包装成 Anthropic / OpenAI 兼容 API（含 `POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/images/generations`、`POST /v1/images/edits`），让只支持远端 API 的客户端也能调用本地模型。
 
-附带一个零依赖的 Web 配置编辑器（`/admin`），不必再手改 JSON。
+附带一个零依赖的 Web 配置编辑器（`/admin`），以及可选的轻量模型调试页（`/playground`）。
 
 ## 架构概览
 
@@ -39,6 +39,7 @@
 - `access_tokens` 为空 = 该接口不需鉴权；非空 = 该接口的所有请求都必须带 `x-api-key` 或 `Authorization: Bearer`。
 - `exposed_models` 是该接口允许看到 / 请求的模型列表，元素是 `{model, target, alias?}` 三元组；不在白名单里的模型在该接口上 404。
 - admin 接口（`admin_host` / `admin_port`）只服务 `/admin/*`，**不会**出现在任何 `ollama_interfaces` / `api_interfaces` 上；同样，`/api/*` 与 `/v1/*` 也**不会**出现在 admin 端口。
+- Model Playground 默认关闭。启用后使用独立端口，按 `/v1/models` 返回的 capabilities/operations 调用聊天、视觉、图片生成/编辑与视频接口；支持粘贴、拖放和选择多张参考图。API key 仅保存在当前浏览器页面内存中。
 - 想让别的机器访问某个接口：把对应实例的 `host` 改成 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
 
 ## 特性一览
@@ -112,6 +113,11 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
   "dashboard_host": "127.0.0.1",
   "dashboard_port": 21432,
   // ... 见下
+
+  // 轻量模型调试页（修改监听设置后重启进程）
+  "playground_enabled": false,
+  "playground_host": "127.0.0.1",
+  "playground_port": 21431,
 
   // 共享设置
   "default_max_tokens": 4096,
@@ -509,10 +515,11 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `vision` | 聊天接口可接收图片输入，例如 `/api/chat` 的 `images` 或 OpenAI/Anthropic 多段图片消息。 |
 | `image_generation` | 图片生成模型，供 OpenAI 兼容 `POST /v1/images/generations` 使用。 |
 | `image_edit` | 图片编辑 / image-to-image 模型，供 OpenAI 兼容 `POST /v1/images/edits` 使用。 |
+| `video_generation` | 视频生成 / image-to-video 模型，供扩展接口 `POST /v1/videos/generations` 使用。 |
 
-聊天模型一般至少包含 `completion`；纯 ComfyUI 图片 workflow 可以不填 `completion`，只声明 `image_generation` / `image_edit`。
+聊天模型一般至少包含 `completion`；纯 ComfyUI 媒体 workflow 可以不填 `completion`，只声明 `image_generation` / `image_edit` / `video_generation`。`/v1/models` 除原始 `capabilities` 外还会返回结构化 `operations`，包含应调用的 endpoint、是否流式、是否接受/要求图片，以及 ComfyUI 媒体参数的默认值和限制，并返回 `estimated_vram_gb` 供调试界面展示；Playground 使用这些字段驱动界面。
 
-### Admin UI / Dashboard
+### Admin UI / Dashboard / Model Playground
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -530,6 +537,10 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `vram_low_free_threshold_mib` | float | `200.0` | 低水位阈值（MiB） |
 | `memory_low_free_reclaim_enabled` | bool | `true` | 检测系统内存低水位时主动回收（仅回收声明了 `estimated_memory_gb` 的模型） |
 | `memory_low_free_threshold_mib` | float | `2048.0` | 内存低水位阈值（MiB） |
+| `playground_enabled` | bool | `false` | 是否启用轻量流式模型调试页；页面不保存历史记录或会话 |
+| `playground_host` / `playground_port` | | `127.0.0.1` / `21431` | Playground 独立 listener；修改后需重启进程 |
+
+启用后打开 `http://127.0.0.1:21431/playground/`，输入某个 interface 的 `access_tokens`，即可加载该 interface 暴露的模型。页面会读取模型的 capabilities/operations，自动提供聊天、视觉输入、图片生成、图片编辑或视频生成模式；图片可粘贴、拖放或从文件选择。若 interface 不要求鉴权，API key 可以留空。
 
 ## 内部 backends 视图
 

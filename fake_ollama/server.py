@@ -23,6 +23,7 @@ from .comfyui_client import ComfyUIClient
 from .config import (
     FORWARDED_BY_HEADER,
     INSTANCE_ID,
+    ComfyUITarget,
     LlamaCppTarget,
     GenericOpenAITarget,
     Settings,
@@ -407,6 +408,11 @@ def _interface_for(request: Request):
     settings: Settings = request.app.state.settings
     local_port = _local_port(request)
     if local_port is not None:
+        if (
+            settings.playground_listener_enabled
+            and local_port == settings.playground_port
+        ):
+            return _playground_interface_for(request, settings)
         for it in settings.ollama_interfaces:
             if it.port == local_port:
                 return it
@@ -544,13 +550,99 @@ def _openai_model_list_entry(
     settings: Settings, iface: Any, public_id: str, created: int
 ) -> Dict[str, Any]:
     profile = _profile_for_public_id(settings, iface, public_id)
+    exposure = iface.exposure_for_public_id(public_id) if iface is not None else None
+    source = settings.source_by_name(exposure.target) if exposure is not None else None
+    capabilities = list(profile.capabilities)
+    capability_set = set(capabilities)
+    operations: List[Dict[str, Any]] = []
+    if capability_set.intersection({"completion", "tools", "vision"}):
+        operations.append(
+            {
+                "id": "chat",
+                "endpoint": "/v1/chat/completions",
+                "stream": True,
+                "accepts_images": "vision" in capability_set,
+                "tool_calling": "tools" in capability_set,
+            }
+        )
+    if "image_generation" in capability_set:
+        operations.append(
+            {
+                "id": "image_generation",
+                "endpoint": "/v1/images/generations",
+                "stream": False,
+                "accepts_images": False,
+            }
+        )
+    if "image_edit" in capability_set:
+        operations.append(
+            {
+                "id": "image_edit",
+                "endpoint": "/v1/images/edits",
+                "stream": False,
+                "accepts_images": True,
+                "requires_images": True,
+                "multiple_images": True,
+            }
+        )
+    if "video_generation" in capability_set:
+        operations.append(
+            {
+                "id": "video_generation",
+                "endpoint": "/v1/videos/generations",
+                "stream": False,
+                "accepts_images": True,
+                "requires_images": False,
+                "multiple_images": True,
+            }
+        )
+    if isinstance(source, ComfyUITarget):
+        common_defaults = {
+            "size": f"{source.default_width}x{source.default_height}",
+            "n": 1,
+            "steps": source.default_steps,
+            "cfg": source.default_cfg,
+            "seed": None,
+        }
+        common_limits = {
+            "max_batch_size": source.max_batch_size,
+            "max_reference_images": source.max_reference_images,
+        }
+        for operation in operations:
+            if operation["id"] not in {
+                "image_generation", "image_edit", "video_generation"
+            }:
+                continue
+            defaults = dict(common_defaults)
+            limits = dict(common_limits)
+            if operation["id"] == "image_edit":
+                defaults["denoise"] = source.default_edit_denoise
+            if operation["id"] == "video_generation":
+                defaults.update(
+                    {
+                        "num_frames": source.default_num_frames,
+                        "fps": source.default_frame_rate,
+                        "prefetch_count": source.default_prefetch_count,
+                    }
+                )
+                limits.update(
+                    {
+                        "max_num_frames": source.max_num_frames,
+                        "num_frames_offset": source.num_frames_offset,
+                        "num_frames_modulo": source.num_frames_modulo,
+                    }
+                )
+            operation["defaults"] = defaults
+            operation["limits"] = limits
     return {
         "id": public_id,
         "object": "model",
         "created": created,
         "owned_by": "fake-ollama",
         "context_length": profile.context_length,
-        "capabilities": list(profile.capabilities),
+        "estimated_vram_gb": profile.estimated_vram_gb,
+        "capabilities": capabilities,
+        "operations": operations,
     }
 
 
@@ -677,10 +769,34 @@ def _bearer_or_api_key(request: Request) -> str:
     return ""
 
 
+def _playground_interface_for(request: Request, settings: Settings):
+    """Pick the model interface represented by a playground request.
+
+    A matching token wins, which lets one playground port work with multiple
+    configured API interfaces.  Without a token, prefer the first open API
+    interface, then an open Ollama interface.  Falling back to the first
+    configured interface preserves its normal 401 response for invalid keys.
+    """
+    candidates = [*settings.api_interfaces, *settings.ollama_interfaces]
+    if not candidates:
+        return None
+    token = _bearer_or_api_key(request)
+    if token:
+        for iface in candidates:
+            if iface.auth_required and iface.is_valid_token(token):
+                return iface
+    for iface in candidates:
+        if not iface.auth_required:
+            return iface
+    return candidates[0]
+
+
 # Path prefixes that are only served by the admin listener when admin_port is set.
 _ADMIN_ONLY_PATH_PREFIXES = ("/admin",)
 # Path prefixes that are only served by the dashboard listener.
 _DASHBOARD_ONLY_PATH_PREFIXES = ("/dashboard",)
+# Path prefixes that are only served by the model playground listener.
+_PLAYGROUND_ONLY_PATH_PREFIXES = ("/playground",)
 # Paths only served on api_interfaces (Anthropic + OpenAI public API).
 _API_ONLY_PATH_PREFIXES = (
     "/v1/messages",
@@ -710,6 +826,8 @@ def _listener_name(request: Request) -> str:
         return "admin"
     if settings.dashboard_listener_enabled and local_port == settings.dashboard_port:
         return "dashboard"
+    if settings.playground_listener_enabled and local_port == settings.playground_port:
+        return "playground"
     iface = _interface_for(request)
     if iface is not None:
         from .config import OllamaInterface
@@ -726,6 +844,8 @@ def _request_surface(path: str) -> str:
         return "admin"
     if _has_path_prefix(path, _DASHBOARD_ONLY_PATH_PREFIXES):
         return "dashboard"
+    if _has_path_prefix(path, _PLAYGROUND_ONLY_PATH_PREFIXES):
+        return "playground"
     if path == "/v1/messages/count_tokens" or path.startswith("/v1/messages/count_tokens/"):
         return "anthropic-count-tokens"
     if _has_path_prefix(path, _API_ONLY_PATH_PREFIXES):
@@ -802,6 +922,8 @@ def _install_port_router(app: FastAPI) -> None:
 
     * admin port → only ``/admin/*``
     * dashboard port → only ``/dashboard/*`` (``/`` redirects to ``/dashboard/``)
+    * playground port → ``/playground/*``, model discovery, chat, image and
+      video generation surfaces used by the capability-aware debugger
     * ``ollama_interfaces[*].port`` → ``/`` plus ``/api/*`` plus ``/v1/chat/completions``
     * ``api_interfaces[*].port`` → ``/v1/messages*``, ``/v1/models``, ``/v1/images*``,
       ``/v1/videos*``, ``/v1/chat/completions``
@@ -825,7 +947,7 @@ def _install_port_router(app: FastAPI) -> None:
             # ~10s and admin is config traffic. Counting them buries real
             # model requests and (on a freshly-restarted process) makes the
             # Stats panel look like it only contains dashboard hits.
-            if ctx["surface"] not in ("dashboard", "admin"):
+            if ctx["surface"] not in ("dashboard", "admin", "playground"):
                 rid = metrics.begin(
                     listener=ctx["listener"],
                     port=ctx["port"],
@@ -864,6 +986,10 @@ def _install_port_router(app: FastAPI) -> None:
                 settings.dashboard_listener_enabled
                 and local_port == settings.dashboard_port
             )
+            is_playground = (
+                settings.playground_listener_enabled
+                and local_port == settings.playground_port
+            )
             ollama_iface = next(
                 (it for it in settings.ollama_interfaces if it.port == local_port),
                 None,
@@ -874,6 +1000,7 @@ def _install_port_router(app: FastAPI) -> None:
             )
             admin_only = _has_path_prefix(path, _ADMIN_ONLY_PATH_PREFIXES)
             dashboard_only = _has_path_prefix(path, _DASHBOARD_ONLY_PATH_PREFIXES)
+            playground_only = _has_path_prefix(path, _PLAYGROUND_ONLY_PATH_PREFIXES)
             api_only = _has_path_prefix(path, _API_ONLY_PATH_PREFIXES)
             shared_v1 = _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES)
             ollama_only = _has_path_prefix(path, _OLLAMA_ONLY_PATH_PREFIXES)
@@ -887,6 +1014,7 @@ def _install_port_router(app: FastAPI) -> None:
             if (
                 not is_admin
                 and not is_dashboard
+                and not is_playground
                 and ollama_iface is None
                 and api_iface is None
             ):
@@ -911,8 +1039,26 @@ def _install_port_router(app: FastAPI) -> None:
                     return _finish(JSONResponse({"detail": "not found"}, status_code=404))
                 return _finish(await call_next(request))
 
-            # Admin/dashboard paths can only be served on their own listeners.
-            if admin_only or dashboard_only:
+            # Playground listener: its static page plus model discovery, chat,
+            # image and video endpoints.  It deliberately exposes no other API
+            # surface.
+            if is_playground:
+                if path == "/":
+                    return _finish(RedirectResponse("/playground/"))
+                playground_media = _has_path_prefix(
+                    path, ("/v1/images", "/v1/videos")
+                )
+                if (
+                    playground_only
+                    or path == "/v1/models"
+                    or shared_v1
+                    or playground_media
+                ):
+                    return _finish(await call_next(request))
+                return _finish(JSONResponse({"detail": "not found"}, status_code=404))
+
+            # Management paths can only be served on their own listeners.
+            if admin_only or dashboard_only or playground_only:
                 return _finish(JSONResponse({"detail": "not found"}, status_code=404))
 
             # Ollama interface: /, /api/*, shared /v1.
@@ -1145,6 +1291,8 @@ def _register_routes(app: FastAPI) -> None:
     _admin.register_admin_routes(app)
     from . import dashboard as _dashboard
     _dashboard.register_dashboard_routes(app)
+    from . import playground as _playground
+    _playground.register_playground_routes(app)
 
 
 def _read_error_text(exc: httpx.HTTPError) -> str:

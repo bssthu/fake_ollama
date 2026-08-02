@@ -542,6 +542,12 @@ def test_openai_models_list(settings):
     assert body["object"] == "list"
     ids = [m["id"] for m in body["data"]]
     assert "claude-3-5-sonnet-20241022@default" in ids
+    model = next(
+        item for item in body["data"]
+        if item["id"] == "claude-3-5-sonnet-20241022@default"
+    )
+    assert model["operations"][0]["id"] == "chat"
+    assert model["operations"][0]["accepts_images"] is True
 
 
 def test_openai_chat_streams_tool_calls(settings):

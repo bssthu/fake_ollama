@@ -31,7 +31,7 @@ build-backend = "setuptools.build_meta"
 include = ["fake_ollama*"]
 
 [tool.setuptools.package-data]
-fake_ollama = ["workflows/*.json"]
+fake_ollama = ["workflows/*.json", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

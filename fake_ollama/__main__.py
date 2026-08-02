@@ -112,6 +112,8 @@ def main() -> None:
     parser.add_argument("--admin-port", type=int, default=None, help="admin bind port (default from config)")
     parser.add_argument("--dashboard-host", default=None, help="dashboard bind host (default from config)")
     parser.add_argument("--dashboard-port", type=int, default=None, help="dashboard bind port (default from config)")
+    parser.add_argument("--playground-host", default=None, help="model playground bind host (default from config)")
+    parser.add_argument("--playground-port", type=int, default=None, help="model playground bind port (default from config)")
     parser.add_argument("--log-level", default="info")
     parser.add_argument(
         "--log-file",
@@ -168,6 +170,11 @@ def main() -> None:
         updates["dashboard_host"] = args.dashboard_host
     if args.dashboard_port is not None:
         updates["dashboard_port"] = args.dashboard_port
+    if args.playground_host is not None:
+        updates["playground_host"] = args.playground_host
+    if args.playground_port is not None:
+        updates["playground_port"] = args.playground_port
+        updates["playground_enabled"] = True
     if updates:
         data = settings.model_dump()
         data.update(updates)
@@ -196,6 +203,8 @@ def main() -> None:
         _add("admin", settings.admin_host, int(settings.admin_port))  # type: ignore[arg-type]
     if settings.dashboard_listener_enabled:
         _add("dashboard", settings.dashboard_host, int(settings.dashboard_port))  # type: ignore[arg-type]
+    if settings.playground_listener_enabled:
+        _add("playground", settings.playground_host, int(settings.playground_port))  # type: ignore[arg-type]
 
     if not configs:
         raise SystemExit(

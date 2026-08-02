@@ -1431,6 +1431,13 @@ class Settings(BaseModel):
     memory_low_free_reclaim_enabled: bool = True
     memory_low_free_threshold_mib: float = 2048.0
 
+    # -- Model playground listener --------------------------------------
+    # Disabled by default so upgrading does not unexpectedly expose a new
+    # socket.  The admin UI can enable it and choose a dedicated port.
+    playground_enabled: bool = False
+    playground_host: str = "127.0.0.1"
+    playground_port: Optional[int] = 21431
+
     # -- Meta ------------------------------------------------------------
     config_path: str = ""
 
@@ -1585,6 +1592,13 @@ class Settings(BaseModel):
                     f"{port_owners[self.dashboard_port]}"
                 )
             port_owners[self.dashboard_port] = "dashboard"
+        if self.playground_enabled and self.playground_port is not None:
+            if self.playground_port in port_owners:
+                raise ValueError(
+                    f"playground_port={self.playground_port} conflicts with "
+                    f"{port_owners[self.playground_port]}"
+                )
+            port_owners[self.playground_port] = "playground"
 
         # 4. Duplicate base_url within llama_cpp_targets — each llama.cpp
         # server process must listen on a distinct address.
@@ -1677,6 +1691,8 @@ class Settings(BaseModel):
             endpoints.append((self.admin_host, self.admin_port))
         if self.dashboard_enabled and self.dashboard_port is not None:
             endpoints.append((self.dashboard_host, self.dashboard_port))
+        if self.playground_enabled and self.playground_port is not None:
+            endpoints.append((self.playground_host, self.playground_port))
         return endpoints
 
     def detect_upstream_cycles(self) -> None:
@@ -1722,7 +1738,7 @@ class Settings(BaseModel):
                 if it.host in loopback_hosts:
                     hosts |= loopback_hosts
             iface_by_port[it.port] = it
-        # Admin / dashboard ports count as "own" listeners but never
+        # Admin / dashboard / playground ports count as "own" listeners but never
         # accept model traffic — anyone pointing an upstream at them
         # is an outright misconfiguration.
         misroute_ports: set[int] = set()
@@ -1782,7 +1798,7 @@ class Settings(BaseModel):
                 if inner is _MISROUTED_LISTENER:
                     raise ValueError(
                         f"cycle detected: source {src.name!r} base_url={base_url!r} "
-                        f"points at this fake_ollama process's admin/dashboard "
+                        f"points at this fake_ollama process's admin/dashboard/playground "
                         f"listener, which does not serve model traffic. Remove the "
                         f"upstream or fix the URL."
                     )
@@ -1949,6 +1965,10 @@ class Settings(BaseModel):
     @property
     def dashboard_listener_enabled(self) -> bool:
         return self.dashboard_enabled and self.dashboard_port is not None
+
+    @property
+    def playground_listener_enabled(self) -> bool:
+        return self.playground_enabled and self.playground_port is not None
 
 
 # ---------------------------------------------------------------------------

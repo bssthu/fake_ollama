@@ -9,7 +9,22 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from fake_ollama.config import Settings, load_settings
+from fake_ollama import admin as admin_module
+from fake_ollama.config import (
+    ApiInterface,
+    AnthropicUpstream,
+    ComfyUITarget,
+    ExposureEntry,
+    GenericOpenAITarget,
+    LlamaCppDefaults,
+    LlamaCppTarget,
+    ModelEntry,
+    OllamaInterface,
+    OllamaTarget,
+    OpenAIUpstream,
+    Settings,
+    load_settings,
+)
 from fake_ollama.server import create_app
 
 
@@ -69,6 +84,10 @@ def test_admin_index_html(admin_settings):
     assert ".content { min-width: 0; }" in resp.text
     assert "overflow-x: hidden; overflow-y: auto" in resp.text
     assert "white-space: pre-wrap; overflow-wrap: anywhere" in resp.text
+    # Top-level settings must show only their actual control. In particular,
+    # booleans must not get a second, misleading "include field" checkbox.
+    assert "if (!field.required && !topLevel)" in resp.text
+    assert "renderField(field, config[field.key], {topLevel: true})" in resp.text
 
 
 def test_admin_index_no_trailing_slash(admin_settings):
@@ -110,6 +129,9 @@ def test_admin_schema(admin_settings):
         "dashboard_port",
         "dashboard_data_path",
         "dashboard_model_reclaim_enabled",
+        "playground_enabled",
+        "playground_host",
+        "playground_port",
     } <= keys
 
     # All removed legacy keys must be absent.
@@ -255,6 +277,7 @@ def test_admin_schema(admin_settings):
         "interface_api",
         "runtime",
         "dashboard",
+        "playground",
         "admin",
     ]
     section_order: list[str] = []
@@ -266,11 +289,57 @@ def test_admin_schema(admin_settings):
         "interfaces",
         "runtime",
         "dashboard",
+        "playground",
         "admin",
     ]
     group_keys = set(group_order)
     for f in fields:
         assert f["group"] in group_keys
+
+
+def test_admin_top_level_defaults_match_settings_model():
+    """The config model is the only source of truth for UI defaults."""
+    actual = Settings().model_dump()
+    schema_by_key = {field["key"]: field for field in admin_module.CONFIG_SCHEMA}
+
+    assert set(schema_by_key) == set(actual) - {"config_path"}
+    for key, field in schema_by_key.items():
+        assert field["default"] == actual[key], key
+
+    assert schema_by_key["playground_enabled"]["default"] is False
+
+
+def test_admin_nested_defaults_match_config_models():
+    pairs = (
+        (admin_module.MODEL_ENTRY_ITEM_SCHEMA, ModelEntry),
+        (admin_module.UPSTREAM_ITEM_SCHEMA, AnthropicUpstream),
+        (admin_module.OPENAI_UPSTREAM_ITEM_SCHEMA, OpenAIUpstream),
+        (admin_module.LOCAL_OPENAI_TARGET_ITEM_SCHEMA, GenericOpenAITarget),
+        (admin_module.OLLAMA_TARGET_ITEM_SCHEMA, OllamaTarget),
+        (admin_module.LLAMA_CPP_TARGET_ITEM_SCHEMA, LlamaCppTarget),
+        (admin_module.LLAMA_CPP_DEFAULTS_SCHEMA, LlamaCppDefaults),
+        (admin_module.COMFYUI_TARGET_ITEM_SCHEMA, ComfyUITarget),
+        (admin_module.EXPOSURE_ITEM_SCHEMA, ExposureEntry),
+        (admin_module.OLLAMA_INTERFACE_ITEM_SCHEMA, OllamaInterface),
+        (admin_module.API_INTERFACE_ITEM_SCHEMA, ApiInterface),
+    )
+    for schema, model_type in pairs:
+        for spec in schema:
+            model_field = model_type.model_fields.get(spec["key"])
+            if model_field is None or model_field.is_required():
+                continue
+            assert spec["default"] == model_field.get_default(
+                call_default_factory=True
+            ), f"{model_type.__name__}.{spec['key']}"
+
+    ollama_port = next(
+        f for f in admin_module.OLLAMA_INTERFACE_ITEM_SCHEMA if f["key"] == "port"
+    )
+    api_port = next(
+        f for f in admin_module.API_INTERFACE_ITEM_SCHEMA if f["key"] == "port"
+    )
+    assert ollama_port["default"] == 21434
+    assert api_port["default"] == 21435
 
 
 # ---------------------------------------------------------------------------

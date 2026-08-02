@@ -22,6 +22,10 @@
   "vram_low_free_reclaim_enabled": true,
   "vram_low_free_threshold_mib": 200.0,
 
+  "playground_enabled": false,
+  "playground_host": "127.0.0.1",
+  "playground_port": 21431,
+
   "_model_sources_remote": "==== Remote model sources ==============================",
 
   "anthropic_upstreams": [
@@ -193,7 +197,7 @@
     }
   ],
 
-  "_profiles": "==== Model profiles ==================================== 数组项格式为 {model, target?, ...}，与 exposed_models 对应。只写 model 表示匹配所有 target；同时写 model + target 只覆盖该组合。查找优先级：model@target > bare model > tagless base。capabilities 是对外功能发现标签：completion 文本/聊天补全，tools tool calling，vision 聊天接口可接收图片输入，image_generation /v1/images/generations 图片生成，image_edit /v1/images/edits image-to-image / edit。",
+  "_profiles": "==== Model profiles ==================================== 数组项格式为 {model, target?, ...}，与 exposed_models 对应。只写 model 表示匹配所有 target；同时写 model + target 只覆盖该组合。查找优先级：model@target > bare model > tagless base。capabilities 是对外功能发现标签：completion 文本/聊天补全，tools tool calling，vision 聊天接口可接收图片输入，image_generation /v1/images/generations 图片生成，image_edit /v1/images/edits image-to-image / edit，video_generation /v1/videos/generations 视频或图生视频。",
 
   "model_profiles": [
     {

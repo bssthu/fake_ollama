@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Model Playground · fake-ollama</title>
+  <link rel="stylesheet" href="/playground/playground.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark">&gt;_</div>
+        <div>
+          <h1>Model Playground</h1>
+          <p>fake-ollama · 轻量、多能力、即时调试</p>
+        </div>
+      </div>
+      <div class="privacy">API key 仅保存在当前页面内存</div>
+    </header>
+
+    <main class="workspace">
+      <aside class="settings card">
+        <div class="section-title">
+          <h2>连接与模型</h2>
+          <span id="connectionStatus" class="status-dot">未连接</span>
+        </div>
+
+        <div class="field">
+          <label for="apiKey">API key</label>
+          <div class="secret-wrap">
+            <input id="apiKey" class="control" type="password"
+                   autocomplete="new-password" spellcheck="false"
+                   placeholder="输入接口 access token">
+            <button id="toggleKey" class="icon-button" type="button"
+                    aria-label="显示 API key" title="显示或隐藏">◉</button>
+          </div>
+          <div class="help">不会写入 localStorage、Cookie 或服务端配置。</div>
+        </div>
+
+        <div class="field">
+          <label for="model">模型</label>
+          <select id="model" disabled>
+            <option value="">先加载模型列表</option>
+          </select>
+          <div id="capabilityList" class="capability-list" aria-label="模型能力"></div>
+        </div>
+
+        <button id="loadModels" class="secondary" type="button">连接并加载模型</button>
+
+        <div class="field">
+          <label for="operation">调试能力</label>
+          <select id="operation" disabled>
+            <option value="">选择模型后自动识别</option>
+          </select>
+          <div id="operationHint" class="help">能力由 /v1/models 返回，不按模型名称猜测。</div>
+        </div>
+
+        <section id="uploadSection" class="upload-section" hidden>
+          <div class="label-row">
+            <span class="label">参考图片</span>
+            <span id="uploadRequirement" class="help"></span>
+          </div>
+          <input id="fileInput" type="file" accept="image/*" multiple hidden>
+          <button id="dropZone" class="drop-zone" type="button">
+            <span class="drop-icon">＋</span>
+            <strong>粘贴、拖放或选择图片</strong>
+            <small>支持多张参考图；点击这里选择文件</small>
+          </button>
+          <div id="attachmentList" class="attachment-list"></div>
+        </section>
+
+        <details class="advanced">
+          <summary>请求参数</summary>
+          <div class="advanced-body">
+            <div id="chatParams">
+              <div class="field">
+                <label for="systemPrompt">System prompt（可选）</label>
+                <textarea id="systemPrompt" rows="4"
+                          placeholder="例如：请用简洁的中文回答。"></textarea>
+              </div>
+              <div class="row parameter-row">
+                <div class="field">
+                  <label for="temperature">Temperature</label>
+                  <input id="temperature" class="control" type="number"
+                         min="0" max="2" step="0.1" value="0.7">
+                </div>
+                <div class="field">
+                  <label for="maxTokens">Max tokens</label>
+                  <input id="maxTokens" class="control" type="number"
+                         min="1" step="1" value="2048">
+                </div>
+              </div>
+            </div>
+
+            <div id="mediaParams" hidden>
+              <div class="row parameter-row">
+                <div class="field">
+                  <label for="mediaSize">尺寸</label>
+                  <input id="mediaSize" class="control" type="text"
+                         placeholder="使用模型默认值">
+                </div>
+                <div class="field">
+                  <label for="mediaCount">数量</label>
+                  <input id="mediaCount" class="control" type="number"
+                         min="1" step="1" value="1">
+                </div>
+              </div>
+              <div class="row parameter-row">
+                <div class="field">
+                  <label for="mediaSeed">Seed（留空随机）</label>
+                  <input id="mediaSeed" class="control" type="number"
+                         min="0" step="1" placeholder="random">
+                </div>
+                <div class="field">
+                  <label for="mediaSteps">Steps（留空用模型默认）</label>
+                  <input id="mediaSteps" class="control" type="number"
+                         min="1" step="1" placeholder="default">
+                </div>
+              </div>
+              <div class="row parameter-row">
+                <div class="field">
+                  <label for="mediaCfg">CFG（可选）</label>
+                  <input id="mediaCfg" class="control" type="number"
+                         min="0" step="0.1" placeholder="default">
+                </div>
+                <div id="denoiseField" class="field" hidden>
+                  <label for="mediaDenoise">Denoise（可选）</label>
+                  <input id="mediaDenoise" class="control" type="number"
+                         min="0" max="1" step="0.05" placeholder="default">
+                </div>
+              </div>
+            </div>
+
+            <div id="videoParams" hidden>
+              <div class="row parameter-row">
+                <div class="field">
+                  <label for="videoFrames">帧数</label>
+                  <input id="videoFrames" class="control" type="number"
+                         min="1" step="1" placeholder="使用模型默认值">
+                </div>
+                <div class="field">
+                  <label for="videoFps">FPS</label>
+                  <input id="videoFps" class="control" type="number"
+                         min="1" step="1" placeholder="使用模型默认值">
+                </div>
+              </div>
+              <div class="field">
+                <label for="videoPrefetch">Prefetch count</label>
+                <input id="videoPrefetch" class="control" type="number"
+                       min="0" step="1" placeholder="使用模型默认值">
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <div class="divider"></div>
+        <div class="help">能力标签未知时会原样显示，但不会错误地调用聊天接口。</div>
+      </aside>
+
+      <section class="result card">
+        <div class="result-head">
+          <div class="result-title">
+            <h2 id="resultTitle">输出</h2>
+            <span id="modelChip" class="model-chip">未选择模型</span>
+            <span id="modelVram" class="resource-chip" hidden></span>
+          </div>
+          <div class="metrics">
+            <span id="ttftMetric" class="metric">首字 —</span>
+            <span id="timeMetric" class="metric">耗时 —</span>
+          </div>
+        </div>
+
+        <div id="answerWrap" class="answer-wrap" aria-live="polite">
+          <div id="emptyState" class="empty">
+            <div>
+              <div class="empty-symbol">✦</div>
+              <strong>选择模型，能力会自动识别</strong>
+              <span>聊天、视觉、图片生成/编辑和视频使用各自对应的接口。</span>
+            </div>
+          </div>
+          <div id="errorBox" class="error-box" role="alert"></div>
+          <details id="reasoning" class="reasoning">
+            <summary>模型思考过程</summary>
+            <pre id="reasoningText"></pre>
+          </details>
+          <div id="answer" class="answer">
+            <div class="answer-label">Assistant</div>
+            <pre id="answerText"></pre>
+          </div>
+          <div id="mediaGallery" class="media-gallery"></div>
+        </div>
+
+        <div class="composer">
+          <div class="composer-box">
+            <textarea id="prompt" placeholder="输入要发送给模型的内容…"
+                      aria-label="提示词"></textarea>
+            <div class="composer-actions">
+              <span class="shortcut">Ctrl / ⌘ + Enter 执行 · 可直接粘贴图片</span>
+              <div class="actions">
+                <button id="clear" class="secondary" type="button">清空</button>
+                <button id="stop" class="stop" type="button" hidden>停止</button>
+                <button id="send" class="primary" type="button" disabled>执行 →</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/playground/playground.js" defer></script>
+</body>
+</html>
