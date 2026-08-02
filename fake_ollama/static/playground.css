@@ -234,7 +234,18 @@ button:disabled { cursor: not-allowed; opacity: 0.48; transform: none !important
   border-radius: 9px;
   background: #eee;
 }
-.attachment img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.attachment img,
+.attachment video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.attachment .attachment-file {
+  align-items: center;
+  display: flex;
+  font-size: 11px;
+  height: 100%;
+  justify-content: center;
+  overflow-wrap: anywhere;
+  padding: 8px;
+  text-align: center;
+}
 .attachment button {
   position: absolute;
   top: 3px;
@@ -424,7 +435,8 @@ details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px
   font: 14px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 .message-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-.message-images img {
+.message-images img,
+.message-images video {
   width: 92px;
   height: 92px;
   object-fit: cover;

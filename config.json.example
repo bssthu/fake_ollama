@@ -81,6 +81,28 @@
     }
   ],
 
+  "_model_sources_generic_openai": "==== Lifecycle-managed OpenAI-compatible sources ====== Mage-VL 示例使用本仓库的 Windows 原生视频分析适配器。先运行 scripts\\install_mage_vl.ps1；服务按首个请求自动启动并在空闲后优雅退出。",
+
+  "generic_openai_targets": [
+    {
+      "name": "mage-vl-local-adapter",
+      "base_url": "http://127.0.0.1:8071",
+      "auth_token": "",
+      "models": [
+        {"name": "mage-vl-local"}
+      ],
+      "auto_start": true,
+      "start_command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"I:\\Projects\\fake_ollama\\scripts\\start_mage_vl.ps1\"",
+      "stop_command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"I:\\Projects\\fake_ollama\\scripts\\stop_mage_vl.ps1\"",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 120,
+      "health_path": "/health",
+      "cwd": "I:\\Projects\\fake_ollama",
+      "max_concurrent_requests": 1,
+      "request_read_timeout_seconds": 0
+    }
+  ],
+
   "_model_sources_llama_cpp": "==== llama.cpp sources =================================",
 
   "llama_cpp_defaults": {
@@ -231,7 +253,7 @@
     }
   ],
 
-  "_profiles": "==== Model profiles ==================================== 数组项格式为 {model, target?, ...}，与 exposed_models 对应。只写 model 表示匹配所有 target；同时写 model + target 只覆盖该组合。查找优先级：model@target > bare model > tagless base。capabilities 是对外功能发现标签：completion 文本/聊天补全，tools tool calling，vision 聊天接口可接收图片输入，image_generation /v1/images/generations 图片生成，image_edit /v1/images/edits image-to-image / edit，video_generation /v1/videos/generations 视频或图生视频。",
+  "_profiles": "==== Model profiles ==================================== 数组项格式为 {model, target?, ...}，与 exposed_models 对应。只写 model 表示匹配所有 target；同时写 model + target 只覆盖该组合。查找优先级：model@target > bare model > tagless base。capabilities 是对外功能发现标签：completion 文本/聊天补全，tools tool calling，vision 聊天接口可接收图片输入，video_understanding /v1/chat/completions 接收本地视频分析，image_generation /v1/images/generations 图片生成，image_edit /v1/images/edits image-to-image / edit，video_generation /v1/videos/generations 视频或图生视频。",
 
   "model_profiles": [
     {
@@ -252,6 +274,17 @@
       "thinking_mode": "enabled",
       "thinking_budget_tokens": 4096,
       "show_thinking": true
+    },
+    {
+      "model": "mage-vl-local",
+      "target": "mage-vl-local-adapter",
+      "capabilities": ["video_understanding"],
+      "context_length": 32768,
+      "max_output_tokens": 512,
+      "estimated_vram_gb": 18,
+      "estimated_memory_gb": 16,
+      "thinking_mode": "disabled",
+      "show_thinking": false
     },
     {
       "model": "deepseek-reasoner",
@@ -350,7 +383,8 @@
         {"model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo"},
         {"model": "qwen-image", "target": "qwen-image-comfyui", "alias": "qwen-image"},
         {"model": "sensenova", "target": "sensenova-comfyui", "alias": "sensenova-z-image"},
-        {"model": "joyai-echo", "target": "joyai-echo-comfyui", "alias": "joyai-echo"}
+        {"model": "joyai-echo", "target": "joyai-echo-comfyui", "alias": "joyai-echo"},
+        {"model": "mage-vl-local", "target": "mage-vl-local-adapter", "alias": "mage-vl-local"}
       ]
     }
   ]

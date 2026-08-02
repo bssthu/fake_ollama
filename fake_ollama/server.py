@@ -671,6 +671,61 @@ def _playground_model_entry(
                 "multiple_images": True,
             }
         )
+    if "video_understanding" in capability_set:
+        operations.append(
+            {
+                "id": "video_analysis",
+                "endpoint": "/v1/chat/completions",
+                "stream": True,
+                "history_mode": "single_turn",
+                "accepts_videos": True,
+                "requires_videos": True,
+                "multiple_videos": False,
+                "limits": {
+                    "max_videos": 1,
+                    "max_video_bytes": 64 * 1024 * 1024,
+                },
+                "parameters": [
+                    {
+                        "name": "segment_seconds",
+                        "label": "时间窗口（秒）",
+                        "type": "number",
+                        "default": 8,
+                        "min": 2,
+                        "max": 60,
+                        "step": 1,
+                        "description": "逐段分析的视频窗口长度。",
+                    },
+                    {
+                        "name": "frames_per_segment",
+                        "label": "每段抽帧数",
+                        "type": "integer",
+                        "default": 8,
+                        "min": 2,
+                        "max": 32,
+                        "step": 1,
+                        "description": "FFmpeg 在每个时间窗口内均匀抽取的帧数。",
+                    },
+                    {
+                        "name": "max_segments",
+                        "label": "最多分析段数",
+                        "type": "integer",
+                        "default": 12,
+                        "min": 1,
+                        "max": 120,
+                        "step": 1,
+                        "description": "长视频超过上限时沿完整时间轴均匀选段；增加段数只增加串行耗时。",
+                    },
+                    {
+                        "name": "include_summary",
+                        "label": "生成整体总结",
+                        "type": "boolean",
+                        "default": False,
+                        "description": "逐段分析后再调用一次模型汇总，耗时会增加。",
+                    },
+                ],
+            }
+        )
     if isinstance(source, ComfyUITarget):
         for operation in operations:
             if operation["id"] not in {

@@ -73,6 +73,9 @@ def test_playground_static_page_and_security_headers():
     assert "clipboardData" in js.text
     assert "image_generation" in js.text
     assert "video_generation" in js.text
+    assert "video_understanding" in js.text
+    assert "video_analysis" in js.text
+    assert "video_url" in js.text
     assert "new FormData()" in js.text
     assert "stream: true" in js.text
     assert "estimated_vram_gb" in js.text
@@ -116,7 +119,7 @@ def test_playground_static_page_and_security_headers():
         "clearComposerInput();"
     )
     assert request_source.index("clearComposerInput();") < request_source.index(
-        "if (op.id === 'chat') await runChat(op, plan);"
+        "if (operationUsesChatEndpoint(op)) await runChat(op, plan);"
     )
     assert "showRequestError" in js.text
     assert response.headers["cache-control"] == "no-store"
@@ -187,6 +190,47 @@ def test_playground_route_is_not_available_on_other_ports():
         assert api_client.get(
             "/playground/api/models", headers={"x-api-key": "key-a"}
         ).status_code == 404
+
+
+def test_video_understanding_has_single_turn_upload_operation():
+    settings = _settings()
+    settings = settings.model_copy(
+        update={
+            "model_profiles": {
+                "model-a@remote": {
+                    "capabilities": ["video_understanding"],
+                    "context_length": 32768,
+                    "max_output_tokens": 512,
+                }
+            }
+        }
+    )
+    app = create_app(settings)
+    with TestClient(app, base_url="http://testserver:21431") as client:
+        response = client.get(
+            "/playground/api/models", headers={"Authorization": "Bearer key-a"}
+        )
+
+    assert response.status_code == 200
+    alpha = response.json()["models"][0]
+    assert alpha["capabilities"] == ["video_understanding"]
+    operation = alpha["operations"][0]
+    assert operation["id"] == "video_analysis"
+    assert operation["endpoint"] == "/v1/chat/completions"
+    assert operation["stream"] is True
+    assert operation["history_mode"] == "single_turn"
+    assert operation["accepts_videos"] is True
+    assert operation["requires_videos"] is True
+    assert operation["limits"]["max_videos"] == 1
+    assert next(
+        item for item in operation["parameters"] if item["name"] == "max_segments"
+    )["max"] == 120
+    assert {item["name"] for item in operation["parameters"]} == {
+        "segment_seconds",
+        "frames_per_segment",
+        "max_segments",
+        "include_summary",
+    }
 
 
 def test_disabled_playground_does_not_register_static_route():

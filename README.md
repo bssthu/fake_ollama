@@ -39,7 +39,7 @@
 - `access_tokens` 为空 = 该接口不需鉴权；非空 = 该接口的所有请求都必须带 `x-api-key` 或 `Authorization: Bearer`。
 - `exposed_models` 是该接口允许看到 / 请求的模型列表，元素是 `{model, target, alias?}` 三元组；不在白名单里的模型在该接口上 404。
 - admin 接口（`admin_host` / `admin_port`）只服务 `/admin/*`，**不会**出现在任何 `ollama_interfaces` / `api_interfaces` 上；同样，`/api/*` 与 `/v1/*` 也**不会**出现在 admin 端口。
-- Model Playground 默认关闭。启用后使用独立端口，按 `/playground/api/models` 返回的 capabilities/operations 调用聊天、视觉、图片生成/编辑与视频接口；支持粘贴、拖放和选择多张参考图。API key 与交互记录仅保存在当前浏览器页面内存中。
+- Model Playground 默认关闭。启用后使用独立端口，按 `/playground/api/models` 返回的 capabilities/operations 调用聊天、视觉、视频分析、图片生成/编辑与视频生成接口；支持图片粘贴/拖放和本地视频选择。API key 与交互记录仅保存在当前浏览器页面内存中。
 - 想让别的机器访问某个接口：把对应实例的 `host` 改成 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
 
 ## 特性一览
@@ -571,11 +571,12 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `completion` | 文本补全 / 聊天模型。Ollama、llama.cpp、Anthropic/OpenAI chat 模型通常需要它。 |
 | `tools` | 工具调用 / function calling。仅在底层模型或上游确实能处理工具调用时声明。 |
 | `vision` | 聊天接口可接收图片输入，例如 `/api/chat` 的 `images` 或 OpenAI/Anthropic 多段图片消息。 |
+| `video_understanding` | OpenAI 兼容聊天接口可接收视频输入，Playground 将其显示为单轮“视频分析”。 |
 | `image_generation` | 图片生成模型，供 OpenAI 兼容 `POST /v1/images/generations` 使用。 |
 | `image_edit` | 图片编辑 / image-to-image 模型，供 OpenAI 兼容 `POST /v1/images/edits` 使用。 |
 | `video_generation` | 视频生成 / image-to-video 模型，供扩展接口 `POST /v1/videos/generations` 使用。 |
 
-聊天模型一般至少包含 `completion`；纯 ComfyUI 媒体 workflow 可以不填 `completion`，只声明 `image_generation` / `image_edit` / `video_generation`。`/playground/api/models` 会返回原始 `capabilities` 和结构化 `operations`，包含 endpoint、是否流式、`history_mode`、图片输入约束、实际绑定的参数 schema、默认值/范围及推荐 preset，并返回 `estimated_vram_gb` / `estimated_memory_gb` 供调试界面展示；Playground 完全由这些字段驱动。标准 `/v1/models` 根据 `anthropic-version` 请求头返回 Anthropic 或 OpenAI 原生结构，不包含这些调试扩展。
+聊天模型一般至少包含 `completion`；纯媒体 workflow 可以不填 `completion`，只声明 `video_understanding`、`image_generation`、`image_edit` 或 `video_generation`。`/playground/api/models` 会返回原始 `capabilities` 和结构化 `operations`，包含 endpoint、是否流式、`history_mode`、图片/视频输入约束、实际绑定的参数 schema、默认值/范围及推荐 preset，并返回 `estimated_vram_gb` / `estimated_memory_gb` 供调试界面展示；Playground 完全由这些字段驱动。标准 `/v1/models` 根据 `anthropic-version` 请求头返回 Anthropic 或 OpenAI 原生结构，不包含这些调试扩展。
 
 ### Admin UI / Dashboard / Model Playground
 
@@ -598,7 +599,7 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `playground_enabled` | bool | `false` | 是否启用轻量流式模型调试页；交互记录仅保留在当前页面内存中，刷新后清空 |
 | `playground_host` / `playground_port` | | `127.0.0.1` / `21431` | Playground 独立 listener；修改后需重启进程 |
 
-启用后打开 `http://127.0.0.1:21431/playground/`，输入某个 interface 的 `access_tokens`，即可加载该 interface 暴露的模型。页面会读取模型的 capabilities/operations，自动提供聊天、视觉输入、图片生成、图片编辑或视频生成模式，并按 workflow 动态显示真正生效的参数与推荐 preset；图片可粘贴、拖放或从文件选择。聊天模式按模型保存当前页面内的完整轮次，每次请求会回传先前的 user/assistant 消息；前端读取 `context_length` 和 `max_output_tokens` 估算预算，超过 90% 安全阈值时优先丢弃最早的完整轮次，必要时再截短当前输入。图片生成、图片编辑和视频生成也会保留逐轮输入与结果，但其 `history_mode=single_turn`，接口只接收本次输入。若 interface 不要求鉴权，API key 可以留空。
+启用后打开 `http://127.0.0.1:21431/playground/`，输入某个 interface 的 `access_tokens`，即可加载该 interface 暴露的模型。页面会读取模型的 capabilities/operations，自动提供聊天、视觉输入、视频分析、图片生成、图片编辑或视频生成模式，并按 workflow 动态显示真正生效的参数与推荐 preset；图片可粘贴、拖放或从文件选择，视频分析可拖放或选择一个本地视频。聊天模式按模型保存当前页面内的完整轮次，每次请求会回传先前的 user/assistant 消息；前端读取 `context_length` 和 `max_output_tokens` 估算预算，超过 90% 安全阈值时优先丢弃最早的完整轮次，必要时再截短当前输入。视频分析、图片生成、图片编辑和视频生成也会保留逐轮输入与结果，但其 `history_mode=single_turn`，接口只接收本次输入。若 interface 不要求鉴权，API key 可以留空。
 
 ## 内部 backends 视图
 

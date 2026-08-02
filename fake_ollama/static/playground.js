@@ -12,9 +12,12 @@
     operation: $('operation'),
     operationHint: $('operationHint'),
     uploadSection: $('uploadSection'),
+    uploadLabel: $('uploadLabel'),
     uploadRequirement: $('uploadRequirement'),
     fileInput: $('fileInput'),
     dropZone: $('dropZone'),
+    dropText: $('dropText'),
+    dropHint: $('dropHint'),
     attachmentList: $('attachmentList'),
     chatParams: $('chatParams'),
     mediaParams: $('mediaParams'),
@@ -55,14 +58,16 @@
     image_generation: '图片生成',
     image_edit: '图片编辑',
     video_generation: '视频生成',
+    video_analysis: '视频分析',
   };
   const KNOWN_CAPABILITIES = new Set([
     'completion', 'tools', 'vision', 'image_generation', 'image_edit',
-    'video_generation',
+    'video_generation', 'video_understanding',
   ]);
   const CONTEXT_THRESHOLD_RATIO = 0.9;
   const DISCOVERY_SCHEMA_VERSION = 1;
   const IMAGE_TOKEN_ESTIMATE = 1024;
+  const VIDEO_TOKEN_ESTIMATE = 8192;
   const textEncoder = new TextEncoder();
 
   const state = {
@@ -145,7 +150,19 @@
         accepts_images: true, requires_images: false, multiple_images: true,
       });
     }
+    if (capabilities.has('video_understanding')) {
+      operations.push({
+        id: 'video_analysis', endpoint: '/v1/chat/completions', stream: true,
+        history_mode: 'single_turn', accepts_videos: true, requires_videos: true,
+        multiple_videos: false,
+        limits: {max_videos: 1, max_video_bytes: 64 * 1024 * 1024},
+      });
+    }
     return operations;
+  }
+
+  function operationUsesChatEndpoint(op) {
+    return Boolean(op && ['chat', 'video_analysis'].includes(op.id));
   }
 
   function modelOperations(modelInfo) {
@@ -230,6 +247,7 @@
     for (const part of content) {
       if (typeof part === 'string') total += estimateTextTokens(part);
       else if (part && part.type === 'image_url') total += IMAGE_TOKEN_ESTIMATE;
+      else if (part && part.type === 'video_url') total += VIDEO_TOKEN_ESTIMATE;
       else if (part && typeof part === 'object') {
         total += estimateTextTokens(part.text ?? part.content ?? '');
       }
@@ -255,16 +273,34 @@
     });
   }
 
+  function videoUrlsFromContent(content) {
+    if (!Array.isArray(content)) return [];
+    return content.flatMap((part) => {
+      if (!part || part.type !== 'video_url') return [];
+      const videoUrl = part.video_url;
+      const url = typeof videoUrl === 'string' ? videoUrl : videoUrl && videoUrl.url;
+      return url ? [url] : [];
+    });
+  }
+
   function userMessageForRequest(
     op,
     prompt = els.prompt.value.trim(),
     attachments = state.attachments,
   ) {
     let content = prompt;
-    if (op.accepts_images && attachments.length) {
+    const accepted = attachments.filter((attachment) => (
+      (attachment.kind === 'image' && op.accepts_images)
+      || (attachment.kind === 'video' && op.accepts_videos)
+    ));
+    if (accepted.length) {
       content = [{type: 'text', text: content}];
-      for (const attachment of attachments) {
-        content.push({type: 'image_url', image_url: {url: attachment.dataUrl}});
+      for (const attachment of accepted) {
+        if (attachment.kind === 'video') {
+          content.push({type: 'video_url', video_url: {url: attachment.dataUrl}});
+        } else {
+          content.push({type: 'image_url', image_url: {url: attachment.dataUrl}});
+        }
       }
     }
     return {role: 'user', content};
@@ -341,6 +377,19 @@
       }
       article.append(images);
     }
+    const videoUrls = videoUrlsFromContent(message.content);
+    if (videoUrls.length) {
+      const videos = document.createElement('div');
+      videos.className = 'message-images';
+      for (const url of videoUrls) {
+        const video = document.createElement('video');
+        video.src = url;
+        video.controls = true;
+        video.preload = 'metadata';
+        videos.append(video);
+      }
+      article.append(videos);
+    }
     if (role === 'assistant' && options.reasoning) {
       const details = document.createElement('details');
       details.className = 'message-reasoning';
@@ -401,7 +450,7 @@
     const op = selectedOperation();
     const info = selectedModel();
     const contextLength = modelContextLength(info);
-    if (!op || op.id !== 'chat' || !contextLength) {
+    if (!op || !operationUsesChatEndpoint(op) || !contextLength) {
       els.contextMetric.hidden = true;
       els.contextMetric.className = 'metric';
       return;
@@ -488,20 +537,52 @@
   function syncOperation() {
     const op = selectedOperation();
     const isChat = op && op.id === 'chat';
+    const isChatRequest = operationUsesChatEndpoint(op);
     const isImageEdit = op && op.id === 'image_edit';
-    const isVideo = op && op.id === 'video_generation';
-    const isMedia = op && !isChat;
+    const isVideoGeneration = op && op.id === 'video_generation';
+    const isVideoAnalysis = op && op.id === 'video_analysis';
+    const isMedia = op && !isChatRequest;
+    const acceptsUploads = op && (op.accepts_images || op.accepts_videos);
 
-    els.uploadSection.hidden = !(op && op.accepts_images);
-    els.uploadRequirement.textContent = op && op.requires_images ? '至少需要 1 张' : '可选';
-    els.chatParams.hidden = !isChat;
-    els.mediaParams.hidden = !isMedia;
-    els.ttftMetric.hidden = !isChat;
-    els.resultTitle.textContent = isChat ? '连续对话' : (op ? '连续调试' : '交互记录');
+    if (op) {
+      const compatible = state.attachments.filter((attachment) => (
+        (attachment.kind === 'image' && op.accepts_images)
+        || (attachment.kind === 'video' && op.accepts_videos)
+      ));
+      if (compatible.length !== state.attachments.length) {
+        state.attachments = compatible;
+        els.fileInput.value = '';
+        renderAttachments();
+      }
+    }
+    els.uploadSection.hidden = !acceptsUploads;
+    els.uploadLabel.textContent = isVideoAnalysis ? '待分析视频' : '参考图片';
+    els.uploadRequirement.textContent = op && (op.requires_images || op.requires_videos)
+      ? '至少需要 1 个文件'
+      : '可选';
+    els.fileInput.accept = isVideoAnalysis ? 'video/*' : 'image/*';
+    els.fileInput.multiple = Boolean(op && (
+      (op.accepts_images && op.multiple_images !== false)
+      || (op.accepts_videos && op.multiple_videos === true)
+    ));
+    els.dropText.textContent = isVideoAnalysis
+      ? '拖放或选择本地视频'
+      : '粘贴、拖放或选择图片';
+    els.dropHint.textContent = isVideoAnalysis
+      ? '首版本地上传单个视频；建议使用短 MP4 验证'
+      : '支持多张参考图；点击这里选择文件';
+    els.chatParams.hidden = !isChatRequest;
+    els.mediaParams.hidden = !(isMedia || isVideoAnalysis);
+    els.ttftMetric.hidden = !isChatRequest;
+    els.resultTitle.textContent = isChat
+      ? '连续对话'
+      : (isVideoAnalysis ? '视频分析记录' : (op ? '连续调试' : '交互记录'));
     els.clear.textContent = '清空记录';
-    els.shortcut.textContent = isChat
-      ? 'Enter 发送 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片'
-      : 'Enter 执行 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片';
+    els.shortcut.textContent = isVideoAnalysis
+      ? 'Enter 分析 · Ctrl / ⌘ + Enter 换行 · 可拖放视频'
+      : (isChat
+        ? 'Enter 发送 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片'
+        : 'Enter 执行 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片');
 
     if (!op) {
       const info = selectedModel();
@@ -525,22 +606,32 @@
       const imageHint = op.accepts_images
         ? (op.requires_images ? '，需要图片输入' : '，可附带图片输入')
         : '';
+      const videoHint = op.accepts_videos
+        ? (op.requires_videos ? '，需要视频输入' : '，可附带视频输入')
+        : '';
       const limits = op.limits || {};
       const limitHints = [usesHistory ? '携带页面内历史' : '仅发送本次输入'];
       if (op.configured === false) limitHints.push('工作流尚未配置');
       if (limits.max_batch_size) limitHints.push(`最多 ${limits.max_batch_size} 个结果`);
       if (limits.max_reference_images) limitHints.push(`最多 ${limits.max_reference_images} 张参考图`);
       if (limits.max_num_frames) limitHints.push(`最多 ${limits.max_num_frames} 帧`);
-      const contextLength = isChat ? modelContextLength() : null;
+      if (limits.max_video_bytes) {
+        limitHints.push(`视频不超过 ${(limits.max_video_bytes / 1024 / 1024).toFixed(0)} MiB`);
+      }
+      const contextLength = isChatRequest ? modelContextLength() : null;
       if (contextLength) limitHints.push(`上下文 ${contextLength.toLocaleString()} tokens`);
       els.operationHint.textContent = [
-        `${op.endpoint}${op.stream ? ' · 流式' : ''}${imageHint}`,
+        `${op.endpoint}${op.stream ? ' · 流式' : ''}${imageHint}${videoHint}`,
         ...limitHints,
       ].join(' · ');
-      els.prompt.placeholder = isChat
-        ? (op.accepts_images ? '输入问题；也可以粘贴或上传图片…' : '输入要发送给模型的内容…')
-        : (isVideo ? '描述要生成的视频…' : (isImageEdit ? '描述希望怎样编辑图片…' : '描述要生成的图片…'));
-      els.send.textContent = isChat ? '发送请求 →' : (isVideo ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →'));
+      els.prompt.placeholder = isVideoAnalysis
+        ? '输入希望模型持续关注和分析的问题…'
+        : (isChat
+          ? (op.accepts_images ? '输入问题；也可以粘贴或上传图片…' : '输入要发送给模型的内容…')
+          : (isVideoGeneration ? '描述要生成的视频…' : (isImageEdit ? '描述希望怎样编辑图片…' : '描述要生成的图片…')));
+      els.send.textContent = isVideoAnalysis
+        ? '分析视频 →'
+        : (isChat ? '发送请求 →' : (isVideoGeneration ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →')));
     }
     renderOperationParameters(op);
     resetOutput();
@@ -713,12 +804,16 @@
 
   function syncSendState() {
     const op = selectedOperation();
-    const missingRequiredImage = Boolean(op && op.requires_images && !state.attachments.length);
+    const hasImage = state.attachments.some((attachment) => attachment.kind === 'image');
+    const hasVideo = state.attachments.some((attachment) => attachment.kind === 'video');
+    const missingRequiredMedia = Boolean(op && (
+      (op.requires_images && !hasImage) || (op.requires_videos && !hasVideo)
+    ));
     const credentialReady = state.loadedCredential !== null
       && state.loadedCredential === els.apiKey.value.trim();
     els.send.disabled = Boolean(state.controller) || !selectedModel() || !op
       || !credentialReady || op.configured === false
-      || !els.prompt.value.trim() || missingRequiredImage;
+      || !els.prompt.value.trim() || missingRequiredMedia;
   }
 
   function showError(message) {
@@ -730,7 +825,7 @@
   function showRequestError(op, message) {
     // Remove the temporary pending turn and progress label after a failure.
     // Partial streamed chat output remains useful for debugging, so preserve it.
-    const keepPartialChat = op.id === 'chat'
+    const keepPartialChat = operationUsesChatEndpoint(op)
       && Boolean(els.answerText.textContent.trim() || els.reasoningText.textContent.trim());
     if (!keepPartialChat) {
       els.answerText.textContent = '';
@@ -759,9 +854,12 @@
 
   function beginRequest(op, plan = null) {
     resetOutput();
-    renderInteractionHistory(plan && plan.userMessage, plan && plan.parameters);
+    renderInteractionHistory(
+      plan && (plan.displayUserMessage || plan.userMessage),
+      plan && plan.parameters,
+    );
     els.answer.classList.add('active');
-    if (op.id === 'chat') {
+    if (operationUsesChatEndpoint(op)) {
       els.answerText.classList.add('cursor');
     } else {
       els.answerText.textContent = op.id === 'video_generation'
@@ -843,27 +941,62 @@
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result || ''));
-      reader.onerror = () => reject(reader.error || new Error('无法读取图片'));
+      reader.onerror = () => reject(reader.error || new Error('无法读取附件'));
       reader.readAsDataURL(file);
     });
   }
 
+  function fileKind(file) {
+    if (!file) return '';
+    const type = String(file.type || '').toLowerCase();
+    if (type.startsWith('image/')) return 'image';
+    if (type.startsWith('video/')) return 'video';
+    const name = String(file.name || '').toLowerCase();
+    if (/\.(png|jpe?g|gif|webp|bmp)$/.test(name)) return 'image';
+    if (/\.(mp4|mov|mkv|webm|avi|mpe?g)$/.test(name)) return 'video';
+    return '';
+  }
+
   async function addFiles(files) {
-    const images = Array.from(files || []).filter((file) => file && file.type.startsWith('image/'));
-    if (!images.length) return;
     const op = selectedOperation();
+    if (!op) return;
+    const candidates = Array.from(files || [])
+      .map((file) => ({file, kind: fileKind(file)}))
+      .filter(({kind}) => (
+        (kind === 'image' && op.accepts_images)
+        || (kind === 'video' && op.accepts_videos)
+      ));
+    if (!candidates.length) {
+      showError(op.accepts_videos ? '请选择受支持的视频文件。' : '请选择受支持的图片文件。');
+      return;
+    }
     const configuredLimit = op && op.limits && op.limits.max_reference_images;
     const maxImages = configuredLimit || 12;
-    for (const file of images) {
-      if (state.attachments.length >= maxImages) {
+    const maxVideos = (op.limits && op.limits.max_videos) || 1;
+    const maxVideoBytes = op.limits && Number(op.limits.max_video_bytes);
+    for (const {file, kind} of candidates) {
+      const currentKindCount = state.attachments.filter(
+        (attachment) => attachment.kind === kind,
+      ).length;
+      if (kind === 'image' && currentKindCount >= maxImages) {
         showError(`当前模型一次最多添加 ${maxImages} 张参考图片。`);
         break;
+      }
+      if (kind === 'video' && currentKindCount >= maxVideos) {
+        showError(`当前模型一次最多添加 ${maxVideos} 个视频。`);
+        break;
+      }
+      if (kind === 'video' && Number.isFinite(maxVideoBytes) && file.size > maxVideoBytes) {
+        showError(`视频不能超过 ${(maxVideoBytes / 1024 / 1024).toFixed(0)} MiB。`);
+        continue;
       }
       const dataUrl = await readFileAsDataUrl(file);
       state.attachments.push({
         file,
         dataUrl,
-        name: file.name || `pasted-${state.attachments.length + 1}.png`,
+        previewUrl: kind === 'video' ? URL.createObjectURL(file) : dataUrl,
+        kind,
+        name: file.name || `pasted-${state.attachments.length + 1}.${kind === 'video' ? 'mp4' : 'png'}`,
       });
     }
     renderAttachments();
@@ -877,9 +1010,18 @@
       const wrap = document.createElement('div');
       wrap.className = 'attachment';
       wrap.title = attachment.name;
-      const image = document.createElement('img');
-      image.src = attachment.dataUrl;
-      image.alt = attachment.name;
+      let preview;
+      if (attachment.kind === 'video') {
+        preview = document.createElement('video');
+        preview.src = attachment.previewUrl || attachment.dataUrl;
+        preview.controls = true;
+        preview.muted = true;
+        preview.preload = 'metadata';
+      } else {
+        preview = document.createElement('img');
+        preview.src = attachment.previewUrl || attachment.dataUrl;
+        preview.alt = attachment.name;
+      }
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.textContent = '×';
@@ -890,7 +1032,7 @@
         updateContextPreview();
         syncSendState();
       });
-      wrap.append(image, remove);
+      wrap.append(preview, remove);
       els.attachmentList.append(wrap);
     });
   }
@@ -1023,11 +1165,28 @@
       ? `${actions.join('；')}。上下文按 ${Math.round(CONTEXT_THRESHOLD_RATIO * 100)}% 阈值保留安全余量。`
       : '';
 
+    const parameters = {};
+    if (op.id === 'video_analysis') {
+      for (const [name, entry] of state.parameterInputs.entries()) {
+        const value = readParameterValue(entry.spec, entry.input);
+        if (value !== null) parameters[name] = value;
+      }
+    }
+    const displayAttachments = state.attachments.map((attachment) => ({
+      ...attachment,
+      dataUrl: attachment.previewUrl || attachment.dataUrl,
+    }));
+    const displayUserMessage = op.id === 'video_analysis'
+      ? userMessageForRequest(op, textFromContent(userMessage.content), displayAttachments)
+      : userMessage;
+
     return {
       modelId,
       operationId: op.id,
       messages,
       userMessage,
+      displayUserMessage,
+      parameters,
       inputTokens,
       outputReserve,
       contextLength,
@@ -1040,6 +1199,7 @@
     const temp = Number(els.temperature.value);
     if (Number.isFinite(temp)) body.temperature = temp;
     if (plan.outputReserve > 0) body.max_tokens = plan.outputReserve;
+    Object.assign(body, plan.parameters || {});
 
     const response = await fetch(op.endpoint, {
       method: 'POST',
@@ -1075,9 +1235,10 @@
     const reasoning = els.reasoningText.textContent;
     const interaction = interactionFor(plan.modelId, plan.operationId);
     interaction.turns.push({
-      user: plan.userMessage,
+      user: plan.displayUserMessage || plan.userMessage,
       assistant: {role: 'assistant', content: assistantContent},
       reasoning,
+      parameters: plan.parameters,
     });
     els.answerText.textContent = '';
     els.answer.classList.remove('active');
@@ -1275,8 +1436,18 @@
   async function runRequest() {
     const op = selectedOperation();
     if (state.controller || !op || !els.prompt.value.trim()) return;
-    if (op.requires_images && !state.attachments.length) {
+    const imageCount = state.attachments.filter(
+      (attachment) => attachment.kind === 'image',
+    ).length;
+    const videoCount = state.attachments.filter(
+      (attachment) => attachment.kind === 'video',
+    ).length;
+    if (op.requires_images && !imageCount) {
       showError('当前能力至少需要一张参考图片。');
+      return;
+    }
+    if (op.requires_videos && !videoCount) {
+      showError('当前能力至少需要一个视频。');
       return;
     }
     const maxReferences = op.limits && op.limits.max_reference_images;
@@ -1284,9 +1455,16 @@
       showError(`当前能力最多接收 ${maxReferences} 张参考图片，请先移除多余图片。`);
       return;
     }
+    const maxVideos = op.limits && op.limits.max_videos;
+    if (maxVideos && videoCount > Number(maxVideos)) {
+      showError(`当前能力最多接收 ${maxVideos} 个视频，请先移除多余视频。`);
+      return;
+    }
     let plan;
     try {
-      plan = op.id === 'chat' ? prepareChatRequest(op) : prepareMediaRequest(op);
+      plan = operationUsesChatEndpoint(op)
+        ? prepareChatRequest(op)
+        : prepareMediaRequest(op);
     } catch (error) {
       showError(error instanceof Error ? error.message : String(error));
       return;
@@ -1303,7 +1481,7 @@
       els.timeMetric.textContent = `耗时 ${((performance.now() - state.startedAt) / 1000).toFixed(1)}s`;
     }, 100);
     try {
-      if (op.id === 'chat') await runChat(op, plan);
+      if (operationUsesChatEndpoint(op)) await runChat(op, plan);
       else await runMedia(op, plan);
     } catch (error) {
       if (error && error.name === 'AbortError') showRequestError(op, '请求已停止。');

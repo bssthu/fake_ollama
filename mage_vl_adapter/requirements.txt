@@ -1,0 +1,13 @@
+# PyTorch is installed separately from the official CUDA wheel index by
+# scripts/install_mage_vl.ps1.
+accelerate>=1.10
+fastapi>=0.116
+huggingface_hub>=0.35
+numpy>=2.0
+pillow>=11.0
+safetensors>=0.6
+# Pin the exact version used by the real GPU validation. Mage-VL ships custom
+# remote code and Transformers 5.14.1 already warns about a future cache API
+# change, so an open-ended upgrade would make the local install non-reproducible.
+transformers==5.14.1
+uvicorn[standard]>=0.35

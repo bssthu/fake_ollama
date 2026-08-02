@@ -59,14 +59,14 @@
 
         <section id="uploadSection" class="upload-section" hidden>
           <div class="label-row">
-            <span class="label">参考图片</span>
+            <span id="uploadLabel" class="label">参考图片</span>
             <span id="uploadRequirement" class="help"></span>
           </div>
           <input id="fileInput" type="file" accept="image/*" multiple hidden>
           <button id="dropZone" class="drop-zone" type="button">
             <span class="drop-icon">＋</span>
-            <strong>粘贴、拖放或选择图片</strong>
-            <small>支持多张参考图；点击这里选择文件</small>
+            <strong id="dropText">粘贴、拖放或选择图片</strong>
+            <small id="dropHint">支持多张参考图；点击这里选择文件</small>
           </button>
           <div id="attachmentList" class="attachment-list"></div>
         </section>

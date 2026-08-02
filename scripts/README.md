@@ -8,6 +8,22 @@
 
 正常使用时不需要手动传 `--base-url` 和 `--api-key`。如果要调试其他实例，可以显式覆盖这两个参数。
 
+## 0. Mage-VL 本机视频分析：call_mage_vl_video.py
+
+先执行一次 `scripts\install_mage_vl.ps1`。模型主体保存在
+`J:\Projects\LLM_Models\Mage\Mage-VL`，独立 Python 环境保存在同级 `.venv`。
+fake_ollama 会在首次请求时自动启动适配器：
+
+```powershell
+python scripts\call_mage_vl_video.py .tmp\joyai-test.mp4 `
+  --prompt "请按时间顺序分析关键动作、场景变化和可见文字。" `
+  --output .tmp\mage-vl-result.txt
+```
+
+默认按 8 秒窗口逐段处理、每段抽取 8 帧、最多分析 12 段。可用
+`--segment-seconds`、`--frames-per-segment`、`--max-segments` 调整；
+`--include-summary` 会在逐段结果后再生成整体总结。
+
 ## 1. 视频生成：call_video_generation.py
 
 用途：调用 fake_ollama 的 OpenAI 兼容视频生成接口：
