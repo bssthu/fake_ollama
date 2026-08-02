@@ -61,6 +61,12 @@ def test_playground_static_page_and_security_headers():
     assert 'id="operation"' in response.text
     assert 'id="operationPreset"' in response.text
     assert 'id="operationParameterList"' in response.text
+    assert 'id="conversation"' in response.text
+    assert 'id="modelMemory"' in response.text
+    assert 'id="contextChip"' in response.text
+    assert 'id="historyModeChip"' in response.text
+    assert 'id="contextMetric"' in response.text
+    assert 'id="contextNotice"' in response.text
     assert css.status_code == 200
     assert css.headers["content-type"].startswith("text/css")
     assert js.status_code == 200
@@ -70,8 +76,48 @@ def test_playground_static_page_and_security_headers():
     assert "new FormData()" in js.text
     assert "stream: true" in js.text
     assert "estimated_vram_gb" in js.text
+    assert "estimated_memory_gb" in js.text
+    assert "fetch('/playground/api/models'" in js.text
+    assert "DISCOVERY_SCHEMA_VERSION = 1" in js.text
     assert "renderOperationParameters" in js.text
     assert "state.parameterInputs" in js.text
+    assert "state.interactionHistories" in js.text
+    assert "operationUsesHistory" in js.text
+    assert "renderInteractionHistory" in js.text
+    assert "prepareChatRequest" in js.text
+    assert "prepareMediaRequest" in js.text
+    assert "historyMessages" in js.text
+    assert "CONTEXT_THRESHOLD_RATIO" in js.text
+    assert "? Math.floor(configured)" in js.text
+    assert "Math.min(requested" not in js.text
+    assert "body.max_tokens = plan.outputReserve" in js.text
+    assert "interaction.turns.push" in js.text
+    assert "仅发送本次输入" in js.text
+    assert "clearComposerInput" in js.text
+    assert "Enter 执行 · Ctrl / ⌘ + Enter 换行" in response.text
+    assert "Enter 发送 · Ctrl / ⌘ + Enter 换行" in js.text
+    assert "els.prompt.setRangeText('\\n'" in js.text
+    assert "shortcutSubmit" not in js.text
+
+    chat_source = js.text.split("async function runChat", 1)[1].split(
+        "function readParameterValue", 1
+    )[0]
+    assert "clearComposerInput();" not in chat_source
+
+    media_source = js.text.split("async function runMedia", 1)[1].split(
+        "async function runRequest", 1
+    )[0]
+    assert "clearComposerInput();" not in media_source
+    request_source = js.text.split("async function runRequest", 1)[1].split(
+        "els.toggleKey.addEventListener", 1
+    )[0]
+    assert request_source.count("clearComposerInput();") == 1
+    assert request_source.index("beginRequest(op, plan);") < request_source.index(
+        "clearComposerInput();"
+    )
+    assert request_source.index("clearComposerInput();") < request_source.index(
+        "if (op.id === 'chat') await runChat(op, plan);"
+    )
     assert "showRequestError" in js.text
     assert response.headers["cache-control"] == "no-store"
     assert "connect-src 'self'" in response.headers["content-security-policy"]
@@ -96,30 +142,51 @@ def test_playground_port_only_exposes_playground_and_model_surfaces():
 def test_playground_api_key_selects_the_matching_interface_models():
     app = create_app(_settings())
     with TestClient(app, base_url="http://testserver:21431") as client:
-        missing = client.get("/v1/models")
-        first = client.get("/v1/models", headers={"Authorization": "Bearer key-a"})
-        second = client.get("/v1/models", headers={"x-api-key": "key-b"})
+        missing = client.get("/playground/api/models")
+        first = client.get(
+            "/playground/api/models",
+            headers={"Authorization": "Bearer key-a"},
+        )
+        second = client.get(
+            "/playground/api/models", headers={"x-api-key": "key-b"}
+        )
+        openai = client.get("/v1/models", headers={"x-api-key": "key-a"})
 
     assert missing.status_code == 401
-    assert [item["id"] for item in first.json()["data"]] == ["alpha"]
-    assert [item["id"] for item in second.json()["data"]] == ["beta"]
-    alpha = first.json()["data"][0]
+    assert first.headers["cache-control"] == "no-store"
+    assert first.json()["schema_version"] == 1
+    assert [item["id"] for item in first.json()["models"]] == ["alpha"]
+    assert [item["id"] for item in second.json()["models"]] == ["beta"]
+    alpha = first.json()["models"][0]
     assert alpha["capabilities"] == ["completion", "tools", "vision"]
+    assert alpha["context_length"] > 0
+    assert "max_output_tokens" in alpha
+    assert "estimated_memory_gb" in alpha
     assert alpha["operations"] == [
         {
             "id": "chat",
             "endpoint": "/v1/chat/completions",
             "stream": True,
+            "history_mode": "conversation",
             "accepts_images": True,
             "tool_calling": True,
         }
     ]
+    assert set(openai.json()["data"][0]) == {
+        "id",
+        "object",
+        "created",
+        "owned_by",
+    }
 
 
 def test_playground_route_is_not_available_on_other_ports():
     app = create_app(_settings())
     with TestClient(app, base_url="http://testserver:21435") as api_client:
         assert api_client.get("/playground/").status_code == 404
+        assert api_client.get(
+            "/playground/api/models", headers={"x-api-key": "key-a"}
+        ).status_code == 404
 
 
 def test_disabled_playground_does_not_register_static_route():
@@ -127,3 +194,6 @@ def test_disabled_playground_does_not_register_static_route():
     app = create_app(settings)
     with TestClient(app, base_url="http://testserver:21431") as client:
         assert client.get("/playground/").status_code == 404
+        assert client.get(
+            "/playground/api/models", headers={"x-api-key": "key-a"}
+        ).status_code == 404

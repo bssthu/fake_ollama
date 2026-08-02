@@ -17,7 +17,7 @@
           <p>fake-ollama · 轻量、多能力、即时调试</p>
         </div>
       </div>
-      <div class="privacy">API key 仅保存在当前页面内存</div>
+      <div class="privacy">API key 与交互记录仅保存在当前页面内存</div>
     </header>
 
     <main class="workspace">
@@ -54,7 +54,7 @@
           <select id="operation" disabled>
             <option value="">选择模型后自动识别</option>
           </select>
-          <div id="operationHint" class="help">能力由 /v1/models 返回，不按模型名称猜测。</div>
+          <div id="operationHint" class="help">能力由 Playground 专用发现接口返回，不按模型名称猜测。</div>
         </div>
 
         <section id="uploadSection" class="upload-section" hidden>
@@ -115,8 +115,12 @@
             <h2 id="resultTitle">输出</h2>
             <span id="modelChip" class="model-chip">未选择模型</span>
             <span id="modelVram" class="resource-chip" hidden></span>
+            <span id="modelMemory" class="resource-chip" hidden></span>
+            <span id="contextChip" class="resource-chip" hidden></span>
+            <span id="historyModeChip" class="resource-chip" hidden></span>
           </div>
           <div class="metrics">
+            <span id="contextMetric" class="metric" hidden>上下文 —</span>
             <span id="ttftMetric" class="metric">首字 —</span>
             <span id="timeMetric" class="metric">耗时 —</span>
           </div>
@@ -127,10 +131,12 @@
             <div>
               <div class="empty-symbol">✦</div>
               <strong>选择模型，能力会自动识别</strong>
-              <span>聊天、视觉、图片生成/编辑和视频使用各自对应的接口。</span>
+              <span id="emptyHint">交互记录只保留在当前页面内。</span>
             </div>
           </div>
+          <div id="contextNotice" class="context-notice" role="status"></div>
           <div id="errorBox" class="error-box" role="alert"></div>
+          <div id="conversation" class="conversation"></div>
           <details id="reasoning" class="reasoning">
             <summary>模型思考过程</summary>
             <pre id="reasoningText"></pre>
@@ -139,7 +145,6 @@
             <div class="answer-label">Assistant</div>
             <pre id="answerText"></pre>
           </div>
-          <div id="mediaGallery" class="media-gallery"></div>
         </div>
 
         <div class="composer">
@@ -147,9 +152,9 @@
             <textarea id="prompt" placeholder="输入要发送给模型的内容…"
                       aria-label="提示词"></textarea>
             <div class="composer-actions">
-              <span class="shortcut">Ctrl / ⌘ + Enter 执行 · 可直接粘贴图片</span>
+              <span id="shortcut" class="shortcut">Enter 执行 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片</span>
               <div class="actions">
-                <button id="clear" class="secondary" type="button">清空</button>
+                <button id="clear" class="secondary" type="button">清空记录</button>
                 <button id="stop" class="stop" type="button" hidden>停止</button>
                 <button id="send" class="primary" type="button" disabled>执行 →</button>
               </div>

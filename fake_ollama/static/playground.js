@@ -28,16 +28,23 @@
     resultTitle: $('resultTitle'),
     modelChip: $('modelChip'),
     modelVram: $('modelVram'),
+    modelMemory: $('modelMemory'),
+    contextChip: $('contextChip'),
+    historyModeChip: $('historyModeChip'),
+    contextMetric: $('contextMetric'),
     ttftMetric: $('ttftMetric'),
     timeMetric: $('timeMetric'),
     emptyState: $('emptyState'),
+    emptyHint: $('emptyHint'),
+    contextNotice: $('contextNotice'),
     errorBox: $('errorBox'),
+    conversation: $('conversation'),
     reasoning: $('reasoning'),
     reasoningText: $('reasoningText'),
     answer: $('answer'),
     answerText: $('answerText'),
-    mediaGallery: $('mediaGallery'),
     prompt: $('prompt'),
+    shortcut: $('shortcut'),
     clear: $('clear'),
     stop: $('stop'),
     send: $('send'),
@@ -53,9 +60,15 @@
     'completion', 'tools', 'vision', 'image_generation', 'image_edit',
     'video_generation',
   ]);
+  const CONTEXT_THRESHOLD_RATIO = 0.9;
+  const DISCOVERY_SCHEMA_VERSION = 1;
+  const IMAGE_TOKEN_ESTIMATE = 1024;
+  const textEncoder = new TextEncoder();
 
   const state = {
     models: new Map(),
+    interactionHistories: new Map(),
+    loadedCredential: null,
     attachments: [],
     controller: null,
     startedAt: 0,
@@ -107,6 +120,7 @@
         id: 'chat',
         endpoint: '/v1/chat/completions',
         stream: true,
+        history_mode: 'conversation',
         accepts_images: capabilities.has('vision'),
         tool_calling: capabilities.has('tools'),
       });
@@ -114,18 +128,20 @@
     if (capabilities.has('image_generation')) {
       operations.push({
         id: 'image_generation', endpoint: '/v1/images/generations',
-        stream: false, accepts_images: false,
+        stream: false, history_mode: 'single_turn', accepts_images: false,
       });
     }
     if (capabilities.has('image_edit')) {
       operations.push({
         id: 'image_edit', endpoint: '/v1/images/edits', stream: false,
+        history_mode: 'single_turn',
         accepts_images: true, requires_images: true, multiple_images: true,
       });
     }
     if (capabilities.has('video_generation')) {
       operations.push({
         id: 'video_generation', endpoint: '/v1/videos/generations', stream: false,
+        history_mode: 'single_turn',
         accepts_images: true, requires_images: false, multiple_images: true,
       });
     }
@@ -142,6 +158,271 @@
   function selectedOperation() {
     const info = selectedModel();
     return modelOperations(info).find((op) => op.id === els.operation.value) || null;
+  }
+
+  function operationHistoryMode(op) {
+    if (op && ['conversation', 'single_turn'].includes(op.history_mode)) {
+      return op.history_mode;
+    }
+    return op && op.id === 'chat' ? 'conversation' : 'single_turn';
+  }
+
+  function operationUsesHistory(op) {
+    return operationHistoryMode(op) === 'conversation';
+  }
+
+  function interactionKey(modelId, operationId) {
+    return JSON.stringify([modelId, operationId]);
+  }
+
+  function interactionFor(modelId, operationId, create = true) {
+    if (!modelId || !operationId) return null;
+    const key = interactionKey(modelId, operationId);
+    let interaction = state.interactionHistories.get(key);
+    if (!interaction && create) {
+      interaction = {turns: [], lastNotice: ''};
+      state.interactionHistories.set(key, interaction);
+    }
+    return interaction || null;
+  }
+
+  function modelContextLength(info = selectedModel()) {
+    const value = info && Number(info.context_length);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
+  }
+
+  function requestedMaxTokens() {
+    const value = Number.parseInt(els.maxTokens.value, 10);
+    return Number.isFinite(value) && value > 0 ? value : 2048;
+  }
+
+  function outputTokenReserve(info = selectedModel()) {
+    const requested = requestedMaxTokens();
+    const configured = info && Number(info.max_output_tokens);
+    return Number.isFinite(configured) && configured > 0
+      ? Math.floor(configured)
+      : requested;
+  }
+
+  function formatTokenCount(value) {
+    const amount = Math.max(0, Math.round(Number(value) || 0));
+    if (amount >= 1000000) return `${(amount / 1000000).toFixed(1)}M`;
+    if (amount >= 1000) return `${(amount / 1000).toFixed(amount >= 10000 ? 0 : 1)}K`;
+    return String(amount);
+  }
+
+  function estimateTextTokens(value) {
+    const text = String(value || '');
+    if (!text) return 0;
+    const cjk = (text.match(/[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]/g) || []).length;
+    const nonCjk = Math.max(0, text.length - cjk);
+    return Math.max(
+      1,
+      Math.ceil(textEncoder.encode(text).length / 4),
+      cjk + Math.ceil(nonCjk / 4),
+    );
+  }
+
+  function estimateContentTokens(content) {
+    if (typeof content === 'string') return estimateTextTokens(content);
+    if (!Array.isArray(content)) return estimateTextTokens(JSON.stringify(content || ''));
+    let total = 0;
+    for (const part of content) {
+      if (typeof part === 'string') total += estimateTextTokens(part);
+      else if (part && part.type === 'image_url') total += IMAGE_TOKEN_ESTIMATE;
+      else if (part && typeof part === 'object') {
+        total += estimateTextTokens(part.text ?? part.content ?? '');
+      }
+    }
+    return total;
+  }
+
+  function estimateMessageTokens(message) {
+    return 5 + estimateTextTokens(message.role || '') + estimateContentTokens(message.content);
+  }
+
+  function estimateMessagesTokens(messages) {
+    return 3 + messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
+  }
+
+  function imageUrlsFromContent(content) {
+    if (!Array.isArray(content)) return [];
+    return content.flatMap((part) => {
+      if (!part || part.type !== 'image_url') return [];
+      const imageUrl = part.image_url;
+      const url = typeof imageUrl === 'string' ? imageUrl : imageUrl && imageUrl.url;
+      return url ? [url] : [];
+    });
+  }
+
+  function userMessageForRequest(
+    op,
+    prompt = els.prompt.value.trim(),
+    attachments = state.attachments,
+  ) {
+    let content = prompt;
+    if (op.accepts_images && attachments.length) {
+      content = [{type: 'text', text: content}];
+      for (const attachment of attachments) {
+        content.push({type: 'image_url', image_url: {url: attachment.dataUrl}});
+      }
+    }
+    return {role: 'user', content};
+  }
+
+  function replaceContentText(content, text) {
+    if (typeof content === 'string') return text;
+    if (!Array.isArray(content)) return text;
+    let replaced = false;
+    const result = content.map((part) => {
+      if (!replaced && part && part.type === 'text') {
+        replaced = true;
+        return {...part, text};
+      }
+      return part;
+    });
+    if (!replaced) result.unshift({type: 'text', text});
+    return result;
+  }
+
+  function truncateTextToTokenBudget(text, tokenBudget) {
+    const original = String(text || '');
+    if (estimateTextTokens(original) <= tokenBudget) return original;
+    const marker = '\n\n…[为适配模型上下文，已截断中间内容]…\n\n';
+    if (tokenBudget <= estimateTextTokens(marker) + 2) return '';
+    let low = 0;
+    let high = original.length;
+    let best = '';
+    while (low <= high) {
+      const keep = Math.floor((low + high) / 2);
+      const head = Math.ceil(keep * 0.55);
+      const tail = keep - head;
+      const candidate = `${original.slice(0, head)}${marker}${tail ? original.slice(-tail) : ''}`;
+      if (estimateTextTokens(candidate) <= tokenBudget) {
+        best = candidate;
+        low = keep + 1;
+      } else {
+        high = keep - 1;
+      }
+    }
+    return best;
+  }
+
+  function historyMessages(turns) {
+    const messages = [];
+    for (const turn of turns) messages.push(turn.user, turn.assistant);
+    return messages;
+  }
+
+  function baseSystemMessages() {
+    const prompt = els.systemPrompt.value.trim();
+    return prompt ? [{role: 'system', content: prompt}] : [];
+  }
+
+  function appendMessageElement(parent, message, role, options = {}) {
+    const article = document.createElement('article');
+    article.className = `message ${role}${options.pending ? ' pending' : ''}`;
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = role === 'user' ? 'User' : 'Assistant';
+    const content = document.createElement('pre');
+    content.className = 'message-content';
+    content.textContent = textFromContent(message.content) || '（无文本内容）';
+    article.append(label, content);
+    const imageUrls = imageUrlsFromContent(message.content);
+    if (imageUrls.length) {
+      const images = document.createElement('div');
+      images.className = 'message-images';
+      for (const url of imageUrls) {
+        const image = document.createElement('img');
+        image.src = url;
+        image.alt = '对话参考图片';
+        images.append(image);
+      }
+      article.append(images);
+    }
+    if (role === 'assistant' && options.reasoning) {
+      const details = document.createElement('details');
+      details.className = 'message-reasoning';
+      const summary = document.createElement('summary');
+      summary.textContent = '模型思考过程';
+      const reasoning = document.createElement('pre');
+      reasoning.textContent = options.reasoning;
+      details.append(summary, reasoning);
+      article.append(details);
+    }
+    if (options.parameters && Object.keys(options.parameters).length) {
+      const details = document.createElement('details');
+      details.className = 'message-parameters';
+      const summary = document.createElement('summary');
+      summary.textContent = '请求参数';
+      const parameters = document.createElement('pre');
+      parameters.textContent = JSON.stringify(options.parameters, null, 2);
+      details.append(summary, parameters);
+      article.append(details);
+    }
+    parent.append(article);
+  }
+
+  function showContextNotice(message = '') {
+    els.contextNotice.textContent = message;
+    els.contextNotice.classList.toggle('visible', Boolean(message));
+  }
+
+  function renderInteractionHistory(pendingUser = null, pendingParameters = null) {
+    els.conversation.replaceChildren();
+    const op = selectedOperation();
+    const interaction = interactionFor(els.model.value, op && op.id, false);
+    for (const turn of (interaction && interaction.turns) || []) {
+      const wrap = document.createElement('section');
+      wrap.className = 'conversation-turn';
+      appendMessageElement(wrap, turn.user, 'user', {parameters: turn.parameters});
+      if (turn.assistant) {
+        appendMessageElement(wrap, turn.assistant, 'assistant', {reasoning: turn.reasoning});
+      } else if (turn.media) {
+        appendMediaResultElement(wrap, turn.media, op);
+      }
+      els.conversation.append(wrap);
+    }
+    if (pendingUser) {
+      const wrap = document.createElement('section');
+      wrap.className = 'conversation-turn pending-turn';
+      appendMessageElement(wrap, pendingUser, 'user', {
+        pending: true,
+        parameters: pendingParameters,
+      });
+      els.conversation.append(wrap);
+    }
+    showContextNotice(op && op.id === 'chat' ? ((interaction && interaction.lastNotice) || '') : '');
+    els.emptyState.hidden = Boolean(els.conversation.children.length || pendingUser);
+  }
+
+  function updateContextPreview() {
+    const op = selectedOperation();
+    const info = selectedModel();
+    const contextLength = modelContextLength(info);
+    if (!op || op.id !== 'chat' || !contextLength) {
+      els.contextMetric.hidden = true;
+      els.contextMetric.className = 'metric';
+      return;
+    }
+    const interaction = interactionFor(els.model.value, op.id, false);
+    const priorTurns = operationUsesHistory(op)
+      ? ((interaction && interaction.turns) || [])
+      : [];
+    const messages = [
+      ...baseSystemMessages(),
+      ...historyMessages(priorTurns),
+    ];
+    if (els.prompt.value.trim()) messages.push(userMessageForRequest(op));
+    const inputTokens = estimateMessagesTokens(messages);
+    const outputTokens = outputTokenReserve(info);
+    const total = inputTokens + outputTokens;
+    const threshold = Math.floor(contextLength * CONTEXT_THRESHOLD_RATIO);
+    els.contextMetric.hidden = false;
+    els.contextMetric.textContent = `预算 ~${formatTokenCount(total)} / ${formatTokenCount(contextLength)}`;
+    els.contextMetric.title = `输入估算 ${inputTokens} + 输出预留 ${outputTokens}；发送阈值为上下文的 ${Math.round(CONTEXT_THRESHOLD_RATIO * 100)}%`;
+    els.contextMetric.className = `metric${total > contextLength ? ' danger' : (total > threshold ? ' warning' : '')}`;
   }
 
   function renderCapabilities(info) {
@@ -182,6 +463,25 @@
       els.modelVram.textContent = '';
       els.modelVram.hidden = true;
     }
+    const estimatedMemory = info && Number(info.estimated_memory_gb);
+    if (Number.isFinite(estimatedMemory) && estimatedMemory > 0) {
+      els.modelMemory.textContent = `预计内存 ${estimatedMemory.toFixed(2)} GiB`;
+      els.modelMemory.title = '来自 model_profiles.estimated_memory_gb';
+      els.modelMemory.hidden = false;
+    } else {
+      els.modelMemory.textContent = '';
+      els.modelMemory.hidden = true;
+    }
+    const contextLength = modelContextLength(info);
+    const hasChat = operations.some((operation) => operation.id === 'chat');
+    if (contextLength && hasChat) {
+      els.contextChip.textContent = `上下文 ${formatTokenCount(contextLength)}`;
+      els.contextChip.title = `模型 context_length=${contextLength}`;
+      els.contextChip.hidden = false;
+    } else {
+      els.contextChip.textContent = '';
+      els.contextChip.hidden = true;
+    }
     syncOperation();
   }
 
@@ -197,24 +497,42 @@
     els.chatParams.hidden = !isChat;
     els.mediaParams.hidden = !isMedia;
     els.ttftMetric.hidden = !isChat;
-    els.resultTitle.textContent = isChat ? '流式输出' : '生成结果';
+    els.resultTitle.textContent = isChat ? '连续对话' : (op ? '连续调试' : '交互记录');
+    els.clear.textContent = '清空记录';
+    els.shortcut.textContent = isChat
+      ? 'Enter 发送 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片'
+      : 'Enter 执行 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片';
 
     if (!op) {
       const info = selectedModel();
       const caps = info && info.capabilities ? info.capabilities.join(', ') : '无';
+      els.historyModeChip.textContent = '';
+      els.historyModeChip.hidden = true;
+      els.emptyHint.textContent = '交互记录只保留在当前页面内。';
       els.operationHint.textContent = `已声明能力：${caps}。当前没有可执行的已适配操作。`;
       els.prompt.placeholder = '该模型没有可执行的 Playground 操作';
       els.send.textContent = '不可执行';
     } else {
+      const usesHistory = operationUsesHistory(op);
+      els.historyModeChip.textContent = usesHistory ? '携带历史' : '单轮请求';
+      els.historyModeChip.title = usesHistory
+        ? '每次请求会携带本页中已完成的较早对话'
+        : '接口仅接收本次输入；较早记录只在本页显示';
+      els.historyModeChip.hidden = false;
+      els.emptyHint.textContent = usesHistory
+        ? '后续请求会携带本页对话，并按模型 context 自动裁剪。'
+        : '接口仅接收本次输入；此前的输入与结果仍会保留在本页。';
       const imageHint = op.accepts_images
         ? (op.requires_images ? '，需要图片输入' : '，可附带图片输入')
         : '';
       const limits = op.limits || {};
-      const limitHints = [];
+      const limitHints = [usesHistory ? '携带页面内历史' : '仅发送本次输入'];
       if (op.configured === false) limitHints.push('工作流尚未配置');
       if (limits.max_batch_size) limitHints.push(`最多 ${limits.max_batch_size} 个结果`);
       if (limits.max_reference_images) limitHints.push(`最多 ${limits.max_reference_images} 张参考图`);
       if (limits.max_num_frames) limitHints.push(`最多 ${limits.max_num_frames} 帧`);
+      const contextLength = isChat ? modelContextLength() : null;
+      if (contextLength) limitHints.push(`上下文 ${contextLength.toLocaleString()} tokens`);
       els.operationHint.textContent = [
         `${op.endpoint}${op.stream ? ' · 流式' : ''}${imageHint}`,
         ...limitHints,
@@ -225,6 +543,9 @@
       els.send.textContent = isChat ? '发送请求 →' : (isVideo ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →'));
     }
     renderOperationParameters(op);
+    resetOutput();
+    renderInteractionHistory();
+    updateContextPreview();
     syncSendState();
   }
 
@@ -393,8 +714,11 @@
   function syncSendState() {
     const op = selectedOperation();
     const missingRequiredImage = Boolean(op && op.requires_images && !state.attachments.length);
+    const credentialReady = state.loadedCredential !== null
+      && state.loadedCredential === els.apiKey.value.trim();
     els.send.disabled = Boolean(state.controller) || !selectedModel() || !op
-      || op.configured === false || !els.prompt.value.trim() || missingRequiredImage;
+      || !credentialReady || op.configured === false
+      || !els.prompt.value.trim() || missingRequiredImage;
   }
 
   function showError(message) {
@@ -404,15 +728,18 @@
   }
 
   function showRequestError(op, message) {
-    // Media requests only contain a temporary progress label until a complete
-    // response arrives.  Do not leave that label looking like active work once
-    // the request has already failed.  Keep partial streamed chat output when
-    // there is any, because it can still be useful while debugging.
-    if (op.id !== 'chat' || !els.answerText.textContent.trim()) {
+    // Remove the temporary pending turn and progress label after a failure.
+    // Partial streamed chat output remains useful for debugging, so preserve it.
+    const keepPartialChat = op.id === 'chat'
+      && Boolean(els.answerText.textContent.trim() || els.reasoningText.textContent.trim());
+    if (!keepPartialChat) {
       els.answerText.textContent = '';
       els.answer.classList.remove('active');
+      els.reasoningText.textContent = '';
+      els.reasoning.classList.remove('visible');
     }
     els.answerText.classList.remove('cursor');
+    renderInteractionHistory();
     showError(message);
   }
 
@@ -425,22 +752,25 @@
     els.answerText.textContent = '';
     els.answer.classList.remove('active');
     els.answerText.classList.remove('cursor');
-    els.mediaGallery.replaceChildren();
-    els.mediaGallery.classList.remove('visible');
     els.emptyState.hidden = false;
     els.ttftMetric.textContent = '首字 —';
     els.timeMetric.textContent = '耗时 —';
   }
 
-  function beginRequest(op) {
+  function beginRequest(op, plan = null) {
     resetOutput();
-    els.emptyState.hidden = true;
+    renderInteractionHistory(plan && plan.userMessage, plan && plan.parameters);
     els.answer.classList.add('active');
     if (op.id === 'chat') {
       els.answerText.classList.add('cursor');
     } else {
-      els.answerText.textContent = op.id === 'video_generation' ? '正在生成视频…' : '正在生成图片…';
+      els.answerText.textContent = op.id === 'video_generation'
+        ? '正在生成视频…'
+        : (op.id === 'image_edit' ? '正在编辑图片…' : '正在生成图片…');
     }
+    els.loadModels.disabled = true;
+    els.model.disabled = true;
+    els.operation.disabled = true;
     els.send.hidden = true;
     els.stop.hidden = false;
   }
@@ -450,8 +780,12 @@
     state.timer = null;
     els.answerText.classList.remove('cursor');
     state.controller = null;
+    els.loadModels.disabled = false;
+    els.model.disabled = state.models.size === 0;
+    els.operation.disabled = modelOperations(selectedModel()).length === 0;
     els.stop.hidden = true;
     els.send.hidden = false;
+    updateContextPreview();
     syncSendState();
   }
 
@@ -533,6 +867,7 @@
       });
     }
     renderAttachments();
+    updateContextPreview();
     syncSendState();
   }
 
@@ -552,6 +887,7 @@
       remove.addEventListener('click', () => {
         state.attachments.splice(index, 1);
         renderAttachments();
+        updateContextPreview();
         syncSendState();
       });
       wrap.append(image, remove);
@@ -563,23 +899,38 @@
     state.attachments = [];
     els.fileInput.value = '';
     renderAttachments();
+    updateContextPreview();
+  }
+
+  function clearComposerInput() {
+    els.prompt.value = '';
+    clearAttachments();
+    syncSendState();
   }
 
   async function loadModelList() {
     if (state.controller) return;
+    const credential = els.apiKey.value.trim();
     els.loadModels.disabled = true;
     els.model.disabled = true;
     setConnection('连接中…');
     try {
-      const response = await fetch('/v1/models', {
+      const response = await fetch('/playground/api/models', {
         headers: authHeaders(false),
         cache: 'no-store',
       });
       if (!response.ok) throw new Error(await responseError(response));
       const data = await response.json();
-      const models = Array.isArray(data.data)
-        ? data.data.filter((item) => item && item.id)
+      if (data.schema_version !== DISCOVERY_SCHEMA_VERSION) {
+        throw new Error(`不支持的模型发现格式：${data.schema_version ?? 'missing'}`);
+      }
+      const models = Array.isArray(data.models)
+        ? data.models.filter((item) => item && item.id)
         : [];
+      if (state.loadedCredential !== null && state.loadedCredential !== credential) {
+        state.interactionHistories.clear();
+      }
+      state.loadedCredential = credential;
       state.models.clear();
       els.model.replaceChildren();
       if (!models.length) {
@@ -605,24 +956,90 @@
     }
   }
 
-  async function runChat(op) {
-    const messages = [];
-    if (els.systemPrompt.value.trim()) {
-      messages.push({role: 'system', content: els.systemPrompt.value.trim()});
-    }
-    let userContent = els.prompt.value.trim();
-    if (op.accepts_images && state.attachments.length) {
-      userContent = [{type: 'text', text: userContent}];
-      for (const attachment of state.attachments) {
-        userContent.push({type: 'image_url', image_url: {url: attachment.dataUrl}});
+  function prepareChatRequest(op) {
+    const modelId = els.model.value;
+    const info = selectedModel();
+    const interaction = interactionFor(modelId, op.id);
+    const usesHistory = operationUsesHistory(op);
+    const systemMessages = baseSystemMessages();
+    const userMessage = userMessageForRequest(op);
+    const contextLength = modelContextLength(info);
+    const outputReserve = outputTokenReserve(info);
+    let turns = usesHistory ? interaction.turns.slice() : [];
+    let messages = [...systemMessages, ...historyMessages(turns), userMessage];
+    let inputTokens = estimateMessagesTokens(messages);
+    let droppedTurns = 0;
+    let truncatedTokens = 0;
+    let threshold = null;
+
+    if (contextLength) {
+      threshold = Math.floor(contextLength * CONTEXT_THRESHOLD_RATIO);
+      const inputBudget = threshold - outputReserve;
+      if (inputBudget < 32) {
+        throw new Error(
+          `输出预算 ${outputReserve} 已占满模型上下文阈值 ${threshold}，请调低 Max tokens。`,
+        );
+      }
+
+      while (turns.length && inputTokens > inputBudget) {
+        turns.shift();
+        droppedTurns += 1;
+        messages = [...systemMessages, ...historyMessages(turns), userMessage];
+        inputTokens = estimateMessagesTokens(messages);
+      }
+
+      if (inputTokens > inputBudget) {
+        const originalText = textFromContent(userMessage.content);
+        const emptyUser = {
+          ...userMessage,
+          content: replaceContentText(userMessage.content, ''),
+        };
+        const fixedMessages = [...systemMessages, ...historyMessages(turns), emptyUser];
+        const availableTextTokens = inputBudget - estimateMessagesTokens(fixedMessages);
+        const shortened = truncateTextToTokenBudget(originalText, availableTextTokens);
+        if (!shortened) {
+          throw new Error(
+            '当前输入和 System prompt 即使移除全部历史仍超过上下文，请缩短输入或调低 Max tokens。',
+          );
+        }
+        truncatedTokens = Math.max(
+          0,
+          estimateTextTokens(originalText) - estimateTextTokens(shortened),
+        );
+        userMessage.content = replaceContentText(userMessage.content, shortened);
+        messages = [...systemMessages, ...historyMessages(turns), userMessage];
+        inputTokens = estimateMessagesTokens(messages);
+        if (inputTokens > inputBudget) {
+          throw new Error('当前输入无法安全压缩到模型上下文范围内，请手动缩短后重试。');
+        }
       }
     }
-    messages.push({role: 'user', content: userContent});
-    const body = {model: els.model.value, messages, stream: true};
+
+    if (droppedTurns) interaction.turns.splice(0, droppedTurns);
+    const actions = [];
+    if (droppedTurns) actions.push(`已丢弃最早 ${droppedTurns} 轮对话`);
+    if (truncatedTokens) actions.push(`已截短当前输入约 ${truncatedTokens} tokens`);
+    interaction.lastNotice = actions.length
+      ? `${actions.join('；')}。上下文按 ${Math.round(CONTEXT_THRESHOLD_RATIO * 100)}% 阈值保留安全余量。`
+      : '';
+
+    return {
+      modelId,
+      operationId: op.id,
+      messages,
+      userMessage,
+      inputTokens,
+      outputReserve,
+      contextLength,
+      threshold,
+    };
+  }
+
+  async function runChat(op, plan) {
+    const body = {model: plan.modelId, messages: plan.messages, stream: true};
     const temp = Number(els.temperature.value);
-    const limit = Number.parseInt(els.maxTokens.value, 10);
     if (Number.isFinite(temp)) body.temperature = temp;
-    if (Number.isFinite(limit) && limit > 0) body.max_tokens = limit;
+    if (plan.outputReserve > 0) body.max_tokens = plan.outputReserve;
 
     const response = await fetch(op.endpoint, {
       method: 'POST',
@@ -654,6 +1071,21 @@
     if (!els.answerText.textContent && !els.reasoningText.textContent) {
       els.answerText.textContent = '（模型返回了空内容）';
     }
+    const assistantContent = els.answerText.textContent || '（模型返回了空内容）';
+    const reasoning = els.reasoningText.textContent;
+    const interaction = interactionFor(plan.modelId, plan.operationId);
+    interaction.turns.push({
+      user: plan.userMessage,
+      assistant: {role: 'assistant', content: assistantContent},
+      reasoning,
+    });
+    els.answerText.textContent = '';
+    els.answer.classList.remove('active');
+    els.reasoningText.textContent = '';
+    els.reasoning.classList.remove('visible');
+    els.reasoning.open = false;
+    renderInteractionHistory();
+    els.prompt.focus();
   }
 
   function readParameterValue(spec, input, validate = true) {
@@ -724,57 +1156,98 @@
     return payload;
   }
 
-  function renderMedia(items, op) {
-    els.answer.classList.remove('active');
-    els.answerText.textContent = '';
-    els.mediaGallery.replaceChildren();
+  function prepareMediaRequest(op) {
+    const payload = mediaPayload(op);
+    const attachments = state.attachments.slice();
+    const parameters = Object.fromEntries(
+      Object.entries(payload).filter(([key]) => !['model', 'prompt', 'response_format'].includes(key)),
+    );
+    return {
+      modelId: els.model.value,
+      operationId: op.id,
+      payload,
+      attachments,
+      parameters,
+      userMessage: userMessageForRequest(op, payload.prompt, attachments),
+    };
+  }
+
+  function normalizeMediaItems(items, op) {
+    const normalized = [];
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index] || {};
       const mime = item.mime_type || (op.id === 'video_generation' ? 'video/mp4' : 'image/png');
       const src = item.url || (item.b64_json ? `data:${mime};base64,${item.b64_json}` : '');
       if (!src) continue;
+      normalized.push({
+        src,
+        mime,
+        filename: item.filename || `${OP_LABELS[op.id] || '结果'} ${index + 1}`,
+        revisedPrompt: item.revised_prompt || '',
+      });
+    }
+    if (!normalized.length) throw new Error('媒体接口没有返回可显示的结果');
+    return normalized;
+  }
+
+  function appendMediaResultElement(parent, items, op) {
+    const article = document.createElement('article');
+    article.className = 'message assistant media-message';
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = 'Assistant';
+    const content = document.createElement('pre');
+    content.className = 'message-content';
+    content.textContent = `已返回 ${items.length} 个${op && op.id === 'video_generation' ? '视频' : '图片'}结果`;
+    const revisedPrompts = [...new Set(items.map((item) => item.revisedPrompt).filter(Boolean))];
+    if (revisedPrompts.length) {
+      content.textContent += `\n\nRevised prompt:\n${revisedPrompts.join('\n')}`;
+    }
+    const gallery = document.createElement('div');
+    gallery.className = 'media-gallery visible';
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
       const card = document.createElement('article');
       card.className = 'media-card';
       let media;
-      if (mime.startsWith('video/')) {
+      if (item.mime.startsWith('video/')) {
         media = document.createElement('video');
         media.controls = true;
         media.preload = 'metadata';
       } else {
         media = document.createElement('img');
-        media.alt = item.filename || `生成结果 ${index + 1}`;
+        media.alt = item.filename;
       }
-      media.src = src;
+      media.src = item.src;
       const meta = document.createElement('div');
       meta.className = 'media-meta';
       const name = document.createElement('span');
-      name.textContent = item.filename || `${OP_LABELS[op.id] || '结果'} ${index + 1}`;
+      name.textContent = item.filename;
       const download = document.createElement('a');
-      download.href = src;
+      download.href = item.src;
       download.download = item.filename || `result-${index + 1}`;
       download.textContent = '下载';
       meta.append(name, download);
       card.append(media, meta);
-      els.mediaGallery.append(card);
+      gallery.append(card);
     }
-    if (!els.mediaGallery.children.length) throw new Error('媒体接口没有返回可显示的结果');
-    els.mediaGallery.classList.add('visible');
+    article.append(label, content, gallery);
+    parent.append(article);
   }
 
-  async function runMedia(op) {
-    const payload = mediaPayload(op);
+  async function runMedia(op, plan) {
     let response;
     if (op.id === 'image_generation') {
       response = await fetch(op.endpoint, {
         method: 'POST',
         headers: authHeaders(true),
-        body: JSON.stringify(payload),
+        body: JSON.stringify(plan.payload),
         signal: state.controller.signal,
       });
     } else {
       const form = new FormData();
-      for (const [key, value] of Object.entries(payload)) form.append(key, String(value));
-      for (const attachment of state.attachments) {
+      for (const [key, value] of Object.entries(plan.payload)) form.append(key, String(value));
+      for (const attachment of plan.attachments) {
         form.append('image[]', attachment.file, attachment.name);
       }
       response = await fetch(op.endpoint, {
@@ -786,7 +1259,17 @@
     }
     if (!response.ok) throw new Error(await responseError(response));
     const data = await response.json();
-    renderMedia(Array.isArray(data.data) ? data.data : [], op);
+    const media = normalizeMediaItems(Array.isArray(data.data) ? data.data : [], op);
+    const interaction = interactionFor(plan.modelId, plan.operationId);
+    interaction.turns.push({
+      user: plan.userMessage,
+      parameters: plan.parameters,
+      media,
+    });
+    els.answerText.textContent = '';
+    els.answer.classList.remove('active');
+    renderInteractionHistory();
+    els.prompt.focus();
   }
 
   async function runRequest() {
@@ -801,18 +1284,27 @@
       showError(`当前能力最多接收 ${maxReferences} 张参考图片，请先移除多余图片。`);
       return;
     }
+    let plan;
+    try {
+      plan = op.id === 'chat' ? prepareChatRequest(op) : prepareMediaRequest(op);
+    } catch (error) {
+      showError(error instanceof Error ? error.message : String(error));
+      return;
+    }
 
     state.controller = new AbortController();
     state.startedAt = performance.now();
     state.firstTokenAt = 0;
-    beginRequest(op);
+    beginRequest(op, plan);
+    clearComposerInput();
+    els.prompt.focus();
     syncSendState();
     state.timer = window.setInterval(() => {
       els.timeMetric.textContent = `耗时 ${((performance.now() - state.startedAt) / 1000).toFixed(1)}s`;
     }, 100);
     try {
-      if (op.id === 'chat') await runChat(op);
-      else await runMedia(op);
+      if (op.id === 'chat') await runChat(op, plan);
+      else await runMedia(op, plan);
     } catch (error) {
       if (error && error.name === 'AbortError') showRequestError(op, '请求已停止。');
       else showRequestError(op, error instanceof Error ? error.message : String(error));
@@ -827,7 +1319,10 @@
     els.apiKey.type = showing ? 'password' : 'text';
     els.toggleKey.setAttribute('aria-label', showing ? '显示 API key' : '隐藏 API key');
   });
-  els.apiKey.addEventListener('input', () => setConnection('凭据已变化'));
+  els.apiKey.addEventListener('input', () => {
+    setConnection('凭据已变化');
+    syncSendState();
+  });
   els.loadModels.addEventListener('click', loadModelList);
   els.model.addEventListener('change', syncModel);
   els.operation.addEventListener('change', syncOperation);
@@ -835,12 +1330,25 @@
     const op = selectedOperation();
     if (op) applyOperationPreset(op, els.operationPreset.value);
   });
-  els.prompt.addEventListener('input', syncSendState);
+  els.prompt.addEventListener('input', () => {
+    syncSendState();
+    updateContextPreview();
+  });
+  els.systemPrompt.addEventListener('input', updateContextPreview);
+  els.maxTokens.addEventListener('input', updateContextPreview);
   els.prompt.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    if (event.key !== 'Enter' || event.isComposing) return;
+    if (event.ctrlKey || event.metaKey) {
       event.preventDefault();
-      runRequest();
+      const start = els.prompt.selectionStart ?? els.prompt.value.length;
+      const end = els.prompt.selectionEnd ?? start;
+      els.prompt.setRangeText('\n', start, end, 'end');
+      els.prompt.dispatchEvent(new Event('input', {bubbles: true}));
+      return;
     }
+    if (event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    runRequest();
   });
 
   els.fileInput.addEventListener('change', () => addFiles(els.fileInput.files));
@@ -875,9 +1383,14 @@
   els.stop.addEventListener('click', () => state.controller && state.controller.abort());
   els.clear.addEventListener('click', () => {
     if (state.controller) state.controller.abort();
-    els.prompt.value = '';
-    clearAttachments();
+    const op = selectedOperation();
+    if (op) {
+      state.interactionHistories.delete(interactionKey(els.model.value, op.id));
+    }
+    clearComposerInput();
     resetOutput();
+    renderInteractionHistory();
+    updateContextPreview();
     syncSendState();
     els.prompt.focus();
   });

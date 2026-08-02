@@ -547,9 +547,79 @@ def _profile_for_public_id(settings: Settings, iface: Any, public_id: str) -> An
     return settings.profile_for(public_id)
 
 
-def _openai_model_list_entry(
-    settings: Settings, iface: Any, public_id: str, created: int
+def _openai_model_entry(public_id: str, created: int) -> Dict[str, Any]:
+    """Return the exact OpenAI Model object shape."""
+
+    return {
+        "id": public_id,
+        "object": "model",
+        "created": created,
+        "owned_by": "fake-ollama",
+    }
+
+
+def _anthropic_model_capabilities(profile: Any) -> Dict[str, Any]:
+    """Map the local profile conservatively to Anthropic's capability schema."""
+
+    capability_set = set(profile.capabilities)
+
+    def support(enabled: bool = False) -> Dict[str, bool]:
+        return {"supported": enabled}
+
+    thinking_enabled = profile.thinking_mode == "enabled"
+    return {
+        "batch": support(),
+        "citations": support(),
+        "code_execution": support(),
+        "context_management": {
+            "clear_thinking_20251015": support(),
+            "clear_tool_uses_20250919": support(),
+            "compact_20260112": support(),
+            "supported": False,
+        },
+        "effort": {
+            "high": support(),
+            "low": support(),
+            "max": support(),
+            "medium": support(),
+            "supported": False,
+            "xhigh": support(),
+        },
+        "image_input": support("vision" in capability_set),
+        "pdf_input": support(),
+        "structured_outputs": support(),
+        "thinking": {
+            "supported": thinking_enabled,
+            "types": {
+                "adaptive": support(),
+                "enabled": support(thinking_enabled),
+            },
+        },
+    }
+
+
+def _anthropic_model_entry(
+    settings: Settings, iface: Any, public_id: str
 ) -> Dict[str, Any]:
+    """Return the Anthropic ModelInfo shape for one exposed model."""
+
+    profile = _profile_for_public_id(settings, iface, public_id)
+    return {
+        "id": public_id,
+        "capabilities": _anthropic_model_capabilities(profile),
+        "created_at": "1970-01-01T00:00:00Z",
+        "display_name": public_id,
+        "max_input_tokens": profile.context_length,
+        "max_tokens": profile.max_output_tokens or profile.context_length,
+        "type": "model",
+    }
+
+
+def _playground_model_entry(
+    settings: Settings, iface: Any, public_id: str
+) -> Dict[str, Any]:
+    """Describe one model for fake-ollama's versioned Playground API."""
+
     profile = _profile_for_public_id(settings, iface, public_id)
     exposure = iface.exposure_for_public_id(public_id) if iface is not None else None
     source = settings.source_by_name(exposure.target) if exposure is not None else None
@@ -562,6 +632,7 @@ def _openai_model_list_entry(
                 "id": "chat",
                 "endpoint": "/v1/chat/completions",
                 "stream": True,
+                "history_mode": "conversation",
                 "accepts_images": "vision" in capability_set,
                 "tool_calling": "tools" in capability_set,
             }
@@ -572,6 +643,7 @@ def _openai_model_list_entry(
                 "id": "image_generation",
                 "endpoint": "/v1/images/generations",
                 "stream": False,
+                "history_mode": "single_turn",
                 "accepts_images": False,
             }
         )
@@ -581,6 +653,7 @@ def _openai_model_list_entry(
                 "id": "image_edit",
                 "endpoint": "/v1/images/edits",
                 "stream": False,
+                "history_mode": "single_turn",
                 "accepts_images": True,
                 "requires_images": True,
                 "multiple_images": True,
@@ -592,6 +665,7 @@ def _openai_model_list_entry(
                 "id": "video_generation",
                 "endpoint": "/v1/videos/generations",
                 "stream": False,
+                "history_mode": "single_turn",
                 "accepts_images": True,
                 "requires_images": False,
                 "multiple_images": True,
@@ -606,14 +680,40 @@ def _openai_model_list_entry(
             operation.update(describe_comfyui_operation(source, operation["id"]))
     return {
         "id": public_id,
-        "object": "model",
-        "created": created,
-        "owned_by": "fake-ollama",
         "context_length": profile.context_length,
+        "max_output_tokens": profile.max_output_tokens,
         "estimated_vram_gb": profile.estimated_vram_gb,
+        "estimated_memory_gb": profile.estimated_memory_gb,
         "capabilities": capabilities,
         "operations": operations,
     }
+
+
+def _public_model_ids(iface: Any) -> List[str]:
+    seen: Dict[str, None] = {}
+    for public_id in iface.public_ids():
+        seen.setdefault(public_id, None)
+    return list(seen)
+
+
+def _model_interface_for_request(request: Request) -> tuple[Settings, Any]:
+    """Resolve and authenticate the interface used for model discovery."""
+
+    settings: Settings = request.app.state.settings
+    iface = _interface_for(request)
+    if iface is None:
+        raise HTTPException(status_code=404, detail="unknown listener")
+    if iface.auth_required:
+        token = _bearer_or_api_key(request)
+        if not iface.is_valid_token(token):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "missing or invalid api token (send via x-api-key "
+                    "or Authorization: Bearer header)"
+                ),
+            )
+    return settings, iface
 
 
 async def _openai_upstream_messages(
@@ -1018,9 +1118,10 @@ def _install_port_router(app: FastAPI) -> None:
                 playground_media = _has_path_prefix(
                     path, ("/v1/images", "/v1/videos")
                 )
+                model_discovery = _has_path_prefix(path, ("/v1/models",))
                 if (
                     playground_only
-                    or path == "/v1/models"
+                    or model_discovery
                     or shared_v1
                     or playground_media
                 ):
@@ -1105,7 +1206,6 @@ def _register_routes(app: FastAPI) -> None:
         iface = _interface_for(request)
         public_ids = iface.public_ids() if iface is not None else []
         for name in public_ids:
-            profile = _profile_for_public_id(settings, iface, name)
             models.append(
                 {
                     "name": name,
@@ -1121,8 +1221,6 @@ def _register_routes(app: FastAPI) -> None:
                         "parameter_size": "unknown",
                         "quantization_level": "none",
                     },
-                    "capabilities": list(profile.capabilities),
-                    "context_length": profile.context_length,
                 }
             )
         return {"models": models}
@@ -1142,7 +1240,11 @@ def _register_routes(app: FastAPI) -> None:
         # "tools" for tool-calling, "vision" for image input). We surface
         # the per-model profile here so users can configure exactly what each
         # model claims to support.
-        capabilities = list(profile.capabilities)
+        capabilities = [
+            capability
+            for capability in profile.capabilities
+            if capability in {"completion", "tools", "vision"}
+        ]
         ctx_len = profile.context_length
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         return {
@@ -1166,7 +1268,6 @@ def _register_routes(app: FastAPI) -> None:
                 "claude.context_length": ctx_len,
             },
             "capabilities": capabilities,
-            "context_length": ctx_len,
             "modified_at": now,
         }
 
@@ -1187,40 +1288,70 @@ def _register_routes(app: FastAPI) -> None:
             detail="Embeddings are not supported by the upstream Anthropic API.",
         )
 
-    # ---- OpenAI-compatible endpoints (Ollama also implements these) -----
+    # ---- Provider-native model discovery + OpenAI-compatible endpoints --
 
     @app.get("/v1/models")
-    async def openai_models(request: Request) -> Dict[str, Any]:
-        settings: Settings = app.state.settings
-        now = int(datetime.now(timezone.utc).timestamp())
-        iface = _interface_for(request)
-        if iface is None:
-            raise HTTPException(status_code=404, detail="unknown listener")
-        # Auth gate: per-interface access_tokens.
-        if iface.auth_required:
-            token = _bearer_or_api_key(request)
-            if not iface.is_valid_token(token):
-                raise HTTPException(
-                    status_code=401,
-                    detail=(
-                        "missing or invalid api token (send via x-api-key "
-                        "or Authorization: Bearer header)"
-                    ),
-                )
-
-        seen: Dict[str, None] = {}
-        names: List[str] = []
-        for n in iface.public_ids():
-            if n not in seen:
-                seen[n] = None
-                names.append(n)
-        return {
-            "object": "list",
-            "data": [
-                _openai_model_list_entry(settings, iface, name, now)
-                for name in names
-            ],
+    async def models(request: Request) -> JSONResponse:
+        settings, iface = _model_interface_for_request(request)
+        names = _public_model_ids(iface)
+        headers = {
+            "Cache-Control": "no-store",
+            "Vary": "anthropic-version",
         }
+        if request.headers.get("anthropic-version"):
+            entries = [
+                _anthropic_model_entry(settings, iface, name) for name in names
+            ]
+            return JSONResponse(
+                {
+                    "data": entries,
+                    "first_id": names[0] if names else None,
+                    "has_more": False,
+                    "last_id": names[-1] if names else None,
+                },
+                headers=headers,
+            )
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        return JSONResponse(
+            {
+                "object": "list",
+                "data": [_openai_model_entry(name, now) for name in names],
+            },
+            headers=headers,
+        )
+
+    @app.get("/v1/models/{model_id}")
+    async def retrieve_model(model_id: str, request: Request) -> JSONResponse:
+        settings, iface = _model_interface_for_request(request)
+        if model_id not in _public_model_ids(iface):
+            raise HTTPException(status_code=404, detail="model not found")
+        if request.headers.get("anthropic-version"):
+            payload = _anthropic_model_entry(settings, iface, model_id)
+        else:
+            now = int(datetime.now(timezone.utc).timestamp())
+            payload = _openai_model_entry(model_id, now)
+        return JSONResponse(
+            payload,
+            headers={
+                "Cache-Control": "no-store",
+                "Vary": "anthropic-version",
+            },
+        )
+
+    @app.get("/playground/api/models", include_in_schema=False)
+    async def playground_models(request: Request) -> JSONResponse:
+        settings, iface = _model_interface_for_request(request)
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "models": [
+                    _playground_model_entry(settings, iface, name)
+                    for name in _public_model_ids(iface)
+                ],
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/v1/chat/completions")
     async def openai_chat_completions(request: Request) -> Any:

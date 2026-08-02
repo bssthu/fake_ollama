@@ -131,16 +131,25 @@ def test_openai_image_generations_routes_to_comfyui_default_model() -> None:
     assert fake.generate_calls[0]["estimated_vram_gb"] == 16.0
 
 
-def test_openai_models_uses_comfyui_target_profile() -> None:
+def test_playground_models_uses_comfyui_target_profile() -> None:
     fake = _FakeComfyClient()
-    client = _client_with_fake(fake)
-    with client:
-        resp = client.get("/v1/models", headers={"x-api-key": "tk"})
+    settings = _settings()
+    settings.model_profiles["z-image-turbo@z-image-comfy"][
+        "estimated_memory_gb"
+    ] = 30.0
+    settings = settings.model_copy(
+        update={"playground_enabled": True, "playground_port": 21431}
+    )
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+    with TestClient(app, base_url="http://testserver:21431") as client:
+        resp = client.get("/playground/api/models", headers={"x-api-key": "tk"})
 
     assert resp.status_code == 200
-    model = next(item for item in resp.json()["data"] if item["id"] == "z-image-turbo")
+    model = next(item for item in resp.json()["models"] if item["id"] == "z-image-turbo")
     assert model["context_length"] == 4096
     assert model["estimated_vram_gb"] == 16.0
+    assert model["estimated_memory_gb"] == 30.0
     assert model["capabilities"] == ["image_generation", "image_edit"]
     assert [operation["id"] for operation in model["operations"]] == [
         "image_generation",
@@ -152,12 +161,38 @@ def test_openai_models_uses_comfyui_target_profile() -> None:
     )
     generation = model["operations"][0]
     assert generation["endpoint"] == "/v1/images/generations"
+    assert generation["history_mode"] == "single_turn"
     assert generation["defaults"]["size"] == "1024x1024"
     assert generation["defaults"]["steps"] == 8
     assert generation["limits"]["max_batch_size"] == 2
     edit = model["operations"][1]
+    assert edit["history_mode"] == "single_turn"
     assert edit["requires_images"] is True
     assert edit["defaults"]["denoise"] == 0.25
+
+
+def test_playground_models_marks_video_generation_as_single_turn() -> None:
+    settings = _settings()
+    settings.model_profiles["z-image-turbo@z-image-comfy"]["capabilities"].append(
+        "video_generation"
+    )
+    settings = settings.model_copy(
+        update={"playground_enabled": True, "playground_port": 21431}
+    )
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": _FakeComfyClient()}
+
+    with TestClient(app, base_url="http://testserver:21431") as client:
+        response = client.get(
+            "/playground/api/models", headers={"x-api-key": "tk"}
+        )
+
+    assert response.status_code == 200
+    operations = response.json()["models"][0]["operations"]
+    video = next(
+        operation for operation in operations if operation["id"] == "video_generation"
+    )
+    assert video["history_mode"] == "single_turn"
 
 
 def test_openai_image_edits_accepts_multipart_image() -> None:
@@ -344,7 +379,9 @@ def test_playground_listener_routes_image_generation_to_comfyui() -> None:
     app = create_app(settings)
     app.state.comfyui_clients = {"z-image-comfy": fake}
     with TestClient(app, base_url="http://testserver:21431") as client:
-        models = client.get("/v1/models", headers={"x-api-key": "tk"})
+        models = client.get(
+            "/playground/api/models", headers={"x-api-key": "tk"}
+        )
         generated = client.post(
             "/v1/images/generations",
             headers={"x-api-key": "tk"},
@@ -352,7 +389,7 @@ def test_playground_listener_routes_image_generation_to_comfyui() -> None:
         )
 
     assert models.status_code == 200
-    model = models.json()["data"][0]
+    model = models.json()["models"][0]
     assert [op["id"] for op in model["operations"]] == [
         "image_generation",
         "image_edit",

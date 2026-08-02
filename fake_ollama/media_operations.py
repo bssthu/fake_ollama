@@ -2,9 +2,9 @@
 
 The ComfyUI workflow remains the execution source of truth.  This module turns
 its logical bindings into a transport-neutral parameter description consumed
-by ``/v1/models`` and the Playground.  A parameter is advertised only when the
-selected workflow actually binds it (apart from API orchestration fields such
-as ``n``), which prevents controls that silently do nothing.
+by ``/playground/api/models``.  A parameter is advertised only when the selected
+workflow actually binds it (apart from API orchestration fields such as ``n``),
+which prevents controls that silently do nothing.
 """
 
 from __future__ import annotations

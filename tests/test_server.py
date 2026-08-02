@@ -72,6 +72,14 @@ def test_tags_lists_models(settings):
     names = [m["name"] for m in body["models"]]
     assert "claude-3-5-sonnet-20241022@default" in names
     assert "llama-test@default" in names
+    assert set(body["models"][0]) == {
+        "name",
+        "model",
+        "modified_at",
+        "size",
+        "digest",
+        "details",
+    }
 
 
 def test_version_endpoint(settings):
@@ -535,19 +543,56 @@ def test_openai_chat_non_streaming_upstream_disconnect_returns_502(settings):
 
 def test_openai_models_list(settings):
     client = _make_client(settings, httpx.MockTransport(lambda req: httpx.Response(404)))
+    model_id = "claude-3-5-sonnet-20241022@default"
     with client:
         resp = client.get("/v1/models")
+        retrieved = client.get(f"/v1/models/{model_id}")
     assert resp.status_code == 200
+    assert resp.headers["vary"] == "anthropic-version"
+    assert resp.headers["cache-control"] == "no-store"
     body = resp.json()
     assert body["object"] == "list"
     ids = [m["id"] for m in body["data"]]
-    assert "claude-3-5-sonnet-20241022@default" in ids
+    assert model_id in ids
     model = next(
         item for item in body["data"]
-        if item["id"] == "claude-3-5-sonnet-20241022@default"
+        if item["id"] == model_id
     )
-    assert model["operations"][0]["id"] == "chat"
-    assert model["operations"][0]["accepts_images"] is True
+    assert set(model) == {"id", "object", "created", "owned_by"}
+    assert retrieved.status_code == 200
+    assert set(retrieved.json()) == {"id", "object", "created", "owned_by"}
+    assert retrieved.json()["id"] == model_id
+
+
+def test_anthropic_models_list_and_retrieve_use_native_schema(settings):
+    client = _make_client(settings, httpx.MockTransport(lambda req: httpx.Response(404)))
+    headers = {"anthropic-version": "2023-06-01"}
+    model_id = "claude-3-5-sonnet-20241022@default"
+    with client:
+        listed = client.get("/v1/models", headers=headers)
+        retrieved = client.get(f"/v1/models/{model_id}", headers=headers)
+
+    assert listed.status_code == 200
+    assert listed.headers["vary"] == "anthropic-version"
+    body = listed.json()
+    assert set(body) == {"data", "first_id", "has_more", "last_id"}
+    assert body["has_more"] is False
+    model = next(item for item in body["data"] if item["id"] == model_id)
+    assert set(model) == {
+        "id",
+        "capabilities",
+        "created_at",
+        "display_name",
+        "max_input_tokens",
+        "max_tokens",
+        "type",
+    }
+    assert model["type"] == "model"
+    assert model["display_name"] == model_id
+    assert model["capabilities"]["image_input"]["supported"] is True
+    assert isinstance(model["capabilities"], dict)
+    assert retrieved.status_code == 200
+    assert retrieved.json() == model
 
 
 def test_openai_chat_streams_tool_calls(settings):
@@ -656,25 +701,29 @@ def _profile_settings(monkeypatch=None):
 
 def test_show_uses_per_model_profile(monkeypatch):
     settings = _profile_settings(monkeypatch)
+    settings.model_profiles["tiny-model"]["capabilities"].append("image_generation")
     client = _make_client(settings, httpx.MockTransport(lambda r: httpx.Response(404)))
     with client:
         resp = client.post("/api/show", json={"model": "tiny-model@default"})
     body = resp.json()
+    # Non-Ollama media labels remain available to the Playground but are not
+    # inserted into Ollama's standard capabilities array.
     assert body["capabilities"] == ["completion"]
-    assert body["context_length"] == 256
+    assert "context_length" not in body
     assert body["model_info"]["general.context_length"] == 256
     assert body["model_info"]["claude.context_length"] == 256
 
 
-def test_tags_includes_profile_fields(monkeypatch):
+def test_tags_does_not_add_nonstandard_profile_fields(monkeypatch):
     settings = _profile_settings(monkeypatch)
     client = _make_client(settings, httpx.MockTransport(lambda r: httpx.Response(404)))
     with client:
         resp = client.get("/api/tags")
     by_name = {m["name"]: m for m in resp.json()["models"]}
-    assert by_name["tiny-model@default"]["context_length"] == 256
-    assert by_name["tiny-model@default"]["capabilities"] == ["completion"]
-    assert "vision" in by_name["big-model@default"]["capabilities"]
+    assert "context_length" not in by_name["tiny-model@default"]
+    assert "capabilities" not in by_name["tiny-model@default"]
+    assert "context_length" not in by_name["big-model@default"]
+    assert "capabilities" not in by_name["big-model@default"]
 
 
 def test_context_limit_enforced(monkeypatch):
