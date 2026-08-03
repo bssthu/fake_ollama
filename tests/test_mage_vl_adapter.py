@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Iterator
 
+import mage_vl_adapter.server as mage_server
 from fastapi.testclient import TestClient
 
 from mage_vl_adapter.server import (
@@ -109,6 +110,43 @@ def test_request_segment_limit_defaults_to_120(tmp_path: Path) -> None:
     prepared = prepare_request(payload, settings)
     try:
         assert prepared.options.max_segments == 120
+    finally:
+        shutil.rmtree(prepared.request_dir)
+
+
+def test_browser_duration_hint_avoids_container_duration_probe(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    settings = _settings(tmp_path)
+    payload = _payload(stream=False)
+    payload.update(
+        {
+            "video_duration_seconds": 8.25,
+            "segment_seconds": 10,
+            "max_segments": 1,
+        }
+    )
+    prepared = prepare_request(payload, settings)
+    engine = MageEngine(settings)
+    monkeypatch.setattr(
+        mage_server,
+        "probe_duration",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("duration probe should not run when a hint is supplied")
+        ),
+    )
+    monkeypatch.setattr(
+        mage_server,
+        "extract_segment_frames",
+        lambda *_args: [],
+    )
+    monkeypatch.setattr(engine, "_generate", lambda *_args: "camera result")
+
+    try:
+        assert prepared.options.video_duration_seconds == 8.25
+        output = "".join(engine.analyze(prepared))
+        assert "视频时长 00:08" in output
+        assert "camera result" in output
     finally:
         shutil.rmtree(prepared.request_dir)
 

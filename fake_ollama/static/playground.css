@@ -260,6 +260,75 @@ button:disabled { cursor: not-allowed; opacity: 0.48; transform: none !important
   cursor: pointer;
 }
 
+.camera-section { display: grid; gap: 9px; }
+.camera-preview-shell {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #181a18;
+}
+.camera-preview-shell video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+.camera-placeholder {
+  width: 100%;
+  height: 100%;
+  padding: 18px;
+  display: grid;
+  place-content: center;
+  gap: 5px;
+  color: rgba(255,255,255,0.68);
+  text-align: center;
+  font-size: 10px;
+}
+.camera-placeholder strong { color: #fff; font-size: 12px; }
+.camera-controls { display: grid; gap: 7px; }
+.camera-controls > label { color: #4c4e49; font-size: 11px; font-weight: 700; }
+.camera-actions { display: flex; gap: 8px; }
+.camera-actions button { flex: 1; min-height: 40px; padding: 8px 10px; }
+.camera-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+.camera-state::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #aaa79f;
+}
+.camera-state.live { color: var(--ok); }
+.camera-state.live::before {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(44, 120, 87, 0.12);
+}
+.camera-state.busy { color: var(--accent-dark); }
+.camera-state.busy::before { background: var(--accent); }
+.camera-state.error { color: var(--danger); }
+.camera-state.error::before { background: var(--danger); }
+.camera-live-text {
+  max-height: 170px;
+  margin: 0;
+  padding: 10px 11px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: #41433f;
+  background: rgba(255,255,255,0.74);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
 .divider { height: 1px; background: var(--line); }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .parameter-row + .parameter-row { margin-top: 10px; }

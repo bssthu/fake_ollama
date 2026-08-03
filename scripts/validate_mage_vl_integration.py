@@ -28,6 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment-seconds", type=float, default=8)
     parser.add_argument("--frames-per-segment", type=int, default=4)
     parser.add_argument("--max-segments", type=int, default=1)
+    parser.add_argument(
+        "--video-duration-seconds",
+        type=float,
+        default=None,
+        help="Optional browser-recorded duration hint for MediaRecorder-style clips.",
+    )
     parser.add_argument("--stream", action="store_true")
     return parser.parse_args()
 
@@ -71,6 +77,8 @@ def main() -> None:
         "max_tokens": 96,
         "temperature": 0,
     }
+    if args.video_duration_seconds is not None:
+        payload["video_duration_seconds"] = args.video_duration_seconds
 
     app = create_app(settings)
     with TestClient(app, base_url=f"http://testserver:{api_port}") as client:
@@ -120,6 +128,7 @@ def main() -> None:
         "discovered_capabilities": mage_entry["capabilities"],
         "discovered_operation": operation,
         "stream": args.stream,
+        "video_duration_seconds": args.video_duration_seconds,
         "proxied_model": proxied_model,
         "answer": answer,
     }

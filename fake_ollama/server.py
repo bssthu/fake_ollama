@@ -685,6 +685,11 @@ def _playground_model_entry(
                     "max_videos": 1,
                     "max_video_bytes": 64 * 1024 * 1024,
                 },
+                "live_camera": {
+                    "supported": True,
+                    "capture_mode": "windowed_media_recorder",
+                    "max_pending_segments": 1,
+                },
                 "parameters": [
                     {
                         "name": "segment_seconds",

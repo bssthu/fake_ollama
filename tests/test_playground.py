@@ -61,6 +61,10 @@ def test_playground_static_page_and_security_headers():
     assert 'id="operation"' in response.text
     assert 'id="operationPreset"' in response.text
     assert 'id="operationParameterList"' in response.text
+    assert 'id="cameraSection"' in response.text
+    assert 'id="cameraPreview"' in response.text
+    assert 'id="cameraStart"' in response.text
+    assert 'id="cameraStop"' in response.text
     assert 'id="conversation"' in response.text
     assert 'id="modelMemory"' in response.text
     assert 'id="contextChip"' in response.text
@@ -76,6 +80,10 @@ def test_playground_static_page_and_security_headers():
     assert "video_understanding" in js.text
     assert "video_analysis" in js.text
     assert "video_url" in js.text
+    assert "navigator.mediaDevices.getUserMedia" in js.text
+    assert "new window.MediaRecorder" in js.text
+    assert "video_duration_seconds" in js.text
+    assert "max_pending_segments: 1" in js.text
     assert "new FormData()" in js.text
     assert "stream: true" in js.text
     assert "estimated_vram_gb" in js.text
@@ -222,6 +230,11 @@ def test_video_understanding_has_single_turn_upload_operation():
     assert operation["accepts_videos"] is True
     assert operation["requires_videos"] is True
     assert operation["limits"]["max_videos"] == 1
+    assert operation["live_camera"] == {
+        "supported": True,
+        "capture_mode": "windowed_media_recorder",
+        "max_pending_segments": 1,
+    }
     assert next(
         item for item in operation["parameters"] if item["name"] == "max_segments"
     )["max"] == 120

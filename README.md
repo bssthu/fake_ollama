@@ -39,7 +39,7 @@
 - `access_tokens` 为空 = 该接口不需鉴权；非空 = 该接口的所有请求都必须带 `x-api-key` 或 `Authorization: Bearer`。
 - `exposed_models` 是该接口允许看到 / 请求的模型列表，元素是 `{model, target, alias?}` 三元组；不在白名单里的模型在该接口上 404。
 - admin 接口（`admin_host` / `admin_port`）只服务 `/admin/*`，**不会**出现在任何 `ollama_interfaces` / `api_interfaces` 上；同样，`/api/*` 与 `/v1/*` 也**不会**出现在 admin 端口。
-- Model Playground 默认关闭。启用后使用独立端口，按 `/playground/api/models` 返回的 capabilities/operations 调用聊天、视觉、视频分析、图片生成/编辑与视频生成接口；支持图片粘贴/拖放和本地视频选择。API key 与交互记录仅保存在当前浏览器页面内存中。
+- Model Playground 默认关闭。启用后使用独立端口，按 `/playground/api/models` 返回的 capabilities/operations 调用聊天、视觉、视频分析、图片生成/编辑与视频生成接口；支持图片粘贴/拖放、本地视频选择，以及手机或 PC 摄像头的分窗近实时分析。API key 与交互记录仅保存在当前浏览器页面内存中。
 - 想让别的机器访问某个接口：把对应实例的 `host` 改成 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
 
 ## 特性一览
@@ -597,9 +597,22 @@ dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排
 | `memory_low_free_reclaim_enabled` | bool | `true` | 检测系统内存低水位时主动回收（仅回收声明了 `estimated_memory_gb` 的模型） |
 | `memory_low_free_threshold_mib` | float | `2048.0` | 内存低水位阈值（MiB） |
 | `playground_enabled` | bool | `false` | 是否启用轻量流式模型调试页；交互记录仅保留在当前页面内存中，刷新后清空 |
-| `playground_host` / `playground_port` | | `127.0.0.1` / `21431` | Playground 独立 listener；修改后需重启进程 |
+| `playground_host` / `playground_port` | | `127.0.0.1` / `21431` | Playground 独立 listener；局域网访问时将 host 改为 `0.0.0.0`，修改后需重启进程 |
 
-启用后打开 `http://127.0.0.1:21431/playground/`，输入某个 interface 的 `access_tokens`，即可加载该 interface 暴露的模型。页面会读取模型的 capabilities/operations，自动提供聊天、视觉输入、视频分析、图片生成、图片编辑或视频生成模式，并按 workflow 动态显示真正生效的参数与推荐 preset；图片可粘贴、拖放或从文件选择，视频分析可拖放或选择一个本地视频。聊天模式按模型保存当前页面内的完整轮次，每次请求会回传先前的 user/assistant 消息；前端读取 `context_length` 和 `max_output_tokens` 估算预算，超过 90% 安全阈值时优先丢弃最早的完整轮次，必要时再截短当前输入。视频分析、图片生成、图片编辑和视频生成也会保留逐轮输入与结果，但其 `history_mode=single_turn`，接口只接收本次输入。若 interface 不要求鉴权，API key 可以留空。
+启用后打开 `http://127.0.0.1:21431/playground/`，输入某个 interface 的 `access_tokens`，即可加载该 interface 暴露的模型。页面会读取模型的 capabilities/operations，自动提供聊天、视觉输入、视频分析、图片生成、图片编辑或视频生成模式，并按 workflow 动态显示真正生效的参数与推荐 preset；图片可粘贴、拖放或从文件选择，视频分析可拖放、选择一个本地视频，或启动手机 / PC 摄像头持续分析。摄像头模式按 `segment_seconds` 连续录制可独立解码的短片段，录制与 Mage-VL 推理并行，但 GPU 请求严格串行；推理落后时只保留最新的一个待处理片段并累计显示丢弃数，所以长时间运行不会形成浏览器内存、请求或显存积压。单段实时输出最多使用 128 个 token，且不执行整体总结。
+
+手机访问时，把 `playground_host` 设为 `0.0.0.0`，重启 fake-ollama 后打开 `http://<PC 局域网 IP>:21431/playground/`，并按需放行 Windows 防火墙的 TCP 21431 入站。这里的 HTTP 方案仅完成应用链路：主流手机浏览器通常只在 HTTPS 安全上下文中开放 `getUserMedia`，因此未配置 HTTPS 时可能看得到页面但无法取得摄像头权限；PC 上的 `http://localhost` 通常可直接使用。不要把 Playground 端口直接暴露到互联网。
+
+可用 Edge / Chrome 内置虚拟摄像头做完整页面烟测（要求 fake-ollama 已启动）：
+
+```powershell
+$env:FAKE_OLLAMA_CAMERA_TEST_API_KEY = "<access token>"
+node scripts\validate_playground_camera.mjs
+```
+
+脚本不需要 npm 依赖，不会打印 API key；它会用临时浏览器 profile 调用真实 Mage-VL，验证连续录制、单槽背压、结果历史和停止收尾后再关闭测试浏览器。
+
+聊天模式按模型保存当前页面内的完整轮次，每次请求会回传先前的 user/assistant 消息；前端读取 `context_length` 和 `max_output_tokens` 估算预算，超过 90% 安全阈值时优先丢弃最早的完整轮次，必要时再截短当前输入。视频分析、图片生成、图片编辑和视频生成也会保留逐轮输入与结果，但其 `history_mode=single_turn`，接口只接收本次输入。若 interface 不要求鉴权，API key 可以留空。
 
 ## 内部 backends 视图
 

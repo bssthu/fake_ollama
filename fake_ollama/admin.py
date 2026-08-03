@@ -539,7 +539,7 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "playground_enabled", "type": "bool", "default": False, "group": "playground",
    "description": "模型调试页的实际启用开关。修改后请点击顶部 Save & Reload，再重启 fake-ollama"},
   {"key": "playground_host", "type": "string", "default": "127.0.0.1", "group": "playground",
-   "description": "模型调试页监听地址。API key 会由浏览器发送到该地址，建议保持 127.0.0.1"},
+   "description": "模型调试页监听地址。保持 127.0.0.1 仅限本机；手机或其他局域网设备访问时可设为 0.0.0.0。API key 会由浏览器发送到该地址，请勿直接暴露到互联网"},
   {"key": "playground_port", "type": "int", "default": 21431, "group": "playground",
    "description": "模型调试页独立监听端口；必须与所有 interface、admin 和 dashboard 端口不同。启用后访问 /playground/"},
 

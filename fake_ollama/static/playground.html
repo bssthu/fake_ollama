@@ -71,6 +71,35 @@
           <div id="attachmentList" class="attachment-list"></div>
         </section>
 
+        <section id="cameraSection" class="camera-section" hidden>
+          <div class="label-row">
+            <span class="label">实时摄像头</span>
+            <span id="cameraStatus" class="camera-state">未启动</span>
+          </div>
+          <div class="camera-preview-shell">
+            <video id="cameraPreview" autoplay muted playsinline hidden></video>
+            <div id="cameraPlaceholder" class="camera-placeholder">
+              <strong>手机或 PC 摄像头预览</strong>
+              <span>按时间窗口持续录制，GPU 忙时只保留最新片段。</span>
+            </div>
+          </div>
+          <div class="camera-controls">
+            <label for="cameraFacing">摄像头方向</label>
+            <select id="cameraFacing">
+              <option value="environment">后置优先</option>
+              <option value="user">前置优先</option>
+              <option value="">系统默认</option>
+            </select>
+            <div class="camera-actions">
+              <button id="cameraStart" class="primary" type="button" disabled>开始实时分析</button>
+              <button id="cameraStop" class="stop" type="button" hidden>停止摄像头</button>
+            </div>
+          </div>
+          <div id="cameraStats" class="help">窗口 — · 已分析 0 · 丢弃 0</div>
+          <pre id="cameraLiveText" class="camera-live-text" hidden></pre>
+          <div class="help">当前按独立短片段近实时分析；HTTP 下手机浏览器可能拒绝摄像头权限，本阶段暂不处理 HTTPS。</div>
+        </section>
+
         <details class="advanced">
           <summary>请求参数</summary>
           <div class="advanced-body">

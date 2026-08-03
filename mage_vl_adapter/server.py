@@ -95,6 +95,7 @@ class AnalysisOptions:
     max_new_tokens: int
     temperature: float
     include_summary: bool
+    video_duration_seconds: float | None
 
 
 @dataclass(frozen=True)
@@ -235,6 +236,18 @@ def _analysis_options(
         include_summary = raw_summary.strip().lower() in {"1", "true", "yes", "on"}
     else:
         include_summary = bool(raw_summary)
+    raw_duration = payload.get("video_duration_seconds")
+    video_duration_seconds = None
+    if raw_duration is not None:
+        video_duration_seconds = float(
+            _bounded_number(
+                payload,
+                "video_duration_seconds",
+                0.1,
+                0.1,
+                3600.0,
+            )
+        )
     return AnalysisOptions(
         segment_seconds=float(
             _bounded_number(
@@ -272,6 +285,7 @@ def _analysis_options(
             _bounded_number(payload, "temperature", 0.0, 0.0, 2.0)
         ),
         include_summary=include_summary,
+        video_duration_seconds=video_duration_seconds,
     )
 
 
@@ -653,7 +667,10 @@ class MageEngine:
         )
 
     def analyze(self, prepared: PreparedRequest) -> Iterator[str]:
-        duration = probe_duration(self.settings.ffmpeg_path, prepared.video_path)
+        duration = prepared.options.video_duration_seconds or probe_duration(
+            self.settings.ffmpeg_path,
+            prepared.video_path,
+        )
         windows, skipped = select_segment_windows(
             duration,
             prepared.options.segment_seconds,

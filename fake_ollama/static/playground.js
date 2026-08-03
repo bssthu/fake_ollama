@@ -19,6 +19,15 @@
     dropText: $('dropText'),
     dropHint: $('dropHint'),
     attachmentList: $('attachmentList'),
+    cameraSection: $('cameraSection'),
+    cameraStatus: $('cameraStatus'),
+    cameraPreview: $('cameraPreview'),
+    cameraPlaceholder: $('cameraPlaceholder'),
+    cameraFacing: $('cameraFacing'),
+    cameraStart: $('cameraStart'),
+    cameraStop: $('cameraStop'),
+    cameraStats: $('cameraStats'),
+    cameraLiveText: $('cameraLiveText'),
     chatParams: $('chatParams'),
     mediaParams: $('mediaParams'),
     operationPresetField: $('operationPresetField'),
@@ -68,6 +77,8 @@
   const DISCOVERY_SCHEMA_VERSION = 1;
   const IMAGE_TOKEN_ESTIMATE = 1024;
   const VIDEO_TOKEN_ESTIMATE = 8192;
+  const LIVE_CAMERA_HISTORY_LIMIT = 200;
+  const LIVE_CAMERA_VIDEO_BITS_PER_SECOND = 2_500_000;
   const textEncoder = new TextEncoder();
 
   const state = {
@@ -80,6 +91,25 @@
     firstTokenAt: 0,
     timer: null,
     parameterInputs: new Map(),
+    camera: {
+      starting: false,
+      active: false,
+      processing: false,
+      stream: null,
+      recorder: null,
+      stopTimer: null,
+      uiTimer: null,
+      captureTask: null,
+      pending: null,
+      sequence: 0,
+      analyzed: 0,
+      dropped: 0,
+      errors: 0,
+      consecutiveErrors: 0,
+      lastError: '',
+      startedAt: 0,
+      settings: null,
+    },
   };
 
   function authHeaders(includeJson = false) {
@@ -156,6 +186,10 @@
         history_mode: 'single_turn', accepts_videos: true, requires_videos: true,
         multiple_videos: false,
         limits: {max_videos: 1, max_video_bytes: 64 * 1024 * 1024},
+        live_camera: {
+          supported: true, capture_mode: 'windowed_media_recorder',
+          max_pending_segments: 1,
+        },
       });
     }
     return operations;
@@ -163,6 +197,13 @@
 
   function operationUsesChatEndpoint(op) {
     return Boolean(op && ['chat', 'video_analysis'].includes(op.id));
+  }
+
+  function operationSupportsLiveCamera(op) {
+    return Boolean(
+      op && op.id === 'video_analysis'
+      && (!op.live_camera || op.live_camera.supported !== false)
+    );
   }
 
   function modelOperations(modelInfo) {
@@ -556,10 +597,11 @@
       }
     }
     els.uploadSection.hidden = !acceptsUploads;
+    els.cameraSection.hidden = !operationSupportsLiveCamera(op);
     els.uploadLabel.textContent = isVideoAnalysis ? '待分析视频' : '参考图片';
-    els.uploadRequirement.textContent = op && (op.requires_images || op.requires_videos)
-      ? '至少需要 1 个文件'
-      : '可选';
+    els.uploadRequirement.textContent = isVideoAnalysis
+      ? '文件模式需要 1 个；摄像头模式无需上传'
+      : (op && (op.requires_images || op.requires_videos) ? '至少需要 1 个文件' : '可选');
     els.fileInput.accept = isVideoAnalysis ? 'video/*' : 'image/*';
     els.fileInput.multiple = Boolean(op && (
       (op.accepts_images && op.multiple_images !== false)
@@ -569,7 +611,7 @@
       ? '拖放或选择本地视频'
       : '粘贴、拖放或选择图片';
     els.dropHint.textContent = isVideoAnalysis
-      ? '首版本地上传单个视频；建议使用短 MP4 验证'
+      ? '上传单个视频，或使用下方手机 / PC 摄像头持续分析'
       : '支持多张参考图；点击这里选择文件';
     els.chatParams.hidden = !isChatRequest;
     els.mediaParams.hidden = !(isMedia || isVideoAnalysis);
@@ -638,6 +680,7 @@
     renderInteractionHistory();
     updateContextPreview();
     syncSendState();
+    syncCameraControls();
   }
 
   function operationParameters(op) {
@@ -811,9 +854,11 @@
     ));
     const credentialReady = state.loadedCredential !== null
       && state.loadedCredential === els.apiKey.value.trim();
-    els.send.disabled = Boolean(state.controller) || !selectedModel() || !op
+    const cameraBusy = state.camera.starting || state.camera.active || state.camera.processing;
+    els.send.disabled = Boolean(state.controller) || cameraBusy || !selectedModel() || !op
       || !credentialReady || op.configured === false
       || !els.prompt.value.trim() || missingRequiredMedia;
+    syncCameraControls();
   }
 
   function showError(message) {
@@ -878,9 +923,10 @@
     state.timer = null;
     els.answerText.classList.remove('cursor');
     state.controller = null;
-    els.loadModels.disabled = false;
-    els.model.disabled = state.models.size === 0;
-    els.operation.disabled = modelOperations(selectedModel()).length === 0;
+    const cameraBusy = state.camera.starting || state.camera.active || state.camera.processing;
+    els.loadModels.disabled = cameraBusy;
+    els.model.disabled = cameraBusy || state.models.size === 0;
+    els.operation.disabled = cameraBusy || modelOperations(selectedModel()).length === 0;
     els.stop.hidden = true;
     els.send.hidden = false;
     updateContextPreview();
@@ -935,6 +981,537 @@
     if (data === '[DONE]') return true;
     consumeChunk(JSON.parse(data));
     return false;
+  }
+
+  function formatCameraTime(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    return hours
+      ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+      : `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+
+  function setCameraStatus(text, kind = '') {
+    els.cameraStatus.textContent = text;
+    els.cameraStatus.className = `camera-state ${kind}`.trim();
+  }
+
+  function cameraWindowSeconds() {
+    const entry = state.parameterInputs.get('segment_seconds');
+    const value = entry ? Number(readParameterValue(entry.spec, entry.input, false)) : 8;
+    return Number.isFinite(value) ? Math.min(60, Math.max(2, value)) : 8;
+  }
+
+  function updateCameraStats() {
+    const camera = state.camera;
+    const windowSeconds = camera.settings
+      ? camera.settings.windowSeconds
+      : cameraWindowSeconds();
+    const elapsed = camera.startedAt
+      ? formatCameraTime((performance.now() - camera.startedAt) / 1000)
+      : '00:00';
+    const queued = camera.pending ? ' · 待处理 1' : '';
+    const windowLabel = Number.isInteger(windowSeconds)
+      ? String(windowSeconds)
+      : Number(windowSeconds).toFixed(1);
+    els.cameraStats.textContent = [
+      `窗口 ${windowLabel}s`,
+      `已录制 ${camera.sequence}`,
+      `已分析 ${camera.analyzed}`,
+      `丢弃 ${camera.dropped}`,
+      `错误 ${camera.errors}`,
+      `运行 ${elapsed}${queued}`,
+    ].join(' · ');
+  }
+
+  function updateCameraStateStatus() {
+    const camera = state.camera;
+    if (camera.starting) {
+      setCameraStatus('等待权限', 'busy');
+    } else if (camera.active && camera.processing) {
+      setCameraStatus('录制中 · GPU 分析中', 'busy');
+    } else if (camera.active && camera.lastError) {
+      setCameraStatus('录制中 · 上段失败', 'error');
+    } else if (camera.active) {
+      setCameraStatus('录制中', 'live');
+    } else if (camera.processing) {
+      setCameraStatus('摄像头已停 · 分析收尾', 'busy');
+    } else if (camera.lastError) {
+      setCameraStatus('已停止：发生错误', 'error');
+    } else if (camera.startedAt) {
+      setCameraStatus('已停止');
+    } else {
+      setCameraStatus('未启动');
+    }
+    updateCameraStats();
+  }
+
+  function syncCameraControls() {
+    const camera = state.camera;
+    const op = selectedOperation();
+    const supported = operationSupportsLiveCamera(op);
+    const credentialReady = state.loadedCredential !== null
+      && state.loadedCredential === els.apiKey.value.trim();
+    const cameraBusy = camera.starting || camera.active || camera.processing;
+    const requestBusy = Boolean(state.controller);
+    const operationReady = supported && op.configured !== false;
+
+    els.cameraStart.hidden = camera.active;
+    els.cameraStart.textContent = camera.starting
+      ? '等待摄像头权限…'
+      : ((!camera.active && camera.processing) ? '等待当前分析…' : '开始实时分析');
+    els.cameraStart.disabled = !operationReady || !credentialReady
+      || !els.prompt.value.trim() || cameraBusy || requestBusy;
+    els.cameraStop.hidden = !camera.active;
+    els.cameraFacing.disabled = cameraBusy;
+
+    els.apiKey.disabled = cameraBusy;
+    els.toggleKey.disabled = cameraBusy;
+    els.prompt.disabled = cameraBusy;
+    els.systemPrompt.disabled = cameraBusy;
+    els.temperature.disabled = cameraBusy;
+    els.maxTokens.disabled = cameraBusy;
+    els.fileInput.disabled = cameraBusy;
+    els.dropZone.disabled = cameraBusy;
+    els.clear.disabled = cameraBusy;
+    for (const entry of state.parameterInputs.values()) {
+      entry.input.disabled = cameraBusy;
+    }
+
+    if (cameraBusy) {
+      els.loadModels.disabled = true;
+      els.model.disabled = true;
+      els.operation.disabled = true;
+    } else if (!requestBusy) {
+      els.loadModels.disabled = false;
+      els.model.disabled = state.models.size === 0;
+      els.operation.disabled = modelOperations(selectedModel()).length === 0;
+    }
+    updateCameraStateStatus();
+  }
+
+  function preferredCameraMimeType() {
+    if (!window.MediaRecorder || typeof window.MediaRecorder.isTypeSupported !== 'function') {
+      return '';
+    }
+    const candidates = [
+      'video/webm;codecs=vp8',
+      'video/webm',
+      'video/mp4;codecs=avc1.42E01E',
+      'video/mp4',
+    ];
+    return candidates.find((value) => window.MediaRecorder.isTypeSupported(value)) || '';
+  }
+
+  function recordCameraWindow(stream, durationMs) {
+    const preferredMime = preferredCameraMimeType();
+    const options = {videoBitsPerSecond: LIVE_CAMERA_VIDEO_BITS_PER_SECOND};
+    if (preferredMime) options.mimeType = preferredMime;
+    let recorder;
+    try {
+      recorder = new window.MediaRecorder(stream, options);
+    } catch (_) {
+      recorder = new window.MediaRecorder(stream);
+    }
+    state.camera.recorder = recorder;
+
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let settled = false;
+      const clearRecorderTimer = () => {
+        if (state.camera.stopTimer) window.clearTimeout(state.camera.stopTimer);
+        state.camera.stopTimer = null;
+      };
+      recorder.addEventListener('dataavailable', (event) => {
+        if (event.data && event.data.size) chunks.push(event.data);
+      });
+      recorder.addEventListener('error', (event) => {
+        if (settled) return;
+        settled = true;
+        clearRecorderTimer();
+        if (state.camera.recorder === recorder) state.camera.recorder = null;
+        reject(event.error || new Error('摄像头录制失败'));
+      });
+      recorder.addEventListener('stop', () => {
+        if (settled) return;
+        settled = true;
+        clearRecorderTimer();
+        if (state.camera.recorder === recorder) state.camera.recorder = null;
+        const baseMime = String(recorder.mimeType || preferredMime || 'video/webm')
+          .split(';')[0];
+        resolve(new Blob(chunks, {type: baseMime}));
+      });
+      try {
+        recorder.start(1000);
+      } catch (error) {
+        settled = true;
+        if (state.camera.recorder === recorder) state.camera.recorder = null;
+        reject(error);
+        return;
+      }
+      state.camera.stopTimer = window.setTimeout(() => {
+        if (recorder.state !== 'inactive') recorder.stop();
+      }, durationMs);
+    });
+  }
+
+  function stopCameraHardware() {
+    const camera = state.camera;
+    if (camera.stopTimer) window.clearTimeout(camera.stopTimer);
+    camera.stopTimer = null;
+    if (camera.recorder && camera.recorder.state !== 'inactive') {
+      try { camera.recorder.stop(); } catch (_) { /* recorder already stopping */ }
+    }
+    if (camera.stream) {
+      for (const track of camera.stream.getTracks()) track.stop();
+    }
+    camera.stream = null;
+    els.cameraPreview.srcObject = null;
+    els.cameraPreview.hidden = true;
+    els.cameraPlaceholder.hidden = false;
+  }
+
+  function stopCameraAnalysis(message = '已停止', isError = false) {
+    const camera = state.camera;
+    camera.starting = false;
+    camera.active = false;
+    camera.pending = null;
+    if (isError) camera.lastError = message;
+    else camera.lastError = '';
+    stopCameraHardware();
+    if (!camera.processing && camera.uiTimer) {
+      window.clearInterval(camera.uiTimer);
+      camera.uiTimer = null;
+    }
+    updateCameraStateStatus();
+    syncSendState();
+  }
+
+  function cameraRequestSettings(op) {
+    const parameters = {};
+    for (const [name, entry] of state.parameterInputs.entries()) {
+      const value = readParameterValue(entry.spec, entry.input);
+      if (value !== null) parameters[name] = value;
+    }
+    const modelTokenLimit = outputTokenReserve(selectedModel()) || 96;
+    const requestedTokens = requestedMaxTokens();
+    const temperature = Number(els.temperature.value);
+    return {
+      modelId: els.model.value,
+      operationId: op.id,
+      endpoint: op.endpoint,
+      headers: authHeaders(true),
+      prompt: els.prompt.value.trim(),
+      systemMessages: baseSystemMessages(),
+      parameters,
+      windowSeconds: cameraWindowSeconds(),
+      maxTokens: Math.max(16, Math.min(128, requestedTokens, modelTokenLimit)),
+      temperature: Number.isFinite(temperature) ? temperature : 0,
+      maxVideoBytes: Number(op.limits && op.limits.max_video_bytes) || (64 * 1024 * 1024),
+    };
+  }
+
+  function consumeCameraSseData(data, result, onUpdate) {
+    if (data === '[DONE]') return true;
+    const chunk = JSON.parse(data);
+    if (chunk && chunk.error) {
+      throw new Error(formatError(chunk.error, '实时摄像头分析失败'));
+    }
+    const choice = chunk && Array.isArray(chunk.choices) ? chunk.choices[0] : null;
+    if (!choice) return false;
+    const delta = choice.delta || {};
+    const content = textFromContent(delta.content ?? '');
+    const reasoning = textFromContent(
+      delta.reasoning_content ?? delta.reasoning ?? delta.thinking ?? ''
+    );
+    if (content) result.content += content;
+    if (reasoning) result.reasoning += reasoning;
+    if (content || reasoning) onUpdate(result);
+    return false;
+  }
+
+  async function readCameraSse(response, onUpdate) {
+    if (!response.ok) throw new Error(await responseError(response));
+    if (!response.body) throw new Error('浏览器没有提供可读取的响应流');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const result = {content: '', reasoning: ''};
+    let buffer = '';
+    let doneEvent = false;
+    while (!doneEvent) {
+      const item = await reader.read();
+      buffer += decoder.decode(item.value || new Uint8Array(), {stream: !item.done});
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        const clean = line.endsWith('\r') ? line.slice(0, -1) : line;
+        if (!clean.startsWith('data:')) continue;
+        const data = clean.slice(5).trimStart();
+        if (!data) continue;
+        if (consumeCameraSseData(data, result, onUpdate)) {
+          doneEvent = true;
+          break;
+        }
+      }
+      if (item.done) break;
+    }
+    if (buffer.trim() && !doneEvent) {
+      const clean = buffer.endsWith('\r') ? buffer.slice(0, -1) : buffer;
+      if (clean.startsWith('data:')) {
+        const data = clean.slice(5).trimStart();
+        if (data) consumeCameraSseData(data, result, onUpdate);
+      }
+    }
+    return result;
+  }
+
+  function appendCameraTurn(segment, answer, reasoning, parameters) {
+    const settings = state.camera.settings;
+    if (!settings) return;
+    const interaction = interactionFor(settings.modelId, settings.operationId);
+    interaction.turns.push({
+      user: {
+        role: 'user',
+        content: `[实时摄像头 ${segment.label} · 第 ${segment.sequence} 段]\n${settings.prompt}`,
+      },
+      assistant: {role: 'assistant', content: answer},
+      reasoning,
+      parameters: {
+        ...parameters,
+        live_camera: true,
+        capture_sequence: segment.sequence,
+        capture_range: segment.label,
+        captured_bytes: segment.blob.size,
+      },
+    });
+    if (interaction.turns.length > LIVE_CAMERA_HISTORY_LIMIT) {
+      interaction.turns.splice(0, interaction.turns.length - LIVE_CAMERA_HISTORY_LIMIT);
+    }
+    if (els.model.value === settings.modelId && selectedOperation()?.id === settings.operationId) {
+      renderInteractionHistory();
+    }
+  }
+
+  async function analyzeCameraSegment(segment) {
+    const settings = state.camera.settings;
+    if (!settings) throw new Error('实时摄像头会话配置已丢失');
+    if (segment.blob.size > settings.maxVideoBytes) {
+      throw new Error(`摄像头片段超过 ${(settings.maxVideoBytes / 1024 / 1024).toFixed(0)} MiB`);
+    }
+    const dataUrl = await readFileAsDataUrl(segment.blob);
+    const prompt = [
+      `这是持续摄像头会话的第 ${segment.sequence} 个片段，源时间 ${segment.label}。`,
+      '只描述这个片段中实际可见的对象、动作、变化和异常；不确定时明确说明。',
+      `用户持续关注的问题：${settings.prompt}`,
+    ].join('\n');
+    const parameters = {
+      ...settings.parameters,
+      segment_seconds: Math.min(60, Math.max(2, segment.durationSeconds + 1)),
+      max_segments: 1,
+      include_summary: false,
+    };
+    const body = {
+      model: settings.modelId,
+      messages: [
+        ...settings.systemMessages,
+        {
+          role: 'user',
+          content: [
+            {type: 'text', text: prompt},
+            {type: 'video_url', video_url: {url: dataUrl}},
+          ],
+        },
+      ],
+      stream: true,
+      max_tokens: settings.maxTokens,
+      temperature: settings.temperature,
+      video_duration_seconds: segment.durationSeconds,
+      ...parameters,
+    };
+    els.cameraLiveText.hidden = false;
+    els.cameraLiveText.textContent = `[${segment.label}] 正在分析第 ${segment.sequence} 段…`;
+    const response = await fetch(settings.endpoint, {
+      method: 'POST',
+      headers: settings.headers,
+      body: JSON.stringify(body),
+    });
+    const result = await readCameraSse(response, (partial) => {
+      const text = partial.content || '（正在生成）';
+      els.cameraLiveText.textContent = `[${segment.label}]\n${text}`;
+    });
+    const answer = result.content.trim() || '（模型返回了空内容）';
+    els.cameraLiveText.textContent = `[${segment.label}]\n${answer}`;
+    appendCameraTurn(segment, answer, result.reasoning, parameters);
+  }
+
+  async function drainCameraSegments() {
+    const camera = state.camera;
+    if (camera.processing) return;
+    camera.processing = true;
+    syncSendState();
+    try {
+      while (camera.pending) {
+        const segment = camera.pending;
+        camera.pending = null;
+        updateCameraStateStatus();
+        try {
+          await analyzeCameraSegment(segment);
+          camera.analyzed += 1;
+          camera.consecutiveErrors = 0;
+          camera.lastError = '';
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          camera.errors += 1;
+          camera.consecutiveErrors += 1;
+          camera.lastError = message;
+          els.cameraLiveText.hidden = false;
+          els.cameraLiveText.textContent = `[${segment.label}] 分析失败：${message}`;
+          if (camera.consecutiveErrors >= 3) {
+            stopCameraAnalysis(`连续 ${camera.consecutiveErrors} 个片段失败：${message}`, true);
+            break;
+          }
+        }
+        updateCameraStateStatus();
+      }
+    } finally {
+      camera.processing = false;
+      if (!camera.active && camera.uiTimer) {
+        window.clearInterval(camera.uiTimer);
+        camera.uiTimer = null;
+      }
+      updateCameraStateStatus();
+      syncSendState();
+    }
+  }
+
+  function enqueueCameraSegment(segment) {
+    const camera = state.camera;
+    if (camera.pending) {
+      camera.pending = segment;
+      camera.dropped += 1;
+    } else {
+      camera.pending = segment;
+    }
+    updateCameraStateStatus();
+    void drainCameraSegments();
+  }
+
+  async function cameraCaptureLoop() {
+    const camera = state.camera;
+    while (camera.active && camera.stream) {
+      const startSeconds = (performance.now() - camera.startedAt) / 1000;
+      const blob = await recordCameraWindow(
+        camera.stream,
+        Math.round(camera.settings.windowSeconds * 1000),
+      );
+      const endSeconds = (performance.now() - camera.startedAt) / 1000;
+      if (!camera.active) break;
+      if (!blob.size) throw new Error('摄像头没有产生可分析的视频数据');
+      camera.sequence += 1;
+      enqueueCameraSegment({
+        sequence: camera.sequence,
+        startSeconds,
+        endSeconds,
+        durationSeconds: Math.max(0.1, endSeconds - startSeconds),
+        label: `${formatCameraTime(startSeconds)}–${formatCameraTime(endSeconds)}`,
+        blob,
+      });
+    }
+  }
+
+  function cameraAccessError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return '当前浏览器没有开放 getUserMedia；手机通过 HTTP 访问时通常会被安全策略阻止。';
+    }
+    if (error && ['NotAllowedError', 'SecurityError'].includes(error.name)) {
+      return `摄像头权限被拒绝：${message}。手机 HTTP 页面可能需要浏览器测试开关或后续 HTTPS 支持。`;
+    }
+    return `无法启动摄像头：${message}`;
+  }
+
+  async function startCameraAnalysis() {
+    const camera = state.camera;
+    const op = selectedOperation();
+    if (camera.starting || camera.active || camera.processing || state.controller) return;
+    try {
+      if (!operationSupportsLiveCamera(op)) throw new Error('当前能力不支持实时摄像头');
+      if (!els.prompt.value.trim()) throw new Error('请先填写希望模型持续关注的问题');
+      if (
+        state.loadedCredential === null
+        || state.loadedCredential !== els.apiKey.value.trim()
+      ) {
+        throw new Error('请先用当前 API key 连接并加载模型');
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('当前浏览器没有开放 getUserMedia');
+      }
+      if (!window.MediaRecorder) throw new Error('当前浏览器不支持 MediaRecorder');
+
+      camera.starting = true;
+      camera.lastError = '';
+      syncSendState();
+      const facingMode = els.cameraFacing.value;
+      const videoConstraints = {
+        width: {ideal: 1280, max: 1920},
+        height: {ideal: 720, max: 1080},
+        frameRate: {ideal: 15, max: 30},
+      };
+      if (facingMode) videoConstraints.facingMode = {ideal: facingMode};
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: videoConstraints,
+        audio: false,
+      });
+      camera.settings = cameraRequestSettings(op);
+      camera.stream = stream;
+      camera.starting = false;
+      camera.active = true;
+      camera.pending = null;
+      camera.sequence = 0;
+      camera.analyzed = 0;
+      camera.dropped = 0;
+      camera.errors = 0;
+      camera.consecutiveErrors = 0;
+      camera.lastError = '';
+      camera.startedAt = performance.now();
+      els.cameraPreview.srcObject = stream;
+      els.cameraPreview.hidden = false;
+      els.cameraPlaceholder.hidden = true;
+      try { await els.cameraPreview.play(); } catch (_) { /* autoplay may already be active */ }
+      for (const track of stream.getVideoTracks()) {
+        track.addEventListener('ended', () => {
+          if (camera.active) stopCameraAnalysis('摄像头已断开', true);
+        }, {once: true});
+      }
+      resetOutput();
+      renderInteractionHistory();
+      els.resultTitle.textContent = '实时摄像头分析记录';
+      if (!window.isSecureContext) {
+        els.cameraLiveText.hidden = false;
+        els.cameraLiveText.textContent = '当前页面不是安全上下文；若浏览器已允许摄像头，将继续运行。';
+      }
+      if (camera.uiTimer) window.clearInterval(camera.uiTimer);
+      camera.uiTimer = window.setInterval(updateCameraStats, 500);
+      syncSendState();
+      camera.captureTask = cameraCaptureLoop().catch((error) => {
+        if (!camera.active) return;
+        const message = cameraAccessError(error);
+        els.cameraLiveText.hidden = false;
+        els.cameraLiveText.textContent = message;
+        stopCameraAnalysis(message, true);
+      });
+    } catch (error) {
+      camera.starting = false;
+      const message = cameraAccessError(error);
+      camera.lastError = message;
+      stopCameraHardware();
+      els.cameraLiveText.hidden = false;
+      els.cameraLiveText.textContent = message;
+      updateCameraStateStatus();
+      syncSendState();
+    }
   }
 
   function readFileAsDataUrl(file) {
@@ -1559,6 +2136,8 @@
 
   els.send.addEventListener('click', runRequest);
   els.stop.addEventListener('click', () => state.controller && state.controller.abort());
+  els.cameraStart.addEventListener('click', startCameraAnalysis);
+  els.cameraStop.addEventListener('click', () => stopCameraAnalysis());
   els.clear.addEventListener('click', () => {
     if (state.controller) state.controller.abort();
     const op = selectedOperation();
@@ -1571,6 +2150,12 @@
     updateContextPreview();
     syncSendState();
     els.prompt.focus();
+  });
+
+  window.addEventListener('pagehide', () => {
+    state.camera.active = false;
+    state.camera.pending = null;
+    stopCameraHardware();
   });
 
   syncModel();
