@@ -7,10 +7,13 @@ import logging
 import asyncio
 import time
 import base64
+import mimetypes
 import secrets
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -24,11 +27,14 @@ from .config import (
     FORWARDED_BY_HEADER,
     INSTANCE_ID,
     ComfyUITarget,
+    H3ContextIRProfile,
+    H3ContextIRProvider,
     LlamaCppTarget,
     GenericOpenAITarget,
     Settings,
     estimate_tokens_from_anthropic_payload,
     get_settings,
+    outbound_cycle_headers,
     parse_forwarded_chain,
     reset_inbound_forwarded_chain,
     set_inbound_forwarded_chain,
@@ -45,6 +51,16 @@ from .converters import (
 )
 from .llama_cpp_client import LlamaCppClient
 from .media_operations import describe_comfyui_operation
+from .h3_context_ir import (
+    SYSTEM_PROMPT as H3_CONTEXT_IR_SYSTEM_PROMPT,
+    build_planning_request,
+    build_repair_request,
+    fallback_plan,
+    is_structured_base_prompt,
+    parse_and_validate_plan,
+    render_base_prompt,
+    resolve_base_mode,
+)
 from .generic_openai_client import GenericOpenAIClient
 from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
@@ -62,6 +78,25 @@ from .reverse_converters import (
 )
 
 logger = logging.getLogger("fake_ollama")
+
+
+EXTERNAL_PLANNER_TOKEN_HEADER = "x-playground-upstream-key"
+_EXTERNAL_PLANNER_PROTOCOLS = ("openai", "anthropic")
+
+
+@dataclass(frozen=True)
+class ExternalPlannerConnection:
+    """Validated, request-scoped credentials for a Playground Planner."""
+
+    protocol: str
+    base_url: str
+    auth_token: str
+    model: str
+    modalities: tuple[str, ...]
+
+    @property
+    def accepts_images(self) -> bool:
+        return "image" in self.modalities
 
 
 class ForwardedCycleMiddleware:
@@ -738,6 +773,102 @@ def _playground_model_entry(
             }:
                 continue
             operation.update(describe_comfyui_operation(source, operation["id"]))
+            if operation["id"] == "video_generation" and source.context_ir_profile:
+                ir_profile = settings.h3_context_ir_profile_by_name(
+                    source.context_ir_profile
+                )
+                if ir_profile is None or not ir_profile.enabled:
+                    operation["configured"] = False
+                    operation["context_ir_profile"] = source.context_ir_profile
+                    continue
+                provider_choices = [
+                    {
+                        "value": "auto",
+                        "label": "Auto by input modality",
+                        "group": "推荐 Planner",
+                        "selection_kind": "auto",
+                    }
+                ]
+                for provider in ir_profile.providers:
+                    provider_choices.append(
+                        _context_ir_provider_choice(
+                            settings,
+                            provider,
+                            value=provider.name,
+                            label=(
+                                f"{provider.name} "
+                                f"({'/'.join(provider.modalities)}; "
+                                f"{provider.model}@{provider.target})"
+                            ),
+                            group="推荐 Planner",
+                            selection_kind="recommended",
+                        )
+                    )
+                provider_choices.extend(
+                    _compatible_context_ir_provider_choices(
+                        settings, iface, ir_profile
+                    )
+                )
+                external_choice = _external_context_ir_provider_choice(ir_profile)
+                if external_choice is not None:
+                    provider_choices.append(external_choice)
+                operation["context_ir_profile"] = ir_profile.name
+                operation["planner_defaults"] = {
+                    "text": ir_profile.default_text_provider,
+                    "image": (
+                        ir_profile.default_multimodal_provider
+                        or ir_profile.default_text_provider
+                    ),
+                }
+                if ir_profile.allow_external_api:
+                    operation["external_planner_api"] = {
+                        "models_endpoint": "/playground/api/external-models",
+                        "protocols": list(_EXTERNAL_PLANNER_PROTOCOLS),
+                    }
+                operation.setdefault("parameters", []).extend(
+                    [
+                        {
+                            "name": "prompt_mode",
+                            "label": "Prompt enhancement",
+                            "type": "select",
+                            "default": source.context_ir_prompt_mode,
+                            "choices": [
+                                {"value": "raw", "label": "Raw / bypass"},
+                                {
+                                    "value": "auto",
+                                    "label": "Auto (bypass structured prompts)",
+                                },
+                                {"value": "enhance", "label": "Always enhance"},
+                            ],
+                            "description": (
+                                "Runs the configured H3 Context-IR-fake profile "
+                                "before submitting the ComfyUI workflow."
+                            ),
+                        },
+                        {
+                            "name": "context_ir_provider",
+                            "label": "Context-IR provider",
+                            "type": "select",
+                            "default": "auto",
+                            "choices": provider_choices,
+                            "advanced": True,
+                        },
+                        {
+                            "name": "context_ir_mode",
+                            "label": "H3 base mode",
+                            "type": "select",
+                            "default": "auto",
+                            "choices": [
+                                {"value": "auto", "label": "Auto by image count"},
+                                {"value": "t2va", "label": "T2VA"},
+                                {"value": "i2va", "label": "I2VA"},
+                                {"value": "fl2va", "label": "FL2VA"},
+                                {"value": "l2va", "label": "L2VA"},
+                            ],
+                            "advanced": True,
+                        },
+                    ]
+                )
     return {
         "id": public_id,
         "context_length": profile.context_length,
@@ -746,6 +877,351 @@ def _playground_model_entry(
         "estimated_memory_gb": profile.estimated_memory_gb,
         "capabilities": capabilities,
         "operations": operations,
+    }
+
+
+def _context_ir_provider_choice(
+    settings: Settings,
+    provider: H3ContextIRProvider,
+    *,
+    value: str,
+    label: str,
+    group: str,
+    selection_kind: str,
+) -> Dict[str, Any]:
+    model_profile = settings.profile_for(
+        f"{provider.model}@{provider.target}"
+    )
+    backend = settings.backend_by_name(provider.target)
+    return {
+        "value": value,
+        "label": label,
+        "group": group,
+        "selection_kind": selection_kind,
+        "model": provider.model,
+        "target": provider.target,
+        "modalities": list(provider.modalities),
+        "backend_kind": backend.kind if backend is not None else None,
+        "protocol": backend.protocol if backend is not None else None,
+        "context_length": model_profile.context_length,
+        "max_output_tokens": model_profile.max_output_tokens,
+        "estimated_vram_gb": model_profile.estimated_vram_gb,
+        "estimated_memory_gb": model_profile.estimated_memory_gb,
+    }
+
+
+def _external_context_ir_provider_choice(
+    profile: H3ContextIRProfile,
+) -> Optional[Dict[str, Any]]:
+    if not profile.allow_external_api:
+        return None
+    return {
+        "value": "external",
+        "label": "临时第三方 API（URL + Token）",
+        "group": "第三方 API",
+        "selection_kind": "external",
+        "model": None,
+        "target": "request-scoped",
+        "modalities": ["text"],
+        "backend_kind": "remote",
+        "protocol": None,
+        "context_length": None,
+        "max_output_tokens": profile.max_output_tokens,
+        "estimated_vram_gb": None,
+        "estimated_memory_gb": None,
+    }
+
+
+def _external_planner_protocol(value: Any) -> str:
+    protocol = str(value or "openai").strip().lower()
+    if protocol not in _EXTERNAL_PLANNER_PROTOCOLS:
+        raise HTTPException(
+            status_code=400,
+            detail="external API protocol must be openai|anthropic",
+        )
+    return protocol
+
+
+def _normalize_external_planner_base_url(value: Any) -> str:
+    raw = str(value or "").strip().rstrip("/")
+    if not raw:
+        raise HTTPException(status_code=400, detail="external API base_url is required")
+    if len(raw) > 2048:
+        raise HTTPException(status_code=400, detail="external API base_url is too long")
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise HTTPException(
+            status_code=400,
+            detail="external API base_url must be an absolute http(s) URL",
+        )
+    if parsed.username or parsed.password:
+        raise HTTPException(
+            status_code=400,
+            detail="external API credentials must use the token field, not URL userinfo",
+        )
+    if parsed.query or parsed.fragment:
+        raise HTTPException(
+            status_code=400,
+            detail="external API base_url must not contain a query or fragment",
+        )
+    path = parsed.path.rstrip("/")
+    lowered = path.lower()
+    for suffix in ("/chat/completions", "/messages", "/models"):
+        if lowered.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            lowered = path.lower()
+            break
+    if lowered.endswith("/v1"):
+        path = path[:-3].rstrip("/")
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
+
+
+def _external_planner_token(request: Request) -> str:
+    token = request.headers.get(EXTERNAL_PLANNER_TOKEN_HEADER, "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=400,
+            detail="external API token is required in x-playground-upstream-key",
+        )
+    if len(token) > 16384:
+        raise HTTPException(status_code=400, detail="external API token is too long")
+    return token
+
+
+def _external_planner_connection(
+    request: Request,
+    profile: H3ContextIRProfile,
+    payload: Dict[str, Any],
+    requested_provider: Any,
+) -> Optional[ExternalPlannerConnection]:
+    if str(requested_provider or "").strip() != "external":
+        return None
+    if not profile.allow_external_api:
+        raise HTTPException(
+            status_code=400,
+            detail="this H3 Context-IR profile does not allow external APIs",
+        )
+    if _listener_name(request) != "playground":
+        raise HTTPException(
+            status_code=400,
+            detail="request-scoped external APIs are only available on the Playground listener",
+        )
+    protocol = _external_planner_protocol(payload.get("external_api_protocol"))
+    base_url = _normalize_external_planner_base_url(
+        payload.get("external_api_base_url")
+    )
+    model = str(payload.get("external_api_model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="external API model is required")
+    if len(model) > 512:
+        raise HTTPException(status_code=400, detail="external API model is too long")
+    raw_modalities = payload.get("external_api_modalities") or "text"
+    if isinstance(raw_modalities, str):
+        values = raw_modalities.replace(";", ",").split(",")
+    elif isinstance(raw_modalities, list):
+        values = raw_modalities
+    else:
+        values = [raw_modalities]
+    modalities = ["text"]
+    if any(str(value).strip().lower() == "image" for value in values):
+        modalities.append("image")
+    return ExternalPlannerConnection(
+        protocol=protocol,
+        base_url=base_url,
+        auth_token=_external_planner_token(request),
+        model=model,
+        modalities=tuple(modalities),
+    )
+
+
+def _external_planner_headers(protocol: str, token: str) -> Dict[str, str]:
+    headers = {"accept": "application/json"}
+    if protocol == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
+    headers["authorization"] = f"Bearer {token}"
+    headers["x-api-key"] = token
+    headers.update(outbound_cycle_headers())
+    return headers
+
+
+@asynccontextmanager
+async def _external_planner_http_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    injected = getattr(app.state, "external_planner_http_client", None)
+    if injected is not None:
+        yield injected
+        return
+    settings: Settings = app.state.settings
+    async with httpx.AsyncClient(
+        timeout=settings.timeout_seconds,
+        trust_env=settings.use_system_proxy,
+    ) as client:
+        yield client
+
+
+def _compatible_context_ir_provider_choices(
+    settings: Settings,
+    iface: Any,
+    profile: H3ContextIRProfile,
+) -> List[Dict[str, Any]]:
+    """Return compatible chat models exposed to the authenticated interface."""
+
+    if not profile.allow_compatible_models:
+        return []
+    recommended = {
+        (provider.model, provider.target) for provider in profile.providers
+    }
+    choices: List[Dict[str, Any]] = []
+    for exposure in iface.exposed_models:
+        try:
+            backend, display_model = settings.resolve_request(
+                exposure.public_id, interface_name=iface.name
+            )
+        except ValueError:
+            continue
+        if backend.protocol not in ("anthropic", "openai", "ollama"):
+            continue
+        if (display_model, backend.name) in recommended:
+            continue
+        model_profile = settings.profile_for(
+            f"{display_model}@{backend.name}"
+        )
+        capabilities = set(model_profile.capabilities)
+        if "completion" not in capabilities:
+            continue
+        modalities = ["text"]
+        if "vision" in capabilities:
+            modalities.append("image")
+        provider = H3ContextIRProvider(
+            name=f"model:{exposure.public_id}",
+            model=display_model,
+            target=backend.name,
+            modalities=modalities,
+            # Plain JSON parsing is the portable choice for arbitrary
+            # OpenAI-compatible APIs; recommended providers may opt in to
+            # response_format=json_object explicitly in config.
+            json_mode=False,
+        )
+        modality_label = "/".join(modalities)
+        choices.append(
+            _context_ir_provider_choice(
+                settings,
+                provider,
+                value=provider.name,
+                label=f"{exposure.public_id} ({modality_label})",
+                group="自选兼容模型",
+                selection_kind="compatible",
+            )
+        )
+    return choices
+
+
+def _playground_context_ir_entry(
+    settings: Settings, iface: Any, profile: H3ContextIRProfile
+) -> Dict[str, Any]:
+    """Expose one orchestration profile as a Playground-only virtual model."""
+
+    default_provider = profile.provider_by_name(
+        profile.default_text_provider or profile.providers[0].name
+    ) or profile.providers[0]
+    model_profile = settings.profile_for(
+        f"{default_provider.model}@{default_provider.target}"
+    )
+    provider_choices = [
+        {
+            "value": "auto",
+            "label": "Auto by input modality",
+            "group": "推荐 Planner",
+            "selection_kind": "auto",
+        }
+    ]
+    for provider in profile.providers:
+        modalities = "/".join(provider.modalities)
+        provider_choices.append(
+            _context_ir_provider_choice(
+                settings,
+                provider,
+                value=provider.name,
+                label=(
+                    f"{provider.name} ({modalities}; "
+                    f"{provider.model}@{provider.target})"
+                ),
+                group="推荐 Planner",
+                selection_kind="recommended",
+            )
+        )
+    provider_choices.extend(
+        _compatible_context_ir_provider_choices(settings, iface, profile)
+    )
+    external_choice = _external_context_ir_provider_choice(profile)
+    if external_choice is not None:
+        provider_choices.append(external_choice)
+    operation = {
+        "id": "h3_context_ir",
+        "endpoint": "/v1/videos/context-ir",
+        "stream": False,
+        "history_mode": "single_turn",
+        "accepts_images": True,
+        "requires_images": False,
+        "multiple_images": True,
+        "limits": {"max_reference_images": 2},
+        "planner_defaults": {
+            "text": profile.default_text_provider,
+            "image": (
+                profile.default_multimodal_provider
+                or profile.default_text_provider
+            ),
+        },
+        "parameters": [
+            {
+                "name": "provider",
+                "label": "Planner provider",
+                "type": "select",
+                "default": "auto",
+                "choices": provider_choices,
+                "description": (
+                    "Auto uses the text default without images and the multimodal "
+                    "default when reference images are attached. Recommended "
+                    "providers are followed by compatible chat models exposed "
+                    "on the selected interface."
+                ),
+            },
+            {
+                "name": "mode",
+                "label": "H3 base mode",
+                "type": "select",
+                "default": "auto",
+                "choices": [
+                    {"value": "auto", "label": "Auto by image count"},
+                    {"value": "t2va", "label": "T2VA (text)"},
+                    {"value": "i2va", "label": "I2VA (first frame)"},
+                    {"value": "fl2va", "label": "FL2VA (first + last)"},
+                    {"value": "l2va", "label": "L2VA (last frame)"},
+                ],
+            },
+            {
+                "name": "duration_seconds",
+                "label": "Duration (seconds)",
+                "type": "number",
+                "default": profile.default_duration_seconds,
+                "min": 4,
+                "max": 15,
+                "step": 0.1,
+            },
+        ],
+    }
+    if profile.allow_external_api:
+        operation["external_planner_api"] = {
+            "models_endpoint": "/playground/api/external-models",
+            "protocols": list(_EXTERNAL_PLANNER_PROTOCOLS),
+        }
+    return {
+        "id": profile.public_model_id,
+        "context_length": model_profile.context_length,
+        "max_output_tokens": profile.max_output_tokens,
+        "estimated_vram_gb": model_profile.estimated_vram_gb,
+        "estimated_memory_gb": model_profile.estimated_memory_gb,
+        "capabilities": ["h3_context_ir"],
+        "operations": [operation],
     }
 
 
@@ -1402,13 +1878,91 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/playground/api/models", include_in_schema=False)
     async def playground_models(request: Request) -> JSONResponse:
         settings, iface = _model_interface_for_request(request)
+        models = [
+            _playground_model_entry(settings, iface, name)
+            for name in _public_model_ids(iface)
+        ]
+        models.extend(
+            _playground_context_ir_entry(settings, iface, profile)
+            for profile in settings.h3_context_ir_profiles
+            if profile.enabled and profile.playground_visible
+        )
         return JSONResponse(
             {
                 "schema_version": 1,
-                "models": [
-                    _playground_model_entry(settings, iface, name)
-                    for name in _public_model_ids(iface)
-                ],
+                "models": models,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/playground/api/external-models", include_in_schema=False)
+    async def playground_external_models(request: Request) -> JSONResponse:
+        settings, _iface = _model_interface_for_request(request)
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+        requested_profile = str(payload.get("profile") or "").strip()
+        profile = settings.h3_context_ir_profile_by_name(requested_profile)
+        if profile is None or not profile.enabled:
+            raise HTTPException(
+                status_code=404,
+                detail=f"H3 Context-IR profile {requested_profile!r} not found",
+            )
+        if not profile.allow_external_api:
+            raise HTTPException(
+                status_code=403,
+                detail="this H3 Context-IR profile does not allow external APIs",
+            )
+        protocol = _external_planner_protocol(payload.get("protocol"))
+        base_url = _normalize_external_planner_base_url(payload.get("base_url"))
+        token = _external_planner_token(request)
+        try:
+            async with _external_planner_http_client(request.app) as client:
+                response = await client.get(
+                    f"{base_url}/v1/models",
+                    headers=_external_planner_headers(protocol, token),
+                    timeout=min(30.0, settings.timeout_seconds),
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "external model detection failed: upstream returned "
+                    f"HTTP {exc.response.status_code}"
+                ),
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"external model detection failed: {exc}",
+            ) from exc
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="external model endpoint returned a non-object response",
+            )
+        raw_models = data.get("data") or data.get("models") or []
+        names: List[str] = []
+        seen: set[str] = set()
+        for item in raw_models:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("id") or item.get("name") or item.get("model") or "").strip()
+            if name and name not in seen:
+                names.append(name)
+                seen.add(name)
+            if len(names) >= 1000:
+                break
+        return JSONResponse(
+            {
+                "protocol": protocol,
+                "base_url": base_url,
+                "models": names,
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -1428,6 +1982,10 @@ def _register_routes(app: FastAPI) -> None:
     @app.post("/v1/videos/generations")
     async def openai_video_generations(request: Request) -> Any:
         return await _handle_openai_video_generation(request)
+
+    @app.post("/v1/videos/context-ir")
+    async def h3_context_ir(request: Request) -> Any:
+        return await _handle_h3_context_ir(request)
 
     @app.post("/v1/embeddings")
     async def openai_embeddings(payload: Dict[str, Any]) -> JSONResponse:
@@ -1874,7 +2432,12 @@ def _image_request_params(
     }
 
 
-def _image_response(images: List[Any], payload: Dict[str, Any]) -> JSONResponse:
+def _image_response(
+    images: List[Any],
+    payload: Dict[str, Any],
+    *,
+    revised_prompt: Optional[str] = None,
+) -> JSONResponse:
     response_format = str(payload.get("response_format") or "b64_json")
     if response_format not in ("b64_json", "url"):
         raise HTTPException(
@@ -1885,17 +2448,20 @@ def _image_response(images: List[Any], payload: Dict[str, Any]) -> JSONResponse:
     for image in images:
         b64 = image.b64_json
         if response_format == "url":
-            data.append({
+            item = {
                 "url": f"data:{image.mime_type};base64,{b64}",
                 "mime_type": image.mime_type,
                 "filename": image.filename,
-            })
+            }
         else:
-            data.append({
+            item = {
                 "b64_json": b64,
                 "mime_type": image.mime_type,
                 "filename": image.filename,
-            })
+            }
+        if revised_prompt is not None:
+            item["revised_prompt"] = revised_prompt
+        data.append(item)
     return JSONResponse(
         {
             "created": int(datetime.now(timezone.utc).timestamp()),
@@ -2044,6 +2610,550 @@ def _video_request_params(
     return params
 
 
+def _context_ir_duration(
+    payload: Dict[str, Any],
+    profile: H3ContextIRProfile,
+    *,
+    video_params: Optional[Dict[str, Any]] = None,
+) -> float:
+    raw = payload.get("duration_seconds", payload.get("duration"))
+    if raw is not None and str(raw).strip():
+        try:
+            duration = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail="duration_seconds must be numeric"
+            ) from exc
+    elif video_params:
+        frame_count = float(video_params.get("num_frames") or 0)
+        frame_rate = float(video_params.get("frame_rate") or 0)
+        duration = (
+            frame_count / frame_rate
+            if frame_count > 0 and frame_rate > 0
+            else profile.default_duration_seconds
+        )
+    else:
+        duration = profile.default_duration_seconds
+    duration = round(duration, 2)
+    if not 4 <= duration <= 15:
+        raise HTTPException(
+            status_code=400,
+            detail="H3 Context-IR duration_seconds must be between 4 and 15",
+        )
+    return duration
+
+
+def _select_context_ir_provider(
+    settings: Settings,
+    profile: H3ContextIRProfile,
+    requested: Any,
+    *,
+    has_images: bool,
+    interface_name: str,
+    external_connection: Optional[ExternalPlannerConnection] = None,
+) -> H3ContextIRProvider:
+    name = str(requested or "auto").strip()
+    if name in ("", "auto"):
+        if has_images and profile.default_multimodal_provider:
+            name = profile.default_multimodal_provider
+        else:
+            name = profile.default_text_provider or profile.providers[0].name
+    if name == "external":
+        if not profile.allow_external_api:
+            raise HTTPException(
+                status_code=400,
+                detail="this H3 Context-IR profile does not allow external APIs",
+            )
+        if external_connection is None:
+            raise HTTPException(
+                status_code=400,
+                detail="external API connection details are required",
+            )
+        return H3ContextIRProvider(
+            name="external",
+            model=external_connection.model,
+            target=f"external:{external_connection.protocol}",
+            modalities=list(external_connection.modalities),
+            json_mode=False,
+        )
+    if name.startswith("model:"):
+        if not profile.allow_compatible_models:
+            raise HTTPException(
+                status_code=400,
+                detail="this H3 Context-IR profile does not allow compatible model selection",
+            )
+        public_model_id = name[len("model:") :].strip()
+        if not public_model_id:
+            raise HTTPException(
+                status_code=400,
+                detail="compatible Planner selection is missing a public model id",
+            )
+        try:
+            backend, display_model = settings.resolve_request(
+                public_model_id, interface_name=interface_name
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if backend.protocol not in ("anthropic", "openai", "ollama"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"model {public_model_id!r} is not a compatible chat Planner"
+                ),
+            )
+        model_profile = settings.profile_for(
+            f"{display_model}@{backend.name}"
+        )
+        capabilities = set(model_profile.capabilities)
+        if "completion" not in capabilities:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"model {public_model_id!r} does not declare the completion capability"
+                ),
+            )
+        modalities = ["text"]
+        if "vision" in capabilities:
+            modalities.append("image")
+        return H3ContextIRProvider(
+            name=name,
+            model=display_model,
+            target=backend.name,
+            modalities=modalities,
+            json_mode=False,
+        )
+    provider = profile.provider_by_name(name)
+    if provider is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unknown H3 Context-IR provider {name!r}; available: "
+                f"{[item.name for item in profile.providers]}"
+            ),
+        )
+    return provider
+
+
+def _image_media_type(filename: str) -> str:
+    guessed, _ = mimetypes.guess_type(filename or "")
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return "image/png"
+
+
+def _neutral_context_ir_messages(
+    planning_request: str,
+    images: List[Tuple[bytes, str]],
+) -> List[Dict[str, Any]]:
+    return [
+        {"role": "system", "text": H3_CONTEXT_IR_SYSTEM_PROMPT, "images": []},
+        {"role": "user", "text": planning_request, "images": images},
+    ]
+
+
+def _openai_context_ir_messages(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for message in messages:
+        images = message.get("images") or []
+        if images:
+            content: Any = [{"type": "text", "text": message["text"]}]
+            for data, filename in images:
+                media_type = _image_media_type(filename)
+                encoded = base64.b64encode(data).decode("ascii")
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{encoded}"
+                        },
+                    }
+                )
+        else:
+            content = message["text"]
+        out.append({"role": message["role"], "content": content})
+    return out
+
+
+def _anthropic_context_ir_messages(
+    messages: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    system_parts = [
+        message["text"] for message in messages if message["role"] == "system"
+    ]
+    out: List[Dict[str, Any]] = []
+    for message in messages:
+        if message["role"] == "system":
+            continue
+        content: List[Dict[str, Any]] = [
+            {"type": "text", "text": message["text"]}
+        ]
+        for data, filename in message.get("images") or []:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": _image_media_type(filename),
+                        "data": base64.b64encode(data).decode("ascii"),
+                    },
+                }
+            )
+        out.append({"role": message["role"], "content": content})
+    return "\n\n".join(system_parts), out
+
+
+def _ollama_context_ir_messages(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for message in messages:
+        item: Dict[str, Any] = {
+            "role": message["role"],
+            "content": message["text"],
+        }
+        images = message.get("images") or []
+        if images:
+            item["images"] = [
+                base64.b64encode(data).decode("ascii") for data, _ in images
+            ]
+        out.append(item)
+    return out
+
+
+def _text_from_openai_response(data: Dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        raise ValueError("OpenAI-compatible provider returned no choices")
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        text = "".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict)
+        )
+        if text.strip():
+            return text
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning
+    raise ValueError("OpenAI-compatible provider returned empty content")
+
+
+def _text_from_anthropic_response(data: Dict[str, Any]) -> str:
+    content = data.get("content") or []
+    text = "".join(
+        str(part.get("text") or "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    )
+    if not text.strip():
+        raise ValueError("Anthropic-compatible provider returned empty content")
+    return text
+
+
+async def _invoke_context_ir_provider(
+    app: FastAPI,
+    profile: H3ContextIRProfile,
+    provider: H3ContextIRProvider,
+    messages: List[Dict[str, Any]],
+    external_connection: Optional[ExternalPlannerConnection] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    if provider.name == "external":
+        if external_connection is None:
+            raise ValueError("external Planner connection is unavailable")
+        async with _external_planner_http_client(app) as http_client:
+            if external_connection.protocol == "anthropic":
+                client = AnthropicClient(
+                    external_connection.base_url,
+                    external_connection.auth_token,
+                    timeout=app.state.settings.timeout_seconds,
+                    trust_env=app.state.settings.use_system_proxy,
+                    client=http_client,
+                )
+                system, wire_messages = _anthropic_context_ir_messages(messages)
+                response = await client.messages(
+                    {
+                        "model": external_connection.model,
+                        "system": system,
+                        "messages": wire_messages,
+                        "max_tokens": profile.max_output_tokens,
+                        "temperature": profile.temperature,
+                        "stream": False,
+                    }
+                )
+                return _text_from_anthropic_response(response), dict(
+                    response.get("usage") or {}
+                )
+            client = OpenAIClient(
+                external_connection.base_url,
+                auth_token=external_connection.auth_token,
+                timeout=app.state.settings.timeout_seconds,
+                trust_env=app.state.settings.use_system_proxy,
+                upstream_name="playground-external",
+                client=http_client,
+            )
+            response = await client.chat(
+                {
+                    "model": external_connection.model,
+                    "messages": _openai_context_ir_messages(messages),
+                    "temperature": profile.temperature,
+                    "max_tokens": profile.max_output_tokens,
+                    "stream": False,
+                }
+            )
+            return _text_from_openai_response(response), dict(
+                response.get("usage") or {}
+            )
+
+    settings: Settings = app.state.settings
+    backend = settings.backend_by_name(provider.target)
+    if backend is None:
+        raise ValueError(f"context IR target {provider.target!r} is unavailable")
+    wire_model = backend.source.resolve_model(provider.model)
+    model_profile = settings.profile_for(f"{provider.model}@{provider.target}")
+    client = _backend_client(app, backend)
+
+    if backend.protocol == "anthropic":
+        system, wire_messages = _anthropic_context_ir_messages(messages)
+        response = await client.messages(
+            {
+                "model": wire_model,
+                "system": system,
+                "messages": wire_messages,
+                "max_tokens": profile.max_output_tokens,
+                "temperature": profile.temperature,
+                "stream": False,
+            }
+        )
+        return _text_from_anthropic_response(response), dict(response.get("usage") or {})
+
+    if backend.protocol == "ollama":
+        payload = {
+            "model": wire_model,
+            "messages": _ollama_context_ir_messages(messages),
+            "stream": False,
+            "think": False,
+            "options": {
+                "temperature": profile.temperature,
+                "num_predict": profile.max_output_tokens,
+            },
+        }
+        response = await client.chat(
+            payload,
+            estimated_vram_gb=model_profile.estimated_vram_gb,
+            estimated_memory_gb=model_profile.estimated_memory_gb,
+        )
+        message = response.get("message") or {}
+        text = str(message.get("content") or message.get("thinking") or "")
+        if not text.strip():
+            raise ValueError("Ollama provider returned empty content")
+        usage = {
+            "prompt_tokens": response.get("prompt_eval_count"),
+            "completion_tokens": response.get("eval_count"),
+        }
+        return text, {key: value for key, value in usage.items() if value is not None}
+
+    if backend.protocol == "openai":
+        payload = {
+            "model": wire_model,
+            "messages": _openai_context_ir_messages(messages),
+            "temperature": profile.temperature,
+            "max_tokens": profile.max_output_tokens,
+            "stream": False,
+        }
+        if provider.json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if backend.kind == "local":
+            if isinstance(backend.source, LlamaCppTarget):
+                _apply_llama_cpp_thinking_config(
+                    settings,
+                    f"{provider.model}@{provider.target}",
+                    {"thinking": {"type": "disabled"}},
+                    payload,
+                )
+            response = await client.chat(
+                payload,
+                estimated_vram_gb=model_profile.estimated_vram_gb,
+                estimated_memory_gb=model_profile.estimated_memory_gb,
+            )
+        else:
+            response = await client.chat(payload)
+        return _text_from_openai_response(response), dict(response.get("usage") or {})
+
+    raise ValueError(
+        f"context IR provider cannot use backend protocol {backend.protocol!r}"
+    )
+
+
+async def _run_h3_context_ir(
+    app: FastAPI,
+    profile: H3ContextIRProfile,
+    *,
+    prompt: str,
+    image_inputs: List[Tuple[bytes, str]],
+    requested_mode: str,
+    duration_seconds: float,
+    interface_name: str,
+    requested_provider: Any = None,
+    external_connection: Optional[ExternalPlannerConnection] = None,
+) -> Dict[str, Any]:
+    try:
+        mode = resolve_base_mode(requested_mode, len(image_inputs))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    provider = _select_context_ir_provider(
+        settings=app.state.settings,
+        profile=profile,
+        requested=requested_provider,
+        has_images=bool(image_inputs),
+        interface_name=interface_name,
+        external_connection=external_connection,
+    )
+    warnings: List[str] = []
+    provider_images = image_inputs
+    if image_inputs and not provider.accepts_images:
+        provider_images = []
+        warnings.append(
+            f"provider {provider.name!r} is text-only; reference images were not "
+            "shown to the planner, but H3 picture labels were preserved"
+        )
+    planning_request = build_planning_request(
+        prompt,
+        mode=mode,
+        duration_seconds=duration_seconds,
+        image_count=len(image_inputs),
+    )
+    messages = _neutral_context_ir_messages(planning_request, provider_images)
+    plan = None
+    raw_response = ""
+    usage: Dict[str, Any] = {}
+    attempts = 0
+    last_error = ""
+    upstream_error = False
+    for attempts in range(1, profile.max_attempts + 1):
+        try:
+            raw_response, usage = await _invoke_context_ir_provider(
+                app,
+                profile,
+                provider,
+                messages,
+                external_connection=external_connection,
+            )
+            plan = parse_and_validate_plan(
+                raw_response,
+                expected_mode=mode,
+                expected_duration_seconds=duration_seconds,
+            )
+            break
+        except httpx.HTTPError as exc:
+            last_error = _read_error_text(exc)
+            upstream_error = True
+            break
+        except (TypeError, ValueError) as exc:
+            last_error = str(exc)
+            if attempts < profile.max_attempts:
+                messages.extend(
+                    [
+                        {"role": "assistant", "text": raw_response, "images": []},
+                        {
+                            "role": "user",
+                            "text": build_repair_request(last_error),
+                            "images": [],
+                        },
+                    ]
+                )
+
+    used_fallback = plan is None
+    if plan is None:
+        if profile.failure_mode == "error":
+            raise HTTPException(
+                status_code=502 if upstream_error else 422,
+                detail=f"H3 Context-IR provider failed: {last_error}",
+            )
+        warnings.append(
+            "planner failed validation; used a lossless one-shot fallback: "
+            + (last_error or "unknown error")
+        )
+        plan = fallback_plan(
+            prompt, mode=mode, duration_seconds=duration_seconds
+        )
+
+    rendered = render_base_prompt(plan)
+    return {
+        "id": "h3cir_" + secrets.token_hex(12),
+        "object": "video.context_ir",
+        "created": int(datetime.now(timezone.utc).timestamp()),
+        "model": profile.public_model_id,
+        "provider": {
+            "name": provider.name,
+            "model": provider.model,
+            "target": provider.target,
+            "modalities": provider.modalities,
+        },
+        "mode": mode,
+        "duration_seconds": duration_seconds,
+        "content": {"prompt": rendered},
+        "ir": plan.model_dump(),
+        "fallback": used_fallback,
+        "attempts": attempts,
+        "warnings": warnings,
+        "usage": usage,
+    }
+
+
+async def _handle_h3_context_ir(request: Request) -> JSONResponse:
+    settings, iface = _model_interface_for_request(request)
+    payload, image_inputs = await _image_payload_from_request(request)
+    prompt = str(payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="missing 'prompt'")
+    requested_profile = str(
+        payload.get("model") or payload.get("profile") or ""
+    ).strip()
+    profile = settings.h3_context_ir_profile_by_name(requested_profile)
+    if profile is None or not profile.enabled:
+        raise HTTPException(
+            status_code=404,
+            detail=f"H3 Context-IR profile {requested_profile!r} not found",
+        )
+    if len(image_inputs) > 2:
+        raise HTTPException(
+            status_code=400,
+            detail="H3 base Context-IR accepts at most two reference images",
+        )
+    for data, filename in image_inputs:
+        if len(data) > 20 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail=f"reference image {filename!r} exceeds 20 MiB",
+            )
+    duration = _context_ir_duration(payload, profile)
+    requested_provider = payload.get("provider")
+    external_connection = _external_planner_connection(
+        request,
+        profile,
+        payload,
+        requested_provider,
+    )
+    result = await _run_h3_context_ir(
+        request.app,
+        profile,
+        prompt=prompt,
+        image_inputs=image_inputs,
+        requested_mode=str(payload.get("mode") or "auto"),
+        duration_seconds=duration,
+        interface_name=iface.name,
+        requested_provider=requested_provider,
+        external_connection=external_connection,
+    )
+    return JSONResponse(result)
+
+
 async def _handle_openai_video_generation(request: Request) -> Any:
     app = request.app
     settings: Settings = app.state.settings
@@ -2054,9 +3164,61 @@ async def _handle_openai_video_generation(request: Request) -> Any:
     backend, real_model, public_model = _dispatch_image_backend(
         request, settings, payload
     )
+    iface = _interface_for(request)
+    if iface is None:  # pragma: no cover - dispatch already requires an interface
+        raise HTTPException(status_code=404, detail="unknown listener")
     target = backend.source
     _enforce_reference_image_limit(target, "video_generation", image_inputs)
     params = _video_request_params(payload, target, app=app)
+    revised_prompt: Optional[str] = None
+    context_ir_profile_name = getattr(target, "context_ir_profile", None)
+    if context_ir_profile_name:
+        context_profile = settings.h3_context_ir_profile_by_name(
+            context_ir_profile_name
+        )
+        if context_profile is None or not context_profile.enabled:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"configured H3 Context-IR profile {context_ir_profile_name!r} "
+                    "is unavailable"
+                ),
+            )
+        prompt_mode = str(
+            payload.get("prompt_mode")
+            or getattr(target, "context_ir_prompt_mode", "auto")
+        ).strip().lower()
+        if prompt_mode not in ("raw", "auto", "enhance"):
+            raise HTTPException(
+                status_code=400,
+                detail="prompt_mode must be raw|auto|enhance",
+            )
+        should_enhance = prompt_mode == "enhance" or (
+            prompt_mode == "auto" and not is_structured_base_prompt(prompt)
+        )
+        if should_enhance:
+            requested_provider = payload.get("context_ir_provider")
+            external_connection = _external_planner_connection(
+                request,
+                context_profile,
+                payload,
+                requested_provider,
+            )
+            context_result = await _run_h3_context_ir(
+                app,
+                context_profile,
+                prompt=prompt,
+                image_inputs=image_inputs,
+                requested_mode=str(payload.get("context_ir_mode") or "auto"),
+                duration_seconds=_context_ir_duration(
+                    payload, context_profile, video_params=params
+                ),
+                interface_name=iface.name,
+                requested_provider=requested_provider,
+                external_connection=external_connection,
+            )
+            revised_prompt = str(context_result["content"]["prompt"])
+            prompt = revised_prompt
     client: ComfyUIClient = _backend_client(app, backend)
     profile = settings.profile_for(f"{real_model}@{backend.name}")
     image_bytes = None
@@ -2077,7 +3239,7 @@ async def _handle_openai_video_generation(request: Request) -> Any:
     except httpx.HTTPError as exc:
         _log_upstream_error(request, exc, payload)
         return _upstream_error(exc)
-    return _image_response(videos, payload)
+    return _image_response(videos, payload, revised_prompt=revised_prompt)
 
 
 def _enforce_limits(

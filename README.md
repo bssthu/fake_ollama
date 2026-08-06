@@ -51,6 +51,7 @@
 - **来源命名清晰区分**：`anthropic_upstreams` / `openai_upstreams`（远端）+ `ollama_targets` / `llama_cpp_targets` / `comfyui_targets`（本机）
 - **循环引用检测**：`anthropic_upstreams[*].base_url` 若指向 fake_ollama 自己的某个监听端口，启动时直接报错，避免转发死循环
 - **本地 target 生命周期接管**：Ollama / llama.cpp / ComfyUI 都可配置 health check、按需启动脚本、启动超时、空闲回收
+- **H3 Context-IR harness**：把自然语言和最多两张参考图转换成 MiniMax H3 Base Prompt；规划器可在本地纯文字/多模态模型与第三方 API 之间切换，并可串到 ComfyUI 视频生成之前
 - **ComfyUI 图片后端**：可把 Z-Image-Turbo / Qwen-Image-Edit / SenseNova-U1 等 ComfyUI API workflow 暴露为 OpenAI 兼容图片生成 / 图片编辑接口。采用声明式 `preset` + bindings 结构，接入新模型只改配置 + JSON；多个图片模型可共用一个 ComfyUI 实例并由 VRAM 协调器互斥换出，避免爆显存。
 - **本地显存预检**：本地模型可在 `model_profiles` 里填 `estimated_vram_gb`；启动前用 `nvidia-smi` 评估可用显存并尝试回收空闲模型
 - **本地内存预检**：部分模型（如 SenseNova / JoyAI 这类会把一部分计算 offload 到内存的 workflow）除显存外还需占用大量主机内存，可在 `model_profiles` 里填 `estimated_memory_gb`；逻辑与显存预检一致，启动前评估可用系统内存并尝试回收空闲模型
@@ -135,6 +136,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
   "llama_cpp_defaults":  { /* … */ },
   "llama_cpp_targets":   [ /* … */ ],
   "comfyui_targets":     [ /* … */ ],
+  "h3_context_ir_profiles": [ /* … */ ],
 
   // 对外接口（每项独立监听）
   "ollama_interfaces":   [ /* … */ ],
@@ -492,6 +494,93 @@ per-target / `llama_cpp_defaults` 上有两个旋钮专门解决这个：
 
 dashboard 表格新增 `Queued` 列，可以直接看每个本地模型当前排队的请求数。
 
+### H3 Context-IR harness
+
+`h3_context_ir_profiles` 是独立于公开聊天模型的编排层。配置内的 provider 只引用已经存在的 `{model, target}`，因此会复用原有的 Anthropic / OpenAI / Ollama 协议适配、token、超时、本地进程生命周期和显存/内存协调器，不保存第二份连接配置。Playground 也可按 profile 显式授权临时第三方连接。
+
+```text
+自然语言 + 0..2 张图
+        │
+        ▼
+h3-context-ir-fake profile
+        ├── text provider  ── 本地 Ollama/llama.cpp 或第三方 API
+        └── image provider ── 本地/远端多模态 Chat API
+        │
+        ▼
+校验后的 H3 Base IR ──► Base Prompt ──► 可选 ComfyUI H3 workflow
+```
+
+```jsonc
+{
+  "h3_context_ir_profiles": [
+    {
+      "name": "default",
+      "alias": "h3-context-ir-fake",
+      "allow_compatible_models": true,
+      "allow_external_api": false,
+      "providers": [
+        {
+          "name": "local-text",
+          "model": "qwen-text",
+          "target": "qwen-text-llama-cpp",
+          "modalities": ["text"],
+          "json_mode": true
+        },
+        {
+          "name": "local-vl",
+          "model": "qwen-vl",
+          "target": "qwen-vl-llama-cpp",
+          "modalities": ["text", "image"],
+          "json_mode": true
+        },
+        {
+          "name": "third-party",
+          "model": "deepseek-chat",
+          "target": "deepseek-openai",
+          "modalities": ["text"],
+          "json_mode": true
+        }
+      ],
+      "default_text_provider": "local-text",
+      "default_multimodal_provider": "local-vl",
+      "max_attempts": 2,
+      "failure_mode": "fallback",
+      "default_duration_seconds": 5
+    }
+  ]
+}
+```
+
+启用 Playground 后，`playground_visible: true` 的 profile 会显示为一个虚拟模型。它不会混入标准 `/v1/models`，也不需要加入接口的 `exposed_models`。Playground 调用 `POST /v1/videos/context-ir`；JSON 和 multipart 都支持以下字段：
+
+- `model`：profile 的 `alias` 或 `name`。
+- `prompt`：用户原始意图。
+- `mode`：`auto`、`t2va`、`i2va`、`fl2va` 或 `l2va`；`auto` 根据参考图数量选择。
+- `duration` / `duration_seconds`：4–15 秒。
+- `provider`：可选推荐 provider 名，或 Playground 中列出的兼容模型；省略时，无图走 `default_text_provider`，有图走 `default_multimodal_provider`。
+- `image` / `images`：最多两张，每张不超过 20 MiB。
+
+`providers` 是 profile 明确推荐的稳定组合。`allow_compatible_models: true` 时，Playground 还会在“自选兼容模型”分组中列出当前 API key 所选接口 `exposed_models` 里的其它聊天模型：必须声明 `completion`，带图能力则由 `vision` capability 决定；ComfyUI 和纯媒体模型不会进入列表。自选仍受接口模型白名单限制，不能借此调用未暴露的 target。
+
+`allow_external_api: true` 会再增加“临时第三方 API”选项。Playground 中选择 OpenAI-compatible 或 Anthropic-compatible，输入 URL 与 token 后，可通过第三方 `/v1/models` 自动识别模型并选择；若网关不提供模型列表，也可手动填写模型 ID。第三方模型端点通常不报告图片能力，因此需要明确选择“纯文字”或“多模态（可看图）”。URL 可填服务根路径、`.../v1` 或具体的 `.../v1/models` / `chat/completions` / `messages` 地址，服务端会规范化后调用。
+
+临时 token 只保留在页面内存，通过单次请求的 `x-playground-upstream-key` 请求头传给 fake-ollama；不会写入 `config.json`、模型 discovery 或交互记录，请求数据日志也会将该头脱敏。临时外部连接只允许从独立 Playground 监听器发起，普通 API/Ollama 监听器不能使用。这个开关允许服务端访问用户填写的任意 HTTP(S) 地址，默认关闭；只应在受信任且有访问 token 的 Playground 上开启。
+
+Playground 的预计显存、预计内存和上下文会随实际 Planner 选择即时更新；`auto` 会根据当前是否附图显示对应默认 Planner 的资源。若给纯文字 Planner 附图，界面会在发送前提醒，响应 `warnings` 也会说明：图片仍用于 `<Picture N>` 对齐，但不会发送给 Planner 分析。
+
+模型只负责生成紧凑 JSON IR；harness 接管模式、时长、时间线验证、官方 Base Prompt 三段式渲染及失败重试。若 provider 不可用或连续返回无效 IR，`failure_mode: fallback` 会生成不丢失原始文字的一镜到底提示词，并在响应的 `fallback` / `warnings` 中明确标记；设为 `error` 则返回错误。
+
+需要把它串到视频生成时，在对应 `comfyui_targets[*]` 上配置：
+
+```jsonc
+{
+  "context_ir_profile": "default",
+  "context_ir_prompt_mode": "auto"
+}
+```
+
+随后 `POST /v1/videos/generations` 可用 `prompt_mode=raw|auto|enhance`、`context_ir_provider` 和 `context_ir_mode` 覆盖 target 默认值。`auto` 会保留已经是 H3 三段式的 prompt，普通自然语言才会增强；响应会附带实际送入 workflow 的 `revised_prompt`。只有真正接受 H3 Base Prompt 的视频 workflow 才应开启这项绑定。
+
 ### Interfaces（接口与白名单）
 
 `ollama_interfaces` / `api_interfaces` 都是数组，每一项独立监听：
@@ -775,6 +864,7 @@ python -m fake_ollama --no-request-data-log
 - [Ollama API 文档](https://github.com/ollama/ollama/blob/main/docs/api.md)
 - [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat)
 - [DeepSeek Anthropic API 兼容性](https://api-docs.deepseek.com/zh-cn/guides/anthropic_api)
+- [MiniMax H3 官方仓库](https://github.com/MiniMax-AI/MiniMax-H3) / [Prompt Writing Skill](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md) / [Base Prompt Guide](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt)
 - [GitHub Copilot 自定义 Ollama provider](https://docs.github.com/en/copilot/customizing-copilot/extending-the-capabilities-of-github-copilot-in-your-ide)
 
 ## 免责声明（Disclaimer）

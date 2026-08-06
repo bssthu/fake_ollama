@@ -34,6 +34,16 @@
     operationPreset: $('operationPreset'),
     operationPresetHint: $('operationPresetHint'),
     operationParameterList: $('operationParameterList'),
+    externalPlanner: $('externalPlanner'),
+    externalPlannerStatus: $('externalPlannerStatus'),
+    externalPlannerProtocol: $('externalPlannerProtocol'),
+    externalPlannerCapability: $('externalPlannerCapability'),
+    externalPlannerUrl: $('externalPlannerUrl'),
+    externalPlannerToken: $('externalPlannerToken'),
+    toggleExternalPlannerToken: $('toggleExternalPlannerToken'),
+    externalPlannerModel: $('externalPlannerModel'),
+    externalPlannerModelList: $('externalPlannerModelList'),
+    detectExternalPlannerModels: $('detectExternalPlannerModels'),
     systemPrompt: $('systemPrompt'),
     temperature: $('temperature'),
     maxTokens: $('maxTokens'),
@@ -68,10 +78,11 @@
     image_edit: '图片编辑',
     video_generation: '视频生成',
     video_analysis: '视频分析',
+    h3_context_ir: 'H3 Prompt 自动增强',
   };
   const KNOWN_CAPABILITIES = new Set([
     'completion', 'tools', 'vision', 'image_generation', 'image_edit',
-    'video_generation', 'video_understanding',
+    'video_generation', 'video_understanding', 'h3_context_ir',
   ]);
   const CONTEXT_THRESHOLD_RATIO = 0.9;
   const DISCOVERY_SCHEMA_VERSION = 1;
@@ -91,6 +102,9 @@
     firstTokenAt: 0,
     timer: null,
     parameterInputs: new Map(),
+    activePlannerChoice: null,
+    activePlannerHasImages: false,
+    externalPlannerDetecting: false,
     camera: {
       starting: false,
       active: false,
@@ -117,6 +131,14 @@
     const key = els.apiKey.value.trim();
     if (key) headers.Authorization = `Bearer ${key}`;
     if (includeJson) headers['Content-Type'] = 'application/json';
+    return headers;
+  }
+
+  function plannerRequestHeaders(plan, includeJson = false) {
+    const headers = authHeaders(includeJson);
+    if (plan && plan.externalPlannerToken) {
+      headers['X-Playground-Upstream-Key'] = plan.externalPlannerToken;
+    }
     return headers;
   }
 
@@ -483,7 +505,10 @@
       });
       els.conversation.append(wrap);
     }
-    showContextNotice(op && op.id === 'chat' ? ((interaction && interaction.lastNotice) || '') : '');
+    const notice = op && op.id === 'chat'
+      ? ((interaction && interaction.lastNotice) || '')
+      : plannerProviderWarning(op);
+    showContextNotice(notice);
     els.emptyState.hidden = Boolean(els.conversation.children.length || pendingUser);
   }
 
@@ -526,6 +551,270 @@
     }
   }
 
+  function renderModelResourceChips(info, {planner = false, showContext = false} = {}) {
+    const estimatedVram = info && Number(info.estimated_vram_gb);
+    const backendKind = info && info.backend_kind;
+    if (Number.isFinite(estimatedVram) && estimatedVram > 0) {
+      els.modelVram.textContent = `预计显存 ${estimatedVram.toFixed(2)} GiB`;
+      els.modelVram.title = planner
+        ? '当前 Planner 对应 model_profiles.estimated_vram_gb'
+        : '来自 model_profiles.estimated_vram_gb';
+      els.modelVram.hidden = false;
+    } else if (planner && backendKind === 'remote') {
+      els.modelVram.textContent = 'Planner 远端 API';
+      els.modelVram.title = '该 Planner 在远端运行，不占用本机模型显存';
+      els.modelVram.hidden = false;
+    } else if (planner) {
+      els.modelVram.textContent = '预计显存 未配置';
+      els.modelVram.title = '当前 Planner 没有 estimated_vram_gb 配置';
+      els.modelVram.hidden = false;
+    } else {
+      els.modelVram.textContent = '';
+      els.modelVram.hidden = true;
+    }
+
+    const estimatedMemory = info && Number(info.estimated_memory_gb);
+    if (Number.isFinite(estimatedMemory) && estimatedMemory > 0) {
+      els.modelMemory.textContent = `预计内存 ${estimatedMemory.toFixed(2)} GiB`;
+      els.modelMemory.title = planner
+        ? '当前 Planner 对应 model_profiles.estimated_memory_gb'
+        : '来自 model_profiles.estimated_memory_gb';
+      els.modelMemory.hidden = false;
+    } else if (planner && backendKind !== 'remote') {
+      els.modelMemory.textContent = '预计内存 未配置';
+      els.modelMemory.title = '当前 Planner 没有 estimated_memory_gb 配置';
+      els.modelMemory.hidden = false;
+    } else {
+      els.modelMemory.textContent = '';
+      els.modelMemory.hidden = true;
+    }
+
+    const contextLength = modelContextLength(info);
+    if (contextLength && showContext) {
+      els.contextChip.textContent = `${planner ? 'Planner ' : ''}上下文 ${formatTokenCount(contextLength)}`;
+      els.contextChip.title = `${planner ? '当前 Planner ' : '模型 '}context_length=${contextLength}`;
+      els.contextChip.hidden = false;
+    } else {
+      els.contextChip.textContent = '';
+      els.contextChip.hidden = true;
+    }
+  }
+
+  function plannerParameterName(op) {
+    if (!op) return '';
+    if (op.id === 'h3_context_ir') return 'provider';
+    return op.context_ir_profile ? 'context_ir_provider' : '';
+  }
+
+  function plannerSelectionValue(op = selectedOperation()) {
+    const parameterName = plannerParameterName(op);
+    const entry = parameterName ? state.parameterInputs.get(parameterName) : null;
+    return entry
+      ? String(readParameterValue(entry.spec, entry.input, false) || 'auto')
+      : '';
+  }
+
+  function externalPlannerSelected(op = selectedOperation()) {
+    return Boolean(op && op.external_planner_api && plannerSelectionValue(op) === 'external');
+  }
+
+  function setExternalPlannerStatus(text, kind = '') {
+    els.externalPlannerStatus.textContent = text;
+    els.externalPlannerStatus.className = `external-planner-status ${kind}`.trim();
+  }
+
+  function externalPlannerConnection(op = selectedOperation(), validate = true, requireModel = true) {
+    if (!externalPlannerSelected(op)) return null;
+    const protocol = els.externalPlannerProtocol.value;
+    const baseUrl = els.externalPlannerUrl.value.trim();
+    const token = els.externalPlannerToken.value.trim();
+    const model = els.externalPlannerModel.value.trim();
+    if (validate) {
+      if (!baseUrl) throw new Error('请输入第三方 API URL。');
+      let parsed;
+      try {
+        parsed = new URL(baseUrl);
+      } catch (_error) {
+        throw new Error('第三方 API URL 必须是完整的 http(s) 地址。');
+      }
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('第三方 API URL 必须使用 http 或 https。');
+      }
+      if (!token) throw new Error('请输入第三方 API token。');
+      if (requireModel && !model) throw new Error('请先识别或输入第三方模型 ID。');
+    }
+    return {
+      protocol,
+      baseUrl,
+      token,
+      model,
+      modalities: els.externalPlannerCapability.value === 'vision'
+        ? ['text', 'image']
+        : ['text'],
+    };
+  }
+
+  function externalPlannerPayload(op = selectedOperation()) {
+    const connection = externalPlannerConnection(op, true, true);
+    if (!connection) return {};
+    return {
+      external_api_protocol: connection.protocol,
+      external_api_base_url: connection.baseUrl,
+      external_api_model: connection.model,
+      external_api_modalities: connection.modalities.join(','),
+    };
+  }
+
+  function syncExternalPlannerUi(op = selectedOperation()) {
+    const visible = externalPlannerSelected(op);
+    els.externalPlanner.hidden = !visible;
+    if (!visible) return;
+    const busy = Boolean(state.controller) || state.externalPlannerDetecting;
+    els.externalPlannerProtocol.disabled = busy;
+    els.externalPlannerCapability.disabled = busy;
+    els.externalPlannerUrl.disabled = busy;
+    els.externalPlannerToken.disabled = busy;
+    els.toggleExternalPlannerToken.disabled = busy;
+    els.externalPlannerModel.disabled = busy;
+    els.detectExternalPlannerModels.disabled = busy
+      || !els.externalPlannerUrl.value.trim()
+      || !els.externalPlannerToken.value.trim();
+  }
+
+  function invalidateExternalPlannerDetection() {
+    els.externalPlannerModelList.replaceChildren();
+    if (!state.externalPlannerDetecting) setExternalPlannerStatus('连接参数已变化');
+    syncExternalPlannerUi();
+    syncSendState();
+  }
+
+  async function detectExternalPlannerModels() {
+    const op = selectedOperation();
+    let connection;
+    try {
+      connection = externalPlannerConnection(op, true, false);
+    } catch (error) {
+      setExternalPlannerStatus(error instanceof Error ? error.message : String(error), 'error');
+      return;
+    }
+    if (!connection || !op.external_planner_api) return;
+    state.externalPlannerDetecting = true;
+    setExternalPlannerStatus('正在识别…');
+    syncExternalPlannerUi(op);
+    try {
+      const headers = authHeaders(true);
+      headers['X-Playground-Upstream-Key'] = connection.token;
+      const response = await fetch(op.external_planner_api.models_endpoint, {
+        method: 'POST',
+        headers,
+        cache: 'no-store',
+        body: JSON.stringify({
+          profile: op.context_ir_profile || els.model.value,
+          protocol: connection.protocol,
+          base_url: connection.baseUrl,
+        }),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const data = await response.json();
+      const models = Array.isArray(data.models)
+        ? data.models.filter((item) => typeof item === 'string' && item.trim())
+        : [];
+      els.externalPlannerModelList.replaceChildren();
+      for (const model of models) {
+        els.externalPlannerModelList.append(new Option(model, model));
+      }
+      if (data.base_url) els.externalPlannerUrl.value = data.base_url;
+      if (!els.externalPlannerModel.value.trim() && models.length) {
+        els.externalPlannerModel.value = models[0];
+      }
+      setExternalPlannerStatus(
+        models.length ? `已识别 ${models.length} 个模型` : '连接成功；请手动输入模型 ID',
+        'ok',
+      );
+    } catch (error) {
+      setExternalPlannerStatus(
+        `识别失败：${error instanceof Error ? error.message : String(error)}`,
+        'error',
+      );
+    } finally {
+      state.externalPlannerDetecting = false;
+      syncExternalPlannerUi(op);
+      updatePlannerProviderUi();
+      syncSendState();
+    }
+  }
+
+  function effectivePlannerChoice(op = selectedOperation()) {
+    if (!op) return null;
+    const parameterName = plannerParameterName(op);
+    if (!parameterName) return null;
+    if (state.controller && state.activePlannerChoice) {
+      return state.activePlannerChoice;
+    }
+    const entry = state.parameterInputs.get(parameterName);
+    if (!entry) return null;
+    const choices = Array.isArray(entry.spec.choices) ? entry.spec.choices : [];
+    const selectedValue = String(readParameterValue(entry.spec, entry.input, false) || 'auto');
+    let choice = choices.find((item) => String(item.value) === selectedValue) || null;
+    if (choice && selectedValue === 'external') {
+      const connection = externalPlannerConnection(op, false, false);
+      choice = {
+        ...choice,
+        protocol: connection.protocol,
+        model: connection.model || null,
+        modalities: connection.modalities,
+      };
+    }
+    if (selectedValue === 'auto') {
+      const hasImages = state.attachments.some((attachment) => attachment.kind === 'image');
+      const defaults = op.planner_defaults || {};
+      const effectiveValue = hasImages ? defaults.image : defaults.text;
+      choice = choices.find((item) => String(item.value) === String(effectiveValue)) || choice;
+    }
+    return choice;
+  }
+
+  function plannerProviderWarning(op = selectedOperation()) {
+    const hasImages = state.controller
+      ? state.activePlannerHasImages
+      : state.attachments.some((attachment) => attachment.kind === 'image');
+    const choice = effectivePlannerChoice(op);
+    const modalities = new Set((choice && choice.modalities) || []);
+    if (hasImages && choice && !modalities.has('image')) {
+      return '提醒：所选 Planner 是纯文字模型。参考图仍用于 H3 的 <Picture N> 对齐，但不会发送给 Planner，因此它无法理解图片内容。';
+    }
+    return '';
+  }
+
+  function updatePlannerProviderUi() {
+    const op = selectedOperation();
+    const parameterName = plannerParameterName(op);
+    if (!op || !parameterName) {
+      els.externalPlanner.hidden = true;
+      return;
+    }
+    syncExternalPlannerUi(op);
+    const choice = effectivePlannerChoice(op);
+    if (choice && op.id === 'h3_context_ir') {
+      renderModelResourceChips(choice, {planner: true, showContext: true});
+    }
+    const warning = plannerProviderWarning(op);
+    const entry = state.parameterInputs.get(parameterName);
+    if (entry) {
+      let warningElement = entry.field.querySelector('.parameter-warning');
+      if (warning && !warningElement) {
+        warningElement = document.createElement('div');
+        warningElement.className = 'help parameter-warning';
+        entry.field.append(warningElement);
+      }
+      if (warningElement) {
+        warningElement.textContent = warning;
+        warningElement.hidden = !warning;
+      }
+    }
+    showContextNotice(warning);
+  }
+
   function syncModel() {
     const info = selectedModel();
     const previous = els.operation.value;
@@ -544,34 +833,8 @@
       if (operations.some((op) => op.id === previous)) els.operation.value = previous;
     }
     els.modelChip.textContent = info ? info.id : '未选择模型';
-    const estimatedVram = info && Number(info.estimated_vram_gb);
-    if (Number.isFinite(estimatedVram) && estimatedVram > 0) {
-      els.modelVram.textContent = `预计显存 ${estimatedVram.toFixed(2)} GiB`;
-      els.modelVram.title = '来自 model_profiles.estimated_vram_gb';
-      els.modelVram.hidden = false;
-    } else {
-      els.modelVram.textContent = '';
-      els.modelVram.hidden = true;
-    }
-    const estimatedMemory = info && Number(info.estimated_memory_gb);
-    if (Number.isFinite(estimatedMemory) && estimatedMemory > 0) {
-      els.modelMemory.textContent = `预计内存 ${estimatedMemory.toFixed(2)} GiB`;
-      els.modelMemory.title = '来自 model_profiles.estimated_memory_gb';
-      els.modelMemory.hidden = false;
-    } else {
-      els.modelMemory.textContent = '';
-      els.modelMemory.hidden = true;
-    }
-    const contextLength = modelContextLength(info);
     const hasChat = operations.some((operation) => operation.id === 'chat');
-    if (contextLength && hasChat) {
-      els.contextChip.textContent = `上下文 ${formatTokenCount(contextLength)}`;
-      els.contextChip.title = `模型 context_length=${contextLength}`;
-      els.contextChip.hidden = false;
-    } else {
-      els.contextChip.textContent = '';
-      els.contextChip.hidden = true;
-    }
+    renderModelResourceChips(info, {showContext: hasChat});
     syncOperation();
   }
 
@@ -582,6 +845,7 @@
     const isImageEdit = op && op.id === 'image_edit';
     const isVideoGeneration = op && op.id === 'video_generation';
     const isVideoAnalysis = op && op.id === 'video_analysis';
+    const isContextIR = op && op.id === 'h3_context_ir';
     const isMedia = op && !isChatRequest;
     const acceptsUploads = op && (op.accepts_images || op.accepts_videos);
 
@@ -618,7 +882,7 @@
     els.ttftMetric.hidden = !isChatRequest;
     els.resultTitle.textContent = isChat
       ? '连续对话'
-      : (isVideoAnalysis ? '视频分析记录' : (op ? '连续调试' : '交互记录'));
+      : (isVideoAnalysis ? '视频分析记录' : (isContextIR ? 'H3 Prompt 增强记录' : (op ? '连续调试' : '交互记录')));
     els.clear.textContent = '清空记录';
     els.shortcut.textContent = isVideoAnalysis
       ? 'Enter 分析 · Ctrl / ⌘ + Enter 换行 · 可拖放视频'
@@ -670,14 +934,15 @@
         ? '输入希望模型持续关注和分析的问题…'
         : (isChat
           ? (op.accepts_images ? '输入问题；也可以粘贴或上传图片…' : '输入要发送给模型的内容…')
-          : (isVideoGeneration ? '描述要生成的视频…' : (isImageEdit ? '描述希望怎样编辑图片…' : '描述要生成的图片…')));
+          : (isContextIR ? '用自然语言描述要生成的 H3 视频…' : (isVideoGeneration ? '描述要生成的视频…' : (isImageEdit ? '描述希望怎样编辑图片…' : '描述要生成的图片…'))));
       els.send.textContent = isVideoAnalysis
         ? '分析视频 →'
-        : (isChat ? '发送请求 →' : (isVideoGeneration ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →')));
+        : (isChat ? '发送请求 →' : (isContextIR ? '增强 H3 Prompt →' : (isVideoGeneration ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →'))));
     }
     renderOperationParameters(op);
     resetOutput();
     renderInteractionHistory();
+    updatePlannerProviderUi();
     updateContextPreview();
     syncSendState();
     syncCameraControls();
@@ -798,8 +1063,24 @@
 
       if (spec.type === 'select') {
         input = document.createElement('select');
+        const groups = new Map();
         for (const choice of spec.choices || []) {
-          input.append(new Option(choice.label == null ? choice.value : choice.label, choice.value));
+          const option = new Option(
+            choice.label == null ? choice.value : choice.label,
+            choice.value,
+          );
+          if (choice.group) {
+            let group = groups.get(choice.group);
+            if (!group) {
+              group = document.createElement('optgroup');
+              group.label = choice.group;
+              groups.set(choice.group, group);
+              input.append(group);
+            }
+            group.append(option);
+          } else {
+            input.append(option);
+          }
         }
       } else {
         input = document.createElement('input');
@@ -838,8 +1119,12 @@
       input.addEventListener('input', () => {
         if (spec.type === 'boolean') setParameterValue(entry, input.checked);
         syncPresetSelection();
+        updatePlannerProviderUi();
       });
-      input.addEventListener('change', syncPresetSelection);
+      input.addEventListener('change', () => {
+        syncPresetSelection();
+        updatePlannerProviderUi();
+      });
       els.operationParameterList.append(field);
     }
     renderOperationPresets(op);
@@ -847,6 +1132,7 @@
 
   function syncSendState() {
     const op = selectedOperation();
+    updatePlannerProviderUi();
     const hasImage = state.attachments.some((attachment) => attachment.kind === 'image');
     const hasVideo = state.attachments.some((attachment) => attachment.kind === 'video');
     const missingRequiredMedia = Boolean(op && (
@@ -855,9 +1141,13 @@
     const credentialReady = state.loadedCredential !== null
       && state.loadedCredential === els.apiKey.value.trim();
     const cameraBusy = state.camera.starting || state.camera.active || state.camera.processing;
+    const externalConnection = externalPlannerConnection(op, false, false);
+    const externalPlannerReady = !externalConnection || Boolean(
+      externalConnection.baseUrl && externalConnection.token && externalConnection.model
+    );
     els.send.disabled = Boolean(state.controller) || cameraBusy || !selectedModel() || !op
       || !credentialReady || op.configured === false
-      || !els.prompt.value.trim() || missingRequiredMedia;
+      || !els.prompt.value.trim() || missingRequiredMedia || !externalPlannerReady;
     syncCameraControls();
   }
 
@@ -907,15 +1197,18 @@
     if (operationUsesChatEndpoint(op)) {
       els.answerText.classList.add('cursor');
     } else {
-      els.answerText.textContent = op.id === 'video_generation'
-        ? '正在生成视频…'
-        : (op.id === 'image_edit' ? '正在编辑图片…' : '正在生成图片…');
+      els.answerText.textContent = op.id === 'h3_context_ir'
+        ? '正在规划并校验 H3 Prompt…'
+        : (op.id === 'video_generation'
+          ? '正在生成视频…'
+          : (op.id === 'image_edit' ? '正在编辑图片…' : '正在生成图片…'));
     }
     els.loadModels.disabled = true;
     els.model.disabled = true;
     els.operation.disabled = true;
     els.send.hidden = true;
     els.stop.hidden = false;
+    syncExternalPlannerUi(op);
   }
 
   function finishRequest() {
@@ -923,6 +1216,8 @@
     state.timer = null;
     els.answerText.classList.remove('cursor');
     state.controller = null;
+    state.activePlannerChoice = null;
+    state.activePlannerHasImages = false;
     const cameraBusy = state.camera.starting || state.camera.active || state.camera.processing;
     els.loadModels.disabled = cameraBusy;
     els.model.disabled = cameraBusy || state.models.size === 0;
@@ -1890,6 +2185,7 @@
       const value = readParameterValue(entry.spec, entry.input);
       if (value !== null) payload[name] = value;
     }
+    Object.assign(payload, externalPlannerPayload(op));
     if (!Object.prototype.hasOwnProperty.call(payload, 'n')) payload.n = 1;
     return payload;
   }
@@ -1906,6 +2202,9 @@
       payload,
       attachments,
       parameters,
+      externalPlannerToken: externalPlannerSelected(op)
+        ? els.externalPlannerToken.value.trim()
+        : '',
       userMessage: userMessageForRequest(op, payload.prompt, attachments),
     };
   }
@@ -1978,7 +2277,7 @@
     if (op.id === 'image_generation') {
       response = await fetch(op.endpoint, {
         method: 'POST',
-        headers: authHeaders(true),
+        headers: plannerRequestHeaders(plan, true),
         body: JSON.stringify(plan.payload),
         signal: state.controller.signal,
       });
@@ -1990,7 +2289,7 @@
       }
       response = await fetch(op.endpoint, {
         method: 'POST',
-        headers: authHeaders(false),
+        headers: plannerRequestHeaders(plan, false),
         body: form,
         signal: state.controller.signal,
       });
@@ -2003,6 +2302,49 @@
       user: plan.userMessage,
       parameters: plan.parameters,
       media,
+    });
+    els.answerText.textContent = '';
+    els.answer.classList.remove('active');
+    renderInteractionHistory();
+    els.prompt.focus();
+  }
+
+  async function runContextIR(op, plan) {
+    const form = new FormData();
+    for (const [key, value] of Object.entries(plan.payload)) {
+      form.append(key, String(value));
+    }
+    for (const attachment of plan.attachments) {
+      form.append('image[]', attachment.file, attachment.name);
+    }
+    const response = await fetch(op.endpoint, {
+      method: 'POST',
+      headers: plannerRequestHeaders(plan, false),
+      body: form,
+      signal: state.controller.signal,
+    });
+    if (!response.ok) throw new Error(await responseError(response));
+    const data = await response.json();
+    const enhancedPrompt = data && data.content && data.content.prompt;
+    if (!enhancedPrompt) {
+      throw new Error('H3 Context-IR 接口没有返回 content.prompt');
+    }
+    const diagnostics = {
+      provider: data.provider,
+      mode: data.mode,
+      duration_seconds: data.duration_seconds,
+      fallback: data.fallback,
+      attempts: data.attempts,
+      warnings: data.warnings,
+      usage: data.usage,
+      ir: data.ir,
+    };
+    const interaction = interactionFor(plan.modelId, plan.operationId);
+    interaction.turns.push({
+      user: plan.userMessage,
+      assistant: {role: 'assistant', content: enhancedPrompt},
+      reasoning: JSON.stringify(diagnostics, null, 2),
+      parameters: plan.parameters,
     });
     els.answerText.textContent = '';
     els.answer.classList.remove('active');
@@ -2048,6 +2390,8 @@
     }
 
     state.controller = new AbortController();
+    state.activePlannerChoice = effectivePlannerChoice(op);
+    state.activePlannerHasImages = imageCount > 0;
     state.startedAt = performance.now();
     state.firstTokenAt = 0;
     beginRequest(op, plan);
@@ -2059,6 +2403,7 @@
     }, 100);
     try {
       if (operationUsesChatEndpoint(op)) await runChat(op, plan);
+      else if (op.id === 'h3_context_ir') await runContextIR(op, plan);
       else await runMedia(op, plan);
     } catch (error) {
       if (error && error.name === 'AbortError') showRequestError(op, '请求已停止。');
@@ -2078,6 +2423,26 @@
     setConnection('凭据已变化');
     syncSendState();
   });
+  els.toggleExternalPlannerToken.addEventListener('click', () => {
+    const showing = els.externalPlannerToken.type === 'text';
+    els.externalPlannerToken.type = showing ? 'password' : 'text';
+    els.toggleExternalPlannerToken.setAttribute(
+      'aria-label',
+      showing ? '显示第三方 API token' : '隐藏第三方 API token',
+    );
+  });
+  els.externalPlannerProtocol.addEventListener('change', invalidateExternalPlannerDetection);
+  els.externalPlannerUrl.addEventListener('input', invalidateExternalPlannerDetection);
+  els.externalPlannerToken.addEventListener('input', invalidateExternalPlannerDetection);
+  els.externalPlannerCapability.addEventListener('change', () => {
+    updatePlannerProviderUi();
+    syncSendState();
+  });
+  els.externalPlannerModel.addEventListener('input', () => {
+    updatePlannerProviderUi();
+    syncSendState();
+  });
+  els.detectExternalPlannerModels.addEventListener('click', detectExternalPlannerModels);
   els.loadModels.addEventListener('click', loadModelList);
   els.model.addEventListener('change', syncModel);
   els.operation.addEventListener('change', syncOperation);

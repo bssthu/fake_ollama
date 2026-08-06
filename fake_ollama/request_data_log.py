@@ -30,6 +30,7 @@ SENSITIVE_HEADERS = {
     "authorization",
     "proxy-authorization",
     "x-api-key",
+    "x-playground-upstream-key",
     "api-key",
     "cookie",
     "set-cookie",

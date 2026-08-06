@@ -61,6 +61,11 @@ def test_playground_static_page_and_security_headers():
     assert 'id="operation"' in response.text
     assert 'id="operationPreset"' in response.text
     assert 'id="operationParameterList"' in response.text
+    assert 'id="externalPlanner"' in response.text
+    assert 'id="externalPlannerUrl"' in response.text
+    assert 'id="externalPlannerToken"' in response.text
+    assert 'id="externalPlannerModel"' in response.text
+    assert 'id="detectExternalPlannerModels"' in response.text
     assert 'id="cameraSection"' in response.text
     assert 'id="cameraPreview"' in response.text
     assert 'id="cameraStart"' in response.text
@@ -88,6 +93,13 @@ def test_playground_static_page_and_security_headers():
     assert "stream: true" in js.text
     assert "estimated_vram_gb" in js.text
     assert "estimated_memory_gb" in js.text
+    assert "effectivePlannerChoice" in js.text
+    assert "updatePlannerProviderUi" in js.text
+    assert "detectExternalPlannerModels" in js.text
+    assert "X-Playground-Upstream-Key" in js.text
+    assert "external_api_base_url" in js.text
+    assert "所选 Planner 是纯文字模型" in js.text
+    assert "parameter-warning" in css.text
     assert "fetch('/playground/api/models'" in js.text
     assert "DISCOVERY_SCHEMA_VERSION = 1" in js.text
     assert "renderOperationParameters" in js.text

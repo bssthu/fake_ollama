@@ -947,6 +947,12 @@ class ComfyUITarget(BaseModel):
     video_workflow_path: Optional[str] = None
     image_to_video_workflow_path: Optional[str] = None
 
+    # Optional prompt-planning stage run before video workflows.  The profile
+    # itself is top-level so the same harness can be previewed in Playground
+    # and reused by multiple H3 task-specific ComfyUI targets.
+    context_ir_profile: Optional[str] = None
+    context_ir_prompt_mode: str = "auto"
+
     # Z-Image-Turbo default model files and sampling parameters.
     diffusion_model: str = "z-image-turbo-fp8-e4m3fn.safetensors"
     diffusion_weight_dtype: str = "default"
@@ -1041,6 +1047,25 @@ class ComfyUITarget(BaseModel):
         if not v:
             return "/system_stats"
         return v if v.startswith("/") else "/" + v
+
+    @field_validator("context_ir_profile")
+    @classmethod
+    def _context_ir_profile_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = v.strip()
+        return value or None
+
+    @field_validator("context_ir_prompt_mode")
+    @classmethod
+    def _context_ir_prompt_mode_valid(cls, v: str) -> str:
+        value = (v or "auto").strip().lower()
+        if value not in ("raw", "auto", "enhance"):
+            raise ValueError(
+                "comfyui_targets[*].context_ir_prompt_mode must be "
+                "raw|auto|enhance"
+            )
+        return value
 
     @field_validator(
         "default_width",
@@ -1253,6 +1278,189 @@ class ComfyUITarget(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# H3 Context-IR-fake orchestration profiles
+# ---------------------------------------------------------------------------
+
+
+class H3ContextIRProvider(BaseModel):
+    """One planner model available to an H3 Context-IR-fake profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    model: str
+    target: str
+    modalities: List[str] = Field(default_factory=lambda: ["text"])
+    json_mode: bool = False
+
+    @field_validator("name", "model", "target")
+    @classmethod
+    def _required_text(cls, v: str) -> str:
+        value = (v or "").strip()
+        if not value:
+            raise ValueError("context IR provider name/model/target must be non-empty")
+        return value
+
+    @field_validator("modalities")
+    @classmethod
+    def _valid_modalities(cls, values: List[str]) -> List[str]:
+        out: List[str] = []
+        for raw in values or []:
+            value = (raw or "").strip().lower()
+            if value not in ("text", "image"):
+                raise ValueError(
+                    "context IR provider modalities currently support text|image"
+                )
+            if value not in out:
+                out.append(value)
+        if "text" not in out:
+            raise ValueError("context IR providers must support text prompts")
+        return out
+
+    @property
+    def accepts_images(self) -> bool:
+        return "image" in self.modalities
+
+
+class H3ContextIRProfile(BaseModel):
+    """A reusable H3 prompt harness with switchable model providers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    alias: Optional[str] = None
+    enabled: bool = True
+    playground_visible: bool = True
+    allow_compatible_models: bool = True
+    allow_external_api: bool = False
+    providers: List[H3ContextIRProvider] = Field(default_factory=list)
+    default_text_provider: Optional[str] = None
+    default_multimodal_provider: Optional[str] = None
+    temperature: float = 0.2
+    max_output_tokens: int = 4096
+    max_attempts: int = 2
+    failure_mode: str = "fallback"
+    default_duration_seconds: float = 5.0
+
+    @field_validator("name")
+    @classmethod
+    def _name_required(cls, v: str) -> str:
+        value = (v or "").strip()
+        if not value:
+            raise ValueError("context IR profile name must be non-empty")
+        if "@" in value:
+            raise ValueError("context IR profile name must not contain '@'")
+        return value
+
+    @field_validator("alias")
+    @classmethod
+    def _alias_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = v.strip()
+        if not value:
+            return None
+        if "@" in value:
+            raise ValueError("context IR profile alias must not contain '@'")
+        return value
+
+    @field_validator("default_text_provider", "default_multimodal_provider")
+    @classmethod
+    def _optional_text_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = v.strip()
+        return value or None
+
+    @field_validator("temperature")
+    @classmethod
+    def _temperature_valid(cls, v: float) -> float:
+        if not 0 <= float(v) <= 2:
+            raise ValueError("context IR profile temperature must be between 0 and 2")
+        return float(v)
+
+    @field_validator("max_output_tokens")
+    @classmethod
+    def _output_tokens_valid(cls, v: int) -> int:
+        if not 256 <= int(v) <= 32768:
+            raise ValueError(
+                "context IR profile max_output_tokens must be between 256 and 32768"
+            )
+        return int(v)
+
+    @field_validator("max_attempts")
+    @classmethod
+    def _attempts_valid(cls, v: int) -> int:
+        if not 1 <= int(v) <= 3:
+            raise ValueError("context IR profile max_attempts must be between 1 and 3")
+        return int(v)
+
+    @field_validator("failure_mode")
+    @classmethod
+    def _failure_mode_valid(cls, v: str) -> str:
+        value = (v or "fallback").strip().lower()
+        if value not in ("fallback", "error"):
+            raise ValueError("context IR profile failure_mode must be fallback|error")
+        return value
+
+    @field_validator("default_duration_seconds")
+    @classmethod
+    def _duration_valid(cls, v: float) -> float:
+        if not 4 <= float(v) <= 15:
+            raise ValueError(
+                "context IR profile default_duration_seconds must be between 4 and 15"
+            )
+        return float(v)
+
+    @model_validator(mode="after")
+    def _provider_defaults(self) -> "H3ContextIRProfile":
+        if not self.providers:
+            raise ValueError("context IR profile must declare at least one provider")
+        names = [provider.name for provider in self.providers]
+        dupes = sorted({name for name in names if names.count(name) > 1})
+        if dupes:
+            raise ValueError(f"duplicate context IR provider names: {dupes}")
+
+        text_default = self.default_text_provider or self.providers[0].name
+        if text_default not in names:
+            raise ValueError(
+                f"default_text_provider {text_default!r} is not in providers"
+            )
+        multimodal_default = self.default_multimodal_provider
+        if multimodal_default is None:
+            multimodal_default = next(
+                (provider.name for provider in self.providers if provider.accepts_images),
+                None,
+            )
+        if multimodal_default is not None:
+            provider = next(
+                (item for item in self.providers if item.name == multimodal_default),
+                None,
+            )
+            if provider is None:
+                raise ValueError(
+                    f"default_multimodal_provider {multimodal_default!r} is not in providers"
+                )
+            if not provider.accepts_images:
+                raise ValueError(
+                    "default_multimodal_provider must declare the image modality"
+                )
+        object.__setattr__(self, "default_text_provider", text_default)
+        object.__setattr__(self, "default_multimodal_provider", multimodal_default)
+        return self
+
+    @property
+    def public_model_id(self) -> str:
+        return self.alias or f"h3-context-ir-fake@{self.name}"
+
+    def provider_by_name(self, name: str) -> Optional[H3ContextIRProvider]:
+        for provider in self.providers:
+            if provider.name == name:
+                return provider
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Interfaces
 # ---------------------------------------------------------------------------
 
@@ -1457,6 +1665,7 @@ class Settings(BaseModel):
     llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
     llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
     comfyui_targets: List[ComfyUITarget] = Field(default_factory=list)
+    h3_context_ir_profiles: List[H3ContextIRProfile] = Field(default_factory=list)
 
     # -- Interfaces ------------------------------------------------------
     ollama_interfaces: List[OllamaInterface] = Field(
@@ -1614,6 +1823,52 @@ class Settings(BaseModel):
                 f"comfyui_targets: {dupes}. Source names are used as "
                 f"the right side of composite model ids and must be globally unique."
             )
+
+        # 1a. Context-IR profiles are orchestration definitions rather than
+        # model sources, but their public Playground ids and names must still
+        # be unique.  Every provider points to an existing non-Comfy source.
+        ir_names = [profile.name for profile in self.h3_context_ir_profiles]
+        ir_lookup_owners: Dict[str, str] = {}
+        for ir_profile in self.h3_context_ir_profiles:
+            for lookup_key in {ir_profile.name, ir_profile.public_model_id}:
+                owner = ir_lookup_owners.get(lookup_key)
+                if owner is not None and owner != ir_profile.name:
+                    raise ValueError(
+                        "duplicate H3 Context-IR lookup id "
+                        f"{lookup_key!r} across profiles {owner!r} and "
+                        f"{ir_profile.name!r}"
+                    )
+                ir_lookup_owners[lookup_key] = ir_profile.name
+        for ir_profile in self.h3_context_ir_profiles:
+            for provider in ir_profile.providers:
+                source = self.source_by_name(provider.target)
+                if source is None:
+                    raise ValueError(
+                        f"H3 Context-IR profile {ir_profile.name!r} provider "
+                        f"{provider.name!r} references unknown target "
+                        f"{provider.target!r}"
+                    )
+                if isinstance(source, ComfyUITarget):
+                    raise ValueError(
+                        f"H3 Context-IR provider {provider.name!r} cannot use "
+                        "a ComfyUI target as its planning model"
+                    )
+                if not source.serves(provider.model):
+                    raise ValueError(
+                        f"H3 Context-IR profile {ir_profile.name!r} provider "
+                        f"{provider.name!r}: target {provider.target!r} does not "
+                        f"serve model {provider.model!r}"
+                    )
+        ir_profile_names = set(ir_names)
+        for comfy_target in self.comfyui_targets:
+            if (
+                comfy_target.context_ir_profile is not None
+                and comfy_target.context_ir_profile not in ir_profile_names
+            ):
+                raise ValueError(
+                    f"comfyui target {comfy_target.name!r} references unknown "
+                    f"context_ir_profile {comfy_target.context_ir_profile!r}"
+                )
 
         # 2. Interface name uniqueness within each list.
         for label, items in (
@@ -1938,6 +2193,14 @@ class Settings(BaseModel):
         for src in self.all_sources():
             if src.name == name:
                 return src
+        return None
+
+    def h3_context_ir_profile_by_name(
+        self, name: str
+    ) -> Optional[H3ContextIRProfile]:
+        for profile in self.h3_context_ir_profiles:
+            if profile.name == name or profile.public_model_id == name:
+                return profile
         return None
 
     def backend_by_name(self, name: str) -> Optional["Backend"]:

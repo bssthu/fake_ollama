@@ -130,6 +130,56 @@
                 <div id="operationPresetHint" class="help"></div>
               </div>
               <div id="operationParameterList" class="operation-parameters"></div>
+              <section id="externalPlanner" class="external-planner" hidden>
+                <div class="external-planner-head">
+                  <div>
+                    <strong>临时第三方 Planner API</strong>
+                    <div class="help">连接信息只保留在当前页面；token 不写入配置或交互记录。</div>
+                  </div>
+                  <span id="externalPlannerStatus" class="external-planner-status">未连接</span>
+                </div>
+                <div class="external-planner-grid">
+                  <div class="field">
+                    <label for="externalPlannerProtocol">API 格式</label>
+                    <select id="externalPlannerProtocol">
+                      <option value="openai">OpenAI-compatible</option>
+                      <option value="anthropic">Anthropic-compatible</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="externalPlannerCapability">图片能力</label>
+                    <select id="externalPlannerCapability">
+                      <option value="text">纯文字</option>
+                      <option value="vision">多模态（可看图）</option>
+                    </select>
+                  </div>
+                  <div class="field external-planner-wide">
+                    <label for="externalPlannerUrl">API URL</label>
+                    <input id="externalPlannerUrl" class="control" type="url"
+                           autocomplete="off" spellcheck="false"
+                           placeholder="例如 https://api.openai.com/v1">
+                  </div>
+                  <div class="field external-planner-wide">
+                    <label for="externalPlannerToken">Token</label>
+                    <div class="secret-wrap">
+                      <input id="externalPlannerToken" class="control" type="password"
+                             autocomplete="new-password" spellcheck="false"
+                             placeholder="输入第三方 API token">
+                      <button id="toggleExternalPlannerToken" class="icon-button" type="button"
+                              aria-label="显示第三方 API token" title="显示或隐藏">◉</button>
+                    </div>
+                  </div>
+                  <div class="field external-planner-wide">
+                    <label for="externalPlannerModel">模型</label>
+                    <input id="externalPlannerModel" class="control" type="text"
+                           list="externalPlannerModelList" autocomplete="off"
+                           spellcheck="false" placeholder="先识别模型，或手动输入模型 ID">
+                    <datalist id="externalPlannerModelList"></datalist>
+                  </div>
+                </div>
+                <button id="detectExternalPlannerModels" class="secondary" type="button">连接并识别模型</button>
+                <div class="help">模型列表由第三方的 <code>/v1/models</code> 返回；接口不报告图片能力时，请按模型实际能力选择。</div>
+              </section>
             </div>
           </div>
         </details>

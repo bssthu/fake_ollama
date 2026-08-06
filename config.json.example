@@ -248,8 +248,53 @@
       "max_reference_images": 5,
       "max_batch_size": 1,
       "output_prefix": "fake_ollama/joyai-echo",
+      "context_ir_profile": "default",
+      "context_ir_prompt_mode": "auto",
       "prompt_timeout_seconds": 7200,
       "poll_interval_seconds": 1.0
+    }
+  ],
+
+  "_h3_context_ir": "==== H3 Context IR harness ============================= Provider references reuse existing model + target routes. The standalone virtual model is visible only in Playground; a ComfyUI video target may opt in through context_ir_profile.",
+
+  "h3_context_ir_profiles": [
+    {
+      "name": "default",
+      "alias": "h3-context-ir-fake",
+      "enabled": true,
+      "playground_visible": true,
+      "allow_compatible_models": true,
+      "allow_external_api": false,
+      "providers": [
+        {
+          "name": "local-text",
+          "model": "qwen3.6-27b-hauhau-q2kp",
+          "target": "qwen3.6-27b-hauhau-q2kp",
+          "modalities": ["text"],
+          "json_mode": true
+        },
+        {
+          "name": "local-vision",
+          "model": "mage-vl-local",
+          "target": "mage-vl-local-adapter",
+          "modalities": ["text", "image"],
+          "json_mode": false
+        },
+        {
+          "name": "remote-api",
+          "model": "deepseek-chat",
+          "target": "deepseek-openai",
+          "modalities": ["text"],
+          "json_mode": true
+        }
+      ],
+      "default_text_provider": "local-text",
+      "default_multimodal_provider": "local-vision",
+      "temperature": 0.2,
+      "max_output_tokens": 4096,
+      "max_attempts": 2,
+      "failure_mode": "fallback",
+      "default_duration_seconds": 5.0
     }
   ],
 

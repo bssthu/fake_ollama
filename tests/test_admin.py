@@ -116,12 +116,13 @@ def test_admin_schema(admin_settings):
         "openai_upstreams",
         "generic_openai_targets",
         "ollama_targets",
-            "llama_cpp_defaults",
-            "llama_cpp_targets",
-            "comfyui_targets",
-            "ollama_interfaces",
-            "api_interfaces",
-            "model_profiles",
+        "llama_cpp_defaults",
+        "llama_cpp_targets",
+        "comfyui_targets",
+        "h3_context_ir_profiles",
+        "ollama_interfaces",
+        "api_interfaces",
+        "model_profiles",
         "admin_host",
         "admin_port",
         "dashboard_enabled",
@@ -254,10 +255,41 @@ def test_admin_schema(admin_settings):
         "num_frames_modulo",
         "default_enable_tile",
         "default_enable_streaming",
+        "context_ir_profile",
+        "context_ir_prompt_mode",
     } <= comfyui_item_keys
     comfyui_item_by_key = {f["key"]: f for f in comfyui["item_schema"]}
     assert comfyui_item_by_key["bindings"]["type"] == "json"
     assert comfyui_item_by_key["static_inputs"]["type"] == "json"
+
+    context_ir = next(
+        f for f in fields if f["key"] == "h3_context_ir_profiles"
+    )
+    assert context_ir["type"] == "object_list"
+    context_ir_item_by_key = {
+        f["key"]: f for f in context_ir["item_schema"]
+    }
+    assert {
+        "name",
+        "alias",
+            "enabled",
+            "playground_visible",
+            "allow_compatible_models",
+            "allow_external_api",
+            "providers",
+        "default_text_provider",
+        "default_multimodal_provider",
+        "temperature",
+        "max_output_tokens",
+        "max_attempts",
+        "failure_mode",
+        "default_duration_seconds",
+    } <= context_ir_item_by_key.keys()
+    providers = context_ir_item_by_key["providers"]
+    assert providers["type"] == "object_list"
+    assert {"name", "model", "target", "modalities", "json_mode"} <= {
+        f["key"] for f in providers["item_schema"]
+    }
 
     # Interface arrays: each entry has its own host/port/tokens/exposed_models.
     ollama_iface = next(f for f in fields if f["key"] == "ollama_interfaces")
@@ -282,6 +314,7 @@ def test_admin_schema(admin_settings):
         "model_sources_ollama",
         "model_sources_llama_cpp",
         "model_sources_comfyui",
+        "h3_context_ir",
         "interface_ollama",
         "interface_api",
         "runtime",
@@ -295,6 +328,7 @@ def test_admin_schema(admin_settings):
             section_order.append(group["section"])
     assert section_order == [
         "model_sources",
+        "h3_context_ir",
         "interfaces",
         "runtime",
         "dashboard",

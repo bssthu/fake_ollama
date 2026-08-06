@@ -14,12 +14,19 @@ from fake_ollama.llama_cpp_client import LlamaCppClient
 from fake_ollama.request_data_log import (
     RequestDataLogMiddleware,
     configure_request_data_logging,
+    headers_from_mapping,
 )
 from fake_ollama.server import create_app
 
 
 def _records(path: Path) -> list[Dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_request_data_log_redacts_request_scoped_upstream_token() -> None:
+    headers = headers_from_mapping({"x-playground-upstream-key": "external-secret"})
+    assert headers["x-playground-upstream-key"].startswith("<redacted sha256:")
+    assert "external-secret" not in headers["x-playground-upstream-key"]
 
 
 def test_request_data_log_records_http_and_backend_payloads(settings, tmp_path):
