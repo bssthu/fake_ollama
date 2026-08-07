@@ -933,8 +933,9 @@ class ComfyUITarget(BaseModel):
 
     # Declarative workflow preset (see ``comfyui_presets``). The default
     # ``z_image_turbo`` reproduces the legacy behaviour from the per-field node
-    # ids/model files below; ``qwen_image_edit_aio``, ``sensenova_u1`` and
-    # ``joyai_echo`` ship bundled workflows + bindings. Set ``bindings`` / ``static_inputs`` to
+    # ids/model files below; ``qwen_image_edit_aio``, ``sensenova_u1``,
+    # ``joyai_echo`` and ``minimax_h3`` ship bundled workflows + bindings. Set
+    # ``bindings`` / ``static_inputs`` to
     # override a preset (or describe an arbitrary workflow) without touching the
     # client; both are keyed by mode, e.g. {"t2i": {...}, "i2i": {...}}.
     preset: str = "z_image_turbo"
@@ -946,6 +947,8 @@ class ComfyUITarget(BaseModel):
     image_to_image_workflow_path: Optional[str] = None
     video_workflow_path: Optional[str] = None
     image_to_video_workflow_path: Optional[str] = None
+    first_last_to_video_workflow_path: Optional[str] = None
+    last_to_video_workflow_path: Optional[str] = None
 
     # Optional prompt-planning stage run before video workflows.  The profile
     # itself is top-level so the same harness can be previewed in Playground
@@ -1249,6 +1252,8 @@ class ComfyUITarget(BaseModel):
             "image_to_image_workflow_path",
             "video_workflow_path",
             "image_to_video_workflow_path",
+            "first_last_to_video_workflow_path",
+            "last_to_video_workflow_path",
             "diffusion_model",
             "diffusion_weight_dtype",
             "text_encoder_model",

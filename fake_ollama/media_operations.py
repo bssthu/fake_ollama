@@ -21,7 +21,7 @@ def _workflow_specs(
     mode_names = {
         "image_generation": ("t2i",),
         "image_edit": ("i2i",),
-        "video_generation": ("video", "i2v"),
+        "video_generation": ("video", "i2v", "fl2va", "l2va"),
     }.get(operation_id, ())
     configured_modes = [mode for mode in mode_names if workflows.get(mode) is not None]
     return configured_modes, [workflows[mode] for mode in configured_modes]
@@ -340,7 +340,7 @@ def describe_comfyui_operation(target: Any, operation_id: str) -> Dict[str, Any]
     image_specs = [
         spec
         for mode, spec in zip(workflow_modes, specs)
-        if mode in {"i2i", "i2v"}
+        if mode in {"i2i", "i2v", "fl2va", "l2va"}
     ]
     reference_limits = [_image_ref_limit(spec) for spec in image_specs]
     max_references = (
@@ -351,7 +351,7 @@ def describe_comfyui_operation(target: Any, operation_id: str) -> Dict[str, Any]
     accepts_images = operation_id == "image_edit" or bool(image_specs)
     requires_images = operation_id == "image_edit" or (
         operation_id == "video_generation"
-        and "i2v" in workflow_modes
+        and any(mode in workflow_modes for mode in ("i2v", "fl2va", "l2va"))
         and "video" not in workflow_modes
     )
     multiple_images = accepts_images and (

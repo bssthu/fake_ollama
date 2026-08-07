@@ -54,6 +54,8 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": args.model,
         "prompt": args.prompt,
+        "prompt_mode": args.prompt_mode,
+        "context_ir_mode": args.context_ir_mode,
         "size": args.size,
         "num_frames": args.num_frames,
         "fps": args.fps,
@@ -147,6 +149,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", required=True, help="Text prompt for the video.")
     parser.add_argument("--model", default="joyai-echo")
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("raw", "auto", "enhance"),
+        default="auto",
+        help="H3 prompt planning mode (default: auto).",
+    )
+    parser.add_argument(
+        "--context-ir-mode",
+        choices=("auto", "t2va", "i2va", "fl2va", "l2va"),
+        default="auto",
+        help="H3 base workflow mode (default: auto by reference-image count).",
+    )
     parser.add_argument("--size", default="256x256")
     parser.add_argument("--num-frames", type=int, default=17)
     parser.add_argument("--fps", type=float, default=8.0)

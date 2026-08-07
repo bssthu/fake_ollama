@@ -56,6 +56,23 @@ class _FakeOpenAIPlanner:
         }
 
 
+class _FakeLocalOpenAIPlanner(_FakeOpenAIPlanner):
+    def __init__(self, responses: list[str] | None = None) -> None:
+        super().__init__(responses)
+        self.release_calls = 0
+
+    async def chat(
+        self,
+        payload: dict[str, Any],
+        **_: Any,
+    ) -> dict[str, Any]:
+        return await super().chat(payload)
+
+    async def release_for_vram(self) -> bool:
+        self.release_calls += 1
+        return True
+
+
 class _FakeComfy:
     def __init__(self) -> None:
         self.video_calls: list[dict[str, Any]] = []
@@ -657,7 +674,99 @@ def test_video_generation_runs_context_ir_before_comfy_and_returns_revised_promp
     call = comfy.video_calls[0]
     assert call["prompt"].startswith("integrated_multimodal_description:")
     assert response.json()["data"][0]["revised_prompt"] == call["prompt"]
+    assert call["video_mode"] == "t2va"
     assert len(planner.calls) == 1
+
+
+def test_video_generation_releases_managed_local_planner_before_comfy() -> None:
+    planner = _FakeLocalOpenAIPlanner()
+    comfy = _FakeComfy()
+    data = _settings(attach_video=True).model_dump()
+    data["openai_upstreams"] = []
+    data["llama_cpp_targets"] = [
+        {
+            "name": "planner",
+            "base_url": "http://planner.test",
+            "model": "planner-text",
+            "auto_start": False,
+        }
+    ]
+    context_profile = data["h3_context_ir_profiles"][0]
+    context_profile["providers"] = [context_profile["providers"][0]]
+    context_profile["providers"][0]["modalities"] = ["text", "image"]
+    context_profile["default_multimodal_provider"] = "text-api"
+    data["model_profiles"] = [
+        profile
+        for profile in data["model_profiles"]
+        if profile["model"] != "planner-vision"
+    ]
+    app = create_app(Settings.model_validate(data))
+    app.state.llama_cpp_clients = {"planner": planner}
+    app.state.comfyui_clients = {"h3-comfy": comfy}
+
+    with TestClient(app, base_url="http://testserver:21435") as client:
+        response = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "h3",
+                "prompt": "A runner crosses a rainy street.",
+                "response_format": "b64_json",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert planner.release_calls == 1
+    assert len(comfy.video_calls) == 1
+
+
+def test_video_generation_routes_explicit_last_frame_mode_without_planner() -> None:
+    comfy = _FakeComfy()
+    data = _settings(attach_video=True).model_dump()
+    data["comfyui_targets"][0]["preset"] = "minimax_h3"
+    app = create_app(Settings.model_validate(data))
+    app.state.comfyui_clients = {"h3-comfy": comfy}
+    with TestClient(app, base_url="http://testserver:21435") as client:
+        response = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "h3",
+                "prompt": "Arrive at this exact final composition.",
+                "prompt_mode": "raw",
+                "context_ir_mode": "l2va",
+                "image": "aW1hZ2U=",
+                "filename": "last.png",
+                "response_format": "b64_json",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert comfy.video_calls[0]["video_mode"] == "l2va"
+    assert comfy.video_calls[0]["prompt"] == "Arrive at this exact final composition."
+
+
+def test_video_generation_rejects_h3_mode_image_count_mismatch() -> None:
+    comfy = _FakeComfy()
+    data = _settings(attach_video=True).model_dump()
+    data["comfyui_targets"][0]["preset"] = "minimax_h3"
+    app = create_app(Settings.model_validate(data))
+    app.state.comfyui_clients = {"h3-comfy": comfy}
+    with TestClient(app, base_url="http://testserver:21435") as client:
+        response = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "h3",
+                "prompt": "End at the supplied frame.",
+                "prompt_mode": "raw",
+                "context_ir_mode": "l2va",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "mode l2va requires 1 image(s), got 0" in response.text
+    assert comfy.video_calls == []
 
 
 def test_video_generation_can_use_request_scoped_external_planner() -> None:

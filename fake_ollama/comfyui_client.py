@@ -552,13 +552,10 @@ class ComfyUIClient:
         image_bytes: Optional[bytes] = None,
         filename: Optional[str] = None,
         image_inputs: Optional[List[Tuple[bytes, str]]] = None,
+        video_mode: str = "auto",
     ) -> List[ComfyUIImage]:
-        has_refs = bool(image_inputs) or image_bytes is not None
-        mode = (
-            "i2v"
-            if has_refs and self._workflows.get("i2v") is not None
-            else "video"
-        )
+        ref_count = len(image_inputs) if image_inputs else int(image_bytes is not None)
+        mode = self._select_video_workflow_mode(video_mode, ref_count)
         return await self._run(
             mode=mode,
             model=model,
@@ -587,6 +584,39 @@ class ComfyUIClient:
             image_inputs=image_inputs,
         )
 
+    def _select_video_workflow_mode(self, requested: str, ref_count: int) -> str:
+        """Map public H3 base modes onto configured workflow slots.
+
+        ``auto`` preserves existing video targets: no image selects ``video``;
+        one or more images select ``i2v`` unless an explicit two-keyframe
+        ``fl2va`` workflow exists.  L2VA is necessarily explicit because it
+        has the same image count as first-frame I2V.
+        """
+
+        value = (requested or "auto").strip().lower()
+        aliases = {
+            "t2v": "video",
+            "t2va": "video",
+            "video": "video",
+            "i2va": "i2v",
+            "i2v": "i2v",
+            "fl2v": "fl2va",
+            "fl2va": "fl2va",
+            "l2v": "l2va",
+            "l2va": "l2va",
+        }
+        if value == "auto":
+            if ref_count >= 2 and self._workflows.get("fl2va") is not None:
+                return "fl2va"
+            if ref_count and self._workflows.get("i2v") is not None:
+                return "i2v"
+            return "video"
+        if value not in aliases:
+            raise ValueError(
+                "video_mode must be auto|t2va|i2va|fl2va|l2va"
+            )
+        return aliases[value]
+
     async def _run(
         self,
         *,
@@ -610,6 +640,8 @@ class ComfyUIClient:
                 "i2i": "image-to-image",
                 "video": "text-to-video",
                 "i2v": "image-to-video",
+                "fl2va": "first-last-frame-to-video",
+                "l2va": "last-frame-to-video",
             }.get(mode, mode)
             raise httpx.ProtocolError(
                 f"ComfyUI target {self.target_id} has no {verb} workflow configured"

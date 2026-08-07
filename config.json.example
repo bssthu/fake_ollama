@@ -252,6 +252,44 @@
       "context_ir_prompt_mode": "auto",
       "prompt_timeout_seconds": 7200,
       "poll_interval_seconds": 1.0
+    },
+    {
+      "name": "minimax-h3-comfyui",
+      "base_url": "http://127.0.0.1:21481",
+      "model": "minimax-h3-768p",
+      "preset": "minimax_h3",
+      "auto_start": true,
+      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-H3\\.venv\\Scripts\\python.exe\" -s main.py --listen 127.0.0.1 --port 21481 --reserve-vram 2 --disable-all-custom-nodes --extra-model-paths-config \"I:\\Projects\\fake_ollama\\runtime\\minimax_h3_extra_model_paths.yaml\"",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 300,
+      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-H3",
+      "min_width": 32,
+      "default_width": 1344,
+      "max_width": 1344,
+      "width_modulo": 32,
+      "min_height": 32,
+      "default_height": 768,
+      "max_height": 1344,
+      "height_modulo": 32,
+      "default_steps": 20,
+      "default_sampler_name": "res_multistep",
+      "default_scheduler": "simple",
+      "min_num_frames": 5,
+      "default_num_frames": 124,
+      "max_num_frames": 362,
+      "num_frames_offset": 5,
+      "num_frames_modulo": 17,
+      "min_frame_rate": 24.0,
+      "default_frame_rate": 24.0,
+      "max_frame_rate": 24.0,
+      "max_reference_images": 2,
+      "max_batch_size": 1,
+      "output_prefix": "fake_ollama/minimax-h3",
+      "context_ir_profile": "default",
+      "context_ir_prompt_mode": "auto",
+      "prompt_timeout_seconds": 14400,
+      "poll_interval_seconds": 1.0,
+      "save_video_node_id": "9"
     }
   ],
 
@@ -391,6 +429,16 @@
       "estimated_memory_gb": 30.0,
       "thinking_mode": "disabled",
       "show_thinking": false
+    },
+    {
+      "model": "minimax-h3-768p",
+      "target": "minimax-h3-comfyui",
+      "capabilities": ["video_generation"],
+      "context_length": 4096,
+      "estimated_vram_gb": 22.0,
+      "estimated_memory_gb": 56.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
     }
   ],
 
@@ -429,6 +477,7 @@
         {"model": "qwen-image", "target": "qwen-image-comfyui", "alias": "qwen-image"},
         {"model": "sensenova", "target": "sensenova-comfyui", "alias": "sensenova-z-image"},
         {"model": "joyai-echo", "target": "joyai-echo-comfyui", "alias": "joyai-echo"},
+        {"model": "minimax-h3-768p", "target": "minimax-h3-comfyui", "alias": "minimax-h3"},
         {"model": "mage-vl-local", "target": "mage-vl-local-adapter", "alias": "mage-vl-local"}
       ]
     }

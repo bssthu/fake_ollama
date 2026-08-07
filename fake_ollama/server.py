@@ -3106,6 +3106,52 @@ async def _run_h3_context_ir(
     }
 
 
+async def _release_context_ir_provider_for_video(
+    app: FastAPI,
+    provider_info: Dict[str, Any],
+) -> bool:
+    """Release a managed local Planner before admitting the H3 video model.
+
+    H3 needs almost the entire VRAM budget of a 24 GiB card.  Waiting for the
+    normal idle-reclaim window after a local Planner call makes the default
+    ``prompt_mode=auto`` path fail even though the two models only need to run
+    sequentially.  The regular participant release hook is concurrency-aware
+    and refuses to stop an unowned or still-active backend.
+    """
+
+    target = str(provider_info.get("target") or "").strip()
+    if not target or target == "request-scoped":
+        return False
+    backend = app.state.settings.backend_by_name(target)
+    if backend is None or backend.kind != "local":
+        return False
+    client = _backend_client(app, backend)
+    release = getattr(client, "release_for_vram", None)
+    if not callable(release):
+        return False
+    try:
+        released = bool(await release())
+    except Exception:
+        logger.warning(
+            "failed to release local H3 Context-IR provider %s before video handoff",
+            target,
+            exc_info=True,
+        )
+        return False
+    if released:
+        logger.info(
+            "released local H3 Context-IR provider %s before video model admission",
+            target,
+        )
+    else:
+        logger.info(
+            "local H3 Context-IR provider %s was not releasable; video resource "
+            "admission will use the current free-resource reading",
+            target,
+        )
+    return released
+
+
 async def _handle_h3_context_ir(request: Request) -> JSONResponse:
     settings, iface = _model_interface_for_request(request)
     payload, image_inputs = await _image_payload_from_request(request)
@@ -3172,6 +3218,19 @@ async def _handle_openai_video_generation(request: Request) -> Any:
     params = _video_request_params(payload, target, app=app)
     revised_prompt: Optional[str] = None
     context_ir_profile_name = getattr(target, "context_ir_profile", None)
+    video_mode = "auto"
+    if context_ir_profile_name or getattr(target, "preset", "") == "minimax_h3":
+        try:
+            video_mode = resolve_base_mode(
+                str(
+                    payload.get("context_ir_mode")
+                    or payload.get("video_mode")
+                    or "auto"
+                ),
+                len(image_inputs),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if context_ir_profile_name:
         context_profile = settings.h3_context_ir_profile_by_name(
             context_ir_profile_name
@@ -3209,7 +3268,7 @@ async def _handle_openai_video_generation(request: Request) -> Any:
                 context_profile,
                 prompt=prompt,
                 image_inputs=image_inputs,
-                requested_mode=str(payload.get("context_ir_mode") or "auto"),
+                requested_mode=video_mode,
                 duration_seconds=_context_ir_duration(
                     payload, context_profile, video_params=params
                 ),
@@ -3219,6 +3278,10 @@ async def _handle_openai_video_generation(request: Request) -> Any:
             )
             revised_prompt = str(context_result["content"]["prompt"])
             prompt = revised_prompt
+            await _release_context_ir_provider_for_video(
+                app,
+                dict(context_result.get("provider") or {}),
+            )
     client: ComfyUIClient = _backend_client(app, backend)
     profile = settings.profile_for(f"{real_model}@{backend.name}")
     image_bytes = None
@@ -3232,6 +3295,7 @@ async def _handle_openai_video_generation(request: Request) -> Any:
             image_bytes=image_bytes,
             filename=filename,
             image_inputs=image_inputs or None,
+            video_mode=video_mode,
             estimated_vram_gb=profile.estimated_vram_gb,
             estimated_memory_gb=profile.estimated_memory_gb,
             **params,

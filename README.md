@@ -297,6 +297,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 | `qwen_image_edit_aio` | Qwen-Image-Edit 整合检查点（如 Qwen-Rapid-AIO） | `CheckpointLoaderSimple` 一次加载 UNet+CLIP+VAE；文生图用 `CLIPTextEncode`，图生图用 `TextEncodeQwenImageEditPlus`（参考图经 conditioning 注入，编辑 `denoise=1.0`） |
 | `sensenova_u1` | SenseNova-U1-8B（自定义节点 `ComfyUI_SenseNova_U1`） | 融合模型节点 + 融合采样节点；分辨率走 `target_pixels` 比例桶（请求 `size` 映射到最近比例，实际输出为该桶原生尺寸） |
 | `joyai_echo` | JoyAI Echo（自定义节点 `ComfyUI_JoyAI_Echo`） | 内置 T2V + 多参考图 I2V；公开尺寸、seed、帧数、FPS、prefetch、分块解码与模型流式加载；默认使用 256² / 17 帧安全调试预设 |
+| `minimax_h3` | MiniMax H3 Base | 官方核心节点；内置 T2V、首帧 I2V、首尾帧 FL2VA、末帧 L2VA 四套 API workflow；固定使用 Pruned INT8 ConvRot DiT + Qwen3-VL-32B NVFP4-AWQ |
 
 当前内置模型的推荐公开参数如下；表中默认值来自对应 target 配置，因而 API 缺省行为、
 `/playground/api/models` 和 Playground 使用同一个值：
@@ -307,6 +308,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 | Qwen-Image-Edit AIO | 同 Z-Image；编辑只接收 1 张参考图 | 1024²、6 steps、CFG 1、`euler_ancestral` / `beta`；编辑 denoise 1.0 |
 | SenseNova-U1 | 原生宽高比桶、`n`、`seed`、`steps`、`cfg`；不显示 workflow 没有输入的 sampler/scheduler/denoise | 1:1、8 steps、CFG 1；实际像素由模型的原生比例桶决定 |
 | JoyAI Echo | `size`、`seed`、`num_frames`、`fps`、`prefetch_count`、`enable_tile`、`enable_streaming` | 安全调试：256²、17 帧、8 FPS、prefetch 1、分块解码开；帧数必须为 `8k+1`，尺寸至少 256 且为 32 的倍数 |
+| MiniMax H3 | `size`、`seed`、`steps`、`sampler_name`、`scheduler`、`num_frames`、`fps`，以及 H3 Context-IR 的模式/Planner 参数 | 1344×768、124 帧、24 FPS、20 steps、`res_multistep` / `simple`；帧数必须为 `17k+5` |
 
 > **JoyAI Echo 节点兼容性**：已在本机验证的 `ComfyUI_JoyAI_Echo` 版本要求节点把
 > `enable_tile` 写入模型实际读取的 `enable_tiles` 属性，并要求 VAE wrapper 将
@@ -314,7 +316,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 > 修复，会分别表现为勾选分块解码仍发生显存不足，或报
 > `unsupported operand type(s) for +: 'generator' and 'int'`。
 
-图片 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` / `<preset>_i2i.json`，视频则对应 T2V / I2V workflow。要接入**其它** ComfyUI 模型，提供 API 格式 workflow JSON，再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可；支持 `t2i`、`i2i`、`video`、`i2v` 四种模式。
+图片 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` / `<preset>_i2i.json`，视频则对应 T2V / I2V / FL2VA / L2VA workflow。要接入**其它** ComfyUI 模型，提供 API 格式 workflow JSON，再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可；支持 `t2i`、`i2i`、`video`、`i2v`、`fl2va`、`l2va` 六种模式。
 
 > **客户端可能按模型名判断是否图片模型**：部分客户端（如 CherryStudio）靠模型 id 的正则/子串匹配来决定走聊天接口还是 `/v1/images/*`——只认 `z-image*` / `qwen-image*` / `flux*` / `sd*` 等已知图片模型名。若把图片模型暴露成它不认识的名字（如 `sensenova`），它会当普通聊天模型发到 `/v1/chat/completions`，被 fake_ollama 以 400「use /v1/images/...」拒绝。对策：在 `exposed_models[*].alias` 里给这类模型起一个**包含已知图片模型关键词的别名**（例如 `sensenova-z-image`）；这只改客户端看到的 id，后端 target 与 `model_profiles` 仍按真实模型名匹配，不受影响。
 
@@ -580,6 +582,59 @@ Playground 的预计显存、预计内存和上下文会随实际 Planner 选择
 ```
 
 随后 `POST /v1/videos/generations` 可用 `prompt_mode=raw|auto|enhance`、`context_ir_provider` 和 `context_ir_mode` 覆盖 target 默认值。`auto` 会保留已经是 H3 三段式的 prompt，普通自然语言才会增强；响应会附带实际送入 workflow 的 `revised_prompt`。只有真正接受 H3 Base Prompt 的视频 workflow 才应开启这项绑定。
+
+#### 本机 MiniMax H3 768p 后端
+
+仓库内置 `minimax_h3` preset，并在示例配置中把它作为独立 ComfyUI target 暴露为
+`minimax-h3`。四种模式共用同一组官方权重：
+
+- `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`（19.53 GiB）
+- `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`（14.61 GiB）
+- `vae/minimax_h3_video_vae_fp16.safetensors`（4.85 GiB）
+- `vae/minimax_h3_audio_vae_fp32.safetensors`（0.56 GiB）
+
+默认模型根目录为 `J:\Projects\LLM_Models\MiniMax-H3`，映射见
+`runtime/minimax_h3_extra_model_paths.yaml`。本机 target 使用独立的
+`I:\Projects\ComfyUI\ComfyUI-H3` 官方主线实例和 `:21481`，不会升级或覆盖现有 Aki
+ComfyUI。启动参数保留 2 GiB 显存给系统；资源协调器按
+`estimated_vram_gb=22`、`estimated_memory_gb=56` 做准入和空闲模型回收。
+
+RTX 4090（SM 8.9）没有原生 NVFP4 Tensor Core。最新版 ComfyUI 会将 NVFP4 标记为
+emulated：磁盘/主存仍使用 NVFP4-AWQ 压缩权重，计算时按层反量化；因此能运行，但文本
+编码速度不会获得 Blackwell 原生 NVFP4 的加速。INT8 ConvRot DiT 则继续走
+`comfy-kitchen` 的量化路径。此差异影响速度和峰值内存，不会把量化模型悄悄换成另一套
+权重。
+
+当 `prompt_mode=auto|enhance` 先调用本地 Planner 时，服务会在规划结束后通过并发感知的
+资源释放接口立即卸载由 fake-ollama 管理的 Planner，再执行 H3 的 22 GiB 准入检查；因此
+24 GiB 显卡不需要等待常规的 60 秒空闲回收窗口。远程/第三方 Planner 不受影响，仍在使用
+或不由 fake-ollama 管理的本地进程也不会被强行停止。
+
+`context_ir_mode` 的选择规则：
+
+- `auto`：0 张图 → T2V，1 张图 → 首帧 I2V，2 张图 → FL2VA。
+- `t2va`：不接图片。
+- `i2va`：1 张图接到 `first_frame`。
+- `fl2va`：第 1 张接 `first_frame`，第 2 张接 `last_frame`。
+- `l2va`：1 张图只接到 `last_frame`；由于与 I2V 同为一张图，必须显式选择。
+
+服务端会在调用 Planner 和 ComfyUI 之前校验模式与图片数；`prompt_mode=raw` 也不会绕过
+这项校验。默认 124 帧约对应 5 秒输入时长，H3 只接受 `17k+5` 帧网格；24 FPS 固定。
+
+```powershell
+$headers = @{ Authorization = "Bearer tk-..." }
+$body = @{
+  model = "minimax-h3"
+  prompt = "A paper boat moves through a rainy neon alley, with synchronized rain and footsteps."
+  context_ir_mode = "t2va"
+  size = "1344x768"
+  num_frames = 124
+  fps = 24
+  response_format = "b64_json"
+} | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:21435/v1/videos/generations `
+  -Method Post -Headers $headers -ContentType "application/json" -Body $body
+```
 
 ### Interfaces（接口与白名单）
 

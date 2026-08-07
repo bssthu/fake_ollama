@@ -103,6 +103,18 @@ class Preset:
     i2i: Optional[WorkflowSpec] = None
     video: Optional[WorkflowSpec] = None
     i2v: Optional[WorkflowSpec] = None
+    fl2va: Optional[WorkflowSpec] = None
+    l2va: Optional[WorkflowSpec] = None
+
+
+WORKFLOW_MODES: Tuple[str, ...] = (
+    "t2i",
+    "i2i",
+    "video",
+    "i2v",
+    "fl2va",
+    "l2va",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +280,74 @@ _JOYAI_I2V = WorkflowSpec(
     operation_presets=_JOYAI_OPERATION_PRESETS,
 )
 
+# MiniMax H3 Base: the same official FL2VA checkpoint serves text-only,
+# first-frame, first+last-frame, and last-frame generation.  Separate API
+# prompt files keep the optional keyframe slots explicit and make mode routing
+# inspectable without depending on frontend subgraph expansion.
+_MINIMAX_H3_OPERATION_PRESETS = (
+    OperationPreset(
+        id="h3_768p_5s",
+        label="768p / 5s",
+        description="官方原生 1344x768、24 FPS，124 帧（约 5 秒）。",
+        recommended=True,
+        values={
+            "size": "1344x768",
+            "num_frames": 124,
+            "fps": 24.0,
+            "steps": 20,
+            "sampler_name": "res_multistep",
+            "scheduler": "simple",
+        },
+    ),
+)
+
+_MINIMAX_H3_COMMON_BINDINGS: Dict[str, List[Placement]] = {
+    "prompt": [("5", "prompt")],
+    "width": [("5", "width")],
+    "height": [("5", "height")],
+    "num_frames": [("5", "length")],
+    "seed": [("6", "noise_seed")],
+    "sampler_name": [("8", "sampler_name")],
+    "scheduler": [("10", "scheduler")],
+    "steps": [("10", "steps")],
+    "frame_rate": [("14", "fps")],
+}
+
+
+def _minimax_h3_spec(
+    filename: str,
+    *,
+    image_bindings: Optional[Dict[str, List[Placement]]] = None,
+    max_image_refs: int = 0,
+) -> WorkflowSpec:
+    return WorkflowSpec(
+        path=WORKFLOW_DIR / filename,
+        bindings={**_MINIMAX_H3_COMMON_BINDINGS, **(image_bindings or {})},
+        max_image_refs=max_image_refs,
+        operation_presets=_MINIMAX_H3_OPERATION_PRESETS,
+    )
+
+
+_MINIMAX_H3_T2V = _minimax_h3_spec("minimax_h3_t2v.json")
+_MINIMAX_H3_I2V = _minimax_h3_spec(
+    "minimax_h3_i2v.json",
+    image_bindings={"image": [("20", "image")]},
+    max_image_refs=1,
+)
+_MINIMAX_H3_FL2VA = _minimax_h3_spec(
+    "minimax_h3_fl2va.json",
+    image_bindings={
+        "image_1": [("20", "image")],
+        "image_2": [("21", "image")],
+    },
+    max_image_refs=2,
+)
+_MINIMAX_H3_L2VA = _minimax_h3_spec(
+    "minimax_h3_l2va.json",
+    image_bindings={"image": [("20", "image")]},
+    max_image_refs=1,
+)
+
 PRESETS: Dict[str, Preset] = {
     "qwen_image_edit_aio": Preset(
         name="qwen_image_edit_aio", t2i=_QWEN_T2I, i2i=_QWEN_I2I
@@ -277,6 +357,13 @@ PRESETS: Dict[str, Preset] = {
     ),
     "joyai_echo": Preset(
         name="joyai_echo", video=_JOYAI_VIDEO, i2v=_JOYAI_I2V
+    ),
+    "minimax_h3": Preset(
+        name="minimax_h3",
+        video=_MINIMAX_H3_T2V,
+        i2v=_MINIMAX_H3_I2V,
+        fl2va=_MINIMAX_H3_FL2VA,
+        l2va=_MINIMAX_H3_L2VA,
     ),
 }
 
@@ -430,6 +517,8 @@ def resolve_workflows(
     i2i_path = fields.get("image_to_image_workflow_path")
     video_path = fields.get("video_workflow_path")
     i2v_path = fields.get("image_to_video_workflow_path")
+    fl2va_path = fields.get("first_last_to_video_workflow_path")
+    l2va_path = fields.get("last_to_video_workflow_path")
     max_image_refs = fields.get("max_reference_images")
 
     if preset_name in _FIELD_PRESETS:
@@ -441,6 +530,8 @@ def resolve_workflows(
             "i2i": preset.i2i,
             "video": preset.video,
             "i2v": preset.i2v,
+            "fl2va": preset.fl2va,
+            "l2va": preset.l2va,
         }
     elif preset_name in _CUSTOM_PRESETS:
         base = {
@@ -464,6 +555,16 @@ def resolve_workflows(
                 if i2v_path
                 else None
             ),
+            "fl2va": (
+                WorkflowSpec(path=Path(fl2va_path), bindings={}, static_inputs={})
+                if fl2va_path
+                else None
+            ),
+            "l2va": (
+                WorkflowSpec(path=Path(l2va_path), bindings={}, static_inputs={})
+                if l2va_path
+                else None
+            ),
         }
     else:
         raise ValueError(
@@ -471,7 +572,7 @@ def resolve_workflows(
         )
 
     resolved: Dict[str, Optional[WorkflowSpec]] = {}
-    for mode in ("t2i", "i2i", "video", "i2v"):
+    for mode in WORKFLOW_MODES:
         spec = base.get(mode)
         if spec is None:
             resolved[mode] = None
@@ -485,12 +586,21 @@ def resolve_workflows(
             path = Path(video_path)
         if mode == "i2v" and i2v_path:
             path = Path(i2v_path)
+        if mode == "fl2va" and fl2va_path:
+            path = Path(fl2va_path)
+        if mode == "l2va" and l2va_path:
+            path = Path(l2va_path)
         static_inputs = _merge_static(spec.static_inputs, override_static.get(mode))
         # Output filename prefix is a per-target, non-request value; route it
         # to the SaveImage node uniformly across presets.
         if output_prefix is not None:
+            output_node = (
+                str(fields.get("save_video_node_id") or "9")
+                if mode in {"video", "i2v", "fl2va", "l2va"}
+                else save_node
+            )
             static_inputs = _merge_static(
-                static_inputs, {save_node: {"filename_prefix": output_prefix}}
+                static_inputs, {output_node: {"filename_prefix": output_prefix}}
             )
         bindings = _merge_bindings(spec.bindings, override_bindings.get(mode))
         mode_max_image_refs = spec.max_image_refs

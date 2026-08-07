@@ -153,3 +153,47 @@ def test_recommended_preset_does_not_override_an_operators_custom_defaults() -> 
     assert operation["default_preset"] is None
     assert operation["defaults"]["size"] == "512x512"
     assert operation["defaults"]["num_frames"] == 33
+
+
+def test_minimax_h3_exposes_all_base_modes_and_768p_defaults() -> None:
+    target = ComfyUITarget(
+        name="h3",
+        model="minimax-h3-768p",
+        preset="minimax_h3",
+        min_width=32,
+        default_width=1344,
+        max_width=1344,
+        width_modulo=32,
+        min_height=32,
+        default_height=768,
+        max_height=1344,
+        height_modulo=32,
+        default_steps=20,
+        default_sampler_name="res_multistep",
+        default_scheduler="simple",
+        min_num_frames=5,
+        default_num_frames=124,
+        max_num_frames=362,
+        num_frames_offset=5,
+        num_frames_modulo=17,
+        min_frame_rate=24,
+        default_frame_rate=24,
+        max_frame_rate=24,
+        max_reference_images=2,
+        max_batch_size=1,
+    )
+
+    operation = describe_comfyui_operation(target, "video_generation")
+
+    assert operation["workflow_modes"] == ["video", "i2v", "fl2va", "l2va"]
+    assert operation["accepts_images"] is True
+    assert operation["requires_images"] is False
+    assert operation["multiple_images"] is True
+    assert operation["limits"]["max_reference_images"] == 2
+    assert operation["limits"]["num_frames_offset"] == 5
+    assert operation["limits"]["num_frames_modulo"] == 17
+    assert operation["defaults"]["size"] == "1344x768"
+    assert operation["defaults"]["num_frames"] == 124
+    assert operation["defaults"]["fps"] == 24
+    assert operation["recommended_preset"] == "h3_768p_5s"
+    assert operation["default_preset"] == "h3_768p_5s"
