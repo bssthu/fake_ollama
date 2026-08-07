@@ -28,6 +28,8 @@
     cameraStop: $('cameraStop'),
     cameraStats: $('cameraStats'),
     cameraLiveText: $('cameraLiveText'),
+    mediaQueueSection: $('mediaQueueSection'),
+    generationCount: $('generationCount'),
     chatParams: $('chatParams'),
     mediaParams: $('mediaParams'),
     operationPresetField: $('operationPresetField'),
@@ -90,6 +92,7 @@
   const VIDEO_TOKEN_ESTIMATE = 8192;
   const LIVE_CAMERA_HISTORY_LIMIT = 200;
   const LIVE_CAMERA_VIDEO_BITS_PER_SECOND = 2_500_000;
+  const MAX_MEDIA_QUEUE_RUNS = 20;
   const textEncoder = new TextEncoder();
 
   const state = {
@@ -167,6 +170,20 @@
 
   function selectedModel() {
     return state.models.get(els.model.value) || null;
+  }
+
+  function operationUsesMediaQueue(op = selectedOperation()) {
+    return Boolean(op && [
+      'image_generation', 'image_edit', 'video_generation',
+    ].includes(op.id));
+  }
+
+  function mediaQueueRunCount() {
+    const value = Number.parseInt(els.generationCount.value, 10);
+    if (!Number.isInteger(value) || value < 1 || value > MAX_MEDIA_QUEUE_RUNS) {
+      throw new Error(`生成份数必须是 1 到 ${MAX_MEDIA_QUEUE_RUNS} 的整数。`);
+    }
+    return value;
   }
 
   function legacyOperations(modelInfo) {
@@ -861,6 +878,7 @@
     const isVideoAnalysis = op && op.id === 'video_analysis';
     const isContextIR = op && op.id === 'h3_context_ir';
     const isMedia = op && !isChatRequest;
+    const usesMediaQueue = operationUsesMediaQueue(op);
     const acceptsUploads = op && (op.accepts_images || op.accepts_videos);
 
     if (op) {
@@ -876,6 +894,7 @@
     }
     els.uploadSection.hidden = !acceptsUploads;
     els.cameraSection.hidden = !operationSupportsLiveCamera(op);
+    els.mediaQueueSection.hidden = !usesMediaQueue;
     els.uploadLabel.textContent = isVideoAnalysis ? '待分析视频' : '参考图片';
     els.uploadRequirement.textContent = isVideoAnalysis
       ? '文件模式需要 1 个；摄像头模式无需上传'
@@ -932,7 +951,8 @@
       const limits = op.limits || {};
       const limitHints = [usesHistory ? '携带页面内历史' : '仅发送本次输入'];
       if (op.configured === false) limitHints.push('工作流尚未配置');
-      if (limits.max_batch_size) limitHints.push(`最多 ${limits.max_batch_size} 个结果`);
+      if (usesMediaQueue) limitHints.push(`可自动排队 1–${MAX_MEDIA_QUEUE_RUNS} 份`);
+      else if (limits.max_batch_size) limitHints.push(`最多 ${limits.max_batch_size} 个结果`);
       if (limits.max_reference_images) limitHints.push(`最多 ${limits.max_reference_images} 张参考图`);
       if (limits.max_num_frames) limitHints.push(`最多 ${limits.max_num_frames} 帧`);
       if (limits.max_video_bytes) {
@@ -964,7 +984,11 @@
 
   function operationParameters(op) {
     if (!op || op.id === 'chat') return [];
-    if (Array.isArray(op.parameters)) return op.parameters;
+    if (Array.isArray(op.parameters)) {
+      return operationUsesMediaQueue(op)
+        ? op.parameters.filter((parameter) => parameter.name !== 'n')
+        : op.parameters;
+    }
 
     // Compatibility with servers that predate the workflow-derived schema.
     const defaults = op.defaults || {};
@@ -981,9 +1005,12 @@
       ['enable_tile', '分块解码', 'boolean'],
       ['enable_streaming', '模型流式加载', 'boolean'],
     ];
-    return legacy
+    const parameters = legacy
       .filter(([name]) => Object.prototype.hasOwnProperty.call(defaults, name))
       .map(([name, label, type]) => ({name, label, type, default: defaults[name]}));
+    return operationUsesMediaQueue(op)
+      ? parameters.filter((parameter) => parameter.name !== 'n')
+      : parameters;
   }
 
   function setParameterValue(entry, value) {
@@ -1068,7 +1095,11 @@
 
     for (const spec of parameters) {
       const field = document.createElement('div');
-      field.className = `field operation-parameter${spec.advanced ? ' advanced-parameter' : ''}`;
+      field.className = [
+        'field operation-parameter',
+        spec.advanced ? 'advanced-parameter' : '',
+        spec.wide ? 'wide-parameter' : '',
+      ].filter(Boolean).join(' ');
       const id = `operation-param-${String(spec.name).replace(/[^a-zA-Z0-9_-]/g, '-')}`;
       const label = document.createElement('label');
       label.htmlFor = id;
@@ -1162,6 +1193,7 @@
     els.send.disabled = Boolean(state.controller) || cameraBusy || !selectedModel() || !op
       || !credentialReady || op.configured === false
       || !els.prompt.value.trim() || missingRequiredMedia || !externalPlannerReady;
+    els.generationCount.disabled = Boolean(state.controller) || !operationUsesMediaQueue(op);
     syncCameraControls();
   }
 
@@ -1214,8 +1246,10 @@
       els.answerText.textContent = op.id === 'h3_context_ir'
         ? '正在规划并校验 H3 Prompt…'
         : (op.id === 'video_generation'
-          ? '正在生成视频…'
-          : (op.id === 'image_edit' ? '正在编辑图片…' : '正在生成图片…'));
+          ? `正在生成第 1/${(plan && plan.runCount) || 1} 份视频…`
+          : (op.id === 'image_edit'
+            ? `正在生成第 1/${(plan && plan.runCount) || 1} 份编辑结果…`
+            : `正在生成第 1/${(plan && plan.runCount) || 1} 份图片…`));
     }
     els.loadModels.disabled = true;
     els.model.disabled = true;
@@ -2206,16 +2240,23 @@
 
   function prepareMediaRequest(op) {
     const payload = mediaPayload(op);
+    const runCount = operationUsesMediaQueue(op) ? mediaQueueRunCount() : 1;
+    // Playground queues independent requests so every target, including video
+    // workflows whose API max_batch_size is 1, gets the same multi-run behavior.
+    payload.n = 1;
     const attachments = state.attachments.slice();
     const parameters = Object.fromEntries(
       Object.entries(payload).filter(([key]) => !['model', 'prompt', 'response_format'].includes(key)),
     );
+    delete parameters.n;
+    if (operationUsesMediaQueue(op)) parameters.generation_count = runCount;
     return {
       modelId: els.model.value,
       operationId: op.id,
       payload,
       attachments,
       parameters,
+      runCount,
       externalPlannerToken: externalPlannerSelected(op)
         ? els.externalPlannerToken.value.trim()
         : '',
@@ -2223,7 +2264,7 @@
     };
   }
 
-  function normalizeMediaItems(items, op) {
+  function normalizeMediaItems(items, op, runNumber = 1, runCount = 1) {
     const normalized = [];
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index] || {};
@@ -2235,6 +2276,8 @@
         mime,
         filename: item.filename || `${OP_LABELS[op.id] || '结果'} ${index + 1}`,
         revisedPrompt: item.revised_prompt || '',
+        runNumber,
+        runCount,
       });
     }
     if (!normalized.length) throw new Error('媒体接口没有返回可显示的结果');
@@ -2273,7 +2316,9 @@
       const meta = document.createElement('div');
       meta.className = 'media-meta';
       const name = document.createElement('span');
-      name.textContent = item.filename;
+      name.textContent = item.runCount > 1
+        ? `第 ${item.runNumber}/${item.runCount} 份 · ${item.filename}`
+        : item.filename;
       const download = document.createElement('a');
       download.href = item.src;
       download.download = item.filename || `result-${index + 1}`;
@@ -2286,18 +2331,29 @@
     parent.append(article);
   }
 
-  async function runMedia(op, plan) {
+  function mediaPayloadForRun(plan, runIndex, reusablePrompt = '') {
+    const payload = {...plan.payload, n: 1};
+    const baseSeed = Number(payload.seed);
+    if (Number.isSafeInteger(baseSeed)) payload.seed = baseSeed + runIndex;
+    if (reusablePrompt && payload.prompt_mode === 'auto') {
+      payload.prompt = reusablePrompt;
+      payload.prompt_mode = 'raw';
+    }
+    return payload;
+  }
+
+  async function requestMediaRun(op, plan, payload) {
     let response;
     if (op.id === 'image_generation') {
       response = await fetch(op.endpoint, {
         method: 'POST',
         headers: plannerRequestHeaders(plan, true),
-        body: JSON.stringify(plan.payload),
+        body: JSON.stringify(payload),
         signal: state.controller.signal,
       });
     } else {
       const form = new FormData();
-      for (const [key, value] of Object.entries(plan.payload)) form.append(key, String(value));
+      for (const [key, value] of Object.entries(payload)) form.append(key, String(value));
       for (const attachment of plan.attachments) {
         form.append('image[]', attachment.file, attachment.name);
       }
@@ -2309,14 +2365,47 @@
       });
     }
     if (!response.ok) throw new Error(await responseError(response));
-    const data = await response.json();
-    const media = normalizeMediaItems(Array.isArray(data.data) ? data.data : [], op);
+    return response.json();
+  }
+
+  async function runMedia(op, plan) {
     const interaction = interactionFor(plan.modelId, plan.operationId);
-    interaction.turns.push({
-      user: plan.userMessage,
-      parameters: plan.parameters,
-      media,
-    });
+    let turn = null;
+    let reusablePrompt = '';
+    const noun = op.id === 'video_generation'
+      ? '视频'
+      : (op.id === 'image_edit' ? '编辑结果' : '图片');
+    for (let runIndex = 0; runIndex < plan.runCount; runIndex += 1) {
+      els.answerText.textContent = runIndex
+        ? `已完成 ${runIndex}/${plan.runCount} 份；正在自动排队生成第 ${runIndex + 1} 份${noun}…`
+        : `正在生成第 1/${plan.runCount} 份${noun}…`;
+      try {
+        const payload = mediaPayloadForRun(plan, runIndex, reusablePrompt);
+        const data = await requestMediaRun(op, plan, payload);
+        const media = normalizeMediaItems(
+          Array.isArray(data.data) ? data.data : [],
+          op,
+          runIndex + 1,
+          plan.runCount,
+        );
+        if (!reusablePrompt) {
+          reusablePrompt = media.find((item) => item.revisedPrompt)?.revisedPrompt || '';
+        }
+        if (!turn) {
+          turn = {user: plan.userMessage, parameters: plan.parameters, media: []};
+          interaction.turns.push(turn);
+        }
+        turn.media.push(...media);
+        renderInteractionHistory();
+      } catch (error) {
+        if (error && error.name === 'AbortError') throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `第 ${runIndex + 1}/${plan.runCount} 份生成失败，队列已停止；`
+          + `已完成 ${runIndex} 份：${message}`
+        );
+      }
+    }
     els.answerText.textContent = '';
     els.answer.classList.remove('active');
     renderInteractionHistory();
@@ -2420,7 +2509,14 @@
       else if (op.id === 'h3_context_ir') await runContextIR(op, plan);
       else await runMedia(op, plan);
     } catch (error) {
-      if (error && error.name === 'AbortError') showRequestError(op, '请求已停止。');
+      if (error && error.name === 'AbortError') {
+        showRequestError(
+          op,
+          plan && plan.runCount > 1
+            ? '生成队列已停止；已完成结果已保留。'
+            : '请求已停止。',
+        );
+      }
       else showRequestError(op, error instanceof Error ? error.message : String(error));
     } finally {
       els.timeMetric.textContent = `耗时 ${((performance.now() - state.startedAt) / 1000).toFixed(2)}s`;
@@ -2470,6 +2566,12 @@
   });
   els.systemPrompt.addEventListener('input', updateContextPreview);
   els.maxTokens.addEventListener('input', updateContextPreview);
+  els.generationCount.addEventListener('change', () => {
+    const value = Number.parseInt(els.generationCount.value, 10);
+    els.generationCount.value = String(
+      Number.isInteger(value) ? Math.min(MAX_MEDIA_QUEUE_RUNS, Math.max(1, value)) : 1
+    );
+  });
   els.prompt.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || event.isComposing) return;
     if (event.ctrlKey || event.metaKey) {

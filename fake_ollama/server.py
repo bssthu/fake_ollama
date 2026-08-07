@@ -84,6 +84,40 @@ EXTERNAL_PLANNER_TOKEN_HEADER = "x-playground-upstream-key"
 _EXTERNAL_PLANNER_PROTOCOLS = ("openai", "anthropic")
 
 
+def _h3_base_mode_choices() -> List[Dict[str, str]]:
+    """Human-readable H3 Base modes shared by both Playground operations."""
+
+    return [
+        {
+            "value": "auto",
+            "label": "自动选择 · 0 张文本 / 1 张首帧 / 2 张首尾帧",
+        },
+        {
+            "value": "t2va",
+            "label": "纯文本生成视频 · T2VA（0 张参考图）",
+        },
+        {
+            "value": "i2va",
+            "label": "首帧引导视频 · I2VA（1 张参考图）",
+        },
+        {
+            "value": "fl2va",
+            "label": "首尾帧约束视频 · FL2VA（2 张参考图）",
+        },
+        {
+            "value": "l2va",
+            "label": "末帧约束视频 · L2VA（1 张参考图，需手动选择）",
+        },
+    ]
+
+
+_H3_BASE_MODE_DESCRIPTION = (
+    "自动模式按参考图数量选择：0 张用 T2VA，1 张用首帧 I2VA，"
+    "2 张用首尾帧 FL2VA。L2VA 同样只需要 1 张图，但该图作为末帧，"
+    "因此必须手动选择。"
+)
+
+
 @dataclass(frozen=True)
 class ExternalPlannerConnection:
     """Validated, request-scoped credentials for a Playground Planner."""
@@ -861,17 +895,13 @@ def _playground_model_entry(
                         },
                         {
                             "name": "context_ir_mode",
-                            "label": "H3 base mode",
+                            "label": "H3 Base 模式",
                             "type": "select",
                             "default": "auto",
-                            "choices": [
-                                {"value": "auto", "label": "Auto by image count"},
-                                {"value": "t2va", "label": "T2VA"},
-                                {"value": "i2va", "label": "I2VA"},
-                                {"value": "fl2va", "label": "FL2VA"},
-                                {"value": "l2va", "label": "L2VA"},
-                            ],
+                            "choices": _h3_base_mode_choices(),
+                            "description": _H3_BASE_MODE_DESCRIPTION,
                             "advanced": True,
+                            "wide": True,
                         },
                     ]
                 )
@@ -1193,16 +1223,12 @@ def _playground_context_ir_entry(
             },
             {
                 "name": "mode",
-                "label": "H3 base mode",
+                "label": "H3 Base 模式",
                 "type": "select",
                 "default": "auto",
-                "choices": [
-                    {"value": "auto", "label": "Auto by image count"},
-                    {"value": "t2va", "label": "T2VA (text)"},
-                    {"value": "i2va", "label": "I2VA (first frame)"},
-                    {"value": "fl2va", "label": "FL2VA (first + last)"},
-                    {"value": "l2va", "label": "L2VA (last frame)"},
-                ],
+                "choices": _h3_base_mode_choices(),
+                "description": _H3_BASE_MODE_DESCRIPTION,
+                "wide": True,
             },
             {
                 "name": "duration_seconds",

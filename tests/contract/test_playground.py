@@ -57,6 +57,9 @@ def test_playground_static_page_and_security_headers():
     assert "轻量、多能力、即时调试" in response.text
     assert 'id="apiKey"' in response.text
     assert 'id="model"' in response.text
+    assert response.text.index('<button id="loadModels"') < response.text.index(
+        '<select id="model"'
+    )
     assert 'id="fileInput"' in response.text
     assert 'id="operation"' in response.text
     assert 'id="operationPreset"' in response.text
@@ -70,6 +73,9 @@ def test_playground_static_page_and_security_headers():
     assert 'id="cameraPreview"' in response.text
     assert 'id="cameraStart"' in response.text
     assert 'id="cameraStop"' in response.text
+    assert 'id="mediaQueueSection"' in response.text
+    assert 'id="generationCount"' in response.text
+    assert 'max="20"' in response.text
     assert 'id="conversation"' in response.text
     assert 'id="modelMemory"' in response.text
     assert 'id="contextChip"' in response.text
@@ -109,6 +115,13 @@ def test_playground_static_page_and_security_headers():
     assert "renderInteractionHistory" in js.text
     assert "prepareChatRequest" in js.text
     assert "prepareMediaRequest" in js.text
+    assert "MAX_MEDIA_QUEUE_RUNS = 20" in js.text
+    assert "operationUsesMediaQueue" in js.text
+    assert "payload.n = 1" in js.text
+    assert "runIndex < plan.runCount" in js.text
+    assert "turn.media.push(...media)" in js.text
+    assert "生成队列已停止；已完成结果已保留。" in js.text
+    assert "media-queue-section" in css.text
     assert "historyMessages" in js.text
     assert "CONTEXT_THRESHOLD_RATIO" in js.text
     assert "? Math.floor(configured)" in js.text

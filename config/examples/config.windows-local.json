@@ -259,7 +259,7 @@
       "model": "minimax-h3-768p",
       "preset": "minimax_h3",
       "auto_start": true,
-      "start_command": "\"C:\\path\\to\\ComfyUI-H3\\.venv\\Scripts\\python.exe\" -s main.py --listen 127.0.0.1 --port 21481 --reserve-vram 2 --disable-all-custom-nodes --extra-model-paths-config \"C:\\path\\to\\fake_ollama\\config\\examples\\comfyui\\minimax_h3_extra_model_paths.yaml\"",
+      "start_command": "\"C:\\path\\to\\ComfyUI-H3\\.venv\\Scripts\\python.exe\" -s main.py --listen 127.0.0.1 --port 21481 --reserve-vram 2 --disable-all-custom-nodes --extra-model-paths-config \"C:\\path\\to\\fake_ollama\\config\\local\\minimax_h3_extra_model_paths.yaml\"",
       "idle_timeout_seconds": 1800,
       "startup_timeout_seconds": 300,
       "cwd": "C:\\path\\to\\ComfyUI-H3",

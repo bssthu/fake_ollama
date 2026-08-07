@@ -1,4 +1,5 @@
-# Example local ComfyUI model-path mapping.
+# Template only. Copy this file to config/local/minimax_h3_extra_model_paths.yaml
+# and replace base_path there; do not point a running target at this placeholder.
 minimax_h3:
   base_path: D:\path\to\models\MiniMax-H3
   diffusion_models: diffusion_models

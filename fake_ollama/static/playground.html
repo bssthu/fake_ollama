@@ -39,6 +39,8 @@
           <div class="help">不会写入 localStorage、Cookie 或服务端配置。</div>
         </div>
 
+        <button id="loadModels" class="secondary" type="button">连接并加载模型</button>
+
         <div class="field">
           <label for="model">模型</label>
           <select id="model" disabled>
@@ -46,8 +48,6 @@
           </select>
           <div id="capabilityList" class="capability-list" aria-label="模型能力"></div>
         </div>
-
-        <button id="loadModels" class="secondary" type="button">连接并加载模型</button>
 
         <div class="field">
           <label for="operation">调试能力</label>
@@ -98,6 +98,15 @@
           <div id="cameraStats" class="help">窗口 — · 已分析 0 · 丢弃 0</div>
           <pre id="cameraLiveText" class="camera-live-text" hidden></pre>
           <div class="help">当前按独立短片段近实时分析；HTTP 下手机浏览器可能拒绝摄像头权限，本阶段暂不处理 HTTPS。</div>
+        </section>
+
+        <section id="mediaQueueSection" class="media-queue-section" hidden>
+          <div>
+            <label for="generationCount">生成份数</label>
+            <div class="help">每份单独提交；完成一份后自动排队重跑下一份。</div>
+          </div>
+          <input id="generationCount" class="control" type="number"
+                 min="1" max="20" step="1" value="1" inputmode="numeric">
         </section>
 
         <details class="advanced">

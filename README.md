@@ -310,6 +310,13 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 | JoyAI Echo | `size`、`seed`、`num_frames`、`fps`、`prefetch_count`、`enable_tile`、`enable_streaming` | 安全调试：256²、17 帧、8 FPS、prefetch 1、分块解码开；帧数必须为 `8k+1`，尺寸至少 256 且为 32 的倍数 |
 | MiniMax H3 | `size`、`seed`、`steps`、`sampler_name`、`scheduler`、`num_frames`、`fps`，以及 H3 Context-IR 的模式/Planner 参数 | 1344×768、124 帧、24 FPS、20 steps、`res_multistep` / `simple`；帧数必须为 `17k+5` |
 
+Playground 的图片生成、图片编辑和视频生成另有 **生成份数**（1～20）控制。它不会放大
+单次 API 请求的 `n`，而是把每份作为独立的 `n=1` 请求串行排队：前一份完成并立即展示后，
+自动重跑下一份；停止或中途失败时保留已经完成的结果。显式 Seed 会按份数依次加一；未填
+Seed 时仍由 target 的 `seed_mode` 决定。H3 `prompt_mode=auto` 若首份调用 Planner 返回了
+`revised_prompt`，后续份数会复用该结构化 Prompt 并以 `raw` 直通，避免重复加载 Planner；
+`prompt_mode=enhance` 则仍按用户选择，每份都重新增强。标准 API 客户端直接传 `n` 的行为不变。
+
 > **JoyAI Echo 节点兼容性**：已在本机验证的 `ComfyUI_JoyAI_Echo` 版本要求节点把
 > `enable_tile` 写入模型实际读取的 `enable_tiles` 属性，并要求 VAE wrapper 将
 > `tiled_decode()` 返回的分块迭代器沿时间维拼接后再进入后处理。旧版节点若未包含这两项
@@ -593,8 +600,17 @@ Playground 的预计显存、预计内存和上下文会随实际 Planner 选择
 - `vae/minimax_h3_video_vae_fp16.safetensors`（4.85 GiB）
 - `vae/minimax_h3_audio_vae_fp32.safetensors`（0.56 GiB）
 
-模型根目录由本机配置决定；路径映射示例见
-`config/examples/comfyui/minimax_h3_extra_model_paths.yaml`。示例 target 使用独立的
+模型根目录由本机配置决定。先把模板复制到被 Git 忽略的本机目录，再填写真实的
+`base_path`：
+
+```powershell
+New-Item -ItemType Directory -Force config/local | Out-Null
+Copy-Item config/examples/comfyui/minimax_h3_extra_model_paths.yaml config/local/minimax_h3_extra_model_paths.yaml
+# 编辑 config/local/minimax_h3_extra_model_paths.yaml 中的 base_path
+```
+
+H3 target 的 `start_command` 必须通过 `--extra-model-paths-config` 指向上述
+`config/local/minimax_h3_extra_model_paths.yaml`，不要直接指向仍含占位路径的模板。示例 target 使用独立的
 ComfyUI 主线实例和 `:21481`，不会升级或覆盖其他 ComfyUI 实例。启动参数保留 2 GiB
 显存给系统；资源协调器按
 `estimated_vram_gb=22`、`estimated_memory_gb=56` 做准入和空闲模型回收。

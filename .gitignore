@@ -46,6 +46,7 @@ htmlcov/
 config.json
 config.json.*
 !config.json.example
+config/local/
 
 # Logs
 *.log

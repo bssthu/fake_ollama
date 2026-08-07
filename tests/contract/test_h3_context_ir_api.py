@@ -14,6 +14,15 @@ from fake_ollama.config import Settings
 from fake_ollama.server import create_app
 
 
+_H3_MODE_LABELS = [
+    "自动选择 · 0 张文本 / 1 张首帧 / 2 张首尾帧",
+    "纯文本生成视频 · T2VA（0 张参考图）",
+    "首帧引导视频 · I2VA（1 张参考图）",
+    "首尾帧约束视频 · FL2VA（2 张参考图）",
+    "末帧约束视频 · L2VA（1 张参考图，需手动选择）",
+]
+
+
 def _planner_content(*, mode: str, duration: float) -> str:
     return json.dumps(
         {
@@ -210,6 +219,11 @@ def test_playground_discovers_and_runs_context_ir_virtual_model() -> None:
         "mode",
         "duration_seconds",
     }
+    mode = next(item for item in operation["parameters"] if item["name"] == "mode")
+    assert mode["label"] == "H3 Base 模式"
+    assert mode["wide"] is True
+    assert [item["label"] for item in mode["choices"]] == _H3_MODE_LABELS
+    assert "L2VA" in mode["description"]
 
     assert response.status_code == 200
     body = response.json()
@@ -245,6 +259,13 @@ def test_playground_exposes_video_prompt_handling_choice() -> None:
         "enhance",
     ]
     assert prompt_mode["choices"][1]["label"] == "直接使用输入（跳过结构化生成）"
+    context_mode = next(
+        item
+        for item in operation["parameters"]
+        if item["name"] == "context_ir_mode"
+    )
+    assert [item["label"] for item in context_mode["choices"]] == _H3_MODE_LABELS
+    assert context_mode["wide"] is True
 
 
 def test_image_request_auto_selects_multimodal_provider() -> None:
