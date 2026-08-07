@@ -614,8 +614,19 @@
       : '';
   }
 
+  function plannerIsBypassed(op = selectedOperation()) {
+    if (!op || !op.context_ir_profile) return false;
+    const entry = state.parameterInputs.get('prompt_mode');
+    return Boolean(
+      entry && String(readParameterValue(entry.spec, entry.input, false)) === 'raw'
+    );
+  }
+
   function externalPlannerSelected(op = selectedOperation()) {
-    return Boolean(op && op.external_planner_api && plannerSelectionValue(op) === 'external');
+    return Boolean(
+      op && op.external_planner_api && !plannerIsBypassed(op)
+      && plannerSelectionValue(op) === 'external'
+    );
   }
 
   function setExternalPlannerStatus(text, kind = '') {
@@ -747,7 +758,7 @@
   function effectivePlannerChoice(op = selectedOperation()) {
     if (!op) return null;
     const parameterName = plannerParameterName(op);
-    if (!parameterName) return null;
+    if (!parameterName || plannerIsBypassed(op)) return null;
     if (state.controller && state.activePlannerChoice) {
       return state.activePlannerChoice;
     }
@@ -789,8 +800,12 @@
   function updatePlannerProviderUi() {
     const op = selectedOperation();
     const parameterName = plannerParameterName(op);
-    if (!op || !parameterName) {
+    const entry = parameterName ? state.parameterInputs.get(parameterName) : null;
+    const bypassed = plannerIsBypassed(op);
+    if (entry) entry.field.hidden = bypassed;
+    if (!op || !parameterName || bypassed) {
       els.externalPlanner.hidden = true;
+      showContextNotice('');
       return;
     }
     syncExternalPlannerUi(op);
@@ -799,7 +814,6 @@
       renderModelResourceChips(choice, {planner: true, showContext: true});
     }
     const warning = plannerProviderWarning(op);
-    const entry = state.parameterInputs.get(parameterName);
     if (entry) {
       let warningElement = entry.field.querySelector('.parameter-warning');
       if (warning && !warningElement) {

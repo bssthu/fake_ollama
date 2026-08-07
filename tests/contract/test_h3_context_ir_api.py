@@ -222,6 +222,31 @@ def test_playground_discovers_and_runs_context_ir_virtual_model() -> None:
     assert planner.calls[0]["response_format"] == {"type": "json_object"}
 
 
+def test_playground_exposes_video_prompt_handling_choice() -> None:
+    app = create_app(_settings(attach_video=True))
+    with TestClient(app, base_url="http://testserver:21431") as client:
+        discovery = client.get(
+            "/playground/api/models", headers={"x-api-key": "tk"}
+        )
+
+    assert discovery.status_code == 200
+    model = next(item for item in discovery.json()["models"] if item["id"] == "h3")
+    operation = next(
+        item for item in model["operations"] if item["id"] == "video_generation"
+    )
+    prompt_mode = next(
+        item for item in operation["parameters"] if item["name"] == "prompt_mode"
+    )
+    assert prompt_mode["label"] == "Prompt 处理方式"
+    assert prompt_mode["default"] == "auto"
+    assert [item["value"] for item in prompt_mode["choices"]] == [
+        "auto",
+        "raw",
+        "enhance",
+    ]
+    assert prompt_mode["choices"][1]["label"] == "直接使用输入（跳过结构化生成）"
+
+
 def test_image_request_auto_selects_multimodal_provider() -> None:
     planner = _FakeOpenAIPlanner()
     app = create_app(_settings())
@@ -676,6 +701,36 @@ def test_video_generation_runs_context_ir_before_comfy_and_returns_revised_promp
     assert response.json()["data"][0]["revised_prompt"] == call["prompt"]
     assert call["video_mode"] == "t2va"
     assert len(planner.calls) == 1
+
+
+def test_video_generation_auto_bypasses_planner_for_structured_prompt() -> None:
+    planner = _FakeOpenAIPlanner()
+    comfy = _FakeComfy()
+    app = create_app(_settings(attach_video=True))
+    app.state.openai_clients = {"planner": planner}
+    app.state.comfyui_clients = {"h3-comfy": comfy}
+    structured_prompt = (
+        "integrated_multimodal_description: [Shot 1] A runner crosses a rainy street.\n"
+        "overall_soundscape: Rain, footsteps, and distant traffic.\n"
+        "non_diegetic_music: None."
+    )
+
+    with TestClient(app, base_url="http://testserver:21435") as client:
+        response = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "h3",
+                "prompt": structured_prompt,
+                "prompt_mode": "auto",
+                "response_format": "b64_json",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert planner.calls == []
+    assert comfy.video_calls[0]["prompt"] == structured_prompt
+    assert "revised_prompt" not in response.json()["data"][0]
 
 
 def test_video_generation_releases_managed_local_planner_before_comfy() -> None:

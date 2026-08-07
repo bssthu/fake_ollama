@@ -829,20 +829,26 @@ def _playground_model_entry(
                     [
                         {
                             "name": "prompt_mode",
-                            "label": "Prompt enhancement",
+                            "label": "Prompt 处理方式",
                             "type": "select",
                             "default": source.context_ir_prompt_mode,
                             "choices": [
-                                {"value": "raw", "label": "Raw / bypass"},
                                 {
                                     "value": "auto",
-                                    "label": "Auto (bypass structured prompts)",
+                                    "label": "自动判断（结构化 Prompt 直接使用）",
                                 },
-                                {"value": "enhance", "label": "Always enhance"},
+                                {
+                                    "value": "raw",
+                                    "label": "直接使用输入（跳过结构化生成）",
+                                },
+                                {
+                                    "value": "enhance",
+                                    "label": "始终自动结构化",
+                                },
                             ],
                             "description": (
-                                "Runs the configured H3 Context-IR-fake profile "
-                                "before submitting the ComfyUI workflow."
+                                "自动判断会让 H3 三段式 Prompt 直接进入 MiniMax H3，"
+                                "仅增强普通描述；直接使用输入则完全跳过 Planner。"
                             ),
                         },
                         {
