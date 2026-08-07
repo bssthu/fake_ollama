@@ -359,6 +359,7 @@ def ollama_messages_to_anthropic(
             cached_thinking = recall_thinking(
                 tool_use_ids=[tc.get("id") for tc in (msg.get("tool_calls") or [])],
                 text=text_clean,
+                allow_last_fallback=not bool(inline_thoughts or reasoning_text),
             )
         if role == "assistant" and msg.get("tool_calls"):
             blocks: List[Dict[str, Any]] = []
@@ -922,6 +923,7 @@ def openai_chat_to_anthropic(
             cached_thinking = recall_thinking(
                 tool_use_ids=[tc.get("id") for tc in (msg.get("tool_calls") or [])],
                 text=assistant_text,
+                allow_last_fallback=not bool(inline_thoughts or reasoning_text),
             )
         if role == "assistant" and msg.get("tool_calls"):
             # Preserve tool_use blocks so subsequent tool_result messages

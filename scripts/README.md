@@ -8,14 +8,13 @@
 
 正常使用时不需要手动传 `--base-url` 和 `--api-key`。如果要调试其他实例，可以显式覆盖这两个参数。
 
-## 0. Mage-VL 本机视频分析：call_mage_vl_video.py
+## 0. Mage-VL 本机视频分析：`examples/call_mage_vl_video.py`
 
-先执行一次 `scripts\install_mage_vl.ps1`。模型主体保存在
-`J:\Projects\LLM_Models\Mage\Mage-VL`，独立 Python 环境保存在同级 `.venv`。
-fake_ollama 会在首次请求时自动启动适配器：
+先按 [`services/mage_vl/README.md`](../services/mage_vl/README.md) 安装独立服务并配置模型目录。
+fake_ollama 会在首次请求时按 `config.json` 中的生命周期命令启动适配器：
 
 ```powershell
-python scripts\call_mage_vl_video.py .tmp\joyai-test.mp4 `
+python scripts\examples\call_mage_vl_video.py .tmp\joyai-test.mp4 `
   --prompt "请按时间顺序分析关键动作、场景变化和可见文字。" `
   --output .tmp\mage-vl-result.txt
 ```
@@ -24,7 +23,7 @@ python scripts\call_mage_vl_video.py .tmp\joyai-test.mp4 `
 `--segment-seconds`、`--frames-per-segment`、`--max-segments` 调整；
 `--include-summary` 会在逐段结果后再生成整体总结。
 
-## 1. 视频生成：call_video_generation.py
+## 1. 视频生成：`examples/call_video_generation.py`
 
 用途：调用 fake_ollama 的 OpenAI 兼容视频生成接口：
 
@@ -37,7 +36,7 @@ POST /v1/videos/generations
 ### 文生视频
 
 ```powershell
-python scripts\call_video_generation.py `
+python scripts\examples\call_video_generation.py `
   --prompt "a cat walking through a neon city, cinematic" `
   --output .tmp\joyai-video.mp4
 ```
@@ -60,7 +59,7 @@ python scripts\call_video_generation.py `
 传入一张或多张参考图时，脚本会调用 image-to-video workflow：
 
 ```powershell
-python scripts\call_video_generation.py `
+python scripts\examples\call_video_generation.py `
   --prompt "make this image move gently, cinematic camera motion" `
   --image path\to\reference.png `
   --output .tmp\joyai-i2v.mp4
@@ -69,7 +68,7 @@ python scripts\call_video_generation.py `
 多参考图：
 
 ```powershell
-python scripts\call_video_generation.py `
+python scripts\examples\call_video_generation.py `
   --prompt "animate these references into one short shot" `
   --image ref1.png ref2.png `
   --output .tmp\joyai-multi-ref.mp4
@@ -90,7 +89,7 @@ $prompt = @"
 - 风格偏电影感，不要文字水印
 "@
 
-python scripts\call_video_generation.py `
+python scripts\examples\call_video_generation.py `
   --prompt $prompt `
   --output .tmp\joyai-video.mp4
 ```
@@ -106,7 +105,7 @@ $prompt = @"
 4. 不确定的地方
 "@
 
-python scripts\call_joyai_vl_recognition.py .tmp\joyai-test.mp4 `
+python scripts\examples\call_joyai_vl_recognition.py .tmp\joyai-test.mp4 `
   --prompt $prompt `
   --output .tmp\joyai-vl-result.txt
 ```
@@ -116,12 +115,12 @@ python scripts\call_joyai_vl_recognition.py .tmp\joyai-test.mp4 `
 ```powershell
 $prompt = Get-Content .tmp\prompt.txt -Raw -Encoding UTF8
 
-python scripts\call_joyai_vl_recognition.py input.mp4 `
+python scripts\examples\call_joyai_vl_recognition.py input.mp4 `
   --prompt $prompt `
   --output .tmp\result.txt
 ```
 
-## 2. 视频/GIF/图片识别：call_joyai_vl_recognition.py
+## 2. 视频/GIF/图片识别：`examples/call_joyai_vl_recognition.py`
 
 用途：调用 fake_ollama 的 OpenAI Chat Completions 接口：
 
@@ -134,7 +133,7 @@ POST /v1/chat/completions
 ### 识别视频
 
 ```powershell
-python scripts\call_joyai_vl_recognition.py .tmp\joyai-test.mp4 `
+python scripts\examples\call_joyai_vl_recognition.py .tmp\joyai-test.mp4 `
   --prompt "请识别这个视频，描述主要画面、人物或物体、动作变化和任何可见文字。" `
   --output .tmp\joyai-vl-result.txt
 ```
@@ -142,7 +141,7 @@ python scripts\call_joyai_vl_recognition.py .tmp\joyai-test.mp4 `
 ### 识别 GIF
 
 ```powershell
-python scripts\call_joyai_vl_recognition.py path\to\input.gif `
+python scripts\examples\call_joyai_vl_recognition.py path\to\input.gif `
   --prompt "请描述这个 GIF 的动作变化。" `
   --output .tmp\gif-result.txt
 ```
@@ -150,7 +149,7 @@ python scripts\call_joyai_vl_recognition.py path\to\input.gif `
 ### 识别静态图片
 
 ```powershell
-python scripts\call_joyai_vl_recognition.py path\to\image.png `
+python scripts\examples\call_joyai_vl_recognition.py path\to\image.png `
   --prompt "请描述这张图片里的内容和文字。" `
   --output .tmp\image-result.txt
 ```
@@ -167,8 +166,8 @@ python scripts\call_joyai_vl_recognition.py path\to\image.png `
 - `--output`：输出路径；`.json` 后缀会保存完整响应，否则保存文本内容
 - `--keep-frames`：保留抽出的 JPEG 帧用于调试；默认会清理临时帧
 
-注意：当前 JoyAI vLLM 主服务在 `I:\Projects\vllm\start_joyai_vl_interaction.sh` 里通过
-`--limit-mm-per-prompt '{"image":32,"video":1}'` 限制了单次 prompt 最多 32 张图片。
+注意：JoyAI vLLM 主服务通常通过
+`--limit-mm-per-prompt '{"image":32,"video":1}'` 限制单次 prompt 最多 32 张图片。
 视频/GIF 识别脚本会把抽出的每一帧作为一张 `image_url` 发送，所以 `--max-frames`
 不能超过 32。默认值是 8。
 
@@ -186,7 +185,7 @@ wsl -d Ubuntu-24.04 --exec ffmpeg
 也可以手动指定：
 
 ```powershell
-python scripts\call_joyai_vl_recognition.py input.mp4 `
+python scripts\examples\call_joyai_vl_recognition.py input.mp4 `
   --ffmpeg-command "wsl -d Ubuntu-24.04 --exec ffmpeg"
 ```
 
@@ -194,7 +193,7 @@ python scripts\call_joyai_vl_recognition.py input.mp4 `
 
 - 默认请求 fake_ollama 的 `api_interface`，并带 `x-api-key`。
 - `generic_openai_targets[*].auth_token` 可以为空；它只影响 fake_ollama 到本机 adapter 的出站调用，不代表外部客户端可以绕过 fake_ollama 的 `access_tokens`。
-- `call_joyai_vl_recognition.py` 会显式禁用 Python `urllib` 的系统代理，避免本地视频帧 payload 误走环境代理。
+- `examples/call_joyai_vl_recognition.py` 会显式禁用 Python `urllib` 的系统代理，避免本地视频帧 payload 误走环境代理。
 - 不建议把 JoyAI adapter 的 `127.0.0.1:8070` 改成裸露到局域网的地址。对外调用应通过 fake_ollama 的 API 入口和 token 控制。
 
 ## 排错
@@ -202,8 +201,8 @@ python scripts\call_joyai_vl_recognition.py input.mp4 `
 检查 fake_ollama 是否看到模型：
 
 ```powershell
-python scripts\call_joyai_vl_recognition.py --help
-python scripts\call_video_generation.py --help
+python scripts\examples\call_joyai_vl_recognition.py --help
+python scripts\examples\call_video_generation.py --help
 ```
 
 常见日志位置：

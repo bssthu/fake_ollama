@@ -1,0 +1,485 @@
+{
+  "_": "Windows 本地多模型部署示例。路径均为示例值，复制后按本机环境调整。",
+
+  "advertised_version": "0.6.4",
+
+  "default_max_tokens": 4096,
+  "timeout_seconds": 300.0,
+  "use_system_proxy": false,
+  "enforce_context_limit": true,
+
+  "admin_enabled": true,
+  "admin_host": "127.0.0.1",
+  "admin_port": 21433,
+
+  "dashboard_enabled": true,
+  "dashboard_host": "127.0.0.1",
+  "dashboard_port": 21432,
+  "dashboard_sample_interval_seconds": 10.0,
+  "dashboard_retention_seconds": 604800.0,
+  "dashboard_data_path": "logs/dashboard_history.json",
+  "dashboard_model_reclaim_enabled": false,
+  "vram_low_free_reclaim_enabled": true,
+  "vram_low_free_threshold_mib": 200.0,
+
+  "playground_enabled": false,
+  "playground_host": "127.0.0.1",
+  "playground_port": 21431,
+
+  "_model_sources_remote": "==== Remote model sources ==============================",
+
+  "anthropic_upstreams": [
+    {
+      "name": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "auth_token": "sk-ant-...",
+      "models": [
+        {"name": "claude-3-5-sonnet-20241022"},
+        {"name": "claude-3-5-haiku-20241022"}
+      ]
+    },
+    {
+      "name": "deepseek",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "auth_token": "sk-deepseek-...",
+      "models": [
+        {"name": "deepseek-chat"},
+        {"name": "deepseek-reasoner", "alias": "deepseek-r1"}
+      ]
+    }
+  ],
+
+  "openai_upstreams": [
+    {
+      "name": "deepseek-openai",
+      "base_url": "https://api.deepseek.com",
+      "auth_token": "sk-deepseek-...",
+      "models": [
+        {"name": "deepseek-chat"},
+        {"name": "deepseek-reasoner"}
+      ]
+    }
+  ],
+
+  "_model_sources_ollama": "==== Ollama sources ====================================",
+
+  "ollama_targets": [
+    {
+      "name": "local-ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "models": [
+        {"name": "llama3.1:8b", "alias": "llama3.1"},
+        {"name": "qwen2.5-coder"}
+      ],
+      "auto_start": false,
+      "start_command": null,
+      "stop_command": null,
+      "idle_timeout_seconds": null,
+      "startup_timeout_seconds": 60,
+      "health_path": "/api/version",
+      "cwd": null
+    }
+  ],
+
+  "_model_sources_generic_openai": "==== Lifecycle-managed OpenAI-compatible sources ====== Mage-VL 示例使用 services\\mage_vl 中的独立视频分析服务。先运行 services\\mage_vl\\scripts\\install.ps1；服务按首个请求自动启动并在空闲后优雅退出。",
+
+  "generic_openai_targets": [
+    {
+      "name": "mage-vl-local-adapter",
+      "base_url": "http://127.0.0.1:8071",
+      "auth_token": "",
+      "models": [
+        {"name": "mage-vl-local"}
+      ],
+      "auto_start": true,
+      "start_command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"services\\mage_vl\\scripts\\start.ps1\"",
+      "stop_command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"services\\mage_vl\\scripts\\stop.ps1\"",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 120,
+      "health_path": "/health",
+      "cwd": ".",
+      "max_concurrent_requests": 1,
+      "request_read_timeout_seconds": 0
+    }
+  ],
+
+  "_model_sources_llama_cpp": "==== llama.cpp sources =================================",
+
+  "llama_cpp_defaults": {
+    "auto_start": true,
+    "idle_timeout_seconds": 1800,
+    "startup_timeout_seconds": 600,
+    "health_path": "/health",
+    "cwd": "C:\\path\\to\\llama.cpp",
+    "binary_path": null,
+    "runtime_root": null,
+    "gpu_layers": 99,
+    "ctx_size": null,
+    "parallel": 1,
+    "batch_size": null,
+    "ubatch_size": null,
+    "flash_attn": null,
+    "cache_type_k": null,
+    "cache_type_v": null,
+    "extra_args": null
+  },
+
+  "llama_cpp_targets": [
+    {
+      "name": "qwen3.6-27b-hauhau-q2kp",
+      "base_url": "http://127.0.0.1:21436",
+      "auth_token": "",
+      "model": "qwen3.6-27b-hauhau-q2kp",
+      "alias": null,
+      "upstream_id": null,
+      "model_path": "D:\\path\\to\\models\\Qwen\\model.gguf",
+      "mmproj_path": null,
+      "ctx_size": 60000,
+      "flash_attn": true,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0"
+    }
+  ],
+
+  "_model_sources_comfyui": "==== ComfyUI media workflow sources ===================== 每个 target 用 preset 选择工作流形态：z_image_turbo、qwen_image_edit_aio、sensenova_u1 或 joyai_echo。workflow bindings 是执行与参数发现的同一事实来源；Playground 只展示当前 workflow 真正绑定的字段。多个 target 可共用同一个 ComfyUI 实例，并由 VRAM 协调器互斥换出。自定义模型使用 API-format workflow + bindings/static_inputs 接入。",
+
+  "comfyui_targets": [
+    {
+      "name": "z-image-turbo-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "auth_token": "",
+      "model": "z-image-turbo",
+      "alias": null,
+      "upstream_id": null,
+      "preset": "z_image_turbo",
+      "auto_start": true,
+      "start_command": "\"C:\\path\\to\\ComfyUI\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "stop_command": null,
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 180,
+      "health_path": "/system_stats",
+      "cwd": "C:\\path\\to\\ComfyUI",
+      "diffusion_model": "z-image-turbo-fp8-e4m3fn.safetensors",
+      "diffusion_weight_dtype": "default",
+      "text_encoder_model": "qwen_3_4b_fp4_mixed.safetensors",
+      "text_encoder_type": "lumina2",
+      "text_encoder_device": "default",
+      "vae_model": "ae.safetensors",
+      "default_width": 1024,
+      "default_height": 1024,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "default_sampler_name": "res_multistep",
+      "default_scheduler": "simple",
+      "default_denoise": 1.0,
+      "default_edit_denoise": 0.25,
+      "default_shift": 3.0,
+      "seed_mode": "random",
+      "seed": 0,
+      "max_batch_size": 2,
+      "output_prefix": "fake_ollama/z-image-turbo",
+      "image_upscale_method": "lanczos",
+      "image_crop": "center",
+      "prompt_timeout_seconds": 600,
+      "poll_interval_seconds": 0.5
+    },
+    {
+      "name": "qwen-image-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "qwen-image",
+      "preset": "qwen_image_edit_aio",
+      "auto_start": true,
+      "start_command": "\"C:\\path\\to\\ComfyUI\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 180,
+      "cwd": "C:\\path\\to\\ComfyUI",
+      "default_steps": 6,
+      "default_cfg": 1.0,
+      "default_sampler_name": "euler_ancestral",
+      "default_scheduler": "beta",
+      "default_denoise": 1.0,
+      "default_edit_denoise": 1.0,
+      "max_batch_size": 2,
+      "output_prefix": "fake_ollama/qwen-image"
+    },
+    {
+      "name": "sensenova-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "sensenova",
+      "preset": "sensenova_u1",
+      "auto_start": true,
+      "start_command": "\"C:\\path\\to\\ComfyUI\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 180,
+      "cwd": "C:\\path\\to\\ComfyUI",
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "max_batch_size": 2,
+      "output_prefix": "fake_ollama/sensenova"
+    },
+    {
+      "name": "joyai-echo-comfyui",
+      "base_url": "http://127.0.0.1:21480",
+      "model": "joyai-echo",
+      "preset": "joyai_echo",
+      "auto_start": true,
+      "start_command": "set \"PATH=C:\\path\\to\\ffmpeg;%PATH%\" && \"C:\\path\\to\\ComfyUI\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 240,
+      "cwd": "C:\\path\\to\\ComfyUI",
+      "min_width": 256,
+      "default_width": 256,
+      "width_modulo": 32,
+      "min_height": 256,
+      "default_height": 256,
+      "height_modulo": 32,
+      "min_num_frames": 17,
+      "default_num_frames": 17,
+      "max_num_frames": 241,
+      "num_frames_offset": 1,
+      "num_frames_modulo": 8,
+      "min_frame_rate": 8.0,
+      "default_frame_rate": 8.0,
+      "max_frame_rate": 120.0,
+      "default_prefetch_count": 1,
+      "max_prefetch_count": 48,
+      "default_enable_tile": true,
+      "default_enable_streaming": false,
+      "max_reference_images": 5,
+      "max_batch_size": 1,
+      "output_prefix": "fake_ollama/joyai-echo",
+      "context_ir_profile": "default",
+      "context_ir_prompt_mode": "auto",
+      "prompt_timeout_seconds": 7200,
+      "poll_interval_seconds": 1.0
+    },
+    {
+      "name": "minimax-h3-comfyui",
+      "base_url": "http://127.0.0.1:21481",
+      "model": "minimax-h3-768p",
+      "preset": "minimax_h3",
+      "auto_start": true,
+      "start_command": "\"C:\\path\\to\\ComfyUI-H3\\.venv\\Scripts\\python.exe\" -s main.py --listen 127.0.0.1 --port 21481 --reserve-vram 2 --disable-all-custom-nodes --extra-model-paths-config \"C:\\path\\to\\fake_ollama\\config\\examples\\comfyui\\minimax_h3_extra_model_paths.yaml\"",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 300,
+      "cwd": "C:\\path\\to\\ComfyUI-H3",
+      "min_width": 32,
+      "default_width": 1344,
+      "max_width": 1344,
+      "width_modulo": 32,
+      "min_height": 32,
+      "default_height": 768,
+      "max_height": 1344,
+      "height_modulo": 32,
+      "default_steps": 20,
+      "default_sampler_name": "res_multistep",
+      "default_scheduler": "simple",
+      "min_num_frames": 5,
+      "default_num_frames": 124,
+      "max_num_frames": 362,
+      "num_frames_offset": 5,
+      "num_frames_modulo": 17,
+      "min_frame_rate": 24.0,
+      "default_frame_rate": 24.0,
+      "max_frame_rate": 24.0,
+      "max_reference_images": 2,
+      "max_batch_size": 1,
+      "output_prefix": "fake_ollama/minimax-h3",
+      "context_ir_profile": "default",
+      "context_ir_prompt_mode": "auto",
+      "prompt_timeout_seconds": 14400,
+      "poll_interval_seconds": 1.0,
+      "save_video_node_id": "9"
+    }
+  ],
+
+  "_h3_context_ir": "==== H3 Context IR harness ============================= Provider references reuse existing model + target routes. The standalone virtual model is visible only in Playground; a ComfyUI video target may opt in through context_ir_profile.",
+
+  "h3_context_ir_profiles": [
+    {
+      "name": "default",
+      "alias": "h3-context-ir-fake",
+      "enabled": true,
+      "playground_visible": true,
+      "allow_compatible_models": true,
+      "allow_external_api": false,
+      "providers": [
+        {
+          "name": "local-text",
+          "model": "qwen3.6-27b-hauhau-q2kp",
+          "target": "qwen3.6-27b-hauhau-q2kp",
+          "modalities": ["text"],
+          "json_mode": true
+        },
+        {
+          "name": "local-vision",
+          "model": "mage-vl-local",
+          "target": "mage-vl-local-adapter",
+          "modalities": ["text", "image"],
+          "json_mode": false
+        },
+        {
+          "name": "remote-api",
+          "model": "deepseek-chat",
+          "target": "deepseek-openai",
+          "modalities": ["text"],
+          "json_mode": true
+        }
+      ],
+      "default_text_provider": "local-text",
+      "default_multimodal_provider": "local-vision",
+      "temperature": 0.2,
+      "max_output_tokens": 4096,
+      "max_attempts": 2,
+      "failure_mode": "fallback",
+      "default_duration_seconds": 5.0
+    }
+  ],
+
+  "_profiles": "==== Model profiles ==================================== 数组项格式为 {model, target?, ...}，与 exposed_models 对应。只写 model 表示匹配所有 target；同时写 model + target 只覆盖该组合。查找优先级：model@target > bare model > tagless base。capabilities 是对外功能发现标签：completion 文本/聊天补全，tools tool calling，vision 聊天接口可接收图片输入，video_understanding /v1/chat/completions 接收本地视频分析，image_generation /v1/images/generations 图片生成，image_edit /v1/images/edits image-to-image / edit，video_generation /v1/videos/generations 视频或图生视频。",
+
+  "model_profiles": [
+    {
+      "model": "claude-3-5-sonnet-20241022",
+      "capabilities": ["completion", "tools", "vision"],
+      "context_length": 200000,
+      "max_output_tokens": 8192,
+      "thinking_mode": "auto",
+      "thinking_budget_tokens": 2048,
+      "show_thinking": true
+    },
+    {
+      "model": "deepseek-reasoner",
+      "target": "deepseek",
+      "capabilities": ["completion", "tools"],
+      "context_length": 65536,
+      "max_output_tokens": 8192,
+      "thinking_mode": "enabled",
+      "thinking_budget_tokens": 4096,
+      "show_thinking": true
+    },
+    {
+      "model": "mage-vl-local",
+      "target": "mage-vl-local-adapter",
+      "capabilities": ["video_understanding"],
+      "context_length": 32768,
+      "max_output_tokens": 512,
+      "estimated_vram_gb": 18,
+      "estimated_memory_gb": 16,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "deepseek-reasoner",
+      "target": "deepseek-openai",
+      "capabilities": ["completion", "tools"],
+      "context_length": 65536,
+      "max_output_tokens": 8192,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "llama3.1",
+      "capabilities": ["completion", "tools"],
+      "context_length": 131072,
+      "estimated_vram_gb": 6.0
+    },
+    {
+      "model": "qwen3.6-27b-hauhau-q2kp",
+      "capabilities": ["completion", "tools"],
+      "context_length": 60000,
+      "estimated_vram_gb": 18.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "z-image-turbo",
+      "target": "z-image-turbo-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 16.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "qwen-image",
+      "target": "qwen-image-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 20.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "sensenova",
+      "target": "sensenova-comfyui",
+      "capabilities": ["image_generation", "image_edit"],
+      "context_length": 4096,
+      "estimated_vram_gb": 13.0,
+      "estimated_memory_gb": 30.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "joyai-echo",
+      "target": "joyai-echo-comfyui",
+      "capabilities": ["video_generation"],
+      "context_length": 4096,
+      "estimated_vram_gb": 12.0,
+      "estimated_memory_gb": 30.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "minimax-h3-768p",
+      "target": "minimax-h3-comfyui",
+      "capabilities": ["video_generation"],
+      "context_length": 4096,
+      "estimated_vram_gb": 22.0,
+      "estimated_memory_gb": 56.0,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    }
+  ],
+
+  "_interfaces": "==== Interfaces ======================================== 每个数组项都是独立 listener（name/host/port/access_tokens/exposed_models）。ollama_interfaces = Ollama-compatible /api/* + /v1/chat/completions。api_interfaces = Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/images/* + /v1/models。每个 exposed_models 项为 {model, target, alias?}；填 alias 时 public id 使用 alias，否则使用 'model@target'。",
+
+  "ollama_interfaces": [
+    {
+      "name": "ollama",
+      "host": "127.0.0.1",
+      "port": 21434,
+      "access_tokens": [],
+      "exposed_models": [
+        {"model": "claude-3-5-sonnet-20241022", "target": "anthropic"},
+        {"model": "deepseek-chat", "target": "deepseek"},
+        {"model": "deepseek-r1", "target": "deepseek"},
+        {"model": "llama3.1", "target": "local-ollama"},
+        {"model": "qwen2.5-coder", "target": "local-ollama"},
+        {"model": "qwen3.6-27b-hauhau-q2kp", "target": "qwen3.6-27b-hauhau-q2kp"}
+      ]
+    }
+  ],
+
+  "api_interfaces": [
+    {
+      "name": "api",
+      "host": "127.0.0.1",
+      "port": 21435,
+      "access_tokens": [
+        "tk-replace-me-with-a-long-random-string"
+      ],
+      "exposed_models": [
+        {"model": "claude-3-5-sonnet-20241022", "target": "anthropic", "alias": "claude-sonnet"},
+        {"model": "deepseek-chat", "target": "deepseek"},
+        {"model": "qwen3.6-27b-hauhau-q2kp", "target": "qwen3.6-27b-hauhau-q2kp"},
+        {"model": "z-image-turbo", "target": "z-image-turbo-comfyui", "alias": "z-image-turbo"},
+        {"model": "qwen-image", "target": "qwen-image-comfyui", "alias": "qwen-image"},
+        {"model": "sensenova", "target": "sensenova-comfyui", "alias": "sensenova-z-image"},
+        {"model": "joyai-echo", "target": "joyai-echo-comfyui", "alias": "joyai-echo"},
+        {"model": "minimax-h3-768p", "target": "minimax-h3-comfyui", "alias": "minimax-h3"},
+        {"model": "mage-vl-local", "target": "mage-vl-local-adapter", "alias": "mage-vl-local"}
+      ]
+    }
+  ]
+}

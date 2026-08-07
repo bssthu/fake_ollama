@@ -1,0 +1,6 @@
+# Example local ComfyUI model-path mapping.
+minimax_h3:
+  base_path: D:\path\to\models\MiniMax-H3
+  diffusion_models: diffusion_models
+  text_encoders: text_encoders
+  vae: vae

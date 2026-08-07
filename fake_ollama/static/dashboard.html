@@ -1,0 +1,954 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fake-ollama dashboard</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f7f8fb;
+  --ink: #172033;
+  --muted: #647087;
+  --line: #d8deea;
+  --panel: #ffffff;
+  --accent: #0f766e;
+  --warn: #b45309;
+  --danger: #b91c1c;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+}
+main {
+  width: min(1440px, 100%);
+  margin: 0 auto;
+  padding: 18px 24px 32px;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+button {
+  min-width: 48px;
+  height: 34px;
+  border: 1px solid #c8d0df;
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+button.soft-disabled {
+  cursor: pointer;
+  opacity: 0.45;
+}
+button.soft-disabled:hover {
+  opacity: 0.65;
+}
+button.icon {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  font-weight: 700;
+  line-height: 1;
+}
+button.icon.danger {
+  border-color: #fecaca;
+  color: var(--danger);
+}
+.status {
+  font-size: 13px;
+  color: var(--muted);
+}
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 18px 0;
+}
+.metric, .panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.metric {
+  padding: 12px 14px;
+}
+.metric span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+.metric strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 22px;
+  line-height: 1.2;
+}
+.panel {
+  margin-top: 14px;
+  padding: 14px;
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.panel h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+canvas {
+  display: block;
+  width: 100%;
+  height: 260px;
+}
+#modelChart {
+  height: 320px;
+}
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 0;
+}
+.legend button {
+  width: auto;
+  min-width: 0;
+  height: 30px;
+  padding: 0 10px;
+  border-color: var(--line);
+}
+.legend button.hidden {
+  opacity: 0.42;
+  text-decoration: line-through;
+}
+.swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th, td {
+  padding: 9px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+th {
+  color: var(--muted);
+  font-weight: 600;
+}
+td.model {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+td.action {
+  text-align: center;
+}
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.path { max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+td.errors { color: var(--danger); white-space: normal; }
+.event-list {
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  max-height: 280px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.event-list .row {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+}
+.event-list .row:last-child { border-bottom: none; }
+.event-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-right: 8px;
+  border-radius: 4px;
+  background: #eef2ff;
+  color: #1e40af;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+.event-tag.error { background: #fee2e2; color: var(--danger); }
+.event-tag.stop { background: #ecfeff; color: #075985; }
+.event-tag.done { background: #ecfccb; color: #3f6212; }
+.subtle { color: var(--muted); font-size: 12px; }
+.panel-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.panel-toolbar button {
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+.empty {
+  padding: 20px 6px;
+  color: var(--muted);
+}
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(23, 32, 51, 0.45);
+  z-index: 1000;
+}
+.modal-overlay.open { display: flex; }
+.modal-box {
+  width: min(420px, 100%);
+  padding: 20px 22px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(23, 32, 51, 0.24);
+}
+.modal-box h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 700;
+}
+.modal-box p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+.modal-actions button {
+  min-width: 84px;
+  padding: 0 14px;
+}
+.modal-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.modal-actions button.primary.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+@media (max-width: 760px) {
+  header { align-items: flex-start; flex-direction: column; padding: 16px; }
+  main { padding: 12px 12px 24px; }
+  .metrics { grid-template-columns: 1fr; }
+  canvas { height: 220px; }
+  #modelChart { height: 260px; }
+  th:nth-child(2), td:nth-child(2) { display: none; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>fake-ollama dashboard</h1>
+  <div class="toolbar" id="rangeButtons"></div>
+</header>
+<main>
+  <div class="status" id="status">loading</div>
+  <section class="metrics">
+    <div class="metric"><span>Free RAM</span><strong id="ramNow">-</strong></div>
+    <div class="metric"><span>Free VRAM</span><strong id="vramNow">-</strong></div>
+    <div class="metric"><span>Loaded Models</span><strong id="modelNow">0</strong></div>
+    <div class="metric"><span>In-flight Requests</span><strong id="inflightNow">0</strong></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Available Memory</h2></div>
+    <canvas id="memoryChart"></canvas>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Available VRAM</h2><span class="status" id="vramThreshold"></span></div>
+    <canvas id="vramChart"></canvas>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Model Estimated VRAM</h2></div>
+    <canvas id="modelChart"></canvas>
+    <div class="legend" id="modelLegend"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Model Estimated Memory</h2></div>
+    <canvas id="modelMemoryChart"></canvas>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Current Models</h2></div>
+    <div id="modelTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>In-flight Requests</h2><span class="status" id="inflightStatus"></span></div>
+    <div id="inflightTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Request Stats</h2>
+      <div class="panel-toolbar" id="statsWindowButtons"></div>
+    </div>
+    <div id="statsTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Queue Wait (per target)</h2><span class="status" id="queueWindowLabel">last 5m</span></div>
+    <div id="queueTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Upstream Slots</h2><span class="status" id="slotsStatus"></span></div>
+    <div id="slotsTable"></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>Recent Upstream Events</h2><span class="status" id="stderrStatus"></span></div>
+    <div id="stderrEvents"></div>
+  </section>
+</main>
+<div class="modal-overlay" id="confirmModal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+  <div class="modal-box">
+    <h3 id="confirmTitle">Confirm</h3>
+    <p id="confirmMessage"></p>
+    <div class="modal-actions">
+      <button type="button" id="confirmCancel">Cancel</button>
+      <button type="button" class="primary" id="confirmOk">OK</button>
+    </div>
+  </div>
+</div>
+<script>
+const ranges = [
+  {label: '1m', seconds: 60},
+  {label: '10m', seconds: 600},
+  {label: '1h', seconds: 3600},
+  {label: '6h', seconds: 21600},
+  {label: '24h', seconds: 86400},
+  {label: '7d', seconds: 604800},
+];
+let selectedRange = 3600;
+let latest = null;
+const hiddenModels = new Set();
+const colors = ['#0f766e', '#2563eb', '#b45309', '#9333ea', '#dc2626', '#0891b2', '#4d7c0f', '#be185d', '#475569', '#ea580c'];
+const statsWindows = [
+  {label: '5m', key: '300'},
+  {label: '1h', key: '3600'},
+];
+let selectedStatsWindow = '300';
+
+function $(id) { return document.getElementById(id); }
+function escapeHtml(value) {
+  const escapes = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
+  return String(value ?? '').replace(/[&<>"']/g, ch => escapes[ch]);
+}
+function confirmDialog(message, opts = {}) {
+  const modal = $('confirmModal');
+  const okBtn = $('confirmOk');
+  const cancelBtn = $('confirmCancel');
+  $('confirmTitle').textContent = opts.title || 'Confirm';
+  $('confirmMessage').textContent = message;
+  okBtn.textContent = opts.okLabel || 'OK';
+  cancelBtn.textContent = opts.cancelLabel || 'Cancel';
+  okBtn.classList.toggle('danger', !!opts.danger);
+  return new Promise(resolve => {
+    let done = false;
+    function close(result) {
+      if (done) return;
+      done = true;
+      modal.classList.remove('open');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      modal.removeEventListener('mousedown', onBackdrop);
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    }
+    function onOk() { close(true); }
+    function onCancel() { close(false); }
+    function onBackdrop(e) { if (e.target === modal) close(false); }
+    function onKey(e) {
+      if (e.key === 'Escape') { e.preventDefault(); close(false); }
+      else if (e.key === 'Enter') { e.preventDefault(); close(true); }
+    }
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    modal.addEventListener('mousedown', onBackdrop);
+    document.addEventListener('keydown', onKey);
+    modal.classList.add('open');
+    okBtn.focus();
+  });
+}
+function fmtGiB(mib) {
+  if (mib === null || mib === undefined || Number.isNaN(Number(mib))) return '-';
+  return (Number(mib) / 1024).toFixed(2) + ' GiB';
+}
+function fmtAge(sec) {
+  if (sec === null || sec === undefined) return '-';
+  if (sec < 60) return Math.round(sec) + 's';
+  if (sec < 3600) return Math.round(sec / 60) + 'm';
+  return (sec / 3600).toFixed(1) + 'h';
+}
+function fmtMs(ms) {
+  if (ms === null || ms === undefined) return '-';
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return '-';
+  if (n < 1000) return Math.round(n) + 'ms';
+  if (n < 60000) return (n / 1000).toFixed(1) + 's';
+  if (n < 3600000) return Math.round(n / 1000) + 's';
+  return (n / 60000).toFixed(1) + 'm';
+}
+function fmtElapsed(ms) {
+  if (ms === null || ms === undefined) return '-';
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return '-';
+  const s = n / 1000;
+  if (s < 60) return s.toFixed(1) + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm' + Math.round(s % 60) + 's';
+  return Math.floor(s / 3600) + 'h' + Math.round((s % 3600) / 60) + 'm';
+}
+function fmtErrorsCell(errors) {
+  if (!errors) return '';
+  const entries = Object.entries(errors).filter(([, n]) => Number(n) > 0);
+  if (!entries.length) return '';
+  entries.sort((a, b) => Number(b[1]) - Number(a[1]));
+  return entries.slice(0, 3).map(([k, n]) => `${escapeHtml(k)}: ${n}`).join(', ');
+}
+function modelLabel(model) {
+  return `${model.model} / ${model.target_id}`;
+}
+function colorFor(i) { return colors[i % colors.length]; }
+function maxSampleGapSeconds() {
+  const interval = Number(latest && latest.sample_interval_seconds) || 10;
+  return Math.max(interval * 2.5, interval + 5);
+}
+
+function setupRangeButtons() {
+  const host = $('rangeButtons');
+  host.innerHTML = '';
+  for (const r of ranges) {
+    const b = document.createElement('button');
+    b.textContent = r.label;
+    b.className = r.seconds === selectedRange ? 'active' : '';
+    b.onclick = () => {
+      selectedRange = r.seconds;
+      setupRangeButtons();
+      loadData();
+    };
+    host.append(b);
+  }
+}
+
+function setupStatsWindowButtons() {
+  const host = $('statsWindowButtons');
+  host.innerHTML = '';
+  for (const w of statsWindows) {
+    const b = document.createElement('button');
+    b.textContent = w.label;
+    b.className = w.key === selectedStatsWindow ? 'active' : '';
+    b.onclick = () => {
+      selectedStatsWindow = w.key;
+      setupStatsWindowButtons();
+      renderStats();
+    };
+    host.append(b);
+  }
+}
+
+function resizeCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return {ctx, width: rect.width, height: rect.height};
+}
+
+function drawChart(canvas, samples, series, opts) {
+  const {ctx, width, height} = resizeCanvas(canvas);
+  ctx.clearRect(0, 0, width, height);
+  const pad = {l: 56, r: 16, t: 30, b: 34};
+  const plotW = Math.max(10, width - pad.l - pad.r);
+  const plotH = Math.max(10, height - pad.t - pad.b);
+  const now = latest ? latest.now : Date.now() / 1000;
+  const minTs = now - selectedRange;
+  const maxTs = now;
+  let yMax = opts.yMax || 0;
+  if (!yMax) {
+    for (const s of samples) {
+      for (const item of series) {
+        const v = item.value(s);
+        if (v !== null && v !== undefined) yMax = Math.max(yMax, Number(v));
+      }
+    }
+    yMax = Math.max(1024, yMax * 1.15);
+  }
+  const x = ts => pad.l + ((ts - minTs) / (maxTs - minTs || 1)) * plotW;
+  const y = v => pad.t + plotH - (Number(v) / (yMax || 1)) * plotH;
+
+  ctx.strokeStyle = '#d8deea';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#647087';
+  ctx.font = '12px ui-sans-serif, system-ui, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.fillText('GiB', 8, 8);
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= 4; i++) {
+    const yy = pad.t + (plotH * i / 4);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, yy);
+    ctx.lineTo(width - pad.r, yy);
+    ctx.stroke();
+    const val = yMax * (1 - i / 4);
+    ctx.fillText((val / 1024).toFixed(val >= 10240 ? 0 : 1), 8, yy);
+  }
+  ctx.textBaseline = 'top';
+  for (let i = 0; i <= 5; i++) {
+    const ts = minTs + selectedRange * i / 5;
+    const xx = x(ts);
+    ctx.beginPath();
+    ctx.moveTo(xx, pad.t);
+    ctx.lineTo(xx, pad.t + plotH);
+    ctx.stroke();
+    const label = new Date(ts * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    ctx.fillText(label, Math.min(width - 58, Math.max(pad.l - 4, xx - 24)), pad.t + plotH + 12);
+  }
+
+  for (const item of series) {
+    if (item.hidden) continue;
+    const maxGap = maxSampleGapSeconds();
+    const pts = samples
+      .filter(s => s.ts >= minTs && s.ts <= maxTs)
+      .map(s => ({ts: Number(s.ts), x: x(s.ts), y: y(item.value(s) || 0), v: item.value(s)}));
+    if (!pts.length) continue;
+    ctx.strokeStyle = item.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    let last = null;
+    for (const p of pts) {
+      if (p.v === null || p.v === undefined) {
+        started = false;
+        last = null;
+        continue;
+      }
+      if (last && p.ts - last.ts > maxGap) {
+        started = false;
+        last = null;
+      }
+      if (!started) {
+        ctx.moveTo(p.x, p.y);
+        started = true;
+      } else if (opts.stepped && last) {
+        ctx.lineTo(p.x, last.y);
+        ctx.lineTo(p.x, p.y);
+      } else {
+        ctx.lineTo(p.x, p.y);
+      }
+      last = p;
+    }
+    if (started) ctx.stroke();
+  }
+}
+
+function renderLegend(models) {
+  const legend = $('modelLegend');
+  legend.innerHTML = '';
+  models.forEach((m, i) => {
+    const b = document.createElement('button');
+    b.className = hiddenModels.has(m.key) ? 'hidden' : '';
+    b.innerHTML = `<span class="swatch" style="background:${colorFor(i)}"></span>${escapeHtml(m.model)}`;
+    b.title = modelLabel(m);
+    b.onclick = () => {
+      if (hiddenModels.has(m.key)) hiddenModels.delete(m.key);
+      else hiddenModels.add(m.key);
+      render();
+    };
+    legend.append(b);
+  });
+}
+
+function renderTable(models) {
+  if (!models.length) {
+    $('modelTable').innerHTML = '<div class="empty">No loaded local models</div>';
+    return;
+  }
+  const reclaimAllowed = Boolean(latest && latest.permissions && latest.permissions.dashboard_model_reclaim_enabled);
+  const rows = models.map(m => {
+    const canForceReclaim = reclaimAllowed && !m.reclaimable;
+    const title = !reclaimAllowed
+      ? 'Dashboard model reclaim is disabled in settings'
+      : (m.reclaimable ? 'Close and reclaim this model' : 'Force close this model');
+    const disabled = reclaimAllowed ? '' : ' disabled';
+    const softDisabled = canForceReclaim ? ' soft-disabled' : '';
+    const force = canForceReclaim ? 'true' : 'false';
+    return `<tr>
+      <td class="model">${escapeHtml(m.model)}</td>
+      <td>${escapeHtml(m.backend)}</td>
+      <td>${escapeHtml(m.target_id)}</td>
+      <td>${fmtGiB(m.estimated_vram_mib)}</td>
+      <td>${fmtGiB(m.estimated_memory_mib)}</td>
+      <td>${m.active_requests || 0}</td>
+      <td>${m.queued_requests || 0}</td>
+      <td>${fmtAge(m.idle_seconds)}</td>
+      <td>${m.reclaimable ? 'yes' : 'no'}</td>
+      <td class="action"><button type="button" class="icon danger${softDisabled}" data-reclaim-key="${escapeHtml(m.key)}" data-reclaim-force="${force}" title="${escapeHtml(title)}"${disabled}>X</button></td>
+    </tr>`;
+  }).join('');
+  $('modelTable').innerHTML = `<table>
+    <thead><tr><th>Model</th><th>Backend</th><th>Target</th><th>Est. VRAM</th><th>Est. Memory</th><th>Active</th><th>Queued</th><th>Idle</th><th>Reclaimable</th><th>Action</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+  for (const btn of $('modelTable').querySelectorAll('button[data-reclaim-key]')) {
+    btn.addEventListener('click', () => reclaimModel(
+      btn.getAttribute('data-reclaim-key') || '',
+      btn.getAttribute('data-reclaim-force') === 'true'
+    ));
+  }
+}
+
+async function reclaimModel(key, force = false) {
+  if (!key) return;
+  const current = (latest && latest.current_models) || [];
+  const model = current.find(m => m.key === key);
+  const label = model ? modelLabel(model) : key;
+  if (force) {
+    const active = Number(model && model.active_requests || 0);
+    const queued = Number(model && model.queued_requests || 0);
+    const activity = [];
+    if (active) activity.push(`${active} active`);
+    if (queued) activity.push(`${queued} queued`);
+    const suffix = activity.length ? ` (${activity.join(', ')})` : '';
+    if (!await confirmDialog(`Force close ${label}${suffix}?\nThis can interrupt in-flight requests.`, {title: 'Force close model', okLabel: 'Force close', danger: true})) return;
+  } else if (!await confirmDialog(`Close and reclaim ${label}?`, {title: 'Close model', okLabel: 'Close'})) {
+    return;
+  }
+  $('status').textContent = `${force ? 'force closing' : 'reclaiming'} ${label}...`;
+  try {
+    const resp = await fetch('/dashboard/reclaim-model', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({key, force}),
+    });
+    const text = await resp.text();
+    let payload = {};
+    try { payload = text ? JSON.parse(text) : {}; } catch (_) {}
+    if (!resp.ok) {
+      throw new Error(payload.detail || payload.reason || payload.error || text || resp.statusText);
+    }
+    $('status').textContent = `${force ? 'force close requested' : 'reclaim requested'} for ${label}`;
+    await loadData();
+  } catch (err) {
+    $('status').textContent = `${force ? 'force close' : 'reclaim'} failed: ${err.message}`;
+  }
+}
+
+function renderInflight() {
+  const items = (latest && latest.inflight_requests) || [];
+  $('inflightNow').textContent = String(items.length);
+  const status = $('inflightStatus');
+  if (items.length) {
+    const oldest = items[0];
+    status.textContent = `${items.length} active — oldest ${fmtElapsed(oldest.elapsed_ms)}`;
+  } else {
+    status.textContent = '';
+  }
+  const host = $('inflightTable');
+  if (!items.length) {
+    host.innerHTML = '<div class="empty">No in-flight requests</div>';
+    return;
+  }
+  const rows = items.map(r => `<tr>
+    <td>${escapeHtml(r.surface || '-')}</td>
+    <td>${escapeHtml(r.target || '-')}</td>
+    <td>${escapeHtml(r.listener || '-')}:${escapeHtml(r.port ?? '-')}</td>
+    <td>${escapeHtml(r.method || '-')}</td>
+    <td class="path" title="${escapeHtml(r.path || '')}">${escapeHtml(r.path || '-')}</td>
+    <td>${escapeHtml(r.client || '-')}</td>
+    <td class="num">${fmtElapsed(r.elapsed_ms)}</td>
+    <td class="errors">${escapeHtml(r.error_type || '')}</td>
+  </tr>`).join('');
+  host.innerHTML = `<table>
+    <thead><tr><th>Surface</th><th>Target</th><th>Listener</th><th>Method</th><th>Path</th><th>Client</th><th class="num">Elapsed</th><th>Error</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderStats() {
+  const host = $('statsTable');
+  const stats = latest && latest.request_stats;
+  const window = stats && stats.windows && stats.windows[selectedStatsWindow];
+  if (!window || !window.groups || !window.groups.length) {
+    host.innerHTML = '<div class="empty">No completed requests in this window</div>';
+    return;
+  }
+  const groups = window.groups.slice().sort((a, b) => (b.total || 0) - (a.total || 0));
+  const rows = groups.map(g => {
+    const cls = g.by_status_class || {};
+    return `<tr>
+      <td>${escapeHtml(g.surface || '-')}</td>
+      <td>${escapeHtml(g.target || '-')}</td>
+      <td>${escapeHtml(g.listener || '-')}:${escapeHtml(g.port ?? '-')}</td>
+      <td class="num">${g.total || 0}</td>
+      <td class="num">${cls['2xx'] || 0}</td>
+      <td class="num">${cls['4xx'] || 0}</td>
+      <td class="num">${cls['5xx'] || 0}</td>
+      <td class="num">${fmtMs(g.p50_ms)}</td>
+      <td class="num">${fmtMs(g.p95_ms)}</td>
+      <td class="num">${fmtMs(g.max_ms)}</td>
+      <td class="errors">${fmtErrorsCell(g.errors)}</td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `<table>
+    <thead><tr><th>Surface</th><th>Target</th><th>Listener</th><th class="num">Total</th><th class="num">2xx</th><th class="num">4xx</th><th class="num">5xx</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th><th>Errors</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function fmtSeconds(sec) {
+  if (sec === null || sec === undefined) return '-';
+  const n = Number(sec);
+  if (!Number.isFinite(n)) return '-';
+  if (n < 1) return (n * 1000).toFixed(0) + 'ms';
+  if (n < 60) return n.toFixed(1) + 's';
+  if (n < 3600) return Math.floor(n / 60) + 'm' + Math.round(n % 60) + 's';
+  return Math.floor(n / 3600) + 'h' + Math.round((n % 3600) / 60) + 'm';
+}
+
+function renderQueueWait() {
+  const host = $('queueTable');
+  const telemetry = (latest && latest.target_telemetry) || [];
+  const rows = telemetry
+    .map(t => t.queue || {target_id: t.target_id})
+    .filter(q => q && (q.queued !== undefined || q.active !== undefined || q.history_size !== undefined));
+  if (!rows.length) {
+    host.innerHTML = '<div class="empty">No llama.cpp targets configured</div>';
+    return;
+  }
+  const trs = rows.map(q => {
+    const cap = Number(q.capacity || 0);
+    const capText = cap > 0 ? `${q.active || 0} / ${cap}` : `${q.active || 0} / -`;
+    return `<tr>
+      <td>${escapeHtml(q.target_id || '-')}</td>
+      <td class="num">${capText}</td>
+      <td class="num">${q.queued || 0}</td>
+      <td class="num">${fmtSeconds(q.pending_max_seconds)}</td>
+      <td class="num">${fmtSeconds(q.p50_seconds)}</td>
+      <td class="num">${fmtSeconds(q.p95_seconds)}</td>
+      <td class="num">${fmtSeconds(q.max_seconds)}</td>
+      <td class="num">${q.history_size || 0}</td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `<table>
+    <thead><tr><th>Target</th><th class="num">Active / Cap</th><th class="num">Queued</th><th class="num">Pending&nbsp;max</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th><th class="num">Samples</th></tr></thead>
+    <tbody>${trs}</tbody>
+  </table>`;
+}
+
+function renderUpstreamSlots() {
+  const host = $('slotsTable');
+  const telemetry = (latest && latest.target_telemetry) || [];
+  const status = $('slotsStatus');
+  if (!telemetry.length) {
+    host.innerHTML = '<div class="empty">No llama.cpp targets configured</div>';
+    status.textContent = '';
+    return;
+  }
+  let totalSlots = 0;
+  let processing = 0;
+  const sections = telemetry.map(t => {
+    const payload = t.slots || {};
+    const slots = payload.slots;
+    if (!Array.isArray(slots)) {
+      const err = payload.error ? escapeHtml(payload.error) : 'unavailable';
+      return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> <span class="subtle">${err}</span></div>`;
+    }
+    if (!slots.length) {
+      return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> <span class="subtle">no slots</span></div>`;
+    }
+    const rows = slots.map(s => {
+      const state = s.state !== undefined ? String(s.state) : '-';
+      const isProcessing =
+        s.is_processing === true || state === 'processing' || (typeof s.state === 'number' && s.state === 1);
+      if (isProcessing) processing += 1;
+      totalSlots += 1;
+      const nPast = s.n_past !== undefined ? s.n_past : (s.prompt && s.prompt.n_past);
+      const nDecoded = s.n_decoded !== undefined ? s.n_decoded : s.n_predict;
+      const nCtx = s.n_ctx !== undefined ? s.n_ctx : (s.params && s.params.n_ctx);
+      const taskId = s.id_task !== undefined ? s.id_task : s.task_id;
+      return `<tr>
+        <td class="num">${s.id !== undefined ? s.id : '-'}</td>
+        <td>${escapeHtml(state)}</td>
+        <td class="num">${taskId !== undefined && taskId !== null ? taskId : '-'}</td>
+        <td class="num">${nPast !== undefined && nPast !== null ? nPast : '-'}</td>
+        <td class="num">${nDecoded !== undefined && nDecoded !== null ? nDecoded : '-'}</td>
+        <td class="num">${nCtx !== undefined && nCtx !== null ? nCtx : '-'}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong>
+      <table>
+        <thead><tr><th class="num">Slot</th><th>State</th><th class="num">Task</th><th class="num">n_past</th><th class="num">n_decoded</th><th class="num">n_ctx</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+  }).join('');
+  host.innerHTML = `<div class="event-list">${sections}</div>`;
+  status.textContent = totalSlots ? `${processing}/${totalSlots} processing` : '';
+}
+
+function renderUpstreamEvents() {
+  const host = $('stderrEvents');
+  const status = $('stderrStatus');
+  const telemetry = (latest && latest.target_telemetry) || [];
+  if (!telemetry.length) {
+    host.innerHTML = '<div class="empty">No llama.cpp targets configured</div>';
+    status.textContent = '';
+    return;
+  }
+  let totalEvents = 0;
+  let errors = 0;
+  const sections = telemetry.map(t => {
+    const stderr = t.stderr || {};
+    const header = stderr.path
+      ? `<span class="subtle">${escapeHtml(stderr.path)}</span>`
+      : '<span class="subtle">no stderr log</span>';
+    if (!stderr.available) {
+      const reason = stderr.error ? ` — ${escapeHtml(stderr.error)}` : '';
+      return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> ${header}${reason}</div>`;
+    }
+    const events = (stderr.events || []).slice().reverse();
+    totalEvents += events.length;
+    if (!events.length) {
+      return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> ${header}<div class="subtle">no recent events</div></div>`;
+    }
+    const lines = events.map(ev => {
+      const cls =
+        ev.type === 'error' ? 'error' :
+        ev.type === 'stop_processing' ? 'stop' :
+        ev.type === 'prompt_processing_done' ? 'done' : '';
+      if (ev.type === 'error') errors += 1;
+      return `<div class="row"><span class="event-tag ${cls}">${escapeHtml(ev.type)}</span>${escapeHtml(ev.text)}</div>`;
+    }).join('');
+    return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong> ${header}
+      <div class="event-list">${lines}</div></div>`;
+  }).join('');
+  host.innerHTML = `<div>${sections}</div>`;
+  const parts = [];
+  if (totalEvents) parts.push(`${totalEvents} events`);
+  if (errors) parts.push(`${errors} error`);
+  status.textContent = parts.join(' • ');
+}
+
+function render() {
+  if (!latest) return;
+  const samples = latest.samples || [];
+  const current = latest.current_models || [];
+  const newest = samples[samples.length - 1] || {};
+  $('ramNow').textContent = fmtGiB(newest.memory_free_mib);
+  $('vramNow').textContent = fmtGiB(newest.vram_free_mib);
+  $('modelNow').textContent = String(current.length);
+  const threshold = latest.limits && latest.limits.vram_low_free_threshold_mib;
+  $('vramThreshold').textContent = threshold ? `release threshold ${Math.round(threshold)} MiB` : '';
+
+  const known = new Map();
+  current.forEach(m => known.set(m.key, m));
+  samples.forEach(s => {
+    Object.keys(s.models || {}).forEach(k => {
+      if (!known.has(k)) {
+        const parts = k.split('|');
+        known.set(k, {key: k, backend: parts[0], target_id: parts[1], model: parts.slice(2).join('|')});
+      }
+    });
+  });
+  const models = Array.from(known.values()).sort((a, b) => String(a.key).localeCompare(String(b.key)));
+  renderLegend(models);
+  renderTable(current);
+
+  drawChart($('memoryChart'), samples, [
+    {key: 'memory_free_mib', color: '#2563eb', value: s => s.memory_free_mib},
+  ], {yMax: newest.memory_total_mib || 0});
+  drawChart($('vramChart'), samples, [
+    {key: 'vram_free_mib', color: '#0f766e', value: s => s.vram_free_mib},
+  ], {yMax: newest.vram_total_mib || 0});
+  drawChart($('modelChart'), samples, models.map((m, i) => ({
+    key: m.key,
+    color: colorFor(i),
+    hidden: hiddenModels.has(m.key),
+    value: s => (s.models && s.models[m.key] !== undefined) ? s.models[m.key] : 0,
+  })), {stepped: true});
+  drawChart($('modelMemoryChart'), samples, models.map((m, i) => ({
+    key: m.key,
+    color: colorFor(i),
+    hidden: hiddenModels.has(m.key),
+    value: s => (s.models_memory && s.models_memory[m.key] !== undefined) ? s.models_memory[m.key] : 0,
+  })), {stepped: true});
+
+  renderInflight();
+  renderStats();
+  renderQueueWait();
+  renderUpstreamSlots();
+  renderUpstreamEvents();
+}
+
+async function loadData() {
+  try {
+    const resp = await fetch(`/dashboard/data?range_seconds=${selectedRange}`, {cache: 'no-store'});
+    if (!resp.ok) throw new Error(await resp.text());
+    latest = await resp.json();
+    $('status').textContent = `updated ${new Date(latest.now * 1000).toLocaleString()}`;
+    render();
+  } catch (err) {
+    $('status').textContent = 'load failed: ' + err.message;
+  }
+}
+
+setupRangeButtons();
+setupStatsWindowButtons();
+loadData();
+setInterval(loadData, 10000);
+window.addEventListener('resize', render);
+</script>
+</body>
+</html>

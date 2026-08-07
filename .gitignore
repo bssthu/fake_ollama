@@ -44,6 +44,7 @@ htmlcov/
 
 # Local config (user-specific; ship config.json.example instead)
 config.json
+config.json.*
 !config.json.example
 
 # Logs

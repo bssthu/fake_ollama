@@ -66,7 +66,7 @@
 # 1. 创建虚拟环境并安装依赖
 python -m venv .venv
 . .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -e ".[test]"
 
 # 2. 准备配置
 Copy-Item config.json.example config.json
@@ -243,8 +243,8 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
     "idle_timeout_seconds": 1800,
     "startup_timeout_seconds": 600,
     "health_path": "/health",
-    "cwd": "I:\\Projects\\llama.cpp",
-    "binary_path": "I:\\Projects\\llama.cpp\\llama-server.exe",
+    "cwd": "C:\\path\\to\\llama.cpp",
+    "binary_path": "C:\\path\\to\\llama.cpp\\llama-server.exe",
     "gpu_layers": 99,
     "flash_attn": true
   },
@@ -343,8 +343,8 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "model": "z-image-turbo",
       "preset": "z_image_turbo",
       "auto_start": true,
-      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
-      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "start_command": "\"C:\\path\\to\\ComfyUI\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "cwd": "C:\\path\\to\\ComfyUI",
       "diffusion_model": "z-image-turbo-fp8-e4m3fn.safetensors",
       "text_encoder_model": "qwen_3_4b_fp4_mixed.safetensors",
       "vae_model": "ae.safetensors",
@@ -361,8 +361,8 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "model": "qwen-image",
       "preset": "qwen_image_edit_aio",
       "auto_start": true,
-      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
-      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "start_command": "\"C:\\path\\to\\ComfyUI\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "cwd": "C:\\path\\to\\ComfyUI",
       "default_steps": 6,
       "default_cfg": 1.0,
       "default_sampler_name": "euler_ancestral",
@@ -377,8 +377,8 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "model": "sensenova",
       "preset": "sensenova_u1",
       "auto_start": true,
-      "start_command": "\"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
-      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "start_command": "\"C:\\path\\to\\ComfyUI\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "cwd": "C:\\path\\to\\ComfyUI",
       "default_steps": 8,
       "default_cfg": 1.0,
       "output_prefix": "fake_ollama/sensenova"
@@ -389,8 +389,8 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
       "model": "joyai-echo",
       "preset": "joyai_echo",
       "auto_start": true,
-      "start_command": "set \"PATH=I:\\Projects\\Tools\\ffmpeg;%PATH%\" && \"I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
-      "cwd": "I:\\Projects\\ComfyUI\\ComfyUI-aki-v3\\ComfyUI",
+      "start_command": "set \"PATH=C:\\path\\to\\ffmpeg;%PATH%\" && \"C:\\path\\to\\ComfyUI\\python\\python.exe\" -s main.py --listen 127.0.0.1 --port 21480",
+      "cwd": "C:\\path\\to\\ComfyUI",
       "min_width": 256,
       "default_width": 256,
       "width_modulo": 32,
@@ -593,10 +593,10 @@ Playground 的预计显存、预计内存和上下文会随实际 Planner 选择
 - `vae/minimax_h3_video_vae_fp16.safetensors`（4.85 GiB）
 - `vae/minimax_h3_audio_vae_fp32.safetensors`（0.56 GiB）
 
-默认模型根目录为 `J:\Projects\LLM_Models\MiniMax-H3`，映射见
-`runtime/minimax_h3_extra_model_paths.yaml`。本机 target 使用独立的
-`I:\Projects\ComfyUI\ComfyUI-H3` 官方主线实例和 `:21481`，不会升级或覆盖现有 Aki
-ComfyUI。启动参数保留 2 GiB 显存给系统；资源协调器按
+模型根目录由本机配置决定；路径映射示例见
+`config/examples/comfyui/minimax_h3_extra_model_paths.yaml`。示例 target 使用独立的
+ComfyUI 主线实例和 `:21481`，不会升级或覆盖其他 ComfyUI 实例。启动参数保留 2 GiB
+显存给系统；资源协调器按
 `estimated_vram_gb=22`、`estimated_memory_gb=56` 做准入和空闲模型回收。
 
 RTX 4090（SM 8.9）没有原生 NVFP4 Tensor Core。最新版 ComfyUI 会将 NVFP4 标记为
@@ -751,7 +751,7 @@ Invoke-RestMethod http://127.0.0.1:21435/v1/videos/generations `
 
 ```powershell
 $env:FAKE_OLLAMA_CAMERA_TEST_API_KEY = "<access token>"
-node scripts\validate_playground_camera.mjs
+node scripts\validation\validate_playground_camera.mjs
 ```
 
 脚本不需要 npm 依赖，不会打印 API key；它会用临时浏览器 profile 调用真实 Mage-VL，验证连续录制、单槽背压、结果历史和停止收尾后再关闭测试浏览器。

@@ -1,0 +1,35 @@
+[project]
+name = "fake-ollama-mage-vl"
+version = "0.1.0"
+description = "Standalone local Mage-VL OpenAI-compatible video analysis service."
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=1.10",
+    "fastapi>=0.116",
+    "huggingface-hub>=0.35",
+    "numpy>=2.0",
+    "pillow>=11.0",
+    "safetensors>=0.6",
+    "transformers==5.14.1",
+    "uvicorn[standard]>=0.35",
+]
+
+[project.optional-dependencies]
+test = [
+    "httpx>=0.27",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+mage-vl-adapter = "mage_vl_adapter.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["mage_vl_adapter*"]

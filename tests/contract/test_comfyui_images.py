@@ -1,0 +1,943 @@
+"""Contract tests for ComfyUI image APIs."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List, Optional
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from fake_ollama.comfyui_client import ComfyUIClient, ComfyUIImage
+from fake_ollama.config import Settings
+from fake_ollama.server import create_app
+
+
+def _settings() -> Settings:
+    return Settings(
+        comfyui_targets=[
+            {
+                "name": "z-image-comfy",
+                "base_url": "http://127.0.0.1:21480",
+                "model": "z-image-turbo",
+                "auto_start": False,
+                "default_width": 1024,
+                "default_height": 1024,
+                "default_steps": 8,
+                "default_edit_denoise": 0.25,
+                "max_batch_size": 2,
+            }
+        ],
+        api_interfaces=[
+            {
+                "name": "api",
+                "host": "127.0.0.1",
+                "port": 21435,
+                "access_tokens": ["tk"],
+                "exposed_models": [
+                    {
+                        "model": "z-image-turbo",
+                        "target": "z-image-comfy",
+                        "alias": "z-image-turbo",
+                    }
+                ],
+            }
+        ],
+        model_profiles=[
+            {
+                "model": "z-image-turbo",
+                "target": "z-image-comfy",
+                "capabilities": ["image_generation", "image_edit"],
+                "context_length": 4096,
+                "estimated_vram_gb": 16.0,
+            }
+        ],
+    )
+
+
+class _FakeComfyClient:
+    idle_timeout_seconds = None
+
+    def __init__(self) -> None:
+        self.generate_calls: List[Dict[str, Any]] = []
+        self.edit_calls: List[Dict[str, Any]] = []
+        self.video_calls: List[Dict[str, Any]] = []
+
+    async def generate_image(self, **kwargs: Any) -> List[ComfyUIImage]:
+        self.generate_calls.append(kwargs)
+        return [
+            ComfyUIImage(
+                data=b"png-a",
+                filename="a.png",
+                subfolder="",
+                image_type="output",
+                mime_type="image/png",
+            )
+        ]
+
+    async def edit_image(self, **kwargs: Any) -> List[ComfyUIImage]:
+        self.edit_calls.append(kwargs)
+        return [
+            ComfyUIImage(
+                data=b"png-edit",
+                filename="edit.png",
+                subfolder="",
+                image_type="output",
+                mime_type="image/png",
+            )
+        ]
+
+    async def generate_video(self, **kwargs: Any) -> List[ComfyUIImage]:
+        self.video_calls.append(kwargs)
+        return [
+            ComfyUIImage(
+                data=b"mp4-video",
+                filename="video.mp4",
+                subfolder="",
+                image_type="output",
+                mime_type="video/mp4",
+            )
+        ]
+
+
+def _client_with_fake(fake: _FakeComfyClient) -> TestClient:
+    settings = _settings()
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+    return TestClient(app, base_url="http://testserver:21435")
+
+
+def test_openai_image_generations_routes_to_comfyui_default_model() -> None:
+    fake = _FakeComfyClient()
+    client = _client_with_fake(fake)
+    with client:
+        resp = client.post(
+            "/v1/images/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "prompt": "a quiet product photo",
+                "size": "768x512",
+                "n": 2,
+                "seed": 123,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["data"][0]["b64_json"] == "cG5nLWE="
+    assert fake.generate_calls[0]["model"] == "z-image-turbo"
+    assert fake.generate_calls[0]["prompt"] == "a quiet product photo"
+    assert fake.generate_calls[0]["width"] == 768
+    assert fake.generate_calls[0]["height"] == 512
+    assert fake.generate_calls[0]["n"] == 2
+    assert fake.generate_calls[0]["estimated_vram_gb"] == 16.0
+
+
+def test_playground_models_uses_comfyui_target_profile() -> None:
+    fake = _FakeComfyClient()
+    settings = _settings()
+    settings.model_profiles["z-image-turbo@z-image-comfy"][
+        "estimated_memory_gb"
+    ] = 30.0
+    settings = settings.model_copy(
+        update={"playground_enabled": True, "playground_port": 21431}
+    )
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+    with TestClient(app, base_url="http://testserver:21431") as client:
+        resp = client.get("/playground/api/models", headers={"x-api-key": "tk"})
+
+    assert resp.status_code == 200
+    model = next(item for item in resp.json()["models"] if item["id"] == "z-image-turbo")
+    assert model["context_length"] == 4096
+    assert model["estimated_vram_gb"] == 16.0
+    assert model["estimated_memory_gb"] == 30.0
+    assert model["capabilities"] == ["image_generation", "image_edit"]
+    assert [operation["id"] for operation in model["operations"]] == [
+        "image_generation",
+        "image_edit",
+    ]
+    assert all(
+        operation["endpoint"] != "/v1/chat/completions"
+        for operation in model["operations"]
+    )
+    generation = model["operations"][0]
+    assert generation["endpoint"] == "/v1/images/generations"
+    assert generation["history_mode"] == "single_turn"
+    assert generation["defaults"]["size"] == "1024x1024"
+    assert generation["defaults"]["steps"] == 8
+    assert generation["limits"]["max_batch_size"] == 2
+    edit = model["operations"][1]
+    assert edit["history_mode"] == "single_turn"
+    assert edit["requires_images"] is True
+    assert edit["defaults"]["denoise"] == 0.25
+
+
+def test_playground_models_marks_video_generation_as_single_turn() -> None:
+    settings = _settings()
+    settings.model_profiles["z-image-turbo@z-image-comfy"]["capabilities"].append(
+        "video_generation"
+    )
+    settings = settings.model_copy(
+        update={"playground_enabled": True, "playground_port": 21431}
+    )
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": _FakeComfyClient()}
+
+    with TestClient(app, base_url="http://testserver:21431") as client:
+        response = client.get(
+            "/playground/api/models", headers={"x-api-key": "tk"}
+        )
+
+    assert response.status_code == 200
+    operations = response.json()["models"][0]["operations"]
+    video = next(
+        operation for operation in operations if operation["id"] == "video_generation"
+    )
+    assert video["history_mode"] == "single_turn"
+
+
+def test_openai_image_edits_accepts_multipart_image() -> None:
+    fake = _FakeComfyClient()
+    client = _client_with_fake(fake)
+    with client:
+        resp = client.post(
+            "/v1/images/edits",
+            headers={"x-api-key": "tk"},
+            data={
+                "model": "z-image-turbo",
+                "prompt": "make it warmer",
+                "size": "512x512",
+            },
+            files={"image": ("input.png", b"input-bytes", "image/png")},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["data"][0]["b64_json"] == "cG5nLWVkaXQ="
+    assert fake.edit_calls[0]["prompt"] == "make it warmer"
+    assert fake.edit_calls[0]["image_bytes"] == b"input-bytes"
+    assert fake.edit_calls[0]["filename"] == "input.png"
+    assert fake.edit_calls[0]["denoise"] == 0.25
+
+
+def test_openai_image_edits_accepts_bracketed_image_field() -> None:
+    # OpenAI's images/edits multipart convention (and the AI SDK's
+    # OpenAICompatibleImageModel) names the input image field "image[]".
+    fake = _FakeComfyClient()
+    client = _client_with_fake(fake)
+    with client:
+        resp = client.post(
+            "/v1/images/edits",
+            headers={"x-api-key": "tk"},
+            data={
+                "model": "z-image-turbo",
+                "prompt": "make it night",
+                "size": "1024x1024",
+            },
+            files={"image[]": ("input.png", b"input-bytes", "image/png")},
+        )
+
+    assert resp.status_code == 200
+    assert fake.edit_calls[0]["prompt"] == "make it night"
+    assert fake.edit_calls[0]["image_bytes"] == b"input-bytes"
+    assert fake.edit_calls[0]["filename"] == "input.png"
+
+
+def test_openai_image_edits_rejects_more_references_than_workflow_accepts() -> None:
+    fake = _FakeComfyClient()
+    client = _client_with_fake(fake)
+    with client:
+        resp = client.post(
+            "/v1/images/edits",
+            headers={"x-api-key": "tk"},
+            data={
+                "model": "z-image-turbo",
+                "prompt": "combine the references",
+                "size": "1024x1024",
+            },
+            files=[
+                ("image[]", ("first.png", b"first-bytes", "image/png")),
+                ("image[]", ("second.png", b"second-bytes", "image/png")),
+            ],
+        )
+
+    assert resp.status_code == 400
+    assert "at most 1 reference image" in resp.json()["detail"]
+    assert fake.edit_calls == []
+
+
+def test_openai_video_generations_routes_to_comfyui() -> None:
+    fake = _FakeComfyClient()
+    client = _client_with_fake(fake)
+    with client:
+        resp = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "z-image-turbo",
+                "prompt": "a slow camera move",
+                "size": "768x512",
+                "num_frames": 81,
+                "fps": 16,
+                "prefetch_count": 5,
+                "enable_tile": True,
+                "enable_streaming": False,
+                "seed": 123,
+            },
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()["data"][0]
+    assert data["b64_json"] == "bXA0LXZpZGVv"
+    assert data["mime_type"] == "video/mp4"
+    call = fake.video_calls[0]
+    assert call["model"] == "z-image-turbo"
+    assert call["prompt"] == "a slow camera move"
+    assert call["width"] == 768
+    assert call["height"] == 512
+    assert call["num_frames"] == 81
+    assert call["frame_rate"] == 16.0
+    assert call["prefetch_count"] == 5
+    assert call["enable_tile"] is True
+    assert call["enable_streaming"] is False
+    assert call["estimated_vram_gb"] == 16.0
+
+
+def test_video_generation_enforces_workflow_frame_alignment() -> None:
+    fake = _FakeComfyClient()
+    settings = _settings()
+    target = settings.comfyui_targets[0]
+    target.min_width = 256
+    target.min_height = 256
+    target.width_modulo = 32
+    target.height_modulo = 32
+    target.min_num_frames = 17
+    target.default_num_frames = 17
+    target.num_frames_offset = 1
+    target.num_frames_modulo = 8
+    target.min_frame_rate = 8.0
+    target.default_frame_rate = 8.0
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+
+    with TestClient(app, base_url="http://testserver:21435") as client:
+        bad_frames = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={"model": "z-image-turbo", "prompt": "move", "num_frames": 18},
+        )
+        bad_fps = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={"model": "z-image-turbo", "prompt": "move", "fps": 4},
+        )
+        bad_size = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "z-image-turbo",
+                "prompt": "move",
+                "size": "264x256",
+            },
+        )
+
+    assert bad_frames.status_code == 400
+    assert "(num_frames - 1) % 8 == 0" in bad_frames.json()["detail"]
+    assert bad_fps.status_code == 400
+    assert "frame_rate must be >= 8.0" in bad_fps.json()["detail"]
+    assert bad_size.status_code == 400
+    assert "width must be divisible by 32" in bad_size.json()["detail"]
+
+
+def test_openai_video_generations_accepts_json_base64_image() -> None:
+    fake = _FakeComfyClient()
+    client = _client_with_fake(fake)
+    with client:
+        resp = client.post(
+            "/v1/videos/generations",
+            headers={"x-api-key": "tk"},
+            json={
+                "model": "z-image-turbo",
+                "prompt": "animate the reference",
+                "size": "512x512",
+                "image": "aW1nLWJ5dGVz",
+                "filename": "reference.png",
+            },
+        )
+
+    assert resp.status_code == 200
+    call = fake.video_calls[0]
+    assert call["prompt"] == "animate the reference"
+    assert call["image_bytes"] == b"img-bytes"
+    assert call["filename"] == "reference.png"
+    assert call["image_inputs"] == [(b"img-bytes", "reference.png")]
+
+
+def test_playground_listener_routes_image_generation_to_comfyui() -> None:
+    fake = _FakeComfyClient()
+    settings = _settings().model_copy(
+        update={"playground_enabled": True, "playground_port": 21431}
+    )
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+    with TestClient(app, base_url="http://testserver:21431") as client:
+        models = client.get(
+            "/playground/api/models", headers={"x-api-key": "tk"}
+        )
+        generated = client.post(
+            "/v1/images/generations",
+            headers={"x-api-key": "tk"},
+            json={"model": "z-image-turbo", "prompt": "a red cube"},
+        )
+
+    assert models.status_code == 200
+    model = models.json()["models"][0]
+    assert [op["id"] for op in model["operations"]] == [
+        "image_generation",
+        "image_edit",
+    ]
+    assert generated.status_code == 200
+    assert fake.generate_calls[0]["prompt"] == "a red cube"
+
+
+def _client_with_seed_mode(fake: _FakeComfyClient, *, seed_mode: str, seed: int) -> TestClient:
+    settings = _settings()
+    settings.comfyui_targets[0].seed_mode = seed_mode
+    settings.comfyui_targets[0].seed = seed
+    app = create_app(settings)
+    app.state.comfyui_clients = {"z-image-comfy": fake}
+    return TestClient(app, base_url="http://testserver:21435")
+
+
+def _gen(client: TestClient, **extra: Any) -> None:
+    body = {"prompt": "a cube", "size": "512x512"}
+    body.update(extra)
+    resp = client.post("/v1/images/generations", headers={"x-api-key": "tk"}, json=body)
+    assert resp.status_code == 200, resp.text
+
+
+def test_seed_mode_fixed_reuses_configured_seed() -> None:
+    fake = _FakeComfyClient()
+    with _client_with_seed_mode(fake, seed_mode="fixed", seed=777) as client:
+        _gen(client)
+        _gen(client)
+    assert fake.generate_calls[0]["seed"] == 777
+    assert fake.generate_calls[1]["seed"] == 777
+
+
+def test_seed_mode_increment_advances_per_request() -> None:
+    fake = _FakeComfyClient()
+    with _client_with_seed_mode(fake, seed_mode="increment", seed=100) as client:
+        _gen(client)            # n defaults to 1 -> 100
+        _gen(client)            # -> 101
+        _gen(client, n=2)       # -> 102, then counter jumps by 2
+        _gen(client)            # -> 104
+    assert [c["seed"] for c in fake.generate_calls] == [100, 101, 102, 104]
+
+
+def test_seed_mode_random_differs_and_request_seed_overrides() -> None:
+    fake = _FakeComfyClient()
+    with _client_with_seed_mode(fake, seed_mode="random", seed=0) as client:
+        _gen(client)
+        _gen(client)
+        _gen(client, seed=42)   # explicit request seed wins even in random mode
+    assert fake.generate_calls[2]["seed"] == 42
+    # random mode should not collapse to a constant
+    assert fake.generate_calls[0]["seed"] != fake.generate_calls[1]["seed"]
+
+
+def test_request_seed_overrides_fixed_mode() -> None:
+    fake = _FakeComfyClient()
+    with _client_with_seed_mode(fake, seed_mode="fixed", seed=5) as client:
+        _gen(client, seed=999)
+    assert fake.generate_calls[0]["seed"] == 999
+
+
+@pytest.mark.asyncio
+async def test_comfyui_client_runs_prompt_and_collects_view_image() -> None:
+    seen_prompt: Optional[Dict[str, Any]] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_prompt
+        if request.method == "GET" and request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {}})
+        if request.method == "POST" and request.url.path == "/prompt":
+            seen_prompt = request.read()
+            return httpx.Response(200, json={"prompt_id": "pid-1"})
+        if request.method == "GET" and request.url.path == "/history/pid-1":
+            return httpx.Response(
+                200,
+                json={
+                    "pid-1": {
+                        "outputs": {
+                            "9": {
+                                "images": [
+                                    {
+                                        "filename": "ComfyUI_00001_.png",
+                                        "subfolder": "",
+                                        "type": "output",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {"status_str": "success"},
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/view":
+            return httpx.Response(200, content=b"image-bytes")
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    client = ComfyUIClient(
+        "http://comfy.test",
+        client=httpx.AsyncClient(transport=transport),
+        workflow_config={"poll_interval_seconds": 0.01},
+    )
+
+    try:
+        images = await client.generate_image(
+            model="z-image-turbo",
+            prompt="hello",
+            width=512,
+            height=512,
+            n=1,
+            seed=7,
+            steps=8,
+            cfg=1.0,
+            sampler_name="res_multistep",
+            scheduler="simple",
+            denoise=1.0,
+        )
+    finally:
+        await client.aclose()
+
+    assert images[0].data == b"image-bytes"
+    assert seen_prompt is not None
+
+
+@pytest.mark.asyncio
+async def test_comfyui_client_single_image_edit_workflow_uploads_first_ref_only(
+    tmp_path,
+) -> None:
+    workflow_path = tmp_path / "single-image-edit.json"
+    workflow_path.write_text(
+        json.dumps(
+            {
+                "1": {"inputs": {"image": ""}},
+                "2": {"inputs": {"text": ""}},
+                "9": {"inputs": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    upload_count = 0
+    seen_prompt: Optional[Dict[str, Any]] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upload_count, seen_prompt
+        if request.method == "GET" and request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {}})
+        if request.method == "POST" and request.url.path == "/upload/image":
+            request.read()
+            upload_count += 1
+            return httpx.Response(200, json={"name": f"uploaded-{upload_count}.png"})
+        if request.method == "POST" and request.url.path == "/prompt":
+            seen_prompt = json.loads(request.read())
+            return httpx.Response(200, json={"prompt_id": "pid-1"})
+        if request.method == "GET" and request.url.path == "/history/pid-1":
+            return httpx.Response(
+                200,
+                json={
+                    "pid-1": {
+                        "outputs": {
+                            "9": {
+                                "images": [
+                                    {
+                                        "filename": "ComfyUI_00001_.png",
+                                        "subfolder": "",
+                                        "type": "output",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {"status_str": "success"},
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/view":
+            return httpx.Response(200, content=b"image-bytes")
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    client = ComfyUIClient(
+        "http://comfy.test",
+        client=httpx.AsyncClient(transport=transport),
+        workflow_config={
+            "preset": "custom",
+            "image_to_image_workflow_path": str(workflow_path),
+            "bindings": {
+                "i2i": {
+                    "prompt": [("2", "text")],
+                    "image": [("1", "image")],
+                }
+            },
+            "poll_interval_seconds": 0.01,
+        },
+    )
+
+    try:
+        images = await client.edit_image(
+            model="z-image-turbo",
+            prompt="use only the first reference",
+            image_bytes=b"first-bytes",
+            filename="first.png",
+            image_inputs=[
+                (b"first-bytes", "first.png"),
+                (b"second-bytes", "second.png"),
+            ],
+            width=512,
+            height=512,
+            n=1,
+            seed=7,
+            steps=8,
+            cfg=1.0,
+            sampler_name="res_multistep",
+            scheduler="simple",
+            denoise=0.25,
+        )
+    finally:
+        await client.aclose()
+
+    assert images[0].data == b"image-bytes"
+    assert upload_count == 1
+    assert seen_prompt is not None
+    prompt = seen_prompt["prompt"]
+    assert prompt["1"]["inputs"]["image"] == "uploaded-1.png"
+    assert prompt["2"]["inputs"]["text"] == "use only the first reference"
+
+
+@pytest.mark.asyncio
+async def test_comfyui_client_collects_video_helper_outputs(tmp_path) -> None:
+    workflow_path = tmp_path / "video.json"
+    workflow_path.write_text(
+        json.dumps(
+            {
+                "1": {"inputs": {"text": ""}},
+                "9": {"inputs": {"frame_count": 0, "fps": 0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    seen_prompt: Optional[Dict[str, Any]] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_prompt
+        if request.method == "GET" and request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {}})
+        if request.method == "POST" and request.url.path == "/prompt":
+            seen_prompt = json.loads(request.read())
+            return httpx.Response(200, json={"prompt_id": "pid-1"})
+        if request.method == "GET" and request.url.path == "/history/pid-1":
+            return httpx.Response(
+                200,
+                json={
+                    "pid-1": {
+                        "outputs": {
+                            "9": {
+                                "gifs": [
+                                    {
+                                        "filename": "out.mp4",
+                                        "subfolder": "",
+                                        "type": "output",
+                                        "format": "video/h264-mp4",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {"status_str": "success"},
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/view":
+            return httpx.Response(200, content=b"mp4-bytes")
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    client = ComfyUIClient(
+        "http://comfy.test",
+        client=httpx.AsyncClient(transport=transport),
+        workflow_config={
+            "preset": "custom",
+            "video_workflow_path": str(workflow_path),
+            "bindings": {
+                "video": {
+                    "prompt": [("1", "text")],
+                    "num_frames": [("9", "frame_count")],
+                    "frame_rate": [("9", "fps")],
+                }
+            },
+            "poll_interval_seconds": 0.01,
+            "save_video_node_id": "9",
+        },
+    )
+
+    try:
+        videos = await client.generate_video(
+            model="joyai-echo",
+            prompt="a slow dolly shot",
+            width=768,
+            height=512,
+            n=1,
+            seed=7,
+            steps=8,
+            cfg=1.0,
+            sampler_name="euler",
+            scheduler="simple",
+            denoise=1.0,
+            num_frames=81,
+            frame_rate=16.0,
+            prefetch_count=5,
+        )
+    finally:
+        await client.aclose()
+
+    assert videos[0].data == b"mp4-bytes"
+    assert videos[0].mime_type == "video/mp4"
+    assert seen_prompt is not None
+    prompt = seen_prompt["prompt"]
+    assert prompt["1"]["inputs"]["text"] == "a slow dolly shot"
+    assert prompt["9"]["inputs"]["frame_count"] == 81
+    assert prompt["9"]["inputs"]["fps"] == 16.0
+
+
+@pytest.mark.asyncio
+async def test_comfyui_client_image_to_video_workflow_uploads_and_binds_ref(
+    tmp_path,
+) -> None:
+    workflow_path = tmp_path / "image-to-video.json"
+    workflow_path.write_text(
+        json.dumps(
+            {
+                "1": {"class_type": "LoadImage", "inputs": {"image": ""}},
+                "2": {
+                    "class_type": "VideoSampler",
+                    "inputs": {"text": "", "frames": 0, "fps": 0},
+                },
+                "9": {"class_type": "SaveVideo", "inputs": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    upload_count = 0
+    seen_prompt: Optional[Dict[str, Any]] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upload_count, seen_prompt
+        if request.method == "GET" and request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {}})
+        if request.method == "POST" and request.url.path == "/upload/image":
+            request.read()
+            upload_count += 1
+            return httpx.Response(200, json={"name": f"uploaded-{upload_count}.png"})
+        if request.method == "POST" and request.url.path == "/prompt":
+            seen_prompt = json.loads(request.read())
+            return httpx.Response(200, json={"prompt_id": "pid-1"})
+        if request.method == "GET" and request.url.path == "/history/pid-1":
+            return httpx.Response(
+                200,
+                json={
+                    "pid-1": {
+                        "outputs": {
+                            "9": {
+                                "videos": [
+                                    {
+                                        "filename": "i2v.mp4",
+                                        "subfolder": "",
+                                        "type": "output",
+                                        "format": "video/h264-mp4",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {"status_str": "success"},
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/view":
+            return httpx.Response(200, content=b"i2v-bytes")
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    client = ComfyUIClient(
+        "http://comfy.test",
+        client=httpx.AsyncClient(transport=transport),
+        workflow_config={
+            "preset": "custom",
+            "image_to_video_workflow_path": str(workflow_path),
+            "bindings": {
+                "i2v": {
+                    "prompt": [("2", "text")],
+                    "image": [("1", "image")],
+                    "num_frames": [("2", "frames")],
+                    "frame_rate": [("2", "fps")],
+                }
+            },
+            "poll_interval_seconds": 0.01,
+            "save_video_node_id": "9",
+        },
+    )
+
+    try:
+        videos = await client.generate_video(
+            model="joyai-echo",
+            prompt="animate the first reference",
+            width=512,
+            height=512,
+            n=1,
+            seed=7,
+            steps=8,
+            cfg=1.0,
+            sampler_name="euler",
+            scheduler="simple",
+            denoise=1.0,
+            num_frames=17,
+            frame_rate=8.0,
+            prefetch_count=1,
+            image_bytes=b"first-bytes",
+            filename="first.png",
+            image_inputs=[
+                (b"first-bytes", "first.png"),
+                (b"second-bytes", "second.png"),
+            ],
+        )
+    finally:
+        await client.aclose()
+
+    assert videos[0].data == b"i2v-bytes"
+    assert videos[0].mime_type == "video/mp4"
+    assert upload_count == 1
+    assert seen_prompt is not None
+    prompt = seen_prompt["prompt"]
+    assert prompt["1"]["inputs"]["image"] == "uploaded-1.png"
+    assert prompt["2"]["inputs"]["text"] == "animate the first reference"
+    assert prompt["2"]["inputs"]["frames"] == 17
+    assert prompt["2"]["inputs"]["fps"] == 8.0
+
+
+@pytest.mark.asyncio
+async def test_comfyui_client_image_to_video_workflow_batches_multi_refs(
+    tmp_path,
+) -> None:
+    workflow_path = tmp_path / "image-to-video-batch.json"
+    workflow_path.write_text(
+        json.dumps(
+            {
+                "1": {"class_type": "LoadImage", "inputs": {"image": ""}},
+                "2": {
+                    "class_type": "JoyAI_Echo_SM_KSampler",
+                    "inputs": {"text": "", "image": ["1", 0]},
+                },
+                "9": {"class_type": "SaveVideo", "inputs": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    upload_count = 0
+    seen_prompt: Optional[Dict[str, Any]] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upload_count, seen_prompt
+        if request.method == "GET" and request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {}})
+        if request.method == "POST" and request.url.path == "/upload/image":
+            request.read()
+            upload_count += 1
+            return httpx.Response(200, json={"name": f"uploaded-{upload_count}.png"})
+        if request.method == "POST" and request.url.path == "/prompt":
+            seen_prompt = json.loads(request.read())
+            return httpx.Response(200, json={"prompt_id": "pid-1"})
+        if request.method == "GET" and request.url.path == "/history/pid-1":
+            return httpx.Response(
+                200,
+                json={
+                    "pid-1": {
+                        "outputs": {
+                            "9": {
+                                "videos": [
+                                    {
+                                        "filename": "i2v.mp4",
+                                        "subfolder": "",
+                                        "type": "output",
+                                        "format": "video/h264-mp4",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {"status_str": "success"},
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/view":
+            return httpx.Response(200, content=b"i2v-bytes")
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    client = ComfyUIClient(
+        "http://comfy.test",
+        client=httpx.AsyncClient(transport=transport),
+        workflow_config={
+            "preset": "custom",
+            "image_to_video_workflow_path": str(workflow_path),
+            "max_reference_images": 5,
+            "bindings": {
+                "i2v": {
+                    "prompt": [("2", "text")],
+                    "images": [("2", "image")],
+                }
+            },
+            "poll_interval_seconds": 0.01,
+            "save_video_node_id": "9",
+        },
+    )
+
+    try:
+        videos = await client.generate_video(
+            model="joyai-echo",
+            prompt="animate all references",
+            width=512,
+            height=512,
+            n=1,
+            seed=7,
+            steps=8,
+            cfg=1.0,
+            sampler_name="euler",
+            scheduler="simple",
+            denoise=1.0,
+            num_frames=17,
+            frame_rate=8.0,
+            prefetch_count=1,
+            image_inputs=[
+                (b"first-bytes", "first.png"),
+                (b"second-bytes", "second.png"),
+                (b"third-bytes", "third.png"),
+            ],
+        )
+    finally:
+        await client.aclose()
+
+    assert videos[0].data == b"i2v-bytes"
+    assert upload_count == 3
+    assert seen_prompt is not None
+    prompt = seen_prompt["prompt"]
+    assert prompt["1"]["inputs"]["image"] == "uploaded-1.png"
+    assert prompt["10"]["inputs"]["image"] == "uploaded-2.png"
+    assert prompt["12"]["inputs"]["image"] == "uploaded-3.png"
+    assert prompt["11"]["class_type"] == "ImageBatch"
+    assert prompt["13"]["class_type"] == "ImageBatch"
+    assert prompt["11"]["inputs"]["image1"] == ["1", 0]
+    assert prompt["11"]["inputs"]["image2"] == ["10", 0]
+    assert prompt["13"]["inputs"]["image1"] == ["11", 0]
+    assert prompt["13"]["inputs"]["image2"] == ["12", 0]
+    assert prompt["2"]["inputs"]["image"] == ["13", 0]
+    assert prompt["2"]["inputs"]["text"] == "animate all references"

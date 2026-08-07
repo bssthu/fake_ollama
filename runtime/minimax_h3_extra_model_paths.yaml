@@ -1,5 +1,0 @@
-minimax_h3:
-  base_path: J:\Projects\LLM_Models\MiniMax-H3
-  diffusion_models: diffusion_models
-  text_encoders: text_encoders
-  vae: vae
