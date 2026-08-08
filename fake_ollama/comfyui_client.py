@@ -15,9 +15,10 @@ import mimetypes
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -34,6 +35,7 @@ from .request_data_log import (
 )
 from .vram import (
     VRAM_IDLE_RECLAIM_SECONDS,
+    LocalTargetResourceError,
     MemoryCoordinator,
     MemoryReleaseCandidate,
     VramCoordinator,
@@ -108,6 +110,8 @@ class ComfyUIClient:
         health_path: str = "/system_stats",
         cwd: Optional[str] = None,
         target_name: str = "comfyui",
+        runtime_group: Optional[str] = None,
+        gpu_device: str = "0",
         workflow_config: Optional[Dict[str, Any]] = None,
         vram_coordinator: Optional[VramCoordinator] = None,
         memory_coordinator: Optional[MemoryCoordinator] = None,
@@ -125,6 +129,9 @@ class ComfyUIClient:
         self._health_path = health_path if health_path.startswith("/") else "/" + health_path
         self._cwd = cwd
         self.target_id = f"comfyui:{target_name}"
+        self._gpu_device = str(gpu_device or "0")
+        group_name = str(runtime_group or f"comfyui:{self._base}").strip()
+        self.vram_runtime_group = f"gpu:{self._gpu_device}|{group_name}"
         self._workflow_config = dict(workflow_config or {})
         # Resolve the declarative {t2i, i2i} workflow specs once. Reading the
         # JSON files themselves is deferred to build time so a missing custom
@@ -148,6 +155,8 @@ class ComfyUIClient:
         self._request_refs = 0
         self._last_used = time.monotonic()
         self._loaded_model: Optional[_LoadedModel] = None
+        self._active_prompt_ids: set[str] = set()
+        self._vram_safety_interrupted = False
         self._shutdown_requested = False
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
@@ -179,10 +188,30 @@ class ComfyUIClient:
         await self.stop_if_owned()
 
     def has_vram_reservation(self, model: str) -> bool:
-        return self._loaded_model is not None
+        loaded = self._loaded_model
+        return bool(
+            loaded is not None
+            and loaded.model == model
+            and loaded.estimated_vram_gb > 0
+        )
 
     def has_memory_reservation(self, model: str) -> bool:
-        return self._loaded_model is not None
+        loaded = self._loaded_model
+        return bool(
+            loaded is not None
+            and loaded.model == model
+            and loaded.estimated_memory_gb > 0
+        )
+
+    def invalidate_vram_reservation(self) -> None:
+        if self._loaded_model is not None:
+            self._loaded_model.estimated_vram_gb = 0.0
+
+    def invalidate_memory_reservation(self) -> None:
+        if self._loaded_model is not None:
+            self._loaded_model.estimated_memory_gb = 0.0
+            if self._loaded_model.estimated_vram_gb <= 0:
+                self._loaded_model = None
 
     def _begin_request_lifecycle(self) -> None:
         self._request_refs += 1
@@ -275,7 +304,12 @@ class ComfyUIClient:
     def vram_release_candidates(
         self, *, now: float, idle_seconds: float
     ) -> list[VramReleaseCandidate]:
-        if self._active or self._request_refs or self._loaded_model is None:
+        if (
+            self._active
+            or self._request_refs
+            or self._loaded_model is None
+            or self._loaded_model.estimated_vram_gb <= 0
+        ):
             return []
         loaded = self._loaded_model
         if now - loaded.last_used_monotonic < idle_seconds:
@@ -293,7 +327,10 @@ class ComfyUIClient:
     def vram_force_release_candidates(
         self, *, now: float
     ) -> list[VramReleaseCandidate]:
-        if self._loaded_model is None:
+        if (
+            self._loaded_model is None
+            or self._loaded_model.estimated_vram_gb <= 0
+        ):
             return []
         loaded = self._loaded_model
         return [
@@ -322,7 +359,7 @@ class ComfyUIClient:
                 model=loaded.model,
                 estimated_memory_gb=loaded.estimated_memory_gb,
                 last_used_monotonic=loaded.last_used_monotonic,
-                release=self._release_for_vram,
+                release=self._release_for_memory,
             )
         ]
 
@@ -338,7 +375,7 @@ class ComfyUIClient:
                 model=loaded.model,
                 estimated_memory_gb=loaded.estimated_memory_gb,
                 last_used_monotonic=loaded.last_used_monotonic,
-                release=lambda: self._release_for_vram(force=True),
+                release=lambda: self._release_for_memory(force=True),
             )
         ]
 
@@ -409,7 +446,7 @@ class ComfyUIClient:
     async def _ensure_ready(self) -> None:
         if await self._healthy():
             return
-        self._clear_all_vram_state()
+        self._invalidate_runtime_resources(full=True)
         if self._shutdown_requested:
             raise httpx.ConnectError(
                 "ComfyUI target is unavailable and fake-ollama is shutting down; "
@@ -464,6 +501,10 @@ class ComfyUIClient:
         denoise: float,
         estimated_vram_gb: Optional[float] = None,
         estimated_memory_gb: Optional[float] = None,
+        request_vram_headroom_gb: float = 0.0,
+        min_free_vram_gb: float = 0.0,
+        vram_cleanup_policy: str = "keep",
+        exclusive_gpu: bool = False,
     ) -> List[ComfyUIImage]:
         return await self._run(
             mode="t2i",
@@ -482,6 +523,10 @@ class ComfyUIClient:
             },
             estimated_vram_gb=estimated_vram_gb,
             estimated_memory_gb=estimated_memory_gb,
+            request_vram_headroom_gb=request_vram_headroom_gb,
+            min_free_vram_gb=min_free_vram_gb,
+            vram_cleanup_policy=vram_cleanup_policy,
+            exclusive_gpu=exclusive_gpu,
             operation="generate_image",
         )
 
@@ -504,6 +549,10 @@ class ComfyUIClient:
         denoise: float,
         estimated_vram_gb: Optional[float] = None,
         estimated_memory_gb: Optional[float] = None,
+        request_vram_headroom_gb: float = 0.0,
+        min_free_vram_gb: float = 0.0,
+        vram_cleanup_policy: str = "keep",
+        exclusive_gpu: bool = False,
     ) -> List[ComfyUIImage]:
         return await self._run(
             mode="i2i",
@@ -522,6 +571,10 @@ class ComfyUIClient:
             },
             estimated_vram_gb=estimated_vram_gb,
             estimated_memory_gb=estimated_memory_gb,
+            request_vram_headroom_gb=request_vram_headroom_gb,
+            min_free_vram_gb=min_free_vram_gb,
+            vram_cleanup_policy=vram_cleanup_policy,
+            exclusive_gpu=exclusive_gpu,
             operation="edit_image",
             image_bytes=image_bytes,
             filename=filename,
@@ -549,6 +602,10 @@ class ComfyUIClient:
         enable_streaming: bool = False,
         estimated_vram_gb: Optional[float] = None,
         estimated_memory_gb: Optional[float] = None,
+        request_vram_headroom_gb: float = 0.0,
+        min_free_vram_gb: float = 0.0,
+        vram_cleanup_policy: str = "keep",
+        exclusive_gpu: bool = False,
         image_bytes: Optional[bytes] = None,
         filename: Optional[str] = None,
         image_inputs: Optional[List[Tuple[bytes, str]]] = None,
@@ -578,6 +635,10 @@ class ComfyUIClient:
             },
             estimated_vram_gb=estimated_vram_gb,
             estimated_memory_gb=estimated_memory_gb,
+            request_vram_headroom_gb=request_vram_headroom_gb,
+            min_free_vram_gb=min_free_vram_gb,
+            vram_cleanup_policy=vram_cleanup_policy,
+            exclusive_gpu=exclusive_gpu,
             operation="generate_video",
             image_bytes=image_bytes,
             filename=filename,
@@ -628,6 +689,10 @@ class ComfyUIClient:
         params: Dict[str, Any],
         estimated_vram_gb: Optional[float],
         estimated_memory_gb: Optional[float] = None,
+        request_vram_headroom_gb: float = 0.0,
+        min_free_vram_gb: float = 0.0,
+        vram_cleanup_policy: str = "keep",
+        exclusive_gpu: bool = False,
         operation: str,
         image_bytes: Optional[bytes] = None,
         filename: Optional[str] = None,
@@ -649,65 +714,150 @@ class ComfyUIClient:
         n = max(1, int(n))
         self._begin_request_lifecycle()
         try:
-            await self._ensure_vram(model, estimated_vram_gb)
-            try:
-                await self._ensure_memory(model, estimated_memory_gb)
-                await self._ensure_ready()
-            except BaseException:
-                self._discard_vram_pending(model)
-                self._discard_memory_pending(model)
-                raise
-            self._active += 1
-            try:
-                self._mark_vram_reserved(model, estimated_vram_gb)
-                self._mark_memory_reserved(model, estimated_memory_gb)
-                base: Dict[str, Any] = {**params, "prompt": prompt}
-                uploads: List[str] = []
-                refs = list(image_inputs or [])
-                if not refs and image_bytes is not None:
-                    refs = [(image_bytes, filename or "input.png")]
-                ref_limit = self._image_ref_limit(spec)
-                if ref_limit is not None:
-                    refs = refs[:ref_limit]
-                for idx, (ref_bytes, ref_name) in enumerate(refs, start=1):
-                    uploads.append(
-                        await self._upload_image(
-                            ref_bytes, ref_name or f"input-{idx}.png"
-                        )
-                    )
-                if uploads:
-                    base["image"] = uploads[0]
-                    base["images"] = uploads
-                    base["image_count"] = len(uploads)
-                    for idx, uploaded in enumerate(uploads, start=1):
-                        base[f"image_{idx}"] = uploaded
-                images: List[ComfyUIImage] = []
-                if spec.binds("batch_size"):
-                    # The workflow batches natively: one submission yields n.
-                    workflow = self._build_workflow(
-                        spec, {**base, "batch_size": n, "seed": int(seed)}
-                    )
-                    images.extend(
-                        await self._submit_and_collect(workflow, operation=operation)
-                    )
-                else:
-                    # No batch slot (e.g. single-image edit graphs): loop with
-                    # an advancing seed so the n outputs differ.
-                    for idx in range(n):
-                        workflow = self._build_workflow(
-                            spec, {**base, "batch_size": 1, "seed": int(seed) + idx}
-                        )
-                        images.extend(
-                            await self._submit_and_collect(
-                                workflow, operation=operation
+            scaled_headroom_gb, workload_key = self._vram_workload(
+                spec,
+                mode=mode,
+                model=model,
+                n=n,
+                params=params,
+                base_headroom_gb=request_vram_headroom_gb,
+            )
+            admission_vram_gb = estimated_vram_gb
+            if admission_vram_gb is not None:
+                admission_vram_gb += max(
+                    0.0,
+                    scaled_headroom_gb
+                    - max(0.0, float(request_vram_headroom_gb)),
+                )
+            async with self._execution_guard(
+                model=model,
+                reload_vram_gb=float(admission_vram_gb or 0.0),
+                workload_key=workload_key,
+                request_headroom_gb=scaled_headroom_gb,
+                min_free_vram_gb=min_free_vram_gb,
+                cleanup_policy=vram_cleanup_policy,
+                exclusive=exclusive_gpu,
+            ):
+                await self._ensure_vram(model, admission_vram_gb)
+                try:
+                    await self._ensure_memory(model, estimated_memory_gb)
+                    await self._ensure_ready()
+                except BaseException:
+                    self._discard_vram_pending(model)
+                    self._discard_memory_pending(model)
+                    raise
+                self._active += 1
+                try:
+                    self._mark_vram_reserved(model, estimated_vram_gb)
+                    self._mark_memory_reserved(model, estimated_memory_gb)
+                    base: Dict[str, Any] = {**params, "prompt": prompt}
+                    uploads: List[str] = []
+                    refs = list(image_inputs or [])
+                    if not refs and image_bytes is not None:
+                        refs = [(image_bytes, filename or "input.png")]
+                    ref_limit = self._image_ref_limit(spec)
+                    if ref_limit is not None:
+                        refs = refs[:ref_limit]
+                    for idx, (ref_bytes, ref_name) in enumerate(refs, start=1):
+                        uploads.append(
+                            await self._upload_image(
+                                ref_bytes, ref_name or f"input-{idx}.png"
                             )
                         )
-                return images[:n]
-            finally:
-                self._active -= 1
+                    if uploads:
+                        base["image"] = uploads[0]
+                        base["images"] = uploads
+                        base["image_count"] = len(uploads)
+                        for idx, uploaded in enumerate(uploads, start=1):
+                            base[f"image_{idx}"] = uploaded
+                    images: List[ComfyUIImage] = []
+                    if spec.binds("batch_size"):
+                        # The workflow batches natively: one submission yields n.
+                        workflow = self._build_workflow(
+                            spec, {**base, "batch_size": n, "seed": int(seed)}
+                        )
+                        images.extend(
+                            await self._submit_and_collect(workflow, operation=operation)
+                        )
+                    else:
+                        # No batch slot (e.g. single-image edit graphs): loop with
+                        # an advancing seed so the n outputs differ.
+                        for idx in range(n):
+                            workflow = self._build_workflow(
+                                spec, {**base, "batch_size": 1, "seed": int(seed) + idx}
+                            )
+                            images.extend(
+                                await self._submit_and_collect(
+                                    workflow, operation=operation
+                                )
+                            )
+                    return images[:n]
+                finally:
+                    self._active -= 1
         finally:
             self._touch_vram_reservation(model)
             self._end_request_lifecycle()
+
+    def _vram_workload(
+        self,
+        spec: WorkflowSpec,
+        *,
+        mode: str,
+        model: str,
+        n: int,
+        params: Dict[str, Any],
+        base_headroom_gb: float,
+    ) -> tuple[float, str]:
+        width = max(1, int(params.get("width") or 1))
+        height = max(1, int(params.get("height") or 1))
+        default_width = max(1, int(self._workflow_config.get("default_width") or width))
+        default_height = max(1, int(self._workflow_config.get("default_height") or height))
+        scale = max(1.0, (width * height) / (default_width * default_height))
+        frames = max(1, int(params.get("num_frames") or 1))
+        if mode in {"video", "i2v", "fl2va", "l2va"}:
+            default_frames = max(
+                1, int(self._workflow_config.get("default_num_frames") or frames)
+            )
+            scale *= max(1.0, frames / default_frames)
+        native_batch = n if spec.binds("batch_size") else 1
+        scale *= max(1, native_batch)
+        headroom_gb = max(0.0, float(base_headroom_gb)) * scale
+        workload_key = (
+            f"{self.vram_runtime_group}|{model}|{mode}|{width}x{height}"
+            f"|frames={frames}|batch={native_batch}"
+        )
+        return headroom_gb, workload_key
+
+    @asynccontextmanager
+    async def _execution_guard(
+        self,
+        *,
+        model: str,
+        workload_key: str,
+        reload_vram_gb: float,
+        request_headroom_gb: float,
+        min_free_vram_gb: float,
+        cleanup_policy: str,
+        exclusive: bool,
+    ) -> AsyncIterator[None]:
+        if self._vram_coordinator is None:
+            yield
+            return
+        self._vram_safety_interrupted = False
+        lease = await self._vram_coordinator.acquire_execution(
+            self,
+            model=model,
+            workload_key=workload_key,
+            reload_vram_gb=reload_vram_gb,
+            request_headroom_gb=request_headroom_gb,
+            min_free_vram_gb=min_free_vram_gb,
+            cleanup_policy=cleanup_policy,
+            exclusive=exclusive,
+            cleanup=self._adaptive_unload_gpu,
+            interrupt=self._interrupt_active_prompt,
+        )
+        async with lease:
+            yield
 
     @staticmethod
     def _image_ref_limit(spec: WorkflowSpec) -> Optional[int]:
@@ -800,9 +950,18 @@ class ComfyUIClient:
         *,
         operation: str,
     ) -> List[ComfyUIImage]:
+        if self._vram_safety_interrupted:
+            raise LocalTargetResourceError(
+                "ComfyUI prompt was not submitted because GPU VRAM fell below "
+                "the configured safety floor during model preparation."
+            )
         prompt_id = await self._queue_prompt(workflow, operation=operation)
-        history = await self._wait_for_history(prompt_id, operation=operation)
-        return await self._collect_outputs(history, operation=operation)
+        self._active_prompt_ids.add(prompt_id)
+        try:
+            history = await self._wait_for_history(prompt_id, operation=operation)
+            return await self._collect_outputs(history, operation=operation)
+        finally:
+            self._active_prompt_ids.discard(prompt_id)
 
     async def _queue_prompt(self, workflow: Dict[str, Any], *, operation: str) -> str:
         url = f"{self._base}/prompt"
@@ -878,6 +1037,11 @@ class ComfyUIClient:
         url = f"{self._base}/history/{prompt_id}"
         headers = self._headers()
         while time.monotonic() < deadline:
+            if self._vram_safety_interrupted:
+                raise LocalTargetResourceError(
+                    f"ComfyUI workflow {prompt_id} was interrupted because GPU VRAM "
+                    "fell below the configured safety floor."
+                )
             resp = await self._client.get(url, headers=headers)
             if resp.status_code >= 400:
                 resp.raise_for_status()
@@ -1179,8 +1343,20 @@ class ComfyUIClient:
     async def _release_for_vram(self, *, force: bool = False) -> bool:
         if not force and (self._active or self._request_refs):
             return False
+        if self._loaded_model is None or self._loaded_model.estimated_vram_gb <= 0:
+            return True
         if await self._free_memory():
-            self._clear_all_vram_state()
+            return True
+        if self._started_by_us or self._stop_command:
+            return await self.stop_if_owned()
+        return False
+
+    async def _release_for_memory(self, *, force: bool = False) -> bool:
+        if not force and (self._active or self._request_refs):
+            return False
+        if self._loaded_model is None or self._loaded_model.estimated_memory_gb <= 0:
+            return True
+        if await self._free_memory():
             return True
         if self._started_by_us or self._stop_command:
             return await self.stop_if_owned()
@@ -1197,6 +1373,7 @@ class ComfyUIClient:
             await resp.aread()
             if 200 <= resp.status_code < 300:
                 logger.info("requested ComfyUI model unload/free_memory at %s", self._base)
+                self._invalidate_runtime_resources(full=True)
                 return True
             logger.warning(
                 "ComfyUI /free returned status=%s body=%s",
@@ -1206,6 +1383,76 @@ class ComfyUIClient:
         except httpx.HTTPError as exc:
             logger.warning("failed to call ComfyUI /free at %s: %s", self._base, exc)
         return False
+
+    async def _adaptive_unload_gpu(self) -> bool:
+        """Unload runtime GPU weights without resetting ComfyUI's object cache."""
+
+        if self._active:
+            return False
+        if (
+            self._vram_coordinator is not None
+            and self._vram_coordinator.runtime_group_active_requests(
+                self.vram_runtime_group
+            )
+        ):
+            return False
+        try:
+            resp = await self._client.post(
+                f"{self._base}/free",
+                json={"unload_models": True, "free_memory": False},
+                headers=self._headers(),
+                timeout=min(30.0, self._timeout),
+            )
+            await resp.aread()
+            if 200 <= resp.status_code < 300:
+                logger.info(
+                    "requested adaptive ComfyUI GPU model unload at %s without cache reset",
+                    self._base,
+                )
+                self._invalidate_runtime_resources(full=False)
+                return True
+            logger.warning(
+                "ComfyUI adaptive /free returned status=%s body=%s",
+                resp.status_code,
+                resp.text,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("failed adaptive ComfyUI /free at %s: %s", self._base, exc)
+        return False
+
+    async def _interrupt_active_prompt(self) -> bool:
+        try:
+            resp = await self._client.post(
+                f"{self._base}/interrupt",
+                json={},
+                headers=self._headers(),
+                timeout=min(10.0, self._timeout),
+            )
+            await resp.aread()
+            ok = 200 <= resp.status_code < 300
+            if ok:
+                self._vram_safety_interrupted = True
+                logger.warning(
+                    "requested ComfyUI interrupt at %s for active prompt(s) %s",
+                    self._base,
+                    sorted(self._active_prompt_ids),
+                )
+            return ok
+        except httpx.HTTPError as exc:
+            logger.warning("failed to interrupt ComfyUI at %s: %s", self._base, exc)
+            return False
+
+    def _invalidate_runtime_resources(self, *, full: bool) -> None:
+        if self._vram_coordinator is not None:
+            self._vram_coordinator.invalidate_runtime_group(self.vram_runtime_group)
+        self.invalidate_vram_reservation()
+        if full:
+            invalidate_memory = getattr(
+                self._memory_coordinator, "invalidate_runtime_group", None
+            )
+            if callable(invalidate_memory):
+                invalidate_memory(self.vram_runtime_group)
+            self.invalidate_memory_reservation()
 
     async def stop_if_owned(self) -> bool:
         if self._stop_command:
@@ -1219,7 +1466,7 @@ class ComfyUIClient:
             returncode = await proc.wait()
             if returncode == 0:
                 self._started_by_us = False
-                self._clear_all_vram_state()
+                self._invalidate_runtime_resources(full=True)
                 return True
             logger.warning("ComfyUI target stop_command exited with status %s", returncode)
             return False
@@ -1231,7 +1478,7 @@ class ComfyUIClient:
                     logger.warning("failed to terminate owned ComfyUI target process tree")
                     return False
                 self._started_by_us = False
-                self._clear_all_vram_state()
+                self._invalidate_runtime_resources(full=True)
                 return True
             logger.warning(
                 "owned ComfyUI target launcher process already exited; cannot stop "

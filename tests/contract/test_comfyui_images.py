@@ -51,6 +51,9 @@ def _settings() -> Settings:
                 "capabilities": ["image_generation", "image_edit"],
                 "context_length": 4096,
                 "estimated_vram_gb": 16.0,
+                "request_vram_headroom_gb": 2.0,
+                "min_free_vram_gb": 2.0,
+                "vram_cleanup_policy": "adaptive",
             }
         ],
     )
@@ -131,6 +134,10 @@ def test_openai_image_generations_routes_to_comfyui_default_model() -> None:
     assert fake.generate_calls[0]["height"] == 512
     assert fake.generate_calls[0]["n"] == 2
     assert fake.generate_calls[0]["estimated_vram_gb"] == 16.0
+    assert fake.generate_calls[0]["request_vram_headroom_gb"] == 2.0
+    assert fake.generate_calls[0]["min_free_vram_gb"] == 2.0
+    assert fake.generate_calls[0]["vram_cleanup_policy"] == "adaptive"
+    assert fake.generate_calls[0]["exclusive_gpu"] is False
 
 
 def test_playground_models_uses_comfyui_target_profile() -> None:

@@ -138,6 +138,10 @@ class ModelProfile:
     show_thinking: bool = True
     estimated_vram_gb: Optional[float] = None
     estimated_memory_gb: Optional[float] = None
+    request_vram_headroom_gb: float = 0.0
+    min_free_vram_gb: float = 0.0
+    vram_cleanup_policy: str = "keep"
+    exclusive_gpu: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelProfile":
@@ -173,6 +177,33 @@ class ModelProfile:
                     estimated_memory_gb = parsed_mem
             except (TypeError, ValueError):
                 estimated_memory_gb = None
+        request_vram_headroom_gb = 0.0
+        try:
+            request_vram_headroom_gb = max(
+                0.0, float(data.get("request_vram_headroom_gb") or 0.0)
+            )
+        except (TypeError, ValueError):
+            pass
+        min_free_vram_gb = 0.0
+        try:
+            min_free_vram_gb = max(
+                0.0, float(data.get("min_free_vram_gb") or 0.0)
+            )
+        except (TypeError, ValueError):
+            pass
+        cleanup_policy = str(data.get("vram_cleanup_policy") or "keep").lower()
+        if cleanup_policy not in {"keep", "adaptive", "unload"}:
+            cleanup_policy = "keep"
+        raw_exclusive = data.get("exclusive_gpu", False)
+        if isinstance(raw_exclusive, str):
+            exclusive_gpu = raw_exclusive.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        else:
+            exclusive_gpu = bool(raw_exclusive)
         return cls(
             capabilities=[str(c) for c in caps],
             context_length=int(ctx),
@@ -182,6 +213,10 @@ class ModelProfile:
             show_thinking=True if show is None else bool(show),
             estimated_vram_gb=estimated_vram_gb,
             estimated_memory_gb=estimated_memory_gb,
+            request_vram_headroom_gb=request_vram_headroom_gb,
+            min_free_vram_gb=min_free_vram_gb,
+            vram_cleanup_policy=cleanup_policy,
+            exclusive_gpu=exclusive_gpu,
         )
 
 
@@ -859,6 +894,12 @@ class ComfyUITarget(BaseModel):
     name: str = ""
     base_url: str = "http://127.0.0.1:8188"
     auth_token: str = ""
+    # Targets that point at the same ComfyUI process must share runtime state.
+    # The default derives this group from base_url; override only for unusual
+    # proxy/process layouts. gpu_device is included in the group key so the
+    # governor can keep device-local residency separate.
+    vram_runtime_group: Optional[str] = None
+    gpu_device: str = "0"
 
     # Single public source-level model served by this target.
     model: str = "z-image-turbo"
@@ -1001,6 +1042,19 @@ class ComfyUITarget(BaseModel):
             return None
         value = v.strip()
         return value or None
+
+    @field_validator("vram_runtime_group")
+    @classmethod
+    def _runtime_group_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = v.strip()
+        return value or None
+
+    @field_validator("gpu_device")
+    @classmethod
+    def _gpu_device_clean(cls, v: str) -> str:
+        return str(v or "0").strip() or "0"
 
     @field_validator("context_ir_prompt_mode")
     @classmethod
@@ -1221,6 +1275,9 @@ class ComfyUITarget(BaseModel):
             "load_image_node_id",
             "image_scale_node_id",
             "max_reference_images",
+            "default_width",
+            "default_height",
+            "default_num_frames",
         ]
         return {key: getattr(self, key) for key in keys}
 

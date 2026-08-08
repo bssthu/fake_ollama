@@ -131,6 +131,10 @@ def _settings(*, attach_video: bool = False) -> Settings:
         profiles["h3-local@h3-comfy"] = {
             "capabilities": ["video_generation"],
             "estimated_vram_gb": 18,
+            "request_vram_headroom_gb": 6,
+            "min_free_vram_gb": 2,
+            "vram_cleanup_policy": "adaptive",
+            "exclusive_gpu": True,
         }
     return Settings(
         openai_upstreams=[
@@ -721,6 +725,10 @@ def test_video_generation_runs_context_ir_before_comfy_and_returns_revised_promp
     assert call["prompt"].startswith("integrated_multimodal_description:")
     assert response.json()["data"][0]["revised_prompt"] == call["prompt"]
     assert call["video_mode"] == "t2va"
+    assert call["request_vram_headroom_gb"] == 6
+    assert call["min_free_vram_gb"] == 2
+    assert call["vram_cleanup_policy"] == "adaptive"
+    assert call["exclusive_gpu"] is True
     assert len(planner.calls) == 1
 
 

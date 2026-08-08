@@ -72,6 +72,7 @@ class LocalTargetResourceError(httpx.ConnectError):
 
 
 ReleaseCallback = Callable[[], Awaitable[bool]]
+InterruptCallback = Callable[[], Awaitable[bool]]
 
 
 @dataclass
@@ -148,18 +149,81 @@ class _PendingEntry:
     confirmed_loaded_at: Optional[float] = None
 
 
+@dataclass
+class _ExecutionLeaseState:
+    lease_id: int
+    owner_id: str
+    runtime_group: str
+    model: str
+    workload_key: str
+    reserved_headroom_mib: float
+    min_free_mib: float
+    exclusive: bool
+    resident_at_start: bool
+    baseline_free_mib: float
+    minimum_free_mib: float
+    interrupt: Optional[InterruptCallback]
+    cleanup: Optional[ReleaseCallback]
+    monitor_task: Optional[asyncio.Task[None]] = None
+    interrupted: bool = False
+    breached: bool = False
+
+
+class VramExecutionLease:
+    """A request-duration GPU lease returned by :class:`VramCoordinator`.
+
+    Admission and model residency are deliberately separate.  A resident model
+    may have zero *load* cost while its next inference still needs several GiB
+    of transient workspace.  This lease keeps that request headroom accounted
+    for until the workflow has fully completed.
+    """
+
+    def __init__(
+        self,
+        coordinator: "VramCoordinator",
+        state: _ExecutionLeaseState,
+        *,
+        cleaned_for_headroom: bool,
+    ) -> None:
+        self._coordinator = coordinator
+        self._state = state
+        self.cleaned_for_headroom = cleaned_for_headroom
+        self._released = False
+
+    @property
+    def minimum_free_mib(self) -> float:
+        return self._state.minimum_free_mib
+
+    @property
+    def breached(self) -> bool:
+        return self._state.breached
+
+    async def __aenter__(self) -> "VramExecutionLease":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if not self._released:
+            self._released = True
+            await self._coordinator.release_execution(self._state.lease_id)
+
+
 # ---------------------------------------------------------------------------
 # Live readings
 # ---------------------------------------------------------------------------
 
 
 async def nvidia_smi_free_vram_mib() -> Optional[float]:
-    """Return total free NVIDIA GPU VRAM in MiB, or None if unavailable."""
+    """Return free MiB on the most constrained NVIDIA GPU, if available.
+
+    Model profiles describe one device's capacity. Summing multiple GPUs would
+    let a job pass admission even when no individual card can hold it, so the
+    shared default governor deliberately uses the minimum device reading.
+    """
     return await _nvidia_smi_query("memory.free")
 
 
 async def nvidia_smi_total_vram_mib() -> Optional[float]:
-    """Return total NVIDIA GPU VRAM (capacity) in MiB, or None if unavailable."""
+    """Return capacity of the smallest NVIDIA GPU in MiB, if available."""
     return await _nvidia_smi_query("memory.total")
 
 
@@ -186,18 +250,16 @@ async def _nvidia_smi_query(field_name: str) -> Optional[float]:
     if proc.returncode != 0:
         return None
 
-    total = 0.0
-    found = False
+    values: list[float] = []
     for raw_line in stdout.decode("utf-8", errors="ignore").splitlines():
         line = raw_line.strip()
         if not line:
             continue
         try:
-            total += float(line.split()[0])
-            found = True
+            values.append(float(line.split()[0]))
         except (ValueError, IndexError):
             continue
-    return total if found else None
+    return min(values) if values else None
 
 
 def system_memory_status_mib() -> tuple[Optional[float], Optional[float]]:
@@ -800,6 +862,342 @@ class VramCoordinator(_ResourceCoordinator):
             ),
             spec=_VRAM_SPEC,
         )
+        self._execution_condition = asyncio.Condition()
+        self._execution_leases: dict[int, _ExecutionLeaseState] = {}
+        self._next_execution_lease_id = 1
+        self._observed_headroom_mib: dict[str, float] = {}
+
+    @staticmethod
+    def runtime_group_for(participant: Any) -> str:
+        value = getattr(participant, "vram_runtime_group", None)
+        return str(value or participant.target_id)
+
+    def invalidate_runtime_group(self, runtime_group: str) -> list[str]:
+        """Invalidate every participant affected by one runtime-wide unload.
+
+        ComfyUI's ``/free`` endpoint operates on the whole server process.  A
+        target-local reservation therefore becomes stale when a sibling target
+        sharing the same base URL unloads models.  Participants opt into the
+        group by exposing ``vram_runtime_group`` and an invalidation callback.
+        """
+
+        invalidated: list[str] = []
+        for participant in list(self._participants.values()):
+            if self.runtime_group_for(participant) != runtime_group:
+                continue
+            callback = getattr(participant, "invalidate_vram_reservation", None)
+            if callable(callback):
+                callback()
+            for key in list(self._pending):
+                if key[0] == participant.target_id:
+                    self._pending.pop(key, None)
+            invalidated.append(participant.target_id)
+        return invalidated
+
+    def runtime_group_active_requests(self, runtime_group: str) -> int:
+        return sum(
+            int(getattr(participant, "active_requests", 0) or 0)
+            for participant in self._participants.values()
+            if self.runtime_group_for(participant) == runtime_group
+        )
+
+    def observed_headroom_mib(self, workload_key: str) -> float:
+        return max(0.0, self._observed_headroom_mib.get(workload_key, 0.0))
+
+    def observed_headroom_snapshots(self) -> list[dict[str, object]]:
+        return [
+            {"workload_key": key, "observed_headroom_mib": value}
+            for key, value in sorted(self._observed_headroom_mib.items())
+        ]
+
+    def execution_snapshots(self) -> list[dict[str, object]]:
+        return [
+            {
+                "lease_id": state.lease_id,
+                "owner_id": state.owner_id,
+                "runtime_group": state.runtime_group,
+                "model": state.model,
+                "workload_key": state.workload_key,
+                "reserved_headroom_mib": state.reserved_headroom_mib,
+                "min_free_mib": state.min_free_mib,
+                "minimum_free_mib": state.minimum_free_mib,
+                "exclusive": state.exclusive,
+                "breached": state.breached,
+            }
+            for state in self._execution_leases.values()
+        ]
+
+    def _effective_free_mib(
+        self, free_mib: float, *, exclude_key: Optional[tuple[str, str]] = None
+    ) -> float:
+        effective = super()._effective_free_mib(
+            free_mib, exclude_key=exclude_key
+        )
+        excluded_owner = exclude_key[0] if exclude_key is not None else None
+        other_leases = [
+            state
+            for state in self._execution_leases.values()
+            if state.owner_id != excluded_owner
+        ]
+        if any(state.exclusive for state in other_leases):
+            return 0.0
+        return max(
+            0.0,
+            effective
+            - sum(state.reserved_headroom_mib for state in other_leases),
+        )
+
+    async def acquire_execution(
+        self,
+        requester: VramParticipant,
+        *,
+        model: str,
+        workload_key: str,
+        reload_vram_gb: float = 0.0,
+        request_headroom_gb: float = 0.0,
+        min_free_vram_gb: float = 0.0,
+        cleanup_policy: str = "keep",
+        exclusive: bool = False,
+        cleanup: Optional[ReleaseCallback] = None,
+        interrupt: Optional[InterruptCallback] = None,
+    ) -> VramExecutionLease:
+        """Queue and admit one full inference execution.
+
+        Existing residency is intentionally *not* treated as zero-cost here.
+        For a resident model, live free VRAM must still cover its transient
+        request headroom plus the configured safety floor.  ``adaptive`` may
+        unload GPU weights while retaining the engine's CPU/object cache, then
+        normal model-load admission runs again inside the returned lease.
+        """
+
+        policy = str(cleanup_policy or "keep").strip().lower()
+        if policy not in {"keep", "adaptive", "unload"}:
+            policy = "keep"
+        runtime_group = self.runtime_group_for(requester)
+        configured_headroom_mib = _gb_to_mib(max(0.0, request_headroom_gb))
+        learned_headroom_mib = self.observed_headroom_mib(workload_key)
+        headroom_mib = max(configured_headroom_mib, learned_headroom_mib)
+        floor_mib = _gb_to_mib(max(0.0, min_free_vram_gb))
+        reload_mib = _gb_to_mib(max(0.0, reload_vram_gb))
+        cleaned = False
+
+        if headroom_mib > 0 and self._cached_total_mib is None:
+            await self._total_mib()
+
+        async with self._execution_condition:
+            while True:
+                if exclusive and any(
+                    int(getattr(participant, "active_requests", 0) or 0) > 0
+                    and participant.target_id != requester.target_id
+                    for participant in self._participants.values()
+                ):
+                    # Legacy local clients use load admission rather than a
+                    # request-duration lease. Poll their active counter so a
+                    # high-variance video job queues behind in-flight text work
+                    # instead of overlapping it.
+                    try:
+                        await asyncio.wait_for(
+                            self._execution_condition.wait(), timeout=0.5
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                if not self._execution_compatible(
+                    runtime_group=runtime_group,
+                    exclusive=exclusive,
+                    headroom_mib=headroom_mib,
+                    floor_mib=floor_mib,
+                ):
+                    await self._execution_condition.wait()
+                    continue
+
+                available_mib = await self._provider()
+                if available_mib is None:
+                    raise LocalTargetResourceError(
+                        f"Unable to determine available GPU VRAM for local model "
+                        f"'{model or requester.target_id}'. "
+                        f"{_VRAM_SPEC.unavailable_hint}"
+                    )
+                reserved_by_others = sum(
+                    state.reserved_headroom_mib
+                    for state in self._execution_leases.values()
+                )
+                effective_free_mib = max(0.0, available_mib - reserved_by_others)
+                resident = bool(requester.has_vram_reservation(model))
+                required_mib = floor_mib + (headroom_mib if resident else 0.0)
+
+                should_clean = resident and (
+                    policy == "unload"
+                    or (policy == "adaptive" and effective_free_mib < required_mib)
+                )
+                if should_clean and cleanup is not None:
+                    logger.info(
+                        "local model %s on %s has %s effective free VRAM; "
+                        "request needs %s transient headroom plus %s safety floor; "
+                        "requesting %s runtime cleanup",
+                        model or requester.target_id,
+                        runtime_group,
+                        _fmt_gib(effective_free_mib),
+                        _fmt_gib(headroom_mib),
+                        _fmt_gib(floor_mib),
+                        policy,
+                    )
+                    cleaned = bool(await cleanup())
+                    if cleaned:
+                        available_mib = await self._wait_for_raw_available_after_release(
+                            max(floor_mib, reload_mib)
+                        ) or 0.0
+                        effective_free_mib = max(
+                            0.0, available_mib - reserved_by_others
+                        )
+                        resident = bool(requester.has_vram_reservation(model))
+                        required_mib = floor_mib + (
+                            headroom_mib if resident else 0.0
+                        )
+                        if reload_mib > 0 and effective_free_mib < reload_mib:
+                            raise LocalTargetResourceError(
+                                f"GPU VRAM cleanup for local model "
+                                f"'{model or requester.target_id}' completed, but only "
+                                f"{_fmt_gib(effective_free_mib)} became available; "
+                                f"about {_fmt_gib(reload_mib)} is required to reload it. "
+                                "No prompt was submitted."
+                            )
+
+                if effective_free_mib < required_mib:
+                    # An already-running lease may be consuming the live free
+                    # reading even when weighted admission allowed both. Queue
+                    # until it exits; with no active lease this is a real
+                    # admission failure and must not reach ComfyUI /prompt.
+                    if self._execution_leases:
+                        await self._execution_condition.wait()
+                        continue
+                    raise LocalTargetResourceError(
+                        f"Insufficient GPU VRAM headroom to run local model "
+                        f"'{model or requester.target_id}': current effective free "
+                        f"is {_fmt_gib(effective_free_mib)}, but this request needs "
+                        f"{_fmt_gib(headroom_mib)} transient headroom plus "
+                        f"{_fmt_gib(floor_mib)} safety reserve. No prompt was submitted."
+                    )
+
+                lease_id = self._next_execution_lease_id
+                self._next_execution_lease_id += 1
+                state = _ExecutionLeaseState(
+                    lease_id=lease_id,
+                    owner_id=requester.target_id,
+                    runtime_group=runtime_group,
+                    model=model,
+                    workload_key=workload_key,
+                    reserved_headroom_mib=headroom_mib,
+                    min_free_mib=floor_mib,
+                    exclusive=exclusive,
+                    resident_at_start=resident,
+                    baseline_free_mib=available_mib,
+                    minimum_free_mib=available_mib,
+                    interrupt=interrupt,
+                    cleanup=cleanup,
+                )
+                self._execution_leases[lease_id] = state
+                state.monitor_task = asyncio.create_task(
+                    self._monitor_execution(state),
+                    name=f"vram-execution-monitor-{lease_id}",
+                )
+                return VramExecutionLease(
+                    self, state, cleaned_for_headroom=cleaned
+                )
+
+    def _execution_compatible(
+        self,
+        *,
+        runtime_group: str,
+        exclusive: bool,
+        headroom_mib: float,
+        floor_mib: float,
+    ) -> bool:
+        leases = list(self._execution_leases.values())
+        if any(state.runtime_group == runtime_group for state in leases):
+            return False
+        if exclusive:
+            return not leases
+        if any(state.exclusive for state in leases):
+            return False
+        if self._cached_total_mib is None:
+            return True
+        usable_mib = max(0.0, self._cached_total_mib - floor_mib)
+        reserved_mib = sum(state.reserved_headroom_mib for state in leases)
+        return reserved_mib + headroom_mib <= usable_mib
+
+    async def _monitor_execution(self, state: _ExecutionLeaseState) -> None:
+        try:
+            while state.lease_id in self._execution_leases:
+                await asyncio.sleep(0.5)
+                available_mib = await self._provider()
+                if available_mib is None:
+                    continue
+                state.minimum_free_mib = min(state.minimum_free_mib, available_mib)
+                if (
+                    state.min_free_mib > 0
+                    and available_mib < state.min_free_mib
+                    and not state.interrupted
+                ):
+                    state.breached = True
+                    logger.error(
+                        "GPU VRAM safety floor breached for %s on %s: free %s, floor %s; interrupting active workflow",
+                        state.model,
+                        state.runtime_group,
+                        _fmt_gib(available_mib),
+                        _fmt_gib(state.min_free_mib),
+                    )
+                    if state.interrupt is not None:
+                        try:
+                            state.interrupted = bool(await state.interrupt())
+                        except Exception:
+                            state.interrupted = False
+                            logger.warning(
+                                "failed to interrupt workflow after GPU VRAM safety breach",
+                                exc_info=True,
+                            )
+                    else:
+                        state.interrupted = True
+        except asyncio.CancelledError:
+            raise
+
+    async def release_execution(self, lease_id: int) -> None:
+        async with self._execution_condition:
+            state = self._execution_leases.get(lease_id)
+            if state is None:
+                return
+            monitor = state.monitor_task
+            if monitor is not None:
+                monitor.cancel()
+                try:
+                    await monitor
+                except asyncio.CancelledError:
+                    pass
+
+            if state.resident_at_start:
+                observed_mib = max(
+                    0.0, state.baseline_free_mib - state.minimum_free_mib
+                )
+                if observed_mib > 0:
+                    # Keep a small allocator/sampling margin. Learned values
+                    # only move upward and never weaken an explicit profile.
+                    learned_mib = observed_mib + 256.0
+                    previous_mib = self._observed_headroom_mib.get(
+                        state.workload_key, 0.0
+                    )
+                    if learned_mib > previous_mib:
+                        self._observed_headroom_mib[state.workload_key] = learned_mib
+
+            if state.breached and state.cleanup is not None:
+                try:
+                    await state.cleanup()
+                except Exception:
+                    logger.warning(
+                        "failed to clean runtime after GPU VRAM safety breach",
+                        exc_info=True,
+                    )
+            self._execution_leases.pop(lease_id, None)
+            self._execution_condition.notify_all()
 
     async def free_vram_mib(self) -> Optional[float]:
         return await self._free_mib()
@@ -814,6 +1212,20 @@ class VramCoordinator(_ResourceCoordinator):
         model: str = "",
         estimated_vram_gb: Optional[float] = None,
     ) -> None:
+        blocking = next(
+            (
+                state
+                for state in self._execution_leases.values()
+                if state.exclusive and state.owner_id != requester.target_id
+            ),
+            None,
+        )
+        if blocking is not None:
+            raise LocalTargetResourceError(
+                f"GPU is reserved by exclusive local workflow "
+                f"'{blocking.model}' on {blocking.runtime_group}; local model "
+                f"'{model or requester.target_id}' was not started."
+            )
         await self._ensure_available(
             requester, model=model, estimated_gb=estimated_vram_gb
         )
@@ -837,6 +1249,24 @@ class MemoryCoordinator(_ResourceCoordinator):
             ),
             spec=_MEMORY_SPEC,
         )
+
+    def invalidate_runtime_group(self, runtime_group: str) -> list[str]:
+        invalidated: list[str] = []
+        for participant in list(self._participants.values()):
+            participant_group = str(
+                getattr(participant, "vram_runtime_group", None)
+                or participant.target_id
+            )
+            if participant_group != runtime_group:
+                continue
+            callback = getattr(participant, "invalidate_memory_reservation", None)
+            if callable(callback):
+                callback()
+            for key in list(self._pending):
+                if key[0] == participant.target_id:
+                    self._pending.pop(key, None)
+            invalidated.append(participant.target_id)
+        return invalidated
 
     async def free_memory_mib(self) -> Optional[float]:
         return await self._free_mib()

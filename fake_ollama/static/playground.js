@@ -2253,6 +2253,9 @@
     return {
       modelId: els.model.value,
       operationId: op.id,
+      generationBatchId: (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+        ? globalThis.crypto.randomUUID()
+        : `media-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       payload,
       attachments,
       parameters,
@@ -2333,6 +2336,9 @@
 
   function mediaPayloadForRun(plan, runIndex, reusablePrompt = '') {
     const payload = {...plan.payload, n: 1};
+    payload.generation_batch_id = plan.generationBatchId;
+    payload.generation_run_index = runIndex + 1;
+    payload.generation_run_count = plan.runCount;
     const baseSeed = Number(payload.seed);
     if (Number.isSafeInteger(baseSeed)) payload.seed = baseSeed + runIndex;
     if (reusablePrompt && payload.prompt_mode === 'auto') {

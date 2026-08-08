@@ -335,6 +335,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 health_path=tgt.health_path,
                 cwd=tgt.cwd,
                 target_name=tgt.name,
+                runtime_group=tgt.vram_runtime_group,
+                gpu_device=tgt.gpu_device,
                 workflow_config=tgt.workflow_config(),
                 vram_coordinator=app.state.vram_coordinator,
                 memory_coordinator=app.state.memory_coordinator,
@@ -911,6 +913,10 @@ def _playground_model_entry(
         "max_output_tokens": profile.max_output_tokens,
         "estimated_vram_gb": profile.estimated_vram_gb,
         "estimated_memory_gb": profile.estimated_memory_gb,
+        "request_vram_headroom_gb": profile.request_vram_headroom_gb,
+        "min_free_vram_gb": profile.min_free_vram_gb,
+        "vram_cleanup_policy": profile.vram_cleanup_policy,
+        "exclusive_gpu": profile.exclusive_gpu,
         "capabilities": capabilities,
         "operations": operations,
     }
@@ -2253,6 +2259,10 @@ async def _handle_openai_image_generation(request: Request) -> Any:
             prompt=prompt,
             estimated_vram_gb=profile.estimated_vram_gb,
             estimated_memory_gb=profile.estimated_memory_gb,
+            request_vram_headroom_gb=profile.request_vram_headroom_gb,
+            min_free_vram_gb=profile.min_free_vram_gb,
+            vram_cleanup_policy=profile.vram_cleanup_policy,
+            exclusive_gpu=profile.exclusive_gpu,
             **params,
         )
     except httpx.HTTPError as exc:
@@ -2291,6 +2301,10 @@ async def _handle_openai_image_edit(request: Request) -> Any:
             image_inputs=image_inputs,
             estimated_vram_gb=profile.estimated_vram_gb,
             estimated_memory_gb=profile.estimated_memory_gb,
+            request_vram_headroom_gb=profile.request_vram_headroom_gb,
+            min_free_vram_gb=profile.min_free_vram_gb,
+            vram_cleanup_policy=profile.vram_cleanup_policy,
+            exclusive_gpu=profile.exclusive_gpu,
             **params,
         )
     except httpx.HTTPError as exc:
@@ -3041,6 +3055,10 @@ async def _handle_openai_video_generation(request: Request) -> Any:
             video_mode=video_mode,
             estimated_vram_gb=profile.estimated_vram_gb,
             estimated_memory_gb=profile.estimated_memory_gb,
+            request_vram_headroom_gb=profile.request_vram_headroom_gb,
+            min_free_vram_gb=profile.min_free_vram_gb,
+            vram_cleanup_policy=profile.vram_cleanup_policy,
+            exclusive_gpu=profile.exclusive_gpu,
             **params,
         )
     except httpx.HTTPError as exc:

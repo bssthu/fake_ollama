@@ -18,6 +18,40 @@ def _write(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
+def test_media_vram_profile_fields_are_parsed() -> None:
+    settings = Settings.model_validate(
+        {
+            "model_profiles": {
+                "video": {
+                    "request_vram_headroom_gb": 6,
+                    "min_free_vram_gb": 2,
+                    "vram_cleanup_policy": "adaptive",
+                    "exclusive_gpu": True,
+                }
+            }
+        }
+    )
+    profile = settings.profile_for("video")
+    assert profile.request_vram_headroom_gb == 6
+    assert profile.min_free_vram_gb == 2
+    assert profile.vram_cleanup_policy == "adaptive"
+    assert profile.exclusive_gpu is True
+
+
+def test_comfy_runtime_group_defaults_and_overrides() -> None:
+    automatic = ComfyUITarget(name="a", base_url="http://127.0.0.1:21480")
+    explicit = ComfyUITarget(
+        name="b",
+        base_url="http://proxy.test",
+        vram_runtime_group="shared-comfy",
+        gpu_device="1",
+    )
+    assert automatic.vram_runtime_group is None
+    assert automatic.gpu_device == "0"
+    assert explicit.vram_runtime_group == "shared-comfy"
+    assert explicit.gpu_device == "1"
+
+
 # ---------------------------------------------------------------------------
 # Loader & top-level shape
 # ---------------------------------------------------------------------------

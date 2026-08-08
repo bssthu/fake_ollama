@@ -642,6 +642,9 @@ class DashboardState:
             inflight = metrics.inflight_snapshot(limit=200)
             request_stats = metrics.stats(now_wall=now)
         target_telemetry = await _collect_target_telemetry(app)
+        coordinator: VramCoordinator | None = getattr(
+            app.state, "vram_coordinator", None
+        )
         return {
             "now": now,
             "range_seconds": range_seconds,
@@ -660,6 +663,14 @@ class DashboardState:
             "inflight_requests": inflight,
             "request_stats": request_stats,
             "target_telemetry": target_telemetry,
+            "gpu_execution_leases": (
+                coordinator.execution_snapshots() if coordinator is not None else []
+            ),
+            "gpu_observed_headroom": (
+                coordinator.observed_headroom_snapshots()
+                if coordinator is not None
+                else []
+            ),
         }
 
 

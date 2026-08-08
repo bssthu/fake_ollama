@@ -53,7 +53,7 @@
 - **本地 target 生命周期接管**：Ollama / llama.cpp / ComfyUI 都可配置 health check、按需启动脚本、启动超时、空闲回收
 - **H3 Context-IR harness**：把自然语言和最多两张参考图转换成 MiniMax H3 Base Prompt；规划器可在本地纯文字/多模态模型与第三方 API 之间切换，并可串到 ComfyUI 视频生成之前
 - **ComfyUI 图片后端**：可把 Z-Image-Turbo / Qwen-Image-Edit / SenseNova-U1 等 ComfyUI API workflow 暴露为 OpenAI 兼容图片生成 / 图片编辑接口。采用声明式 `preset` + bindings 结构，接入新模型只改配置 + JSON；多个图片模型可共用一个 ComfyUI 实例并由 VRAM 协调器互斥换出，避免爆显存。
-- **本地显存预检**：本地模型可在 `model_profiles` 里填 `estimated_vram_gb`；启动前用 `nvidia-smi` 评估可用显存并尝试回收空闲模型
+- **本地显存治理**：`estimated_vram_gb` 控制模型加载准入；媒体模型还可配置请求瞬时余量、安全下限、自适应 GPU 权重卸载和全程独占租约。相同模型连续运行也会重新检查实时显存
 - **本地内存预检**：部分模型（如 SenseNova / JoyAI 这类会把一部分计算 offload 到内存的 workflow）除显存外还需占用大量主机内存，可在 `model_profiles` 里填 `estimated_memory_gb`；逻辑与显存预检一致，启动前评估可用系统内存并尝试回收空闲模型
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP）
 - **零依赖 Web 编辑器**：按「Forward / Reverse / Shared / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
@@ -228,6 +228,9 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 - `auto_start: true`：health check 失败时执行 `start_command`；`stop_command` / `idle_timeout_seconds` 控制空闲回收。
 - 模型名匹配按 Ollama 规则：`foo` 与 `foo:latest` 等价；省略 tag 只代表 `latest`。
 - 每个本地模型的显存估算在 `model_profiles[*].estimated_vram_gb` 里配置。请求触发模型加载前，fake-ollama 调用 `nvidia-smi` 检查可用显存；不足时按 LRU 卸载其他空闲超过 60 秒的本地模型，每轮重新读真实 free VRAM。
+- 媒体模型可再配置 `request_vram_headroom_gb`（已驻留模型的单次推理瞬时余量）、`min_free_vram_gb`（运行中安全下限）、`vram_cleanup_policy=keep|adaptive|unload` 和 `exclusive_gpu`。余量会按实际分辨率、视频帧数及 workflow 原生 batch 放大；非原生 batch 的串行循环不会重复放大。
+- ComfyUI target 默认以 `gpu_device + base_url` 作为运行时分组，也可用 `vram_runtime_group` 显式覆盖。组内 `/free`、进程退出和健康检查失败会使所有 sibling target 的显存/内存 reservation 一起失效。
+- 多 GPU 主机不会把各卡空闲显存相加后做准入；默认协调器使用最紧张设备的读数并采用全局保守租约，避免“总空闲够、单卡放不下”仍启动任务。`gpu_device` 当前用于隔离运行时状态，不负责跨卡调度。
 - 主机内存估算在 `model_profiles[*].estimated_memory_gb` 里配置，由独立的内存协调器按同样逻辑准入与回收：加载前读取系统可用内存，不足时卸载其他声明了 `estimated_memory_gb` 的空闲模型。Dashboard 的「Model Estimated Memory」面板与 Current Models 表里的 Est. Memory 列展示该维度。
 
 #### llama_cpp_targets
@@ -327,7 +330,7 @@ Seed 时仍由 target 的 `seed_mode` 决定。H3 `prompt_mode=auto` 若首份�
 
 > **客户端可能按模型名判断是否图片模型**：部分客户端（如 CherryStudio）靠模型 id 的正则/子串匹配来决定走聊天接口还是 `/v1/images/*`——只认 `z-image*` / `qwen-image*` / `flux*` / `sd*` 等已知图片模型名。若把图片模型暴露成它不认识的名字（如 `sensenova`），它会当普通聊天模型发到 `/v1/chat/completions`，被 fake_ollama 以 400「use /v1/images/...」拒绝。对策：在 `exposed_models[*].alias` 里给这类模型起一个**包含已知图片模型关键词的别名**（例如 `sensenova-z-image`）；这只改客户端看到的 id，后端 target 与 `model_profiles` 仍按真实模型名匹配，不受影响。
 
-> **多模型共用一个 ComfyUI 实例 + 显存互斥**：把多个 target 的 `base_url` / `start_command` 指向同一个 ComfyUI（如下例三个图片模型共用 `:21480`）。fake_ollama 的 VRAM 协调器按各模型 `model_profiles.estimated_vram_gb` 准入与 LRU 换出，大图模型运行前会先挤出空闲的 llama.cpp 模型；同实例内的图片模型切换由 ComfyUI 自身的智能内存负责（显存放不下时自动 offload 到内存）。这样在 24GB 卡上接入 28GB 的 Qwen 检查点也不会爆显存。
+> **多模型共用一个 ComfyUI 实例 + 显存互斥**：把多个 target 的 `base_url` / `start_command` 指向同一个 ComfyUI（如下例三个图片模型共用 `:21480`）。fake_ollama 会按 `GPU + base_url` 自动归并运行时状态：任一 target 卸载模型时会同步失效整组 reservation；每次推理持有全程执行租约，并按模型加载预算、请求瞬时余量和安全下限重新读取真实 free VRAM。显存不足时 `adaptive` 策略先卸载 GPU 权重但保留 ComfyUI 对象缓存，仍不足则在提交 `/prompt` 前返回 503。ComfyUI 的自动 offload 仍会使用，但不再被当作防止 OOM 的唯一保障。
 
 > **24GB 卡（RTX 4090）实测性能与显存提示**：
 > - **Qwen-Image-Edit AIO（fp8 28GB）**：显存**腾干净**时 DiT 完全驻留（文本编码器一次性放 CPU），文生图 ~5s/张（冷加载 ~25s）、图生图 ~15s/张；但若显存被占（DiT 放不下）会退化为**逐步从内存流式加载，单步从 ~0.7s 涨到 ~18s（约 110s/张），非常卡**。所以把它的 `estimated_vram_gb` 设得较高（20），让协调器先把 GPU 腾出来，确保驻留跑得快。本地只有 28GB fp8 整合检查点；想更省显存需另找更小的量化版本（如 Q4 GGUF 的 DiT ~12GB）。
@@ -439,14 +442,20 @@ Seed 时仍由 target 的 `seed_mode` 决定。H3 `prompt_mode=auto` 若首份�
       "target": "z-image-turbo-comfyui",
       "capabilities": ["image_generation", "image_edit"],
       "context_length": 4096,
-      "estimated_vram_gb": 16
+      "estimated_vram_gb": 16,
+      "request_vram_headroom_gb": 2,
+      "min_free_vram_gb": 2,
+      "vram_cleanup_policy": "adaptive"
     },
     {
       "model": "qwen-image",
       "target": "qwen-image-comfyui",
       "capabilities": ["image_generation", "image_edit"],
       "context_length": 4096,
-      "estimated_vram_gb": 20
+      "estimated_vram_gb": 20,
+      "request_vram_headroom_gb": 3,
+      "min_free_vram_gb": 2,
+      "vram_cleanup_policy": "adaptive"
     },
     {
       "model": "sensenova",
@@ -454,7 +463,10 @@ Seed 时仍由 target 的 `seed_mode` 决定。H3 `prompt_mode=auto` 若首份�
       "capabilities": ["image_generation", "image_edit"],
       "context_length": 4096,
       "estimated_vram_gb": 13,
-      "estimated_memory_gb": 30
+      "estimated_memory_gb": 30,
+      "request_vram_headroom_gb": 3,
+      "min_free_vram_gb": 2,
+      "vram_cleanup_policy": "adaptive"
     },
     {
       "model": "joyai-echo",
@@ -462,7 +474,11 @@ Seed 时仍由 target 的 `seed_mode` 决定。H3 `prompt_mode=auto` 若首份�
       "capabilities": ["video_generation"],
       "context_length": 4096,
       "estimated_vram_gb": 12,
-      "estimated_memory_gb": 30
+      "estimated_memory_gb": 30,
+      "request_vram_headroom_gb": 4,
+      "min_free_vram_gb": 2,
+      "vram_cleanup_policy": "adaptive",
+      "exclusive_gpu": true
     }
   ]
 }
@@ -613,7 +629,10 @@ H3 target 的 `start_command` 必须通过 `--extra-model-paths-config` 指向�
 `config/local/minimax_h3_extra_model_paths.yaml`，不要直接指向仍含占位路径的模板。示例 target 使用独立的
 ComfyUI 主线实例和 `:21481`，不会升级或覆盖其他 ComfyUI 实例。启动参数保留 2 GiB
 显存给系统；资源协调器按
-`estimated_vram_gb=22`、`estimated_memory_gb=56` 做准入和空闲模型回收。
+`estimated_vram_gb=21`、`estimated_memory_gb=56` 做加载准入；连续推理另外使用
+`request_vram_headroom_gb=6`、`min_free_vram_gb=2`、`vram_cleanup_policy=adaptive`
+和 `exclusive_gpu=true`。默认参数下，上一轮结束后若空闲显存不足 8 GiB，会先卸载 GPU
+权重但保留 ComfyUI 对象缓存，确认重新腾出至少 21 GiB 后才提交下一份视频。
 
 RTX 4090（SM 8.9）没有原生 NVFP4 Tensor Core。最新版 ComfyUI 会将 NVFP4 标记为
 emulated：磁盘/主存仍使用 NVFP4-AWQ 压缩权重，计算时按层反量化；因此能运行，但文本

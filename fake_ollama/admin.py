@@ -270,6 +270,10 @@ COMFYUI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "ComfyUI server 的 base URL，例如 http://127.0.0.1:21480"},
     {"key": "auth_token", "type": "string", "default": "", "secret": True,
      "description": "可选：调用 ComfyUI 时同时以 Authorization: Bearer 和 x-api-key 发送的 token"},
+    {"key": "vram_runtime_group", "type": "string", "default": None,
+     "description": "可选：显存运行时分组；留空时按 base_url 自动归组。共享同一 ComfyUI 进程的 target 必须处于同一组"},
+    {"key": "gpu_device", "type": "string", "default": "0",
+     "description": "该 ComfyUI 运行时使用的 GPU 设备标识；参与显存运行时分组"},
     {"key": "model", "type": "string", "default": "z-image-turbo", "required": True,
      "autocomplete": "model_names",
      "description": "该 ComfyUI workflow target 对外提供的图片模型显示名"},
@@ -463,6 +467,14 @@ MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选：单条响应的输出 token 数；同时作为 max_tokens 的下限与上限——配了之后，无论客户端传什么 max_tokens / num_predict，最终都会被强制设为该值（防止 VS Code Copilot 等客户端的小默认值导致 finish_reason=length 被整段拒）。受 context_length 预检约束"},
     {"key": "estimated_vram_gb", "type": "float", "default": None,
      "description": "可选：该模型加载后预计占用的 GPU 显存（GB）。本地 Ollama / llama.cpp / ComfyUI target 会使用它做启动前预检、空闲模型回收和 Dashboard 展示"},
+    {"key": "request_vram_headroom_gb", "type": "float", "default": 0.0,
+     "description": "模型已驻留时，单次推理仍需保留的瞬时显存余量（GB）；媒体工作流会按分辨率、帧数和原生 batch 放大"},
+    {"key": "min_free_vram_gb", "type": "float", "default": 0.0,
+     "description": "推理期间必须保留的显存安全下限（GB）；低于该值会中断当前 ComfyUI prompt"},
+    {"key": "vram_cleanup_policy", "type": "string", "default": "keep",
+     "description": "keep=始终复用；adaptive=余量不足时仅卸载 GPU 权重；unload=每次请求前卸载 GPU 权重"},
+    {"key": "exclusive_gpu", "type": "bool", "default": False,
+     "description": "是否在完整推理期间独占 GPU 执行租约；适合高波动视频工作流"},
     {"key": "estimated_memory_gb", "type": "float", "default": None,
      "description": "可选：该模型加载后预计占用的系统内存 / RAM（GB）。部分模型（如 SenseNova、JoyAI 这类会把一部分计算 offload 到内存的 workflow）除显存外还需占用大量主机内存。本地 Ollama / llama.cpp / ComfyUI target 会使用它做启动前预检、空闲模型回收和 Dashboard 展示，逻辑与 estimated_vram_gb 一致"},
     {"key": "thinking_mode", "type": "string", "default": "auto",
@@ -760,6 +772,7 @@ def _settings_to_dict(s: Settings) -> Dict[str, Any]:
             "image_to_video_workflow_path",
             "first_last_to_video_workflow_path",
             "last_to_video_workflow_path",
+            "vram_runtime_group",
         ]:
             if target.get(key) is None:
                 target.pop(key, None)
@@ -858,6 +871,8 @@ def _comfyui_client_matches(
     settings: Settings,
     target: Any,
 ) -> bool:
+    group_name = target.vram_runtime_group or f"comfyui:{target.base_url.rstrip('/')}"
+    expected_runtime_group = f"gpu:{target.gpu_device}|{group_name}"
     return (
         getattr(client, "_base", None) == target.base_url.rstrip("/")
         and getattr(client, "_auth_token", None) == target.auth_token
@@ -870,6 +885,9 @@ def _comfyui_client_matches(
         and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
         and getattr(client, "_health_path", None) == target.health_path
         and getattr(client, "_cwd", None) == target.cwd
+        and getattr(client, "_gpu_device", None) == target.gpu_device
+        and getattr(client, "vram_runtime_group", None)
+            == expected_runtime_group
         and getattr(client, "_workflow_config", None) == target.workflow_config()
     )
 
@@ -1017,6 +1035,8 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             health_path=tgt.health_path,
             cwd=tgt.cwd,
             target_name=tgt.name,
+            runtime_group=tgt.vram_runtime_group,
+            gpu_device=tgt.gpu_device,
             workflow_config=tgt.workflow_config(),
             vram_coordinator=vram_coordinator,
             memory_coordinator=memory_coordinator,
