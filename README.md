@@ -228,7 +228,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 - `auto_start: true`：health check 失败时执行 `start_command`；`stop_command` / `idle_timeout_seconds` 控制空闲回收。
 - 模型名匹配按 Ollama 规则：`foo` 与 `foo:latest` 等价；省略 tag 只代表 `latest`。
 - 每个本地模型的显存估算在 `model_profiles[*].estimated_vram_gb` 里配置。请求触发模型加载前，fake-ollama 调用 `nvidia-smi` 检查可用显存；不足时按 LRU 卸载其他空闲超过 60 秒的本地模型，每轮重新读真实 free VRAM。
-- 媒体模型可再配置 `request_vram_headroom_gb`（已驻留模型的单次推理瞬时余量）、`min_free_vram_gb`（运行中安全下限）、`vram_cleanup_policy=keep|adaptive|unload` 和 `exclusive_gpu`。余量会按实际分辨率、视频帧数及 workflow 原生 batch 放大；非原生 batch 的串行循环不会重复放大。
+- 媒体模型可再配置 `request_vram_headroom_gb`（已驻留模型的单次推理瞬时余量）、`min_free_vram_gb`（请求准入及运行观测下限）、`vram_cleanup_policy=keep|adaptive|unload` 和 `exclusive_gpu`。余量会按实际分辨率、视频帧数及 workflow 原生 batch 放大；非原生 batch 的串行循环不会重复放大。运行中会持续记录最低空闲显存；越过观测下限时不抢在 ComfyUI DynamicVRAM 分配器之前中断健康 prompt，而是在当前任务完成后清理运行时。真实 CUDA OOM 或 ComfyUI workflow 错误仍会使请求失败。
 - ComfyUI target 默认以 `gpu_device + base_url` 作为运行时分组，也可用 `vram_runtime_group` 显式覆盖。组内 `/free`、进程退出和健康检查失败会使所有 sibling target 的显存/内存 reservation 一起失效。
 - 多 GPU 主机不会把各卡空闲显存相加后做准入；默认协调器使用最紧张设备的读数并采用全局保守租约，避免“总空闲够、单卡放不下”仍启动任务。`gpu_device` 当前用于隔离运行时状态，不负责跨卡调度。
 - 主机内存估算在 `model_profiles[*].estimated_memory_gb` 里配置，由独立的内存协调器按同样逻辑准入与回收：加载前读取系统可用内存，不足时卸载其他声明了 `estimated_memory_gb` 的空闲模型。Dashboard 的「Model Estimated Memory」面板与 Current Models 表里的 Est. Memory 列展示该维度。

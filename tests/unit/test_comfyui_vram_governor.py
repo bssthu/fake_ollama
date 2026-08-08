@@ -355,7 +355,7 @@ async def test_exclusive_execution_blocks_other_local_model_load_admission() -> 
 
 
 @pytest.mark.asyncio
-async def test_safety_floor_interrupts_active_execution() -> None:
+async def test_safety_floor_observes_breach_without_interrupting_execution() -> None:
     free = {"mib": 10 * 1024.0}
     coordinator = VramCoordinator(
         provider=_provider(free), total_provider=_constant(24 * 1024.0)
@@ -374,25 +374,119 @@ async def test_safety_floor_interrupts_active_execution() -> None:
 
     participant = Participant()
     coordinator.register(participant)
-    interrupted = asyncio.Event()
-
-    async def interrupt() -> bool:
-        interrupted.set()
-        return True
-
     lease = await coordinator.acquire_execution(
         participant,
         model="h3",
         workload_key="h3",
         request_headroom_gb=6,
         min_free_vram_gb=2,
-        interrupt=interrupt,
     )
     await lease.__aenter__()
     free["mib"] = 1024.0
-    await asyncio.wait_for(interrupted.wait(), timeout=1.5)
+    await asyncio.sleep(0.75)
     assert lease.breached
     await lease.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_safety_floor_crossing_does_not_abort_comfyui_allocator() -> None:
+    free = {"mib": 10 * 1024.0}
+    coordinator = VramCoordinator(
+        provider=_provider(free), total_provider=_constant(24 * 1024.0)
+    )
+
+    class Participant:
+        target_id = "h3"
+        vram_runtime_group = "gpu:0|h3"
+        active_requests = 0
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return True
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            return []
+
+    participant = Participant()
+    coordinator.register(participant)
+    lease = await coordinator.acquire_execution(
+        participant,
+        model="h3",
+        workload_key="h3",
+        request_headroom_gb=6,
+        min_free_vram_gb=2,
+    )
+    await lease.__aenter__()
+    # This reproduces the observed 1.92 GiB NVML reading from a ComfyUI
+    # process configured with --reserve-vram 2.
+    free["mib"] = 1.92 * 1024.0
+    await asyncio.sleep(0.75)
+    assert lease.breached
+    await lease.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_post_breach_cleanup_waits_for_nvml_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    free = {"mib": 10 * 1024.0}
+    coordinator = VramCoordinator(
+        provider=_provider(free), total_provider=_constant(24 * 1024.0)
+    )
+
+    class Participant:
+        target_id = "h3"
+        vram_runtime_group = "gpu:0|h3"
+        active_requests = 0
+
+        def has_vram_reservation(self, model: str) -> bool:
+            return True
+
+        def vram_release_candidates(self, *, now: float, idle_seconds: float):
+            return []
+
+    participant = Participant()
+    coordinator.register(participant)
+    cleanup_calls = 0
+    reclaim_finished = asyncio.Event()
+
+    async def cleanup() -> bool:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+        async def publish_reclaimed_vram() -> None:
+            await asyncio.sleep(0.02)
+            free["mib"] = 22 * 1024.0
+            reclaim_finished.set()
+
+        asyncio.create_task(publish_reclaimed_vram())
+        return True
+
+    monkeypatch.setattr(
+        "fake_ollama.vram._VRAM_EXECUTION_MONITOR_INTERVAL_SECONDS", 0.01
+    )
+    monkeypatch.setattr(
+        "fake_ollama.vram._POST_RELEASE_REFRESH_DELAYS_SECONDS",
+        (0.0, 0.01, 0.02),
+    )
+    lease = await coordinator.acquire_execution(
+        participant,
+        model="minimax-h3-768p",
+        workload_key="h3",
+        reload_vram_gb=21,
+        request_headroom_gb=6,
+        min_free_vram_gb=2,
+        cleanup=cleanup,
+    )
+    await lease.__aenter__()
+    free["mib"] = 512.0
+    await asyncio.sleep(0.02)
+    assert lease.breached
+
+    await lease.__aexit__(None, None, None)
+
+    assert cleanup_calls == 1
+    assert reclaim_finished.is_set()
+    assert free["mib"] == 22 * 1024.0
 
 
 @pytest.mark.asyncio

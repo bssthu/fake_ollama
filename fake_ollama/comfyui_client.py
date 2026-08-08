@@ -156,7 +156,6 @@ class ComfyUIClient:
         self._last_used = time.monotonic()
         self._loaded_model: Optional[_LoadedModel] = None
         self._active_prompt_ids: set[str] = set()
-        self._vram_safety_interrupted = False
         self._shutdown_requested = False
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
@@ -843,7 +842,6 @@ class ComfyUIClient:
         if self._vram_coordinator is None:
             yield
             return
-        self._vram_safety_interrupted = False
         lease = await self._vram_coordinator.acquire_execution(
             self,
             model=model,
@@ -854,7 +852,6 @@ class ComfyUIClient:
             cleanup_policy=cleanup_policy,
             exclusive=exclusive,
             cleanup=self._adaptive_unload_gpu,
-            interrupt=self._interrupt_active_prompt,
         )
         async with lease:
             yield
@@ -950,11 +947,6 @@ class ComfyUIClient:
         *,
         operation: str,
     ) -> List[ComfyUIImage]:
-        if self._vram_safety_interrupted:
-            raise LocalTargetResourceError(
-                "ComfyUI prompt was not submitted because GPU VRAM fell below "
-                "the configured safety floor during model preparation."
-            )
         prompt_id = await self._queue_prompt(workflow, operation=operation)
         self._active_prompt_ids.add(prompt_id)
         try:
@@ -1037,11 +1029,6 @@ class ComfyUIClient:
         url = f"{self._base}/history/{prompt_id}"
         headers = self._headers()
         while time.monotonic() < deadline:
-            if self._vram_safety_interrupted:
-                raise LocalTargetResourceError(
-                    f"ComfyUI workflow {prompt_id} was interrupted because GPU VRAM "
-                    "fell below the configured safety floor."
-                )
             resp = await self._client.get(url, headers=headers)
             if resp.status_code >= 400:
                 resp.raise_for_status()
@@ -1419,28 +1406,6 @@ class ComfyUIClient:
         except httpx.HTTPError as exc:
             logger.warning("failed adaptive ComfyUI /free at %s: %s", self._base, exc)
         return False
-
-    async def _interrupt_active_prompt(self) -> bool:
-        try:
-            resp = await self._client.post(
-                f"{self._base}/interrupt",
-                json={},
-                headers=self._headers(),
-                timeout=min(10.0, self._timeout),
-            )
-            await resp.aread()
-            ok = 200 <= resp.status_code < 300
-            if ok:
-                self._vram_safety_interrupted = True
-                logger.warning(
-                    "requested ComfyUI interrupt at %s for active prompt(s) %s",
-                    self._base,
-                    sorted(self._active_prompt_ids),
-                )
-            return ok
-        except httpx.HTTPError as exc:
-            logger.warning("failed to interrupt ComfyUI at %s: %s", self._base, exc)
-            return False
 
     def _invalidate_runtime_resources(self, *, full: bool) -> None:
         if self._vram_coordinator is not None:

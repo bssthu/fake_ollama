@@ -54,6 +54,7 @@ VRAM_IDLE_RECLAIM_SECONDS = 60.0
 PENDING_LOADED_GRACE_SECONDS = 2.0
 _NVIDIA_SMI_TIMEOUT_SECONDS = 3.0
 _POST_RELEASE_REFRESH_DELAYS_SECONDS = (0.0, 0.5, 1.0, 2.0)
+_VRAM_EXECUTION_MONITOR_INTERVAL_SECONDS = 0.5
 
 
 class LocalTargetResourceError(httpx.ConnectError):
@@ -72,7 +73,6 @@ class LocalTargetResourceError(httpx.ConnectError):
 
 
 ReleaseCallback = Callable[[], Awaitable[bool]]
-InterruptCallback = Callable[[], Awaitable[bool]]
 
 
 @dataclass
@@ -157,15 +157,14 @@ class _ExecutionLeaseState:
     model: str
     workload_key: str
     reserved_headroom_mib: float
+    reload_vram_mib: float
     min_free_mib: float
     exclusive: bool
     resident_at_start: bool
     baseline_free_mib: float
     minimum_free_mib: float
-    interrupt: Optional[InterruptCallback]
     cleanup: Optional[ReleaseCallback]
     monitor_task: Optional[asyncio.Task[None]] = None
-    interrupted: bool = False
     breached: bool = False
 
 
@@ -959,7 +958,6 @@ class VramCoordinator(_ResourceCoordinator):
         cleanup_policy: str = "keep",
         exclusive: bool = False,
         cleanup: Optional[ReleaseCallback] = None,
-        interrupt: Optional[InterruptCallback] = None,
     ) -> VramExecutionLease:
         """Queue and admit one full inference execution.
 
@@ -1088,12 +1086,12 @@ class VramCoordinator(_ResourceCoordinator):
                     model=model,
                     workload_key=workload_key,
                     reserved_headroom_mib=headroom_mib,
+                    reload_vram_mib=reload_mib,
                     min_free_mib=floor_mib,
                     exclusive=exclusive,
                     resident_at_start=resident,
                     baseline_free_mib=available_mib,
                     minimum_free_mib=available_mib,
-                    interrupt=interrupt,
                     cleanup=cleanup,
                 )
                 self._execution_leases[lease_id] = state
@@ -1129,7 +1127,7 @@ class VramCoordinator(_ResourceCoordinator):
     async def _monitor_execution(self, state: _ExecutionLeaseState) -> None:
         try:
             while state.lease_id in self._execution_leases:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(_VRAM_EXECUTION_MONITOR_INTERVAL_SECONDS)
                 available_mib = await self._provider()
                 if available_mib is None:
                     continue
@@ -1137,27 +1135,19 @@ class VramCoordinator(_ResourceCoordinator):
                 if (
                     state.min_free_mib > 0
                     and available_mib < state.min_free_mib
-                    and not state.interrupted
+                    and not state.breached
                 ):
                     state.breached = True
-                    logger.error(
-                        "GPU VRAM safety floor breached for %s on %s: free %s, floor %s; interrupting active workflow",
+                    logger.warning(
+                        "GPU VRAM free space crossed the configured floor for %s "
+                        "on %s: free %s, floor %s; leaving the active workflow "
+                        "under the runtime allocator's control and scheduling "
+                        "cleanup after it completes",
                         state.model,
                         state.runtime_group,
                         _fmt_gib(available_mib),
                         _fmt_gib(state.min_free_mib),
                     )
-                    if state.interrupt is not None:
-                        try:
-                            state.interrupted = bool(await state.interrupt())
-                        except Exception:
-                            state.interrupted = False
-                            logger.warning(
-                                "failed to interrupt workflow after GPU VRAM safety breach",
-                                exc_info=True,
-                            )
-                    else:
-                        state.interrupted = True
         except asyncio.CancelledError:
             raise
 
@@ -1190,10 +1180,36 @@ class VramCoordinator(_ResourceCoordinator):
 
             if state.breached and state.cleanup is not None:
                 try:
-                    await state.cleanup()
+                    cleaned = bool(await state.cleanup())
+                    if cleaned:
+                        # ComfyUI's /free response can arrive before CUDA/WDDM
+                        # publishes the reclaimed memory through NVML.  Keep the
+                        # execution lease (and therefore the next request) held
+                        # until the model can actually be admitted again.
+                        threshold_mib = max(
+                            state.min_free_mib, state.reload_vram_mib
+                        )
+                        available_mib = await self._wait_for_raw_available_after_release(
+                            threshold_mib
+                        )
+                        if (
+                            threshold_mib > 0
+                            and (
+                                available_mib is None
+                                or available_mib < threshold_mib
+                            )
+                        ):
+                            logger.warning(
+                                "GPU VRAM cleanup for %s completed but reclamation "
+                                "has not reached the next-admission threshold: "
+                                "available %s, threshold %s",
+                                state.model,
+                                _fmt_gib(available_mib or 0.0),
+                                _fmt_gib(threshold_mib),
+                            )
                 except Exception:
                     logger.warning(
-                        "failed to clean runtime after GPU VRAM safety breach",
+                        "failed to clean runtime after GPU VRAM floor crossing",
                         exc_info=True,
                     )
             self._execution_leases.pop(lease_id, None)

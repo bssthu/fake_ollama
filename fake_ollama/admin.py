@@ -470,7 +470,7 @@ MODEL_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "request_vram_headroom_gb", "type": "float", "default": 0.0,
      "description": "模型已驻留时，单次推理仍需保留的瞬时显存余量（GB）；媒体工作流会按分辨率、帧数和原生 batch 放大"},
     {"key": "min_free_vram_gb", "type": "float", "default": 0.0,
-     "description": "推理期间必须保留的显存安全下限（GB）；低于该值会中断当前 ComfyUI prompt"},
+     "description": "请求准入及推理观测的空闲显存下限（GB）；运行中越线会记录并在 prompt 完成后清理，不会抢先中断 ComfyUI DynamicVRAM；真实 OOM 仍按 workflow 失败返回"},
     {"key": "vram_cleanup_policy", "type": "string", "default": "keep",
      "description": "keep=始终复用；adaptive=余量不足时仅卸载 GPU 权重；unload=每次请求前卸载 GPU 权重"},
     {"key": "exclusive_gpu", "type": "bool", "default": False,
