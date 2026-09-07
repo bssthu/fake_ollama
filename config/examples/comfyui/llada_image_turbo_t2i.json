@@ -33,12 +33,12 @@
         0
       ],
       "positive": [
-        "2",
+        "13",
         0
       ],
       "negative": [
-        "3",
-        0
+        "13",
+        1
       ],
       "cfg": 1
     }
@@ -115,6 +115,23 @@
       ],
       "latent_image": [
         "8",
+        0
+      ]
+    }
+  },
+  "13": {
+    "class_type": "ReleaseTextEncoderAfterConditioning",
+    "inputs": {
+      "clip": [
+        "1",
+        1
+      ],
+      "positive": [
+        "2",
+        0
+      ],
+      "negative": [
+        "3",
         0
       ]
     }

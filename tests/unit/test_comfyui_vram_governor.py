@@ -243,6 +243,71 @@ async def test_cleanup_failure_rejects_before_comfy_prompt() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy,released_free_gib,expected_success",
+    [("adaptive", 22, True), ("adaptive", 15, False), ("keep", 22, False)],
+)
+async def test_model_switch_reclaims_shared_cache_before_cold_load_admission(
+    policy, released_free_gib, expected_success,
+):
+    free = {"mib": 15 * 1024.0}
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, json.loads(request.content)))
+        if request.url.path == "/free":
+            free["mib"] = released_free_gib * 1024.0
+            return httpx.Response(200, json={})
+        return httpx.Response(404)
+
+    coordinator = VramCoordinator(
+        provider=_provider(free), total_provider=_constant(24 * 1024.0),
+    )
+    clients = [
+        ComfyUIClient(
+            "http://comfy.test", target_name=name, vram_coordinator=coordinator,
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        for name in ("base", "turbo")
+    ]
+    base, turbo = clients
+    base._mark_vram_reserved("base", 20)
+    base._mark_memory_reserved("base", 40)
+
+    async def switch():
+        turbo._begin_request_lifecycle()
+        try:
+            async with turbo._execution_guard(
+                model="turbo", workload_key="turbo-default", reload_vram_gb=20,
+                request_headroom_gb=3, min_free_vram_gb=2,
+                cleanup_policy=policy, exclusive=True,
+            ):
+                await turbo._ensure_vram("turbo", 20)
+        finally:
+            turbo._end_request_lifecycle()
+
+    try:
+        if expected_success:
+            await switch()
+            assert coordinator.has_pending(turbo.target_id, "turbo")
+        else:
+            with pytest.raises(LocalTargetResourceError):
+                await switch()
+            assert not coordinator.has_pending(turbo.target_id, "turbo")
+        if policy == "adaptive":
+            assert calls == [("/free", {"unload_models": True, "free_memory": False})]
+            assert not base.has_vram_reservation("base")
+            assert base.has_memory_reservation("base")
+        else:
+            assert not calls
+            assert base.has_vram_reservation("base")
+    finally:
+        for client in clients:
+            client._clear_all_vram_state()
+            await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_shared_comfy_runtime_unload_invalidates_all_target_reservations() -> None:
     free_bodies: list[dict[str, Any]] = []
 

@@ -259,6 +259,16 @@ async def test_llada_example_exposes_and_applies_image_parameters(variant, editi
     assert workflow["5"]["class_type"] == (
         "KSamplerSelect" if variant == "base" else "T8SamplerLLaDAImageTurbo"
     )
+    # Both encodings must finish before the encoder is released; sampling must
+    # depend on that boundary for Base/Turbo and generation/editing alike.
+    assert workflow["13"]["class_type"] == "ReleaseTextEncoderAfterConditioning"
+    assert _node_inputs(workflow, "13") == {
+        "clip": ["1", 1],
+        "positive": ["2", 0],
+        "negative": ["2", 1] if editing else ["3", 0],
+    }
+    assert _node_inputs(workflow, "4")["positive"] == ["13", 0]
+    assert _node_inputs(workflow, "4")["negative"] == ["13", 1]
     if editing:
         assert _node_inputs(workflow, "8")["image"] == "uploaded.png"
         assert _node_inputs(workflow, "2")["image"] == ["12", 0]

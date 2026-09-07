@@ -32,11 +32,11 @@
         0
       ],
       "positive": [
-        "2",
+        "13",
         0
       ],
       "negative": [
-        "2",
+        "13",
         1
       ],
       "cfg": 5
@@ -129,6 +129,23 @@
       "width": 1024,
       "height": 1024,
       "crop": "center"
+    }
+  },
+  "13": {
+    "class_type": "ReleaseTextEncoderAfterConditioning",
+    "inputs": {
+      "clip": [
+        "1",
+        1
+      ],
+      "positive": [
+        "2",
+        0
+      ],
+      "negative": [
+        "2",
+        1
+      ]
     }
   }
 }

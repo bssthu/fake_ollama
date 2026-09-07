@@ -1041,20 +1041,27 @@ class VramCoordinator(_ResourceCoordinator):
                 resident = bool(requester.has_vram_reservation(model))
                 required_mib = floor_mib + (headroom_mib if resident else 0.0)
 
-                should_clean = resident and (
-                    policy == "unload"
-                    or (policy == "adaptive" and effective_free_mib < required_mib)
+                # A different model in the same runtime may still own cached
+                # GPU weights. Make room for a cold model before its separate
+                # load admission, while holding the runtime execution lock.
+                cleanup_required_mib = (
+                    required_mib if resident else max(required_mib, reload_mib)
+                )
+                should_clean = (policy == "unload" and resident) or (
+                    policy == "adaptive" and effective_free_mib < cleanup_required_mib
                 )
                 if should_clean and cleanup is not None:
                     logger.info(
                         "local model %s on %s has %s effective free VRAM; "
-                        "request needs %s transient headroom plus %s safety floor; "
+                        "request needs %s transient headroom plus %s safety floor "
+                        "and %s for a cold model load; "
                         "requesting %s runtime cleanup",
                         model or requester.target_id,
                         runtime_group,
                         _fmt_gib(effective_free_mib),
                         _fmt_gib(headroom_mib),
                         _fmt_gib(floor_mib),
+                        _fmt_gib(reload_mib),
                         policy,
                     )
                     cleaned = bool(await cleanup())

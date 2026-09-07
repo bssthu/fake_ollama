@@ -17,6 +17,23 @@ Use ComfyUI 0.34.0 or later, the current T8 GitHub node code, and Comfy Kitchen
 installation uses `J:\Projects\LLM_Models\LLaDA-Image\models` through an
 `extra_model_paths.yaml` file and a separate ComfyUI instance on port 21482.
 
+Install the bundled [memory boundary node](../../../services/comfyui_memory/__init__.py)
+as `ComfyUI/custom_nodes/comfyui_memory/__init__.py` before using these workflows,
+then restart ComfyUI normally. Both positive and negative conditioning feed this
+node before CFGGuider. It releases only their text encoder and its clones through
+ComfyUI's model manager; conditioning tensors and the node cache remain intact.
+The same boundary covers Base/Turbo generation and reference-image editing.
+
+The launch examples also use `--disable-pinned-memory --vram-headroom 3`.
+The first removes large host weight-transfer buffers; the second asks DynamicVRAM
+to maintain 3 GiB of additional free VRAM, including usage by other applications.
+This is a best-effort allocator margin, not a hard GPU memory cap. The existing
+`--reserve-vram 2` remains for ComfyUI's other memory planning. These settings do
+not change weights, precision, resolution, steps or sampling. Weight loading speed
+depends on storage and system file caching; measurements below are specific to
+this machine. Do not disable the conditioning cache to reduce the peak: doing so
+would run the large text encoder again on every seed change.
+
 | Model | Default resolution | Steps | CFG | Sampling |
 | --- | --- | --- | --- | --- |
 | `llada-image` | 1024 x 1024 | 50 | 5 | Euler with the LLaDA Base schedule |
@@ -45,7 +62,8 @@ Open `http://127.0.0.1:21431/playground/`, enter an existing interface token,
 load models, choose one of the two LLaDA models and expand **请求参数**.
 The dedicated ComfyUI page is `http://127.0.0.1:21482/` while that runtime is running.
 
-Local validation on 2026-09-08 used an RTX 4090 24 GB and 96 GB system RAM:
+Initial validation before the memory optimization on 2026-09-08 used an RTX 4090
+24 GB and 96 GB system RAM:
 1024-square Base generation took 42.4 s and editing took 89.3 s; Turbo generation
 through Playground took 16.0 s and editing took 18.1 s. A same-prompt Turbo seed
 change took 4.8 s because text conditioning was cached. Full cold-start Turbo
@@ -55,3 +73,29 @@ before execution; it was not an actual OOM measurement. Both model files passed
 their published SHA256 checks. Raw local results and samples are in
 `J:\Projects\LLM_Models\LLaDA-Image\validation`; these measurements cover the
 tested fox prompt/edit only. Shared-runtime, workflow and API checks: 82 passed.
+
+With the memory boundary, pinned memory disabled and DynamicVRAM headroom set to
+3 GiB, the final 1024-square validation on the same day measured:
+
+| Case | GPU peak before / after (GiB) | ComfyUI working-set peak before / after (GiB) | Time before / after (s) |
+| --- | --- | --- | --- |
+| User's Base prompt, uncached conditioning | 23.06 / 19.81 | 24.57 / 2.78 | 39.5 / 38.3 |
+| Base reference-image editing | 22.71 / 20.06 | 27.52 / 2.58 | 89.3 / 83.5 |
+| Turbo reference-image editing | 23.04 / 20.07 | 27.53 / 2.60 | 18.1 / 12.2 |
+
+The first row's private commit fell from 47.72 to 21.60 GiB. Private commit is
+virtual-memory commitment, not physical RAM usage, and must not be added to the
+working set. GPU readings include the desktop. These are individual sampled runs,
+not averages or memory guarantees; process and OS file-cache warmup differ.
+The same-prompt Base seed change still ran all 50 steps (31.4 s) with cached
+conditioning. Six fixed-input comparisons, covering both variants and both
+operations, were pixel-identical to the original images.
+
+Real Edge validation covered Playground auto-start and generation, plus loading
+all six installed native workflows with the memory boundary connected. VQ
+generation was not benchmarked. Both directions of Base/Turbo switching passed:
+adaptive admission now unloads cached runtime weights when needed for a cold model
+load, retaining the conditioning cache and verifying the actual free space before
+submitting a prompt. The `keep` policy still prevents this cleanup. Related checks:
+85 passed. Detailed reports, runtime logs and reproducible diagnostic scripts are
+in `J:\Projects\LLM_Models\LLaDA-Image\validation\memory-optimization-20260908`.
