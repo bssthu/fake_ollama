@@ -271,6 +271,8 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 
 #### comfyui_targets
 
+LLaDA-Image Base / Turbo 的社区 INT8 ComfyUI 接入见 [配置说明](config/examples/comfyui/llada_image.md) 和 [双模型配置样例](config/examples/comfyui/llada_image.json)。两版均支持 Playground 文生图、单参考图编辑和真实节点参数调整。
+
 视频 workflow 既可以使用内置 `joyai_echo` preset，也可以使用
 `custom` / `comfyui_api` + `video_workflow_path` / `image_to_video_workflow_path`。
 请求字段分别绑定在 `bindings.video`（文生视频）和 `bindings.i2v`（图生视频）；

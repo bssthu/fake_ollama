@@ -120,6 +120,7 @@ def test_openai_image_generations_routes_to_comfyui_default_model() -> None:
             headers={"x-api-key": "tk"},
             json={
                 "prompt": "a quiet product photo",
+                "negative_prompt": "text, watermark",
                 "size": "768x512",
                 "n": 2,
                 "seed": 123,
@@ -130,6 +131,7 @@ def test_openai_image_generations_routes_to_comfyui_default_model() -> None:
     assert resp.json()["data"][0]["b64_json"] == "cG5nLWE="
     assert fake.generate_calls[0]["model"] == "z-image-turbo"
     assert fake.generate_calls[0]["prompt"] == "a quiet product photo"
+    assert fake.generate_calls[0]["negative_prompt"] == "text, watermark"
     assert fake.generate_calls[0]["width"] == 768
     assert fake.generate_calls[0]["height"] == 512
     assert fake.generate_calls[0]["n"] == 2
@@ -214,6 +216,7 @@ def test_openai_image_edits_accepts_multipart_image() -> None:
             data={
                 "model": "z-image-turbo",
                 "prompt": "make it warmer",
+                "negative_prompt": "blurry",
                 "size": "512x512",
             },
             files={"image": ("input.png", b"input-bytes", "image/png")},
@@ -222,6 +225,7 @@ def test_openai_image_edits_accepts_multipart_image() -> None:
     assert resp.status_code == 200
     assert resp.json()["data"][0]["b64_json"] == "cG5nLWVkaXQ="
     assert fake.edit_calls[0]["prompt"] == "make it warmer"
+    assert fake.edit_calls[0]["negative_prompt"] == "blurry"
     assert fake.edit_calls[0]["image_bytes"] == b"input-bytes"
     assert fake.edit_calls[0]["filename"] == "input.png"
     assert fake.edit_calls[0]["denoise"] == 0.25

@@ -36,6 +36,7 @@ WORKFLOW_DIR = Path(__file__).resolve().parent / "workflows"
 # of explicit width/height.
 DYNAMIC_PARAMS: Tuple[str, ...] = (
     "prompt",
+    "negative_prompt",
     "seed",
     "steps",
     "cfg",

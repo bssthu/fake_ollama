@@ -1,0 +1,339 @@
+{
+  "comfyui_targets": [
+    {
+      "name": "llada-image-comfyui",
+      "model": "llada-image",
+      "base_url": "http://127.0.0.1:21482",
+      "auto_start": true,
+      "start_command": "\"J:\\Projects\\LLM_Models\\LLaDA-Image\\.venv\\Scripts\\python.exe\" -s main.py --listen 127.0.0.1 --port 21482 --reserve-vram 2 --extra-model-paths-config \"J:\\Projects\\LLM_Models\\LLaDA-Image\\extra_model_paths.yaml\"",
+      "cwd": "J:\\Projects\\LLM_Models\\LLaDA-Image\\ComfyUI",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 300,
+      "preset": "custom",
+      "text_to_image_workflow_path": "config/examples/comfyui/llada_image_base_t2i.json",
+      "image_to_image_workflow_path": "config/examples/comfyui/llada_image_base_i2i.json",
+      "bindings": {
+        "t2i": {
+          "prompt": [
+            [
+              "2",
+              "text"
+            ]
+          ],
+          "negative_prompt": [
+            [
+              "3",
+              "text"
+            ]
+          ],
+          "seed": [
+            [
+              "7",
+              "noise_seed"
+            ]
+          ],
+          "steps": [
+            [
+              "6",
+              "steps"
+            ]
+          ],
+          "cfg": [
+            [
+              "4",
+              "cfg"
+            ]
+          ],
+          "width": [
+            [
+              "8",
+              "width"
+            ]
+          ],
+          "height": [
+            [
+              "8",
+              "height"
+            ]
+          ],
+          "batch_size": [
+            [
+              "8",
+              "batch_size"
+            ]
+          ],
+          "sampler_name": [
+            [
+              "5",
+              "sampler_name"
+            ]
+          ]
+        },
+        "i2i": {
+          "prompt": [
+            [
+              "2",
+              "prompt"
+            ]
+          ],
+          "negative_prompt": [
+            [
+              "2",
+              "negative_prompt"
+            ]
+          ],
+          "seed": [
+            [
+              "7",
+              "noise_seed"
+            ]
+          ],
+          "steps": [
+            [
+              "6",
+              "steps"
+            ]
+          ],
+          "cfg": [
+            [
+              "4",
+              "cfg"
+            ]
+          ],
+          "width": [
+            [
+              "12",
+              "width"
+            ]
+          ],
+          "height": [
+            [
+              "12",
+              "height"
+            ]
+          ],
+          "image": [
+            [
+              "8",
+              "image"
+            ]
+          ],
+          "sampler_name": [
+            [
+              "5",
+              "sampler_name"
+            ]
+          ]
+        }
+      },
+      "min_width": 256,
+      "min_height": 256,
+      "default_width": 1024,
+      "default_height": 1024,
+      "max_width": 1536,
+      "max_height": 1536,
+      "width_modulo": 32,
+      "height_modulo": 32,
+      "default_steps": 50,
+      "default_cfg": 5,
+      "default_sampler_name": "euler",
+      "max_batch_size": 1,
+      "max_reference_images": 1,
+      "default_edit_denoise": 1,
+      "output_prefix": "fake_ollama/llada-image",
+      "prompt_timeout_seconds": 1800,
+      "poll_interval_seconds": 1
+    },
+    {
+      "name": "llada-image-turbo-comfyui",
+      "model": "llada-image-turbo",
+      "base_url": "http://127.0.0.1:21482",
+      "auto_start": true,
+      "start_command": "\"J:\\Projects\\LLM_Models\\LLaDA-Image\\.venv\\Scripts\\python.exe\" -s main.py --listen 127.0.0.1 --port 21482 --reserve-vram 2 --extra-model-paths-config \"J:\\Projects\\LLM_Models\\LLaDA-Image\\extra_model_paths.yaml\"",
+      "cwd": "J:\\Projects\\LLM_Models\\LLaDA-Image\\ComfyUI",
+      "idle_timeout_seconds": 1800,
+      "startup_timeout_seconds": 300,
+      "preset": "custom",
+      "text_to_image_workflow_path": "config/examples/comfyui/llada_image_turbo_t2i.json",
+      "image_to_image_workflow_path": "config/examples/comfyui/llada_image_turbo_i2i.json",
+      "bindings": {
+        "t2i": {
+          "prompt": [
+            [
+              "2",
+              "text"
+            ]
+          ],
+          "negative_prompt": [
+            [
+              "3",
+              "text"
+            ]
+          ],
+          "seed": [
+            [
+              "7",
+              "noise_seed"
+            ]
+          ],
+          "steps": [
+            [
+              "6",
+              "steps"
+            ]
+          ],
+          "cfg": [
+            [
+              "4",
+              "cfg"
+            ]
+          ],
+          "width": [
+            [
+              "8",
+              "width"
+            ]
+          ],
+          "height": [
+            [
+              "8",
+              "height"
+            ]
+          ],
+          "batch_size": [
+            [
+              "8",
+              "batch_size"
+            ]
+          ]
+        },
+        "i2i": {
+          "prompt": [
+            [
+              "2",
+              "prompt"
+            ]
+          ],
+          "negative_prompt": [
+            [
+              "2",
+              "negative_prompt"
+            ]
+          ],
+          "seed": [
+            [
+              "7",
+              "noise_seed"
+            ]
+          ],
+          "steps": [
+            [
+              "6",
+              "steps"
+            ]
+          ],
+          "cfg": [
+            [
+              "4",
+              "cfg"
+            ]
+          ],
+          "width": [
+            [
+              "12",
+              "width"
+            ]
+          ],
+          "height": [
+            [
+              "12",
+              "height"
+            ]
+          ],
+          "image": [
+            [
+              "8",
+              "image"
+            ]
+          ]
+        }
+      },
+      "min_width": 256,
+      "min_height": 256,
+      "default_width": 1024,
+      "default_height": 1024,
+      "max_width": 1536,
+      "max_height": 1536,
+      "width_modulo": 32,
+      "height_modulo": 32,
+      "default_steps": 4,
+      "default_cfg": 1,
+      "default_sampler_name": "euler",
+      "max_batch_size": 1,
+      "max_reference_images": 1,
+      "default_edit_denoise": 1,
+      "output_prefix": "fake_ollama/llada-image-turbo",
+      "prompt_timeout_seconds": 1800,
+      "poll_interval_seconds": 1
+    }
+  ],
+  "model_profiles": [
+    {
+      "model": "llada-image",
+      "target": "llada-image-comfyui",
+      "capabilities": [
+        "image_generation",
+        "image_edit"
+      ],
+      "context_length": 4096,
+      "estimated_vram_gb": 20,
+      "estimated_memory_gb": 40,
+      "request_vram_headroom_gb": 3,
+      "min_free_vram_gb": 2,
+      "vram_cleanup_policy": "adaptive",
+      "exclusive_gpu": true,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "llada-image-turbo",
+      "target": "llada-image-turbo-comfyui",
+      "capabilities": [
+        "image_generation",
+        "image_edit"
+      ],
+      "context_length": 4096,
+      "estimated_vram_gb": 20,
+      "estimated_memory_gb": 40,
+      "request_vram_headroom_gb": 3,
+      "min_free_vram_gb": 2,
+      "vram_cleanup_policy": "adaptive",
+      "exclusive_gpu": true,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    }
+  ],
+  "api_interfaces": [
+    {
+      "name": "api",
+      "host": "127.0.0.1",
+      "port": 21435,
+      "access_tokens": [
+        "replace-with-your-local-token"
+      ],
+      "exposed_models": [
+        {
+          "model": "llada-image",
+          "target": "llada-image-comfyui",
+          "alias": "llada-image"
+        },
+        {
+          "model": "llada-image-turbo",
+          "target": "llada-image-turbo-comfyui",
+          "alias": "llada-image-turbo"
+        }
+      ]
+    }
+  ],
+  "playground_enabled": true
+}

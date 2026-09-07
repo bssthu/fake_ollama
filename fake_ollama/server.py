@@ -2161,6 +2161,7 @@ def _image_request_params(
         "height": height,
         "n": n,
         "seed": seed,
+        "negative_prompt": str(payload.get("negative_prompt") or ""),
         "steps": _coerce_int_payload(
             payload, ("steps", "num_inference_steps"), target.default_steps
         ),

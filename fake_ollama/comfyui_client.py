@@ -171,6 +171,10 @@ class ComfyUIClient:
         return self._active
 
     @property
+    def request_refs(self) -> int:
+        return max(self._active, self._request_refs)
+
+    @property
     def last_used_monotonic(self) -> float:
         return self._last_used
 
@@ -498,6 +502,7 @@ class ComfyUIClient:
         sampler_name: str,
         scheduler: str,
         denoise: float,
+        negative_prompt: str = "",
         estimated_vram_gb: Optional[float] = None,
         estimated_memory_gb: Optional[float] = None,
         request_vram_headroom_gb: float = 0.0,
@@ -519,6 +524,7 @@ class ComfyUIClient:
                 "sampler_name": sampler_name,
                 "scheduler": scheduler,
                 "denoise": denoise,
+                "negative_prompt": negative_prompt,
             },
             estimated_vram_gb=estimated_vram_gb,
             estimated_memory_gb=estimated_memory_gb,
@@ -546,6 +552,7 @@ class ComfyUIClient:
         sampler_name: str,
         scheduler: str,
         denoise: float,
+        negative_prompt: str = "",
         estimated_vram_gb: Optional[float] = None,
         estimated_memory_gb: Optional[float] = None,
         request_vram_headroom_gb: float = 0.0,
@@ -567,6 +574,7 @@ class ComfyUIClient:
                 "sampler_name": sampler_name,
                 "scheduler": scheduler,
                 "denoise": denoise,
+                "negative_prompt": negative_prompt,
             },
             estimated_vram_gb=estimated_vram_gb,
             estimated_memory_gb=estimated_memory_gb,
@@ -1309,26 +1317,49 @@ class ComfyUIClient:
             raise ValueError(f"ComfyUI workflow node {node_id!r} has invalid inputs")
         inputs[input_name] = value
 
+    def _runtime_in_use(self) -> bool:
+        return bool(
+            self.request_refs
+            or (
+                self._vram_coordinator is not None
+                and self._vram_coordinator.runtime_group_request_refs(
+                    self.vram_runtime_group
+                )
+            )
+        )
+
     async def stop_if_idle(self) -> None:
-        if not self._idle_timeout or self._active or self._request_refs:
+        if not self._idle_timeout or self._runtime_in_use():
             return
-        idle_for = time.monotonic() - self._last_used
+        last_used = self._last_used
+        if self._vram_coordinator is not None:
+            last_used = max(
+                last_used,
+                self._vram_coordinator.runtime_group_last_used(self.vram_runtime_group),
+            )
+        idle_for = time.monotonic() - last_used
         if idle_for < self._idle_timeout:
             return
-        if not (self._started_by_us or self._stop_command):
+        if self._process is not None and self._process.returncode is not None:
+            self._started_by_us = False
+        if not (
+            self._started_by_us
+            or (self._stop_command and self._loaded_model is not None)
+        ):
             return
         logger.info(
             "stopping idle ComfyUI target %s after %.1fs idle",
             self.target_id,
             idle_for,
         )
-        await self.stop_if_owned()
+        if await self.stop_if_owned():
+            self._last_used = time.monotonic()
 
     async def release_for_vram(self) -> bool:
         return await self._release_for_vram()
 
     async def _release_for_vram(self, *, force: bool = False) -> bool:
-        if not force and (self._active or self._request_refs):
+        if not force and self._runtime_in_use():
             return False
         if self._loaded_model is None or self._loaded_model.estimated_vram_gb <= 0:
             return True
@@ -1339,7 +1370,7 @@ class ComfyUIClient:
         return False
 
     async def _release_for_memory(self, *, force: bool = False) -> bool:
-        if not force and (self._active or self._request_refs):
+        if not force and self._runtime_in_use():
             return False
         if self._loaded_model is None or self._loaded_model.estimated_memory_gb <= 0:
             return True

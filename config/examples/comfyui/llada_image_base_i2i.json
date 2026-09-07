@@ -1,0 +1,134 @@
+{
+  "1": {
+    "class_type": "T8LLaDAImageCheckpointLoader",
+    "inputs": {
+      "ckpt_name": "LLaDA-Image-Base-INT8-ConvRot-Mixed-AIO.safetensors"
+    }
+  },
+  "2": {
+    "class_type": "T8LLaDAImageEditConditioning",
+    "inputs": {
+      "clip": [
+        "1",
+        1
+      ],
+      "vae": [
+        "1",
+        2
+      ],
+      "image": [
+        "12",
+        0
+      ],
+      "prompt": "Turn the fox into a white arctic fox while preserving the snowy forest.",
+      "negative_prompt": ""
+    }
+  },
+  "4": {
+    "class_type": "CFGGuider",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "2",
+        0
+      ],
+      "negative": [
+        "2",
+        1
+      ],
+      "cfg": 5
+    }
+  },
+  "5": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "6": {
+    "class_type": "T8LLaDAImageScheduler",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "steps": 50
+    }
+  },
+  "7": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 42
+    }
+  },
+  "8": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "llada_image_edit_source.png"
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "10",
+        0
+      ],
+      "filename_prefix": "fake_ollama/llada-image"
+    }
+  },
+  "10": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "11",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    }
+  },
+  "11": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "7",
+        0
+      ],
+      "guider": [
+        "4",
+        0
+      ],
+      "sampler": [
+        "5",
+        0
+      ],
+      "sigmas": [
+        "6",
+        0
+      ],
+      "latent_image": [
+        "2",
+        2
+      ]
+    }
+  },
+  "12": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "8",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": 1024,
+      "height": 1024,
+      "crop": "center"
+    }
+  }
+}

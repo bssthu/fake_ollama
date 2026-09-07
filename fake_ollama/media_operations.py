@@ -130,6 +130,13 @@ def describe_comfyui_operation(target: Any, operation_id: str) -> Dict[str, Any]
     parameters: List[Dict[str, Any]] = []
     default_size = f"{target.default_width}x{target.default_height}"
 
+    if "negative_prompt" in bound:
+        parameters.append(
+            _parameter(
+                "negative_prompt", "负面提示词", "string", "", advanced=True,
+            )
+        )
+
     if {"width", "height", "size_ratio"}.intersection(bound):
         ratio_options = next(
             (spec.size_ratio_options for spec in specs if spec.size_ratio_options),

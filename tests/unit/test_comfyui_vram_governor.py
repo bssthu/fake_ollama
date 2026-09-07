@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import time
 from typing import Any, Optional
 
 import httpx
@@ -23,6 +24,83 @@ def _constant(value: float):
         return value
 
     return read
+
+
+@pytest.mark.asyncio
+async def test_shared_comfy_idle_timeout_waits_for_sibling_requests_and_activity(monkeypatch):
+    coordinator = VramCoordinator(provider=_constant(20 * 1024.0))
+    clients = [
+        ComfyUIClient(
+            "http://comfy.test:8188", target_name=name,
+            vram_coordinator=coordinator, idle_timeout_seconds=60,
+            stop_command="configured-stop", client=httpx.AsyncClient(),
+        )
+        for name in ("base", "turbo")
+    ]
+    base, turbo = clients
+    stopped = []
+
+    async def stop():
+        stopped.append(True)
+        return True
+
+    monkeypatch.setattr(base, "stop_if_owned", stop)
+    try:
+        base._last_used = turbo._last_used = time.monotonic() - 120
+        # A stop command alone does not mean an unused target owns a runtime.
+        await base.stop_if_idle()
+        assert not stopped
+        base._mark_vram_reserved("base", 20)
+        base._mark_memory_reserved("base", 40)
+        turbo._begin_request_lifecycle()
+        await base.stop_if_idle()
+        assert not stopped
+        assert not await base._release_for_vram()
+        assert not await base._release_for_memory()
+        turbo._end_request_lifecycle()
+        await base.stop_if_idle()
+        assert not stopped
+        turbo._last_used = time.monotonic() - 120
+        turbo._active = 1
+        await base.stop_if_idle()
+        assert not stopped
+        turbo._active = 0
+        await base.stop_if_idle()
+        assert len(stopped) == 1
+        # Stopping resets the shared idle clock, avoiding repeated stop calls.
+        await base.stop_if_idle()
+        assert len(stopped) == 1
+    finally:
+        for client in clients:
+            client._stop_command = None
+            await client.aclose()
+            await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_comfy_idle_timeout_does_not_wait_for_another_runtime(monkeypatch):
+    coordinator = VramCoordinator(provider=_constant(20 * 1024.0))
+    own = ComfyUIClient("http://comfy.test:8188", target_name="own", vram_coordinator=coordinator, idle_timeout_seconds=60, stop_command="stop", client=httpx.AsyncClient())
+    other = ComfyUIClient("http://comfy.test:8189", target_name="other", vram_coordinator=coordinator, client=httpx.AsyncClient())
+    stopped = []
+
+    async def stop():
+        stopped.append(True)
+        return True
+
+    monkeypatch.setattr(own, "stop_if_owned", stop)
+    try:
+        own._last_used = time.monotonic() - 120
+        own._mark_vram_reserved("own", 20)
+        other._active = 1
+        await own.stop_if_idle()
+        assert len(stopped) == 1
+    finally:
+        own._stop_command = None
+        await own.aclose()
+        await other.aclose()
+        await own._client.aclose()
+        await other._client.aclose()
 
 
 @pytest.mark.asyncio

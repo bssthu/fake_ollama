@@ -16,6 +16,7 @@ from fake_ollama.comfyui_presets import (
     resolve_workflows,
 )
 from fake_ollama.config import ComfyUITarget
+from fake_ollama.media_operations import describe_comfyui_operation
 
 
 def _recording_client(workflow_config: Dict[str, Any]) -> tuple[ComfyUIClient, List[Dict[str, Any]]]:
@@ -203,6 +204,65 @@ async def test_joyai_echo_i2v_builtin_workflow_batches_reference_images() -> Non
 # ---------------------------------------------------------------------------
 # Full build chain per preset
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["base", "turbo"])
+@pytest.mark.parametrize("editing", [False, True])
+async def test_llada_example_exposes_and_applies_image_parameters(variant, editing):
+    root = Path(__file__).resolve().parents[2]
+    config = json.loads(
+        (root / "config/examples/comfyui/llada_image.json").read_text(encoding="utf-8")
+    )
+    model = "llada-image" if variant == "base" else "llada-image-turbo"
+    fields = next(item for item in config["comfyui_targets"] if item["model"] == model)
+    for name in ("text_to_image_workflow_path", "image_to_image_workflow_path"):
+        fields[name] = str(root / fields[name])
+    target = ComfyUITarget(**fields)
+    operation = describe_comfyui_operation(
+        target, "image_edit" if editing else "image_generation"
+    )
+    names = {parameter["name"] for parameter in operation["parameters"]}
+    assert {"size", "steps", "cfg", "seed", "negative_prompt"} <= names
+    assert "denoise" not in names
+    assert "scheduler" not in names
+    assert ("sampler_name" in names) == (variant == "base")
+    assert operation["defaults"]["steps"] == (50 if variant == "base" else 4)
+    if editing:
+        assert operation["limits"]["max_reference_images"] == 1
+
+    client, posted = _recording_client(target.workflow_config())
+    kwargs = dict(
+        model=model, prompt="a fox", negative_prompt="watermark, blurry",
+        width=768, height=512, n=1, seed=123, steps=7, cfg=2.5,
+        sampler_name="euler", scheduler="simple", denoise=1.0,
+    )
+    try:
+        if editing:
+            await client.edit_image(**kwargs, image_bytes=b"png", filename="input.png")
+        else:
+            await client.generate_image(**kwargs)
+    finally:
+        await client.aclose()
+
+    assert len(posted) == 1
+    workflow = posted[0]
+    assert _node_inputs(workflow, "2")["prompt" if editing else "text"] == "a fox"
+    assert _node_inputs(workflow, "2" if editing else "3")[
+        "negative_prompt" if editing else "text"
+    ] == "watermark, blurry"
+    assert _node_inputs(workflow, "6")["steps"] == 7
+    assert _node_inputs(workflow, "4")["cfg"] == 2.5
+    assert _node_inputs(workflow, "7")["noise_seed"] == 123
+    size_node = _node_inputs(workflow, "12" if editing else "8")
+    assert (size_node["width"], size_node["height"]) == (768, 512)
+    assert workflow["5"]["class_type"] == (
+        "KSamplerSelect" if variant == "base" else "T8SamplerLLaDAImageTurbo"
+    )
+    if editing:
+        assert _node_inputs(workflow, "8")["image"] == "uploaded.png"
+        assert _node_inputs(workflow, "2")["image"] == ["12", 0]
+        assert _node_inputs(workflow, "11")["latent_image"] == ["2", 2]
 
 
 @pytest.mark.asyncio

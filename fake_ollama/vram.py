@@ -900,6 +900,23 @@ class VramCoordinator(_ResourceCoordinator):
             if self.runtime_group_for(participant) == runtime_group
         )
 
+    def runtime_group_request_refs(self, runtime_group: str) -> int:
+        return sum(
+            int(getattr(participant, "request_refs", participant.active_requests) or 0)
+            for participant in self._participants.values()
+            if self.runtime_group_for(participant) == runtime_group
+        )
+
+    def runtime_group_last_used(self, runtime_group: str) -> float:
+        return max(
+            (
+                float(getattr(participant, "last_used_monotonic", 0.0))
+                for participant in self._participants.values()
+                if self.runtime_group_for(participant) == runtime_group
+            ),
+            default=0.0,
+        )
+
     def observed_headroom_mib(self, workload_key: str) -> float:
         return max(0.0, self._observed_headroom_mib.get(workload_key, 0.0))
 
