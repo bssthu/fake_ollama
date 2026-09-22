@@ -15,7 +15,7 @@ import mimetypes
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -39,6 +39,7 @@ from .vram import (
     MemoryCoordinator,
     MemoryReleaseCandidate,
     VramCoordinator,
+    VramExecutionLease,
     VramReleaseCandidate,
 )
 
@@ -308,8 +309,7 @@ class ComfyUIClient:
         self, *, now: float, idle_seconds: float
     ) -> list[VramReleaseCandidate]:
         if (
-            self._active
-            or self._request_refs
+            self._runtime_in_use(allow_admission=True)
             or self._loaded_model is None
             or self._loaded_model.estimated_vram_gb <= 0
         ):
@@ -349,7 +349,7 @@ class ComfyUIClient:
     def memory_release_candidates(
         self, *, now: float, idle_seconds: float
     ) -> list[MemoryReleaseCandidate]:
-        if self._active or self._request_refs or self._loaded_model is None:
+        if self._runtime_in_use(allow_admission=True) or self._loaded_model is None:
             return []
         loaded = self._loaded_model
         if loaded.estimated_memory_gb <= 0:
@@ -744,10 +744,15 @@ class ComfyUIClient:
                 min_free_vram_gb=min_free_vram_gb,
                 cleanup_policy=vram_cleanup_policy,
                 exclusive=exclusive_gpu,
-            ):
-                await self._ensure_vram(model, admission_vram_gb)
+            ) as lease:
                 try:
-                    await self._ensure_memory(model, estimated_memory_gb)
+                    with lease.admission() if lease is not None else nullcontext():
+                        await self._ensure_vram(model, admission_vram_gb)
+                        await self._ensure_memory(model, estimated_memory_gb)
+                        # Releasing the shared RAM/object cache also invalidates
+                        # the GPU reservation acquired above. Re-admit it before
+                        # submitting a prompt (normally this is an idempotent call).
+                        await self._ensure_vram(model, admission_vram_gb)
                     await self._ensure_ready()
                 except BaseException:
                     self._discard_vram_pending(model)
@@ -846,9 +851,9 @@ class ComfyUIClient:
         min_free_vram_gb: float,
         cleanup_policy: str,
         exclusive: bool,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncIterator[Optional[VramExecutionLease]]:
         if self._vram_coordinator is None:
-            yield
+            yield None
             return
         lease = await self._vram_coordinator.acquire_execution(
             self,
@@ -862,7 +867,7 @@ class ComfyUIClient:
             cleanup=self._adaptive_unload_gpu,
         )
         async with lease:
-            yield
+            yield lease
 
     @staticmethod
     def _image_ref_limit(spec: WorkflowSpec) -> Optional[int]:
@@ -1317,8 +1322,8 @@ class ComfyUIClient:
             raise ValueError(f"ComfyUI workflow node {node_id!r} has invalid inputs")
         inputs[input_name] = value
 
-    def _runtime_in_use(self) -> bool:
-        return bool(
+    def _runtime_in_use(self, *, allow_admission: bool = False) -> bool:
+        busy = bool(
             self.request_refs
             or (
                 self._vram_coordinator is not None
@@ -1327,6 +1332,11 @@ class ComfyUIClient:
                 )
             )
         )
+        if busy and allow_admission and self._vram_coordinator is not None:
+            return not self._vram_coordinator.runtime_group_admitting_here(
+                self.vram_runtime_group
+            )
+        return busy
 
     async def stop_if_idle(self) -> None:
         if not self._idle_timeout or self._runtime_in_use():
@@ -1359,7 +1369,7 @@ class ComfyUIClient:
         return await self._release_for_vram()
 
     async def _release_for_vram(self, *, force: bool = False) -> bool:
-        if not force and self._runtime_in_use():
+        if not force and self._runtime_in_use(allow_admission=True):
             return False
         if self._loaded_model is None or self._loaded_model.estimated_vram_gb <= 0:
             return True
@@ -1370,7 +1380,7 @@ class ComfyUIClient:
         return False
 
     async def _release_for_memory(self, *, force: bool = False) -> bool:
-        if not force and self._runtime_in_use():
+        if not force and self._runtime_in_use(allow_admission=True):
             return False
         if self._loaded_model is None or self._loaded_model.estimated_memory_gb <= 0:
             return True

@@ -37,8 +37,9 @@ import logging
 import math
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Iterator, Optional, Protocol
 
 import httpx
 
@@ -166,6 +167,7 @@ class _ExecutionLeaseState:
     cleanup: Optional[ReleaseCallback]
     monitor_task: Optional[asyncio.Task[None]] = None
     breached: bool = False
+    admission_task: Optional[asyncio.Task[Any]] = None
 
 
 class VramExecutionLease:
@@ -196,6 +198,18 @@ class VramExecutionLease:
     @property
     def breached(self) -> bool:
         return self._state.breached
+
+    @contextmanager
+    def admission(self) -> Iterator[None]:
+        """Allow this task to reclaim idle siblings before inference starts."""
+        if self._released:
+            raise RuntimeError("cannot admit resources with a released execution lease")
+        previous = self._state.admission_task
+        self._state.admission_task = asyncio.current_task()
+        try:
+            yield
+        finally:
+            self._state.admission_task = previous
 
     async def __aenter__(self) -> "VramExecutionLease":
         return self
@@ -454,16 +468,18 @@ class _ResourceCoordinator:
         *,
         model: str = "",
         estimated_gb: Optional[float] = None,
+        reserve: bool = True,
     ) -> None:
+        """Reclaim and check capacity; optionally reserve it for model loading."""
         if estimated_gb is None:
             return
         key = (requester.target_id, model)
         required_mib = _gb_to_mib(estimated_gb)
         async with self._lock:
             # Idempotent: same target+model already pending or already loaded.
-            if key in self._pending:
+            if reserve and key in self._pending:
                 return
-            if self._spec.reservation(requester, model):
+            if reserve and self._spec.reservation(requester, model):
                 return
 
             available_mib = await self._provider()
@@ -475,7 +491,8 @@ class _ResourceCoordinator:
                 )
             effective_free = self._effective_free_mib(available_mib, exclude_key=key)
             if effective_free >= required_mib:
-                self._record_pending(key, estimated_gb)
+                if reserve:
+                    self._record_pending(key, estimated_gb)
                 return
 
             candidates = self._eligible_candidates(model)
@@ -544,7 +561,8 @@ class _ResourceCoordinator:
                             _fmt_gib(current_effective_free),
                             model or requester.target_id,
                         )
-                        self._record_pending(key, estimated_gb)
+                        if reserve:
+                            self._record_pending(key, estimated_gb)
                         return
                 else:
                     logger.warning(
@@ -559,7 +577,8 @@ class _ResourceCoordinator:
                         refreshed_mib, exclude_key=key
                     )
                 if current_effective_free >= required_mib:
-                    self._record_pending(key, estimated_gb)
+                    if reserve:
+                        self._record_pending(key, estimated_gb)
                     return
 
             raise self._insufficient_error(
@@ -907,6 +926,19 @@ class VramCoordinator(_ResourceCoordinator):
             if self.runtime_group_for(participant) == runtime_group
         )
 
+    def runtime_group_admitting_here(self, runtime_group: str) -> bool:
+        """Only the lease's admission task may ignore queued request refs."""
+        if self.runtime_group_active_requests(runtime_group):
+            return False
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            return False
+        return task is not None and any(
+            state.runtime_group == runtime_group and state.admission_task is task
+            for state in self._execution_leases.values()
+        )
+
     def runtime_group_last_used(self, runtime_group: str) -> float:
         return max(
             (
@@ -1076,14 +1108,32 @@ class VramCoordinator(_ResourceCoordinator):
                         required_mib = floor_mib + (
                             headroom_mib if resident else 0.0
                         )
-                        if reload_mib > 0 and effective_free_mib < reload_mib:
-                            raise LocalTargetResourceError(
-                                f"GPU VRAM cleanup for local model "
-                                f"'{model or requester.target_id}' completed, but only "
-                                f"{_fmt_gib(effective_free_mib)} became available; "
-                                f"about {_fmt_gib(reload_mib)} is required to reload it. "
-                                "No prompt was submitted."
-                            )
+
+                if (
+                    not resident and reload_mib > 0
+                    and effective_free_mib < max(floor_mib, reload_mib)
+                ):
+                    # Runtime-local cleanup cannot release weights held by a
+                    # different service. Use normal idle eviction before rejecting
+                    # the cold load, including when free VRAM is below the floor.
+                    # Reserve later, inside the lease, so cancellation or another
+                    # failed execution check cannot leave a pending allocation.
+                    await self._ensure_available(
+                        requester, model=model,
+                        estimated_gb=max(floor_mib, reload_mib) / 1024.0,
+                        reserve=False,
+                    )
+                    refreshed_mib = await self._provider()
+                    if refreshed_mib is None:
+                        raise LocalTargetResourceError(
+                            f"Unable to determine available GPU VRAM for local model "
+                            f"'{model or requester.target_id}' after idle reclamation. "
+                            "No prompt was submitted."
+                        )
+                    available_mib = refreshed_mib
+                    effective_free_mib = self._effective_free_mib(
+                        available_mib, exclude_key=(requester.target_id, model)
+                    )
 
                 if effective_free_mib < required_mib:
                     # An already-running lease may be consuming the live free
