@@ -64,6 +64,7 @@ from .h3_context_ir import (
 from .generic_openai_client import GenericOpenAIClient
 from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
+from .security import RequestBodyLimitMiddleware, is_loopback_host, require_management_access
 from .request_data_log import RequestDataLogMiddleware
 from .vram import LocalTargetResourceError, MemoryCoordinator, VramCoordinator
 from .dashboard import DashboardState, RequestMetrics, run_runtime_monitor
@@ -397,8 +398,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.request_metrics = RequestMetrics()
     app.state.ensure_local_target_idle_monitor = _sync_local_target_idle_monitor
     app.state.ensure_runtime_monitor = _sync_runtime_monitor
-    _install_port_router(app)
     app.add_middleware(RequestDataLogMiddleware)
+    app.add_middleware(RequestBodyLimitMiddleware)
+    _install_port_router(app)
     app.add_middleware(ForwardedCycleMiddleware)
     _register_routes(app)
     return app
@@ -1030,6 +1032,14 @@ def _external_planner_token(request: Request) -> str:
     return token
 
 
+def _authorise_external_planner_url(profile: H3ContextIRProfile, value: Any) -> str:
+    base_url = _normalize_external_planner_base_url(value)
+    allowed = {_normalize_external_planner_base_url(url) for url in profile.external_api_allowed_base_urls}
+    if base_url not in allowed:
+        raise HTTPException(403, "external API URL is not in this profile's allowed base URLs")
+    return base_url
+
+
 def _external_planner_connection(
     request: Request,
     profile: H3ContextIRProfile,
@@ -1049,8 +1059,8 @@ def _external_planner_connection(
             detail="request-scoped external APIs are only available on the Playground listener",
         )
     protocol = _external_planner_protocol(payload.get("external_api_protocol"))
-    base_url = _normalize_external_planner_base_url(
-        payload.get("external_api_base_url")
+    base_url = _authorise_external_planner_url(
+        profile, payload.get("external_api_base_url")
     )
     model = str(payload.get("external_api_model") or "").strip()
     if not model:
@@ -1096,6 +1106,7 @@ async def _external_planner_http_client(app: FastAPI) -> AsyncIterator[httpx.Asy
     async with httpx.AsyncClient(
         timeout=settings.timeout_seconds,
         trust_env=settings.use_system_proxy,
+        follow_redirects=False,
     ) as client:
         yield client
 
@@ -1177,6 +1188,8 @@ def _playground_context_ir_entry(
         }
     ]
     for provider in profile.providers:
+        if not _context_ir_provider_is_exposed(settings, iface.name, provider):
+            continue
         modalities = "/".join(provider.modalities)
         provider_choices.append(
             _context_ir_provider_choice(
@@ -1414,25 +1427,19 @@ def _bearer_or_api_key(request: Request) -> str:
 
 
 def _playground_interface_for(request: Request, settings: Settings):
-    """Pick the model interface represented by a playground request.
-
-    A matching token wins, which lets one playground port work with multiple
-    configured API interfaces.  Without a token, prefer the first open API
-    interface, then an open Ollama interface.  Falling back to the first
-    configured interface preserves its normal 401 response for invalid keys.
-    """
+    """Select explicit credentials; anonymous use stays on a local listener."""
     candidates = [*settings.api_interfaces, *settings.ollama_interfaces]
-    if not candidates:
-        return None
     token = _bearer_or_api_key(request)
     if token:
         for iface in candidates:
             if iface.auth_required and iface.is_valid_token(token):
                 return iface
-    for iface in candidates:
-        if not iface.auth_required:
-            return iface
-    return candidates[0]
+        raise HTTPException(401, "invalid api token")
+    if is_loopback_host(settings.playground_host):
+        for iface in candidates:
+            if not iface.auth_required and is_loopback_host(iface.host):
+                return iface
+    raise HTTPException(401, "Playground requires an interface API token")
 
 
 # Path prefixes that are only served by the admin listener when admin_port is set.
@@ -1513,10 +1520,10 @@ def _request_log_context(request: Request) -> Dict[str, Any]:
     return {
         "listener": _listener_name(request),
         "port": local_port if local_port is not None else "-",
-        "surface": _request_surface(request.url.path),
+        "surface": _request_surface(request.scope["path"]),
         "client": client,
         "method": request.method,
-        "path": request.url.path,
+        "path": request.scope["path"],
     }
 
 
@@ -1578,7 +1585,7 @@ def _install_port_router(app: FastAPI) -> None:
     async def _split(request: Request, call_next):
         settings: Settings = request.app.state.settings
         local_port = _local_port(request)
-        path = request.url.path
+        path = request.scope["path"]
         started_at = time.perf_counter()
 
         metrics: Optional[RequestMetrics] = getattr(
@@ -1615,6 +1622,17 @@ def _install_port_router(app: FastAPI) -> None:
             if rid is not None and metrics is not None:
                 metrics.end(rid, status=response.status_code)
             return response
+
+        async def _serve():
+            # Header checks run before any request parsing or data logging.
+            try:
+                if path.startswith(("/admin", "/dashboard")):
+                    require_management_access(request)
+                elif path.startswith(("/api/", "/v1/", "/playground/api/")):
+                    _authorise_interface(request)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+            return await call_next(request)
 
         try:
             if getattr(request.app.state, "shutdown_requested", False):
@@ -1673,7 +1691,7 @@ def _install_port_router(app: FastAPI) -> None:
             if is_admin:
                 if not admin_only:
                     return _finish(JSONResponse({"detail": "not found"}, status_code=404))
-                return _finish(await call_next(request))
+                return _finish(await _serve())
 
             # Dashboard listener: only /dashboard/* and a / redirect.
             if is_dashboard:
@@ -1681,7 +1699,7 @@ def _install_port_router(app: FastAPI) -> None:
                     return _finish(RedirectResponse("/dashboard/"))
                 if not dashboard_only:
                     return _finish(JSONResponse({"detail": "not found"}, status_code=404))
-                return _finish(await call_next(request))
+                return _finish(await _serve())
 
             # Playground listener: its static page plus model discovery, chat,
             # image and video endpoints.  It deliberately exposes no other API
@@ -1699,7 +1717,7 @@ def _install_port_router(app: FastAPI) -> None:
                     or shared_v1
                     or playground_media
                 ):
-                    return _finish(await call_next(request))
+                    return _finish(await _serve())
                 return _finish(JSONResponse({"detail": "not found"}, status_code=404))
 
             # Management paths can only be served on their own listeners.
@@ -1713,7 +1731,7 @@ def _install_port_router(app: FastAPI) -> None:
                         JSONResponse({"detail": "not found"}, status_code=404)
                     )
                 if ollama_only or shared_v1 or path in ("/",):
-                    return _finish(await call_next(request))
+                    return _finish(await _serve())
                 return _finish(
                     JSONResponse({"detail": "not found"}, status_code=404)
                 )
@@ -1725,7 +1743,7 @@ def _install_port_router(app: FastAPI) -> None:
                         JSONResponse({"detail": "not found"}, status_code=404)
                     )
                 if api_only or shared_v1:
-                    return _finish(await call_next(request))
+                    return _finish(await _serve())
                 return _finish(
                     JSONResponse({"detail": "not found"}, status_code=404)
                 )
@@ -2401,6 +2419,18 @@ def _context_ir_duration(
     return duration
 
 
+def _context_ir_provider_is_exposed(settings: Settings, interface_name: str, provider: H3ContextIRProvider) -> bool:
+    iface = settings.interface_by_name(interface_name)
+    backend = settings.backend_by_name(provider.target)
+    if iface is None or backend is None:
+        return False
+    wanted = backend.source.resolve_model(provider.model)
+    for exposure in iface.exposed_models:
+        if exposure.target == provider.target and backend.source.resolve_model(exposure.model) == wanted:
+            return True
+    return False
+
+
 def _select_context_ir_provider(
     settings: Settings,
     profile: H3ContextIRProfile,
@@ -2489,6 +2519,8 @@ def _select_context_ir_provider(
                 f"{[item.name for item in profile.providers]}"
             ),
         )
+    if not _context_ir_provider_is_exposed(settings, interface_name, provider):
+        raise HTTPException(403, "Planner model is not exposed on this interface")
     return provider
 
 

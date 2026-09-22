@@ -26,7 +26,9 @@ Send = Callable[[Message], Awaitable[None]]
 
 LOGGER_NAME = "fake_ollama.request_data"
 DEFAULT_REQUEST_DATA_LOG_FILE = Path("logs") / "fake_ollama.requests.jsonl"
+MAX_LOG_BODY_BYTES = 64 * 1024
 SENSITIVE_HEADERS = {
+    "x-management-token",
     "authorization",
     "proxy-authorization",
     "x-api-key",
@@ -113,6 +115,9 @@ def log_data_event(event: str, *, request_id: Optional[str] = None, **fields: An
 
 def body_from_bytes(body: bytes) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"bytes": len(body)}
+    if len(body) > MAX_LOG_BODY_BYTES:
+        payload["truncated"] = True
+        body = body[:MAX_LOG_BODY_BYTES]
     try:
         payload["encoding"] = "utf-8"
         payload["text"] = body.decode("utf-8")
@@ -123,14 +128,52 @@ def body_from_bytes(body: bytes) -> Dict[str, Any]:
 
 
 def body_from_text(text: str) -> Dict[str, Any]:
-    return {
-        "bytes": len(text.encode("utf-8")),
-        "encoding": "utf-8",
-        "text": text,
-    }
+    return body_from_bytes(text.encode("utf-8"))
 
 
 def body_from_json(value: Any) -> Dict[str, Any]:
+    # Limit traversal and individual strings before serializing: a base64
+    # video must never be copied in full just to decide to truncate its log.
+    budget = MAX_LOG_BODY_BYTES
+    truncated = False
+
+    def preview(item, depth=0):
+        nonlocal budget, truncated
+        if budget <= 0 or depth > 32:
+            truncated = True
+            return None
+        budget -= 8
+        if isinstance(item, str):
+            encoded = item[:max(0, budget)].encode("utf-8")
+            clipped = encoded[:max(0, budget)].decode("utf-8", errors="ignore")
+            budget -= len(encoded)
+            if clipped != item:
+                truncated = True
+            return clipped
+        if isinstance(item, dict):
+            result = {}
+            for key, child in item.items():
+                if budget <= 0:
+                    truncated = True
+                    break
+                result[str(preview(str(key), depth + 1))] = preview(child, depth + 1)
+            return result
+        if isinstance(item, (list, tuple)):
+            result = []
+            for child in item:
+                if budget <= 0:
+                    truncated = True
+                    break
+                result.append(preview(child, depth + 1))
+            return result
+        return item
+
+    bounded = preview(value)
+    encoded = json.dumps(bounded, ensure_ascii=False, default=_json_default).encode("utf-8")
+    if truncated or len(encoded) > MAX_LOG_BODY_BYTES:
+        result = body_from_bytes(encoded)
+        result["truncated"] = True
+        return result
     return {"json": value}
 
 
@@ -231,45 +274,43 @@ class RequestDataLogMiddleware:
             headers=headers_from_raw(scope.get("headers") or []),
         )
 
-        replay_messages: list[Message] = []
-        request_chunks: list[bytes] = []
+        request_preview = bytearray()
+        request_bytes = 0
         disconnected = False
-        while True:
+        body_logged = False
+        response_logged_bytes = 0
+
+        def log_request_body() -> None:
+            nonlocal body_logged
+            if body_logged:
+                return
+            body_logged = True
+            body = body_from_bytes(bytes(request_preview))
+            body["bytes"] = request_bytes
+            if request_bytes > len(request_preview):
+                body["truncated"] = True
+            log_data_event(
+                "http_request_body", request_id=request_id,
+                disconnected=disconnected, body=body,
+            )
+
+        async def logging_receive() -> Message:
+            nonlocal request_bytes, disconnected
             message = await receive()
-            replay_messages.append(message)
-            message_type = message.get("type")
-            if message_type == "http.request":
+            if message.get("type") == "http.request":
                 chunk = message.get("body") or b""
-                if chunk:
-                    request_chunks.append(chunk)
+                request_bytes += len(chunk)
+                remaining = MAX_LOG_BODY_BYTES - len(request_preview)
+                request_preview.extend(chunk[:remaining])
                 if not message.get("more_body", False):
-                    break
-            elif message_type == "http.disconnect":
+                    log_request_body()
+            elif message.get("type") == "http.disconnect":
                 disconnected = True
-                break
-            else:
-                break
-
-        request_body = b"".join(request_chunks)
-        log_data_event(
-            "http_request_body",
-            request_id=request_id,
-            disconnected=disconnected,
-            body=body_from_bytes(request_body),
-        )
-
-        replay_index = 0
-
-        async def replay_receive() -> Message:
-            nonlocal replay_index
-            if replay_index < len(replay_messages):
-                msg = replay_messages[replay_index]
-                replay_index += 1
-                return msg
-            return await receive()
+                log_request_body()
+            return message
 
         async def logging_send(message: Message) -> None:
-            nonlocal response_status, response_bytes
+            nonlocal response_status, response_bytes, response_logged_bytes
             message_type = message.get("type")
             if message_type == "http.response.start":
                 response_status = int(message.get("status") or 0)
@@ -282,17 +323,23 @@ class RequestDataLogMiddleware:
             elif message_type == "http.response.body":
                 chunk = message.get("body") or b""
                 response_bytes += len(chunk)
-                if chunk:
+                if chunk and response_logged_bytes < MAX_LOG_BODY_BYTES:
+                    preview = chunk[:MAX_LOG_BODY_BYTES - response_logged_bytes]
+                    response_logged_bytes += len(preview)
+                    body = body_from_bytes(preview)
+                    body["bytes"] = len(chunk)
+                    if len(preview) < len(chunk):
+                        body["truncated"] = True
                     log_data_event(
                         "http_response_body",
                         request_id=request_id,
                         more_body=bool(message.get("more_body", False)),
-                        body=body_from_bytes(chunk),
+                        body=body,
                     )
             await send(message)
 
         try:
-            await self.app(scope, replay_receive, logging_send)
+            await self.app(scope, logging_receive, logging_send)
         except BaseException as exc:
             outcome = (
                 "cancelled"
@@ -310,6 +357,7 @@ class RequestDataLogMiddleware:
             )
             raise
         finally:
+            log_request_body()
             duration_ms = (time.perf_counter() - started_at) * 1000.0
             end_outcome = (
                 "cancelled"
@@ -322,7 +370,7 @@ class RequestDataLogMiddleware:
                 outcome=end_outcome,
                 status=response_status,
                 duration_ms=round(duration_ms, 2),
-                request_bytes=len(request_body),
+                request_bytes=request_bytes,
                 response_bytes=response_bytes,
                 error=error,
             )

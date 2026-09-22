@@ -16,9 +16,8 @@ user can drop a field back to its default). Object lists
 rendered as repeatable groups with add/remove buttons. A "raw JSON"
 toggle is kept as an escape hatch.
 
-Security: there is **no** authentication. Keep the admin listener on
-localhost, or disable via ``"admin_enabled": false`` if the service is
-reachable from anything untrusted.
+Security: local pages bootstrap an ephemeral management credential. Remote
+management requires separately configured management_access_tokens.
 """
 
 from __future__ import annotations
@@ -30,8 +29,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+from .security import management_page, require_management_access
 
 from .anthropic_client import AnthropicClient
 from .comfyui_client import ComfyUIClient
@@ -430,7 +431,9 @@ H3_CONTEXT_IR_PROFILE_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "allow_compatible_models", "type": "bool", "default": True,
      "description": "允许从当前接口 exposed_models 中自选其它 completion 模型；带图兼容性按 vision capability 判断"},
     {"key": "allow_external_api", "type": "bool", "default": False,
-     "description": "允许 Playground 临时输入第三方 OpenAI/Anthropic-compatible URL 与 token；该能力可访问任意网络地址，建议只在受信任的本机 Playground 开启"},
+     "description": "允许 Playground 使用下方白名单中的第三方 API 地址与临时 token"},
+    {"key": "external_api_allowed_base_urls", "type": "string_list", "default": [],
+     "description": "允许的第三方 API base URL，逐项精确匹配；空列表禁止访问。填写内网地址即明确授权访问该地址"},
     {"key": "providers", "type": "object_list", "default": [],
      "item_schema": H3_CONTEXT_IR_PROVIDER_ITEM_SCHEMA,
      "nav_label_keys": ["name", "model"],
@@ -578,6 +581,10 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "description": "API 接口数组（Anthropic /v1/messages + OpenAI /v1/chat/completions + /v1/images/* + /v1/models）。每个 entry 独立的 host/port/access_tokens/exposed_models"},
 
   # ---- Runtime & profiles --------------------------------------------------
+  {"key": "max_request_body_bytes", "type": "int", "default": 67108864, "group": "runtime",
+   "description": "单个请求体上限（字节），默认 64 MiB；上传更大视频时可调整"},
+  {"key": "request_body_timeout_seconds", "type": "float", "default": 60.0, "group": "runtime",
+   "description": "接收请求体的超时，不影响模型推理时限"},
   {"key": "default_max_tokens", "type": "int", "default": 4096, "group": "runtime",
    "description": "缺省的 max_tokens / num_predict"},
   {"key": "timeout_seconds", "type": "float", "default": 300.0, "group": "runtime",
@@ -625,12 +632,14 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "playground_port", "type": "int", "default": 21431, "group": "playground",
    "description": "模型调试页独立监听端口；必须与所有 interface、admin 和 dashboard 端口不同。启用后访问 /playground/"},
 
+  {"key": "management_access_tokens", "type": "string_list", "default": [], "group": "admin",
+   "description": "Admin 与 Dashboard 独立管理凭据。空列表仅允许本机页面；设置后浏览器登录时用户名任意，密码填写该 token"},
   {"key": "admin_enabled", "type": "bool", "default": True, "group": "admin",
    "description": "是否启用本 /admin 编辑器（关闭后需手动改 config.json）"},
   {"key": "admin_host", "type": "string", "default": "127.0.0.1", "group": "admin",
-   "description": "Admin UI 监听地址。强烈建议保持 127.0.0.1；/admin 没有内置鉴权"},
+   "description": "Admin UI 监听地址。默认仅限本机；远程访问必须配置 management_access_tokens"},
   {"key": "admin_port", "type": "int", "default": 21433, "group": "admin",
-   "description": "Admin UI 独立监听端口。设为 null 才会把 /admin 挂回 internal 端口（旧行为，不推荐）"},
+   "description": "Admin UI 独立监听端口；null 表示不启动管理监听"},
 ]
 
 
@@ -1109,24 +1118,26 @@ def register_admin_routes(app: FastAPI) -> None:
     if not settings.admin_enabled:
         return
 
-    @app.get("/admin", include_in_schema=False)
-    @app.get("/admin/", include_in_schema=False)
-    async def admin_index() -> HTMLResponse:
-        return HTMLResponse(_INDEX_HTML)
+    router = APIRouter(dependencies=[Depends(require_management_access)])
 
-    @app.get("/admin/schema", include_in_schema=False)
+    @router.get("/admin", include_in_schema=False)
+    @router.get("/admin/", include_in_schema=False)
+    async def admin_index() -> HTMLResponse:
+        return management_page(app, _INDEX_HTML)
+
+    @router.get("/admin/schema", include_in_schema=False)
     async def admin_schema() -> JSONResponse:
         return JSONResponse({"fields": CONFIG_SCHEMA, "groups": GROUP_LABELS})
 
-    @app.post("/admin/generate-token", include_in_schema=False)
+    @router.post("/admin/generate-token", include_in_schema=False)
     async def admin_generate_token() -> JSONResponse:
         return JSONResponse({"token": generate_access_token()})
 
-    @app.get("/admin/config", include_in_schema=False)
+    @router.get("/admin/config", include_in_schema=False)
     async def admin_get_config(request: Request) -> JSONResponse:
         return JSONResponse(_settings_to_dict(request.app.state.settings))
 
-    @app.put("/admin/config", include_in_schema=False)
+    @router.put("/admin/config", include_in_schema=False)
     async def admin_put_config(request: Request) -> PlainTextResponse:
         try:
             data = await request.json()
@@ -1154,7 +1165,7 @@ def register_admin_routes(app: FastAPI) -> None:
         await _swap_settings(request.app, new_settings)
         return PlainTextResponse(f"saved to {save_path}")
 
-    @app.post("/admin/probe-models", include_in_schema=False)
+    @router.post("/admin/probe-models", include_in_schema=False)
     async def admin_probe_models(request: Request) -> JSONResponse:
         try:
             body = await request.json()
@@ -1240,3 +1251,5 @@ def register_admin_routes(app: FastAPI) -> None:
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"probe failed: {exc}") from exc
         return JSONResponse({"models": names})
+
+    app.include_router(router)

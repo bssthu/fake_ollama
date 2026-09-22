@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fake_ollama.config import Settings
+from fake_ollama.security import management_session_token
 from fake_ollama.dashboard import (
     DashboardState,
     RequestMetrics,
@@ -217,7 +218,7 @@ def test_dashboard_reclaim_model_rejects_when_disabled(tmp_path: Path) -> None:
     )
     app = _route_app(_settings(tmp_path / "history.json"), coordinator=coord)
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1:21432", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)}) as client:
         resp = client.post(
             "/dashboard/reclaim-model", json={"key": "ollama|ollama:t|m"}
         )
@@ -235,7 +236,7 @@ def test_dashboard_reclaim_model_calls_coordinator_when_enabled(tmp_path: Path) 
     )
     app = _route_app(settings, coordinator=coord)
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1:21432", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)}) as client:
         resp = client.post(
             "/dashboard/reclaim-model", json={"key": "ollama|ollama:t|m"}
         )
@@ -257,7 +258,7 @@ def test_dashboard_reclaim_model_passes_force_when_enabled(tmp_path: Path) -> No
     snapshot["active_requests"] = 1
     app = _route_app(settings, snapshot=snapshot, coordinator=coord)
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1:21432", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)}) as client:
         resp = client.post(
             "/dashboard/reclaim-model",
             json={"key": "ollama|ollama:t|m", "force": True},

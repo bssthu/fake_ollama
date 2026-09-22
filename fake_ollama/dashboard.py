@@ -14,8 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+
+from .security import management_page, require_management_access
 
 from .vram import (
     MemoryCoordinator,
@@ -713,12 +715,14 @@ def register_dashboard_routes(app: FastAPI) -> None:
     if not settings.dashboard_listener_enabled:
         return
 
-    @app.get("/dashboard", include_in_schema=False)
-    @app.get("/dashboard/", include_in_schema=False)
-    async def dashboard_index() -> HTMLResponse:
-        return HTMLResponse(_DASHBOARD_HTML)
+    router = APIRouter(dependencies=[Depends(require_management_access)])
 
-    @app.get("/dashboard/data", include_in_schema=False)
+    @router.get("/dashboard", include_in_schema=False)
+    @router.get("/dashboard/", include_in_schema=False)
+    async def dashboard_index() -> HTMLResponse:
+        return management_page(app, _DASHBOARD_HTML)
+
+    @router.get("/dashboard/data", include_in_schema=False)
     async def dashboard_data(
         request: Request,
         range_seconds: float = Query(default=3600.0, ge=1.0),
@@ -728,7 +732,7 @@ def register_dashboard_routes(app: FastAPI) -> None:
             await state.data(request.app, range_seconds=range_seconds)
         )
 
-    @app.post("/dashboard/reclaim-model", include_in_schema=False)
+    @router.post("/dashboard/reclaim-model", include_in_schema=False)
     async def dashboard_reclaim_model(request: Request) -> JSONResponse:
         settings = request.app.state.settings
         if not _dashboard_model_reclaim_enabled(settings):
@@ -778,3 +782,5 @@ def register_dashboard_routes(app: FastAPI) -> None:
         )
         status_code = 200 if result.get("released") else 409
         return JSONResponse(result, status_code=status_code)
+
+    app.include_router(router)

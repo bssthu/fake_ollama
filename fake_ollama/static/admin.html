@@ -110,8 +110,7 @@
 
 <div class="sub">file: <code id="path">(loading...)</code></div>
 <div class="warn">
-  <b>Warning:</b> 本编辑器没有鉴权。请保持 <code>admin_host=127.0.0.1</code>，或在 <code>config.json</code> 里设置
-  <code>"admin_enabled": false</code>。保存会原子重建上游连接池。
+  默认仅允许本机管理。远程访问需设置 <code>management_access_tokens</code>，与模型接口的 API key 分开。
 </div>
 
 <div class="layout">
@@ -132,6 +131,13 @@
 </div>
 
 <script>
+const managementToken = '__MANAGEMENT_TOKEN__';
+function managementFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set('X-Management-Token', managementToken);
+  return window.fetch(url, {...options, headers, cache: 'no-store'});
+}
+
 // Resolve admin base whether the user landed on /admin or /admin/.
 const ADMIN_BASE = (() => {
   const m = location.pathname.match(/^(.*?\/admin)(\/.*)?$/);
@@ -258,7 +264,7 @@ function makeScalar(field, value) {
 }
 
 async function requestGeneratedToken() {
-  const response = await fetch(ADMIN_BASE + '/generate-token', {method: 'POST'});
+  const response = await managementFetch(ADMIN_BASE + '/generate-token', {method: 'POST'});
   if (!response.ok) throw new Error(await response.text() || ('HTTP ' + response.status));
   const body = await response.json();
   if (!body || typeof body.token !== 'string') throw new Error('Invalid token response');
@@ -558,7 +564,7 @@ function makeObjectList(field, value) {
         const prev = detectBtn.textContent;
         detectBtn.textContent = 'detecting...';
         try {
-          const r = await fetch(ADMIN_BASE + '/probe-models', {
+          const r = await managementFetch(ADMIN_BASE + '/probe-models', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({kind: field.detect_models, base_url: baseUrl, auth_token: token}),
@@ -1233,8 +1239,8 @@ async function load() {
   setStatus('loading...');
   try {
     const [schemaResp, cfgResp] = await Promise.all([
-      fetch(ADMIN_BASE + '/schema'),
-      fetch(ADMIN_BASE + '/config'),
+      managementFetch(ADMIN_BASE + '/schema'),
+      managementFetch(ADMIN_BASE + '/config'),
     ]);
     if (!schemaResp.ok) throw new Error('schema: ' + await schemaResp.text());
     if (!cfgResp.ok) throw new Error('config: ' + await cfgResp.text());
@@ -1269,7 +1275,7 @@ async function save() {
     catch (e) { return setStatus('invalid form value: ' + e.message, 'err'); }
   }
   try {
-    const r = await fetch(ADMIN_BASE + '/config', {
+    const r = await managementFetch(ADMIN_BASE + '/config', {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload),

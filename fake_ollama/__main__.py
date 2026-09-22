@@ -129,14 +129,14 @@ def main() -> None:
         "--request-data-log-file",
         default=str(DEFAULT_REQUEST_DATA_LOG_FILE),
         help=(
-            "write full request/response data JSONL to this file "
+            "write request/response previews (up to 64 KiB) as JSONL "
             "(default: logs/fake_ollama.requests.jsonl)"
         ),
     )
     parser.add_argument(
         "--no-request-data-log",
         action="store_true",
-        help="disable the separate full request/response data JSONL log",
+        help="disable the separate request/response preview JSONL log",
     )
     args = parser.parse_args()
 

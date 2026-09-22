@@ -203,7 +203,9 @@ async def test_request_data_log_marks_routed_disconnect_499_cancelled(
         for message in sent
     )
     records = _records(log_file)
-    assert not any(record["event"] == "http_request_error" for record in records)
+    errors = [record for record in records if record["event"] == "http_request_error"]
+    assert len(errors) == 1
+    assert errors[0]["outcome"] == "cancelled"
     body = next(record for record in records if record["event"] == "http_request_body")
     assert body["disconnected"] is True
     end = next(record for record in records if record["event"] == "http_request_end")

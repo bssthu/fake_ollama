@@ -1338,6 +1338,7 @@ class H3ContextIRProfile(BaseModel):
     playground_visible: bool = True
     allow_compatible_models: bool = True
     allow_external_api: bool = False
+    external_api_allowed_base_urls: List[str] = Field(default_factory=list)
     providers: List[H3ContextIRProvider] = Field(default_factory=list)
     default_text_provider: Optional[str] = None
     default_multimodal_provider: Optional[str] = None
@@ -1368,6 +1369,22 @@ class H3ContextIRProfile(BaseModel):
         if "@" in value:
             raise ValueError("context IR profile alias must not contain '@'")
         return value
+
+    @field_validator("external_api_allowed_base_urls")
+    @classmethod
+    def _external_api_urls(cls, urls: List[str]) -> List[str]:
+        for url in urls:
+            parsed = urlparse(url)
+            if (
+                url != url.strip() or any(char.isspace() for char in url)
+                or parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or "\\" in url
+            ):
+                raise ValueError("external API allowlist requires absolute http(s) base URLs without credentials, query or fragment")
+            if parsed.port is not None and not 1 <= parsed.port <= 65535:
+                raise ValueError("invalid external API port")
+        return list(dict.fromkeys(urls))
 
     @field_validator("default_text_provider", "default_multimodal_provider")
     @classmethod
@@ -1684,9 +1701,12 @@ class Settings(BaseModel):
     timeout_seconds: float = 300.0
     use_system_proxy: bool = False
     enforce_context_limit: bool = True
+    max_request_body_bytes: int = Field(default=64 * 1024 * 1024, gt=0)
+    request_body_timeout_seconds: float = Field(default=60.0, gt=0, allow_inf_nan=False)
     model_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
     # -- Admin UI listener ----------------------------------------------
+    management_access_tokens: List[str] = Field(default_factory=list)
     admin_enabled: bool = True
     admin_host: str = "127.0.0.1"
     admin_port: Optional[int] = 21433
@@ -1718,6 +1738,13 @@ class Settings(BaseModel):
 
     # -- Meta ------------------------------------------------------------
     config_path: str = ""
+
+    @field_validator("management_access_tokens")
+    @classmethod
+    def _management_tokens(cls, tokens: List[str]) -> List[str]:
+        if any(not token.strip() for token in tokens):
+            raise ValueError("management tokens must be non-empty")
+        return list(dict.fromkeys(tokens))
 
     @field_validator("model_profiles", mode="before")
     @classmethod

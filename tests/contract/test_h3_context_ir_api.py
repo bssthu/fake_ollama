@@ -101,7 +101,7 @@ class _FakeComfy:
 
 def _settings(*, attach_video: bool = False) -> Settings:
     comfy = []
-    exposed = []
+    exposed = [{"model": "planner-text", "target": "planner"}, {"model": "planner-vision", "target": "planner"}]
     profiles: dict[str, dict[str, Any]] = {
         "planner-text@planner": {
             "capabilities": ["completion"],
@@ -127,7 +127,7 @@ def _settings(*, attach_video: bool = False) -> Settings:
                 "context_ir_prompt_mode": "auto",
             }
         ]
-        exposed = [{"model": "h3-local", "target": "h3-comfy", "alias": "h3"}]
+        exposed.append({"model": "h3-local", "target": "h3-comfy", "alias": "h3"})
         profiles["h3-local@h3-comfy"] = {
             "capabilities": ["video_generation"],
             "estimated_vram_gb": 18,
@@ -192,6 +192,10 @@ def _settings(*, attach_video: bool = False) -> Settings:
 def _settings_with_external(*, attach_video: bool = False) -> Settings:
     data = _settings(attach_video=attach_video).model_dump()
     data["h3_context_ir_profiles"][0]["allow_external_api"] = True
+    data["h3_context_ir_profiles"][0]["external_api_allowed_base_urls"] = [
+        "https://provider.test/api", "https://provider.test", "https://gateway.test",
+        "https://anthropic-gateway.test",
+    ]
     return Settings.model_validate(data)
 
 
@@ -213,7 +217,7 @@ def test_playground_discovers_and_runs_context_ir_virtual_model() -> None:
         )
 
     assert discovery.status_code == 200
-    virtual = discovery.json()["models"][0]
+    virtual = next(model for model in discovery.json()["models"] if "h3_context_ir" in model["capabilities"])
     assert virtual["id"] == "h3-context-ir-fake@default"
     assert virtual["capabilities"] == ["h3_context_ir"]
     operation = virtual["operations"][0]
@@ -367,7 +371,7 @@ def test_discovery_advertises_request_scoped_external_planner_when_enabled() -> 
             "/playground/api/models", headers={"x-api-key": "tk"}
         )
 
-    virtual = discovery.json()["models"][0]
+    virtual = next(model for model in discovery.json()["models"] if "h3_context_ir" in model["capabilities"])
     operation = virtual["operations"][0]
     provider_parameter = next(
         item for item in operation["parameters"] if item["name"] == "provider"
@@ -774,6 +778,9 @@ def test_video_generation_releases_managed_local_planner_before_comfy() -> None:
             "model": "planner-text",
             "auto_start": False,
         }
+    ]
+    data["api_interfaces"][0]["exposed_models"] = [
+        entry for entry in data["api_interfaces"][0]["exposed_models"] if entry["model"] != "planner-vision"
     ]
     context_profile = data["h3_context_ir_profiles"][0]
     context_profile["providers"] = [context_profile["providers"][0]]

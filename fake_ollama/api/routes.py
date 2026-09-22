@@ -29,10 +29,9 @@ def register_routes(app: FastAPI) -> None:
 
     @app.get("/api/tags")
     async def tags(request: Request) -> Dict[str, Any]:
-        settings: Settings = app.state.settings
+        settings, iface = core._model_interface_for_request(request)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         models = []
-        iface = core._interface_for(request)
         public_ids = iface.public_ids() if iface is not None else []
         for name in public_ids:
             models.append(
@@ -59,10 +58,11 @@ def register_routes(app: FastAPI) -> None:
         return {"models": []}
 
     @app.post("/api/show")
-    async def show(payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def show(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
         settings: Settings = app.state.settings
         name = payload.get("name") or payload.get("model") or ""
-        profile = settings.profile_for(name)
+        backend, display_model = core._dispatch(request, settings, name)
+        profile = settings.profile_for(f"{display_model}@{backend.name}")
         # Some clients (e.g. the GitHub Copilot VS Code extension's Ollama
         # integration) silently drop models whose /api/show response does not
         # advertise the capabilities they need ("completion" for chat,
@@ -210,7 +210,7 @@ def register_routes(app: FastAPI) -> None:
                 detail="this H3 Context-IR profile does not allow external APIs",
             )
         protocol = core._external_planner_protocol(payload.get("protocol"))
-        base_url = core._normalize_external_planner_base_url(payload.get("base_url"))
+        base_url = core._authorise_external_planner_url(profile, payload.get("base_url"))
         token = core._external_planner_token(request)
         try:
             async with core._external_planner_http_client(request.app) as client:

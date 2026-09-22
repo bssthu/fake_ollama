@@ -16,7 +16,7 @@
 │  fake_ollama 进程（asyncio.gather 同时跑多个 uvicorn）           │
 │                                                                  │
 │  admin listener          (默认 127.0.0.1:21433)                  │
-│    /admin/*          Web 配置编辑器（无内置鉴权）                │
+│    /admin/*          Web 配置编辑器（独立管理凭据）              │
 │                                                                  │
 │  ollama_interfaces[*]    （数组，可 0..N 个；典型: 21434）       │
 │    /                 ping                                        │
@@ -587,11 +587,11 @@ h3-context-ir-fake profile
 - `provider`：可选推荐 provider 名，或 Playground 中列出的兼容模型；省略时，无图走 `default_text_provider`，有图走 `default_multimodal_provider`。
 - `image` / `images`：最多两张，每张不超过 20 MiB。
 
-`providers` 是 profile 明确推荐的稳定组合。`allow_compatible_models: true` 时，Playground 还会在“自选兼容模型”分组中列出当前 API key 所选接口 `exposed_models` 里的其它聊天模型：必须声明 `completion`，带图能力则由 `vision` capability 决定；ComfyUI 和纯媒体模型不会进入列表。自选仍受接口模型白名单限制，不能借此调用未暴露的 target。
+`providers` 是 profile 明确推荐的稳定组合。所有 Planner（包括默认选择、推荐 provider 和视频生成时的编排）都必须在当前接口的 `exposed_models` 中授权。`allow_compatible_models: true` 时，Playground 还会在“自选兼容模型”分组中列出当前 API key 所选接口 `exposed_models` 里的其它聊天模型：必须声明 `completion`，带图能力则由 `vision` capability 决定；ComfyUI 和纯媒体模型不会进入列表。
 
 `allow_external_api: true` 会再增加“临时第三方 API”选项。Playground 中选择 OpenAI-compatible 或 Anthropic-compatible，输入 URL 与 token 后，可通过第三方 `/v1/models` 自动识别模型并选择；若网关不提供模型列表，也可手动填写模型 ID。第三方模型端点通常不报告图片能力，因此需要明确选择“纯文字”或“多模态（可看图）”。URL 可填服务根路径、`.../v1` 或具体的 `.../v1/models` / `chat/completions` / `messages` 地址，服务端会规范化后调用。
 
-临时 token 只保留在页面内存，通过单次请求的 `x-playground-upstream-key` 请求头传给 fake-ollama；不会写入 `config.json`、模型 discovery 或交互记录，请求数据日志也会将该头脱敏。临时外部连接只允许从独立 Playground 监听器发起，普通 API/Ollama 监听器不能使用。这个开关允许服务端访问用户填写的任意 HTTP(S) 地址，默认关闭；只应在受信任且有访问 token 的 Playground 上开启。
+临时 token 只保留在页面内存，通过单次请求的 `x-playground-upstream-key` 请求头传给 fake-ollama；不会写入 `config.json`、模型 discovery 或交互记录，请求数据日志也会将该头脱敏。临时外部连接只允许从独立 Playground 监听器发起，普通 API/Ollama 监听器不能使用。还必须在该 profile 的 `external_api_allowed_base_urls` 中逐项配置可信 base URL（例如 `["https://provider.example/api"]`）；规范化后精确匹配，不接受通配符，不跟随重定向。空列表拒绝所有临时第三方地址；填写回环或内网 URL 即明确授权访问该地址。管理员应只添加自己信任其 DNS 与服务的地址。
 
 Playground 的预计显存、预计内存和上下文会随实际 Planner 选择即时更新；`auto` 会根据当前是否附图显示对应默认 Planner 的资源。若给纯文字 Planner 附图，界面会在发送前提醒，响应 `warnings` 也会说明：图片仍用于 `<Picture N>` 对齐，但不会发送给 Planner 分析。
 
@@ -764,7 +764,7 @@ Invoke-RestMethod http://127.0.0.1:21435/v1/videos/generations `
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `admin_enabled` | bool | `true` | 是否注册 `/admin` |
-| `admin_host` | string | `127.0.0.1` | admin listener 地址（**无内置鉴权**） |
+| `admin_host` | string | `127.0.0.1` | admin listener 地址；远程管理需独立凭据 |
 | `admin_port` | int | `21433` | admin listener 端口 |
 | `dashboard_enabled` | bool | `true` | 是否启用资源监控 dashboard |
 | `dashboard_host` / `dashboard_port` | | `127.0.0.1` / `21432` | dashboard listener |
@@ -793,7 +793,7 @@ node scripts\validation\validate_playground_camera.mjs
 
 脚本不需要 npm 依赖，不会打印 API key；它会用临时浏览器 profile 调用真实 Mage-VL，验证连续录制、单槽背压、结果历史和停止收尾后再关闭测试浏览器。
 
-聊天模式按模型保存当前页面内的完整轮次，每次请求会回传先前的 user/assistant 消息；前端读取 `context_length` 和 `max_output_tokens` 估算预算，超过 90% 安全阈值时优先丢弃最早的完整轮次，必要时再截短当前输入。视频分析、图片生成、图片编辑和视频生成也会保留逐轮输入与结果，但其 `history_mode=single_turn`，接口只接收本次输入。若 interface 不要求鉴权，API key 可以留空。
+聊天模式按模型保存当前页面内的完整轮次，每次请求会回传先前的 user/assistant 消息；前端读取 `context_length` 和 `max_output_tokens` 估算预算，超过 90% 安全阈值时优先丢弃最早的完整轮次，必要时再截短当前输入。视频分析、图片生成、图片编辑和视频生成也会保留逐轮输入与结果，但其 `history_mode=single_turn`，接口只接收本次输入。仅当 Playground 和所选免鉴权 interface 都绑定回环地址时，API key 才可以留空。监听 `0.0.0.0` 或其它非回环地址时必须填写某个接口的有效 token；无效 token 不会回退到匿名接口。
 
 ## 内部 backends 视图
 
@@ -911,16 +911,16 @@ curl -X POST http://127.0.0.1:21435/v1/chat/completions `
 
 ## 请求数据日志
 
-`logs/fake_ollama.log` 只放运行日志；完整请求 / 响应数据默认写到 `logs/fake_ollama.requests.jsonl`。
+`logs/fake_ollama.log` 只放运行日志；请求 / 响应预览默认写到 `logs/fake_ollama.requests.jsonl`。
 
 每行是一条 JSON 事件，核心字段：
 
 - `request_id`：同一次入口请求贯穿入口 HTTP、后端请求、响应 chunk、返给 agent 的 chunk。
 - `event`：`http_request_start` / `http_request_body` / `backend_request` / `backend_response_body` / `http_response_body` / `http_request_end` / `backend_error`。
-- `body`：完整请求体 / 响应体 / 流式 chunk。文本 UTF-8，非文本 base64。
+- `body`：最多 64 KiB 的正文预览，超出时标记 `truncated: true`。入口响应的所有 chunk 共用 64 KiB 记录预算；后端单条记录同样限长。文本 UTF-8，非文本 base64。
 - `headers`：`Authorization` / `x-api-key` / cookie 等敏感头只留 sha256 指纹。
 
-只记录 `/api/*` 与 `/v1/*`，不记录 `/admin/*`。默认 100MB × 10 个文件轮转。
+只记录通过入口认证的 `/api/*` 与 `/v1/*`，不记录 `/admin/*`。默认 100MB × 10 个文件轮转。请求体在读取过程中累计限长，默认 `max_request_body_bytes: 67108864`（64 MiB）；`request_body_timeout_seconds: 60` 限制接收正文的时间，不限制推理时间。上传更大视频时需主动调高上限。
 
 ```powershell
 python -m fake_ollama --request-data-log-file I:\path\requests.jsonl
@@ -932,7 +932,9 @@ python -m fake_ollama --no-request-data-log
 - `.env` / `config.json` 已加入 `.gitignore`，不要提交真实 token。
 - `logs/fake_ollama.requests.jsonl*` 会包含 prompt、工具参数、模型输出、图片 base64，应按敏感数据处理。
 - 所有接口默认 `127.0.0.1`。要对外暴露：要么把对应实例的 `host` 改 `0.0.0.0`，要么保持 `127.0.0.1` + Nginx/Caddy 反代加 TLS。
-- **`/admin` 无任何鉴权**，默认绑 `127.0.0.1`。若改成 `0.0.0.0` 必须自己加一层鉴权反代，或 `"admin_enabled": false`。
+- Admin / Dashboard 默认只允许回环监听、回环客户端与回环 Host。本机浏览器页面自动取得进程内管理凭据，所有管理 API 都验证该凭据；页面不缓存，跨站请求被拒绝。
+- 远程访问或经反向代理提供管理页时，必须配置独立的 `management_access_tokens`，并使用 TLS。浏览器登录框的用户名可填 `admin`，密码填写管理 token；页面会自动认证后续 API 请求。命令行可使用 `Authorization: Bearer <management-token>` 或 `X-Management-Token`。模型接口的 token 不授予管理权限。修改管理凭据后旧页面失效，重新加载登录即可。
+- 更新环境依赖后重启进程才会加载安全修复；端口隔离按 ASGI 原始路径判定，管理路由自身也独立验证监听端口及凭据。
 - 反向代理 token：建议用 Web UI 的 Generate 生成 ≥24 字节随机串，不要复用其他系统 token。Token 池可放多个，便于按客户端轮换。
 
 ## 故障排查

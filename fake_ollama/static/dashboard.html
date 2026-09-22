@@ -362,6 +362,13 @@ td.errors { color: var(--danger); white-space: normal; }
   </div>
 </div>
 <script>
+const managementToken = '__MANAGEMENT_TOKEN__';
+function managementFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set('X-Management-Token', managementToken);
+  return window.fetch(url, {...options, headers, cache: 'no-store'});
+}
+
 const ranges = [
   {label: '1m', seconds: 60},
   {label: '10m', seconds: 600},
@@ -668,7 +675,7 @@ async function reclaimModel(key, force = false) {
   }
   $('status').textContent = `${force ? 'force closing' : 'reclaiming'} ${label}...`;
   try {
-    const resp = await fetch('/dashboard/reclaim-model', {
+    const resp = await managementFetch('/dashboard/reclaim-model', {
       method: 'POST',
       headers: {'content-type': 'application/json'},
       body: JSON.stringify({key, force}),
@@ -820,12 +827,12 @@ function renderUpstreamSlots() {
       const nCtx = s.n_ctx !== undefined ? s.n_ctx : (s.params && s.params.n_ctx);
       const taskId = s.id_task !== undefined ? s.id_task : s.task_id;
       return `<tr>
-        <td class="num">${s.id !== undefined ? s.id : '-'}</td>
+        <td class="num">${escapeHtml(s.id !== undefined ? s.id : '-')}</td>
         <td>${escapeHtml(state)}</td>
-        <td class="num">${taskId !== undefined && taskId !== null ? taskId : '-'}</td>
-        <td class="num">${nPast !== undefined && nPast !== null ? nPast : '-'}</td>
-        <td class="num">${nDecoded !== undefined && nDecoded !== null ? nDecoded : '-'}</td>
-        <td class="num">${nCtx !== undefined && nCtx !== null ? nCtx : '-'}</td>
+        <td class="num">${escapeHtml(taskId !== undefined && taskId !== null ? taskId : '-')}</td>
+        <td class="num">${escapeHtml(nPast !== undefined && nPast !== null ? nPast : '-')}</td>
+        <td class="num">${escapeHtml(nDecoded !== undefined && nDecoded !== null ? nDecoded : '-')}</td>
+        <td class="num">${escapeHtml(nCtx !== undefined && nCtx !== null ? nCtx : '-')}</td>
       </tr>`;
     }).join('');
     return `<div class="row"><strong>${escapeHtml(t.target_id)}</strong>
@@ -934,7 +941,7 @@ function render() {
 
 async function loadData() {
   try {
-    const resp = await fetch(`/dashboard/data?range_seconds=${selectedRange}`, {cache: 'no-store'});
+    const resp = await managementFetch(`/dashboard/data?range_seconds=${selectedRange}`, {cache: 'no-store'});
     if (!resp.ok) throw new Error(await resp.text());
     latest = await resp.json();
     $('status').textContent = `updated ${new Date(latest.now * 1000).toLocaleString()}`;

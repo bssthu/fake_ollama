@@ -1202,8 +1202,30 @@ class LlamaCppClient:
             error = "slots response is not a list"
             self._slots_cache = (time.time(), None, error)
             return {"slots": None, "error": error, "url": url}
-        self._slots_cache = (time.time(), data, None)
-        return {"slots": data, "error": None, "url": url}
+        # Treat telemetry as untrusted data, not HTML or arbitrary objects.
+        numeric_fields = ("id", "id_task", "task_id", "n_past", "n_decoded", "n_predict", "n_ctx")
+        sanitized = []
+        for raw in data:
+            if not isinstance(raw, dict):
+                continue
+            slot = {key: value for key, value in raw.items() if key in (*numeric_fields, "state", "is_processing")}
+            for key in numeric_fields:
+                if key not in slot:
+                    continue
+                value = slot[key]
+                if isinstance(value, bool) or not (isinstance(value, int) or isinstance(value, float) and math.isfinite(value)):
+                    slot[key] = None
+            for nested_key, field in (("prompt", "n_past"), ("params", "n_ctx")):
+                nested = raw.get(nested_key)
+                value = nested.get(field) if isinstance(nested, dict) else None
+                if slot.get(field) is None and isinstance(value, (int, float)) and not isinstance(value, bool) and (isinstance(value, int) or math.isfinite(value)):
+                    slot[field] = value
+            if not isinstance(slot.get("state"), (str, int)):
+                slot["state"] = "-"
+            slot["is_processing"] = slot.get("is_processing") is True
+            sanitized.append(slot)
+        self._slots_cache = (time.time(), sanitized, None)
+        return {"slots": sanitized, "error": None, "url": url}
 
     def slots_cache_snapshot(self) -> Dict[str, Any]:
         """Return the most recent ``fetch_upstream_slots`` result, or empty."""

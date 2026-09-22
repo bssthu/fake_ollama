@@ -27,11 +27,13 @@ from fake_ollama.config import (
     load_settings,
 )
 from fake_ollama.server import create_app
+from fake_ollama.security import management_session_token
 
 
 def _admin_client(settings: Settings) -> TestClient:
     # Admin listener default port is 21433.
-    return TestClient(create_app(settings), base_url="http://testserver:21433")
+    app = create_app(settings)
+    return TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)})
 
 
 @pytest.fixture
@@ -85,7 +87,7 @@ def test_admin_index_html(admin_settings):
     assert ".content { min-width: 0; }" in resp.text
     assert "overflow-x: hidden; overflow-y: auto" in resp.text
     assert "white-space: pre-wrap; overflow-wrap: anywhere" in resp.text
-    assert "fetch(ADMIN_BASE + '/generate-token', {method: 'POST'})" in resp.text
+    assert "managementFetch(ADMIN_BASE + '/generate-token', {method: 'POST'})" in resp.text
     assert "crypto.getRandomValues" not in resp.text
     # Top-level settings must show only their actual control. In particular,
     # booleans must not get a second, misleading "include field" checkbox.
@@ -419,7 +421,7 @@ def test_admin_generate_token_uses_ui_compatible_format(admin_settings):
 
 def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
     app = create_app(admin_settings)
-    client = TestClient(app, base_url="http://testserver:21433")
+    client = TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)})
     new_cfg = {
         "anthropic_upstreams": [
             {
@@ -556,7 +558,7 @@ def test_admin_hot_reload_reuses_unchanged_local_clients(tmp_path: Path):
         ],
     )
     app = create_app(settings)
-    client = TestClient(app, base_url="http://testserver:21433")
+    client = TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)})
 
     with client:
         old_ollama = app.state.ollama_clients["local"]
@@ -622,7 +624,7 @@ def test_admin_routes_are_only_on_admin_port(admin_settings):
     with TestClient(app, base_url="http://testserver:21434") as ollama:
         assert ollama.get("/admin/").status_code == 404
         assert ollama.get("/api/version").status_code == 200
-    with TestClient(app, base_url="http://testserver:21433") as admin:
+    with TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)}) as admin:
         assert admin.get("/admin/").status_code == 200
         assert admin.get("/api/version").status_code == 404
 
@@ -632,9 +634,9 @@ def test_dashboard_routes_are_only_on_dashboard_port(admin_settings):
     with TestClient(app, base_url="http://testserver:21434") as ollama:
         assert ollama.get("/dashboard/").status_code == 404
         assert ollama.get("/api/version").status_code == 200
-    with TestClient(app, base_url="http://testserver:21433") as admin:
+    with TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)}) as admin:
         assert admin.get("/dashboard/").status_code == 404
-    with TestClient(app, base_url="http://testserver:21432") as dashboard:
+    with TestClient(app, base_url="http://127.0.0.1:21432", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)}) as dashboard:
         assert dashboard.get("/dashboard/").status_code == 200
         assert dashboard.get("/", follow_redirects=False).status_code in (307, 308)
         assert dashboard.get("/api/version").status_code == 404

@@ -118,7 +118,7 @@ def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
         assert ollama.get("/api/version").status_code == 200
     with TestClient(app, base_url="http://testserver:21435") as api:
         assert api.get("/v1/models", headers={"x-api-key": "rev-tk-1"}).status_code == 200
-    with TestClient(app, base_url="http://testserver:21433") as admin:
+    with TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000)) as admin:
         assert admin.get("/admin/").status_code == 200
 
     access_messages = [
