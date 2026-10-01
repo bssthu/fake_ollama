@@ -1,0 +1,6 @@
+.venv/
+runtime/
+__pycache__/
+
+# Generated validation output
+/validation/synthetic-contract.json
