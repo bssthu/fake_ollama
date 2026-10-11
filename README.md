@@ -608,10 +608,12 @@ Playground 的预计显存、预计内存和上下文会随实际 Planner 选择
 
 随后 `POST /v1/videos/generations` 可用 `prompt_mode=raw|auto|enhance`、`context_ir_provider` 和 `context_ir_mode` 覆盖 target 默认值。`auto` 会保留已经是 H3 三段式的 prompt，普通自然语言才会增强；响应会附带实际送入 workflow 的 `revised_prompt`。只有真正接受 H3 Base Prompt 的视频 workflow 才应开启这项绑定。
 
-#### 本机 MiniMax H3 768p 后端
+### 本机 MiniMax H3 768p 后端
+
+#### 模型与路径
 
 仓库内置 `minimax_h3` preset，并在示例配置中把它作为独立 ComfyUI target 暴露为
-`minimax-h3`。四种模式共用同一组官方权重：
+`minimax-h3`。四种 HTTP 模式共用以下权重：
 
 - `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`（19.53 GiB）
 - `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`（14.61 GiB）
@@ -626,6 +628,8 @@ New-Item -ItemType Directory -Force config/local | Out-Null
 Copy-Item config/examples/comfyui/minimax_h3_extra_model_paths.yaml config/local/minimax_h3_extra_model_paths.yaml
 # 编辑 config/local/minimax_h3_extra_model_paths.yaml 中的 base_path
 ```
+
+#### 服务与资源配置
 
 H3 target 的 `start_command` 必须通过 `--extra-model-paths-config` 指向上述
 `config/local/minimax_h3_extra_model_paths.yaml`，不要直接指向仍含占位路径的模板。示例 target 使用独立的
@@ -643,9 +647,11 @@ emulated：磁盘/主存仍使用 NVFP4-AWQ 压缩权重，计算时按层反量
 权重。
 
 当 `prompt_mode=auto|enhance` 先调用本地 Planner 时，服务会在规划结束后通过并发感知的
-资源释放接口立即卸载由 fake-ollama 管理的 Planner，再执行 H3 的 22 GiB 准入检查；因此
+资源释放接口立即卸载由 fake-ollama 管理的 Planner，再执行 H3 target 配置的资源准入检查；因此
 24 GiB 显卡不需要等待常规的 60 秒空闲回收窗口。远程/第三方 Planner 不受影响，仍在使用
 或不由 fake-ollama 管理的本地进程也不会被强行停止。
+
+#### HTTP 模式与调用
 
 `context_ir_mode` 的选择规则：
 
@@ -672,6 +678,21 @@ $body = @{
 Invoke-RestMethod http://127.0.0.1:21435/v1/videos/generations `
   -Method Post -Headers $headers -ContentType "application/json" -Body $body
 ```
+
+#### Ref2VA 参考生成
+
+Ref2VA 使用 `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors`，
+与上述 FL2VA 是不同权重，共用文本编码器和音视频 VAE。将它放到同一模型根目录的
+`diffusion_models` 下，即可复用 `--extra-model-paths-config` 配置。
+
+当前通过 [Ref2VA 工作流构建工具](scripts/README.md#h3-ref2va-原生工作流) 接收参考图片和视频，
+再提交到原生 ComfyUI `/prompt`。模板位于
+[`minimax_h3_ref2va.json`](fake_ollama/workflows/minimax_h3_ref2va.json)。
+`minimax_h3` preset、`/v1/videos/generations` 和 Playground 尚未提供 Ref2VA 模式；
+该构建工具也尚未提供参考音频输入。原生请求的资源管理和节点要求见脚本说明。
+
+本机安装、迁移验证及后续接入事项保存在模型根目录的 `USAGE.md`，
+可按 `config/local/minimax_h3_extra_model_paths.yaml` 中的 `base_path` 查找。
 
 ### Interfaces（接口与白名单）
 

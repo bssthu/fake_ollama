@@ -1,12 +1,14 @@
 # scripts 使用说明
 
-这里的脚本用于直接调用正在运行的 fake_ollama 本地 API。默认都会读取仓库根目录的 `config.json`：
+这里提供 fake_ollama API 调用示例和 ComfyUI 工作流构建工具。命令均在仓库根目录执行。
+`examples/call_*.py` 调用示例默认读取仓库根目录的 `config.json`：
 
 - `base_url`：使用第一个 `api_interfaces` 的 `host` / `port`
 - `api_key`：使用第一个 `api_interfaces[*].access_tokens[0]`
 - 认证头：通过 `x-api-key` 发送
 
-正常使用时不需要手动传 `--base-url` 和 `--api-key`。如果要调试其他实例，可以显式覆盖这两个参数。
+API 调用示例正常使用时不需要手动传 `--base-url` 和 `--api-key`；调试其他实例时可显式覆盖。
+[H3 Ref2VA 构建工具](#h3-ref2va-原生工作流) 只写出工作流 JSON，不读取 API 配置或凭据。
 
 ## 0. Mage-VL 本机视频分析：`examples/call_mage_vl_video.py`
 
@@ -23,7 +25,11 @@ python scripts\examples\call_mage_vl_video.py .tmp\joyai-test.mp4 `
 `--segment-seconds`、`--frames-per-segment`、`--max-segments` 调整；
 `--include-summary` 会在逐段结果后再生成整体总结。
 
-## 1. 视频生成：`examples/call_video_generation.py`
+## 1. 视频生成
+
+### 调用 fake_ollama API
+
+脚本：`examples/call_video_generation.py`。
 
 用途：调用 fake_ollama 的 OpenAI 兼容视频生成接口：
 
@@ -33,7 +39,7 @@ POST /v1/videos/generations
 
 当前主要用于 `joyai-echo` 这类 ComfyUI 视频生成模型。
 
-### 文生视频
+#### 文生视频
 
 ```powershell
 python scripts\examples\call_video_generation.py `
@@ -54,7 +60,7 @@ python scripts\examples\call_video_generation.py `
 - `--timeout`：默认 `7200`
 - `--output`：输出 mp4 路径
 
-### 图生视频
+#### 图生视频
 
 传入一张或多张参考图时，脚本会调用 image-to-video workflow：
 
@@ -75,6 +81,67 @@ python scripts\examples\call_video_generation.py `
 ```
 
 返回结果默认要求 `response_format=b64_json`，脚本会解码第一个视频结果并写入 `--output`。
+
+### H3 Ref2VA 原生工作流
+
+[`examples/build_h3_ref_workflow.py`](examples/build_h3_ref_workflow.py) 生成可提交到 ComfyUI `/prompt` 的 JSON，
+适用于用图片指定角色、用视频参考动作的生成任务。构建命令只写文件，不启动服务、不上传素材，也不提交推理。
+模型路径配置见 [MiniMax H3 后端说明](../README.md#本机-minimax-h3-768p-后端)。
+
+#### 准备运行环境与素材
+
+1. 启动已配置公共模型目录的 H3 ComfyUI。检查 `GET /object_info/UNETLoader` 的候选列表包含
+   `minimax_h3_ref2va_pruned_int8_convrot.safetensors`，并确认存在
+   `MiniMaxH3ReferenceToVideo`、`LoadVideo`、`GetVideoComponents` 节点。
+2. 将参考素材上传或放入**这个 ComfyUI 实例**的 input 目录。参数填写其 input 相对文件名，
+   例如 `identity.png`、`motion_24fps.mp4`；不能填写客户端绝对路径或含 `..` 的路径。
+3. 将参考视频预先转换为 24 fps。节点会截短过长视频，并将视频参考长度向下对齐 `17k+5` 网格；
+   不会自动根据原始 FPS 保持时长。需要放慢动作时，先调整参考视频时间轴。
+4. 创建非空 UTF-8 提示词文件，例如 `.tmp/h3-reference-prompt.txt`。
+   用 `<Picture 1>`、`<Video 1>` 明确身份、着装和动作参考的分工；图片和视频分别从 1 编号，按各自参数顺序对应。
+
+#### 构建工作流
+
+```powershell
+.\.venv\Scripts\python.exe scripts\examples\build_h3_ref_workflow.py `
+  --prompt-file .tmp\h3-reference-prompt.txt `
+  --image identity.png --image wardrobe.png --video motion_24fps.mp4 `
+  --width 768 --height 768 --frames 141 --steps 25 --seed 2026092192 `
+  --output .tmp\h3-reference-workflow.json
+```
+
+| 参数 | 默认值与限制 |
+| --- | --- |
+| `--image` / `--video` | 可重复，最多 9 张图和 3 段视频；至少提供一项参考素材 |
+| `--width` / `--height` | 默认 768×768；均为 32 的正整数倍，总像素不超过 768×1344 |
+| `--frames` | 默认 124；范围 5–362，满足 `17k+5`；输出固定 24 fps |
+| `--steps` / `--seed` | 默认 20 步、种子 0；步数范围 1–100 |
+| `--first-frame` | 可选首帧图片文件名；要求服务端已有 `MiniMaxH3AddGuide` |
+| `--output` | 必填；写出 JSON，已有文件不会被覆盖 |
+
+普通 Ref2VA 无需 `MiniMaxH3AddGuide`。使用 `--first-frame` 前应检查
+`GET /object_info/MiniMaxH3AddGuide`，不能仅凭模型文件已安装就认定该节点可用。
+构建工具目前不提供参考音频输入。
+
+#### 提交与获取结果
+
+原生 `/prompt` 请求直接进入 ComfyUI，不经过 fake_ollama 的请求资源协调器。
+生成时应独占 H3 队列、串行提交，监测 GPU、RAM 和系统提交余量，保留至少 3 GiB 空闲显存；
+不足时向目标 ComfyUI 请求 `/interrupt`。此工具不实施这些资源检查，应由提交端负责。
+
+`21481` 是示例 H3 ComfyUI 端口，按实际运行实例调整：
+
+```powershell
+$comfyUrl = 'http://127.0.0.1:21481'
+$workflow = Get-Content .tmp\h3-reference-workflow.json -Raw -Encoding UTF8 | ConvertFrom-Json
+$body = @{ prompt = $workflow; client_id = [guid]::NewGuid().ToString() } | ConvertTo-Json -Depth 100
+$result = Invoke-RestMethod "$comfyUrl/prompt" `
+  -Method Post -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
+$result.prompt_id
+```
+
+通过 `GET /history/{prompt_id}` 查看执行状态和输出，再按输出的 `filename`、`subfolder`、`type`
+调用 `/view` 下载。fake_ollama 的 `/v1/videos/generations` 和 Playground 尚未支持此参考模式。
 
 ## 多行 prompt 写法
 
@@ -191,7 +258,7 @@ python scripts\examples\call_joyai_vl_recognition.py input.mp4 `
 
 ## 认证和安全边界
 
-- 默认请求 fake_ollama 的 `api_interface`，并带 `x-api-key`。
+- `call_*.py` 默认请求 fake_ollama 的 `api_interface`，并带 `x-api-key`；Ref2VA 构建工具仅写本地 JSON。
 - `generic_openai_targets[*].auth_token` 可以为空；它只影响 fake_ollama 到本机 adapter 的出站调用，不代表外部客户端可以绕过 fake_ollama 的 `access_tokens`。
 - `examples/call_joyai_vl_recognition.py` 会显式禁用 Python `urllib` 的系统代理，避免本地视频帧 payload 误走环境代理。
 - 不建议把 JoyAI adapter 的 `127.0.0.1:8070` 改成裸露到局域网的地址。对外调用应通过 fake_ollama 的 API 入口和 token 控制。
