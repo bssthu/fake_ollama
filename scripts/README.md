@@ -37,7 +37,7 @@ python scripts\examples\call_mage_vl_video.py .tmp\joyai-test.mp4 `
 POST /v1/videos/generations
 ```
 
-当前主要用于 `joyai-echo` 这类 ComfyUI 视频生成模型。
+适用于 `joyai-echo`、`minimax-h3` 等已配置的 ComfyUI 视频生成模型。
 
 #### 文生视频
 
@@ -81,6 +81,35 @@ python scripts\examples\call_video_generation.py `
 ```
 
 返回结果默认要求 `response_format=b64_json`，脚本会解码第一个视频结果并写入 `--output`。
+
+### H3 Ref2VA 与任意帧关键帧
+
+统一 API 已接入 Ref2VA，并沿用 fake_ollama 的资源准入与排队。使用独立 Ref2VA 权重，
+target 需为 `minimax_h3` preset，`max_reference_images` 设为 9 可使用全部参考图槽位。
+
+```powershell
+python scripts\examples\call_video_generation.py `
+  --model minimax-h3 --video-mode ref2va --prompt-mode raw `
+  --prompt "The person in <Picture 1> follows the movement in <Video 1>." `
+  --image identity.png --video motion_24fps.mp4 `
+  --keyframe 36 middle.png --keyframe -1 ending.png `
+  --size 768x768 --num-frames 124 --fps 24 --steps 20 `
+  --output .tmp\h3-reference.mp4
+```
+
+- `--video-mode`: `auto|t2va|i2va|fl2va|l2va|ref2va`；`auto` 保持旧的 0／1／2 图语义。
+- `--video` 可重复，最多 3 段；`--image` 最多 9 张，Ref2VA 至少需要一项参考素材。
+- `--keyframe FRAME_INDEX IMAGE_PATH` 可重复，最多 16 项；帧号从 0 开始，`-1` 是末帧。
+  Base 模式同样支持该参数，但不能与已有首／末帧约束占用同一位置。
+- Ref2VA 和关键帧要求 `--prompt-mode raw`，不调用目前只支持 Base 模式的 Context-IR。
+- H3 的宽高须是 32 的倍数，帧数为 `17k+5`，输出固定 24 FPS。
+- 参考视频提前转换为 24 FPS、2–15 秒；目前只使用画面，不使用参考音轨。
+- 关键帧需要服务端 `MiniMaxH3AddGuide`；[安装与回滚说明](../services/comfyui_h3_guides/README.md)。
+
+Playground 中选择 `H3 video mode` → `Ref2VA` 后上传图片／视频。
+高级参数 `Keyframes (JSON)` 可填写 `[{"image_index":0,"time_seconds":1.5}]`，
+其中图片索引只计算图片，所选图片转为关键帧而不再作为普通参考图。
+选择 Ref2VA 或填写关键帧会将 Prompt 处理方式设为 raw。
 
 ### H3 Ref2VA 原生工作流
 
@@ -141,7 +170,7 @@ $result.prompt_id
 ```
 
 通过 `GET /history/{prompt_id}` 查看执行状态和输出，再按输出的 `filename`、`subfolder`、`type`
-调用 `/view` 下载。fake_ollama 的 `/v1/videos/generations` 和 Playground 尚未支持此参考模式。
+调用 `/view` 下载。需要 fake_ollama 负责资源准入与排队时，使用上面的统一 API 入口。
 
 ## 多行 prompt 写法
 

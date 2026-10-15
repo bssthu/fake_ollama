@@ -21,7 +21,7 @@ def _workflow_specs(
     mode_names = {
         "image_generation": ("t2i",),
         "image_edit": ("i2i",),
-        "video_generation": ("video", "i2v", "fl2va", "l2va"),
+        "video_generation": ("video", "i2v", "fl2va", "l2va", "ref2va"),
     }.get(operation_id, ())
     configured_modes = [mode for mode in mode_names if workflows.get(mode) is not None]
     return configured_modes, [workflows[mode] for mode in configured_modes]
@@ -68,6 +68,7 @@ def _parameter(
     step: Optional[float] = None,
     nullable: bool = False,
     choices: Optional[List[Dict[str, Any]]] = None,
+    wide: bool = False,
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "name": name,
@@ -88,6 +89,8 @@ def _parameter(
         result["nullable"] = True
     if choices:
         result["choices"] = choices
+    if wide:
+        result["wide"] = True
     return result
 
 
@@ -347,7 +350,7 @@ def describe_comfyui_operation(target: Any, operation_id: str) -> Dict[str, Any]
     image_specs = [
         spec
         for mode, spec in zip(workflow_modes, specs)
-        if mode in {"i2i", "i2v", "fl2va", "l2va"}
+        if mode in {"i2i", "i2v", "fl2va", "l2va", "ref2va"}
     ]
     reference_limits = [_image_ref_limit(spec) for spec in image_specs]
     max_references = (
@@ -378,12 +381,34 @@ def describe_comfyui_operation(target: Any, operation_id: str) -> Dict[str, Any]
             }
         )
 
+    h3 = operation_id == "video_generation" and getattr(target, "preset", "") == "minimax_h3"
+    if h3:
+        parameters.extend([
+            _parameter("video_mode", "H3 video mode", "select", "auto", choices=[
+                {"value": "auto", "label": "Auto: text / first / first + last"},
+                {"value": "t2va", "label": "T2VA: text"},
+                {"value": "i2va", "label": "I2VA: first frame"},
+                {"value": "fl2va", "label": "FL2VA: first + last frame"},
+                {"value": "l2va", "label": "L2VA: last frame"},
+                {"value": "ref2va", "label": "Ref2VA: image / video references (raw prompt)"},
+            ]),
+            _parameter("keyframes", "Keyframes (JSON)", "text", "[]", advanced=True,
+                       description='Example: [{"image_index":0,"time_seconds":1.5}]. Index starts at 0 in image upload order; assigned images become guides. Requires raw prompt.', wide=True),
+        ])
+        defaults.update(video_mode="auto", keyframes="[]")
+        limits.update(max_videos=3, max_keyframes=16)
+        if not getattr(target, "context_ir_profile", None):
+            parameters.append(_parameter("prompt_mode", "Prompt handling", "select", "raw",
+                                         choices=[{"value": "raw", "label": "Raw prompt"}]))
+            defaults["prompt_mode"] = "raw"
     return {
         "configured": bool(specs),
         "workflow_modes": workflow_modes,
         "accepts_images": accepts_images,
         "requires_images": requires_images,
         "multiple_images": multiple_images,
+        "accepts_videos": h3,
+        "multiple_videos": h3,
         "parameters": parameters,
         "defaults": defaults,
         "limits": limits,

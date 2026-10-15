@@ -299,9 +299,9 @@ COMFYUI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "preset", "type": "string", "default": "z_image_turbo",
      "description": "Declarative workflow preset：z_image_turbo、qwen_image_edit_aio、sensenova_u1、joyai_echo、minimax_h3；提供自定义 workflow path + bindings 时使用 custom/comfyui_api。"},
     {"key": "bindings", "type": "json", "default": None,
-     "description": "Optional JSON mapping of request fields to workflow node inputs, keyed by mode: t2i, i2i, video, i2v, fl2va, l2va."},
+     "description": "Optional JSON mapping of request fields to workflow node inputs, keyed by mode: t2i, i2i, video, i2v, fl2va, l2va, ref2va."},
     {"key": "static_inputs", "type": "json", "default": None,
-     "description": "Optional JSON mapping of fixed workflow node inputs, keyed by mode: t2i, i2i, video, i2v, fl2va, l2va."},
+     "description": "Optional JSON mapping of fixed workflow node inputs, keyed by mode: t2i, i2i, video, i2v, fl2va, l2va, ref2va."},
     {"key": "text_to_image_workflow_path", "type": "string", "default": None,
      "description": "可选：/v1/images/generations 使用的 ComfyUI API-format workflow JSON；留空使用内置 Z-Image-Turbo text-to-image workflow"},
     {"key": "image_to_image_workflow_path", "type": "string", "default": None,
@@ -314,6 +314,8 @@ COMFYUI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "Optional ComfyUI API-format workflow JSON for first+last-frame video generation (FL2VA)."},
     {"key": "last_to_video_workflow_path", "type": "string", "default": None,
      "description": "Optional ComfyUI API-format workflow JSON for last-frame video generation (L2VA)."},
+    {"key": "reference_to_video_workflow_path", "type": "string", "default": None,
+     "description": "Optional native H3 reference workflow (Ref2VA); bindings/static_inputs use the ref2va mode."},
     {"key": "context_ir_profile", "type": "string", "default": None,
      "description": "可选：生成视频前使用的 h3_context_ir_profiles 名称；留空表示不做 Prompt 自动增强"},
     {"key": "context_ir_prompt_mode", "type": "string", "default": "auto",
@@ -781,6 +783,7 @@ def _settings_to_dict(s: Settings) -> Dict[str, Any]:
             "image_to_video_workflow_path",
             "first_last_to_video_workflow_path",
             "last_to_video_workflow_path",
+            "reference_to_video_workflow_path",
             "vram_runtime_group",
         ]:
             if target.get(key) is None:

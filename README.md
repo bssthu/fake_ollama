@@ -653,13 +653,14 @@ emulated：磁盘/主存仍使用 NVFP4-AWQ 压缩权重，计算时按层反量
 
 #### HTTP 模式与调用
 
-`context_ir_mode` 的选择规则：
+`video_mode` 的选择规则（旧字段 `context_ir_mode` 仍可用于四种 Base 模式；同时指定时不能冲突）：
 
 - `auto`：0 张图 → T2V，1 张图 → 首帧 I2V，2 张图 → FL2VA。
 - `t2va`：不接图片。
 - `i2va`：1 张图接到 `first_frame`。
 - `fl2va`：第 1 张接 `first_frame`，第 2 张接 `last_frame`。
 - `l2va`：1 张图只接到 `last_frame`；由于与 I2V 同为一张图，必须显式选择。
+- `ref2va`：显式使用 Ref2VA 权重，图片／视频作为身份、外观或动作参考；要求 `prompt_mode=raw`。
 
 服务端会在调用 Planner 和 ComfyUI 之前校验模式与图片数；`prompt_mode=raw` 也不会绕过
 这项校验。默认 124 帧约对应 5 秒输入时长，H3 只接受 `17k+5` 帧网格；24 FPS 固定。
@@ -685,13 +686,43 @@ Ref2VA 使用 `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensor
 与上述 FL2VA 是不同权重，共用文本编码器和音视频 VAE。将它放到同一模型根目录的
 `diffusion_models` 下，即可复用 `--extra-model-paths-config` 配置。
 
-当前通过 [Ref2VA 工作流构建工具](scripts/README.md#h3-ref2va-原生工作流) 接收参考图片和视频，
-再提交到原生 ComfyUI `/prompt`。模板位于
-[`minimax_h3_ref2va.json`](fake_ollama/workflows/minimax_h3_ref2va.json)。
-`minimax_h3` preset、`/v1/videos/generations` 和 Playground 尚未提供 Ref2VA 模式；
-该构建工具也尚未提供参考音频输入。原生请求的资源管理和节点要求见脚本说明。
+`minimax_h3` preset 的 `/v1/videos/generations` 和 Playground 支持 `video_mode=ref2va`。
+设置 target 的 `max_reference_images=9` 可开放全部参考图槽位；原有 Base 模式仍按 0／1／2 张图校验。
+可用 `reference_to_video_workflow_path` 覆盖模板，`bindings` / `static_inputs` 使用 `ref2va` 键。
+内置模板使用 `MiniMaxH3ReferenceToVideo`，不会把 Ref2VA 权重替换进 FL2VA 图中。
 
-本机安装、迁移验证及后续接入事项保存在模型根目录的 `USAGE.md`，
+| 输入 | JSON | multipart |
+| --- | --- | --- |
+| 参考图片，最多 9 张 | `images`: base64/data URL 数组，`filenames`: 文件名数组 | 重复 `image[]` 文件 |
+| 参考视频，最多 3 段 | `videos`: base64/data URL 数组，`video_filenames`: 文件名数组 | 重复 `video[]` 文件 |
+| 任意帧图片约束，最多 16 项 | `keyframes`: 对象数组 | `keyframes`: JSON 字符串 |
+
+Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 24 FPS、2–15 秒；
+目前只使用视频画面，音轨及独立参考音频未接入。提示词用 `<Picture 1>` / `<Video 1>`
+按各自输入顺序引用素材。Context-IR 尚不能规划参考模式，必须显式传 `prompt_mode=raw`。
+统一 API 仍经过原有 GPU/RAM 准入、排队和运行中显存监控。
+
+关键帧既可用于 Ref2VA，也可用于四种 Base 模式。例如：
+
+```json
+"keyframes": [
+  {"time_seconds": 1.5, "image_index": 1},
+  {"frame_index": -1, "image": "data:image/png;base64,...", "filename": "end.png"}
+]
+```
+
+每项使用 `frame_index` 或 `time_seconds` 二选一；帧号从 0 开始，负数从片尾倒数，秒数四舍五入到最近帧。
+图片来源可用 `image` 的 base64/data URL、`image_index`（从 0 开始的图片上传顺序）或
+`image_field`（独立 multipart 文件字段名）。被 `image_index` 选中的图片从普通参考／首尾帧输入中移出，
+其余图片保留顺序。重复位置、越界位置和与 Base 首尾帧冲突的约束均返回 400，不能静默丢弃。
+关键帧同样要求 `prompt_mode=raw`，并需要 ComfyUI 的 `MiniMaxH3AddGuide` 节点；
+旧安装可按[关键帧补丁说明](services/comfyui_h3_guides/README.md)检查、备份和安装。
+
+[统一 API 调用示例](scripts/README.md#h3-ref2va-与任意帧关键帧)包含本地文件上传命令。
+[原生构建工具](scripts/README.md#h3-ref2va-原生工作流)仍可独立输出 `/prompt` 工作流，
+但原生请求的资源管理由调用者负责。
+
+本机安装、历史迁移验证和当前接入边界保存在模型根目录的 `USAGE.md`，
 可按 `config/local/minimax_h3_extra_model_paths.yaml` 中的 `base_path` 查找。
 
 ### Interfaces（接口与白名单）

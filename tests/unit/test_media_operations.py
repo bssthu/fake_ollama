@@ -185,7 +185,7 @@ def test_minimax_h3_exposes_all_base_modes_and_768p_defaults() -> None:
 
     operation = describe_comfyui_operation(target, "video_generation")
 
-    assert operation["workflow_modes"] == ["video", "i2v", "fl2va", "l2va"]
+    assert operation["workflow_modes"] == ["video", "i2v", "fl2va", "l2va", "ref2va"]
     assert operation["accepts_images"] is True
     assert operation["requires_images"] is False
     assert operation["multiple_images"] is True

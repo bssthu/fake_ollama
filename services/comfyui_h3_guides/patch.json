@@ -1,0 +1,309 @@
+{
+  "upstream": "https://github.com/Comfy-Org/ComfyUI/pull/15439",
+  "files": [
+    {
+      "path": "comfy/ldm/minimax/model.py",
+      "source_sha256": "882c280b05aa60cd17f231e5e2389b921b52880fb3b4e23574c0aba5f2bd5024",
+      "result_sha256": "ecbd7d0546e656ee1ac0027addc6d202c284bb51be99011b09a0e1f792827b24",
+      "edits": [
+        {
+          "start": 101,
+          "end": 101,
+          "lines": [
+            "\n",
+            "\n",
+            "def _ref_t_span(blk):\n",
+            "    # time-axis span a reference block occupies ahead of the target streams\n",
+            "    kind = blk[\"kind\"]\n",
+            "    if kind == \"image\":\n",
+            "        return 1.0\n",
+            "    if kind == \"audio\":\n",
+            "        return float(blk[\"ref_audio_t\"])\n",
+            "    if kind in (\"video\", \"video_audio\"):\n",
+            "        return max(float(blk[\"ref_audio_t\"]), sum(_video_t_spans(blk[\"latent_t\"])))\n",
+            "    return 0.0\n"
+          ]
+        },
+        {
+          "start": 299,
+          "end": 300,
+          "lines": [
+            "    def __init__(self, text_len, latent_t, latent_h, latent_w, audio_t, keyframes=None, refs=None):\n"
+          ]
+        },
+        {
+          "start": 310,
+          "end": 311,
+          "lines": []
+        },
+        {
+          "start": 313,
+          "end": 313,
+          "lines": [
+            "        target_audio_w = (float(w_grid[0]), float(w_grid[-1]))\n",
+            "        # refs pack between text and the targets, so the target timeline starts after their spans\n",
+            "        cursor = float(text_len)\n",
+            "        for blk in refs or ():\n",
+            "            cursor += _ref_t_span(blk)\n",
+            "\n"
+          ]
+        },
+        {
+          "start": 314,
+          "end": 315,
+          "lines": [
+            "            # fl2va: keyframe cond rows right after text, sharing the target spatial grid;\n",
+            "            # anchors count from the target timeline origin, FRAME_RESCALE per pixel frame, 1.0 per audio latent frame\n"
+          ]
+        },
+        {
+          "start": 316,
+          "end": 331,
+          "lines": [
+            "                cond_t = cursor + FRAME_RESCALE * kf[\"resolved_frame_index\"]\n",
+            "                video_latent = kf.get(\"latent\")\n",
+            "                if video_latent is not None:\n",
+            "                    vt = video_latent.shape[2]\n",
+            "                    n = vt * frame_rows\n",
+            "                    segments.append((\"cond\", n))\n",
+            "                    pos.append(_video_grid(vt, frame, cond_t))\n",
+            "                    img_pos.append(torch.arange(row, row + n))\n",
+            "                    img_update.append(torch.zeros(n, dtype=torch.bool))\n",
+            "                    row += n\n",
+            "                audio_latent = kf.get(\"audio_latent\")\n",
+            "                if audio_latent is not None:\n",
+            "                    rt = audio_latent.shape[-1]\n",
+            "                    segments.append((\"cond_audio\", rt * 2))\n",
+            "                    pos.append(_audio_grid(cond_t, rt, *target_audio_w))\n",
+            "                    audio_pos.append(torch.arange(row, row + rt * 2))\n",
+            "                    audio_update.append(torch.zeros(rt * 2, dtype=torch.bool))\n",
+            "                    row += rt * 2\n"
+          ]
+        },
+        {
+          "start": 332,
+          "end": 333,
+          "lines": []
+        },
+        {
+          "start": 400,
+          "end": 401,
+          "lines": [
+            "        # kinds: text / cond / cond_audio / ref_img / ref_audio / audio / video\n"
+          ]
+        },
+        {
+          "start": 522,
+          "end": 524,
+          "lines": [
+            "                                  refs=payload.get(\"refs\"))\n"
+          ]
+        },
+        {
+          "start": 536,
+          "end": 537,
+          "lines": [
+            "        has_aud_cond = any(k in (\"cond_audio\", \"ref_audio\") for _, _, k in layout.segments)\n"
+          ]
+        },
+        {
+          "start": 539,
+          "end": 540,
+          "lines": [
+            "                 \"cond_audio\": max(t_a, aud_aug), \"ref_audio\": max(t_a, aud_aug)}\n"
+          ]
+        },
+        {
+          "start": 543,
+          "end": 544,
+          "lines": [
+            "        seg_tag = {\"text\": 1, \"video\": 0, \"audio\": 2, \"cond\": 0, \"ref_img\": 0, \"cond_audio\": 2, \"ref_audio\": 2}\n"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "comfy/model_base.py",
+      "source_sha256": "befc06e588684986371eab1359b3b54c1290c5993a071b93014df38065762a92",
+      "result_sha256": "8e01eb6371f1d2ca6d6df0ce83fd31086c34b232432009e670e71c93b0ef0842",
+      "edits": [
+        {
+          "start": 2092,
+          "end": 2094,
+          "lines": [
+            "            payload[\"cond_video_latents\"] = [kf[\"latent\"] for kf in keyframes if kf.get(\"latent\") is not None]\n",
+            "            payload[\"cond_audio_latents\"] = [kf[\"audio_latent\"] for kf in keyframes if kf.get(\"audio_latent\") is not None]\n"
+          ]
+        },
+        {
+          "start": 2097,
+          "end": 2099,
+          "lines": [
+            "            payload[\"cond_video_latents\"] = payload.get(\"cond_video_latents\", []) + [r[\"latent\"] for r in refs if \"latent\" in r]\n",
+            "            payload[\"cond_audio_latents\"] = payload.get(\"cond_audio_latents\", []) + [r[\"audio_latent\"] for r in refs if r.get(\"audio_latent\") is not None]\n"
+          ]
+        },
+        {
+          "start": 2110,
+          "end": 2111,
+          "lines": [
+            "                refs=payload.get(\"refs\"))\n"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "comfy_extras/nodes_minimax_h3.py",
+      "source_sha256": "5c3f78efef772850f90660c5ff82e31078b5baef10f427053ed82fb8b4a7ecd1",
+      "result_sha256": "4253e2ed45d438b5938cd456f086cd7c8e90744b0ca44ef27cae271b2ea99d70",
+      "edits": [
+        {
+          "start": 22,
+          "end": 22,
+          "lines": [
+            "from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE\n"
+          ]
+        },
+        {
+          "start": 67,
+          "end": 67,
+          "lines": [
+            "\n",
+            "\n",
+            "def _encode_ref_audio(audio_vae, audio):\n",
+            "    waveform = audio[\"waveform\"]  # [B, C, L]\n",
+            "    sr = audio[\"sample_rate\"]\n",
+            "    vae_sr = getattr(audio_vae, \"audio_sample_rate\", 32000)\n",
+            "    if sr != vae_sr:\n",
+            "        waveform = torchaudio.functional.resample(waveform, sr, vae_sr)\n",
+            "    z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]\n",
+            "    return z, z.shape[-1]\n"
+          ]
+        },
+        {
+          "start": 146,
+          "end": 150,
+          "lines": [
+            "            cond = node_helpers.conditioning_set_values(cond, {\"minimax_keyframes\": keyframes})\n"
+          ]
+        },
+        {
+          "start": 151,
+          "end": 151,
+          "lines": [
+            "\n",
+            "\n",
+            "class MiniMaxH3AddGuide(io.ComfyNode):\n",
+            "    \"\"\"Anchor image and/or audio guides at an arbitrary pixel frame of the target video.\"\"\"\n",
+            "\n",
+            "    @classmethod\n",
+            "    def define_schema(cls):\n",
+            "        return io.Schema(\n",
+            "            node_id=\"MiniMaxH3AddGuide\",\n",
+            "            display_name=\"Add Guide for MiniMax H3\",\n",
+            "            category=\"model/conditioning/minimax\",\n",
+            "            description=\"Anchor an image, a short clip, audio, or a clip with its soundtrack at any frame of a MiniMax H3 video. Chain several nodes to anchor several frames.\",\n",
+            "            inputs=[\n",
+            "                io.Conditioning.Input(\"positive\"),\n",
+            "                io.Vae.Input(\"vae\", optional=True, tooltip=\"Video VAE, needed when an image is connected.\"),\n",
+            "                io.Vae.Input(\"audio_vae\", optional=True, tooltip=\"Audio VAE, needed when an audio is connected.\"),\n",
+            "                io.Latent.Input(\"latent\"),\n",
+            "                io.Image.Input(\"image\", optional=True, tooltip=\"Image or video frames to anchor. Multi-frame batches are anchored as a clip and cropped down to the model's valid clip lengths: 5, 22, 39... (17k + 5) frames. Batches shorter than 5 frames use only the first image.\"),\n",
+            "                io.Audio.Input(\"audio\", optional=True,\n",
+            "                               tooltip=\"Soundtrack to anchor starting at the same frame index, cropped to the video's remaining duration.\"),\n",
+            "                io.Int.Input(\"frame_idx\", default=0, min=-9999, max=9999,\n",
+            "                             tooltip=\"Frame index to anchor the image or the clip's first frame at. Negative values are counted from the end of the video.\"),\n",
+            "            ],\n",
+            "            outputs=[io.Conditioning.Output(display_name=\"positive\")],\n",
+            "        )\n",
+            "\n",
+            "    @classmethod\n",
+            "    def execute(cls, positive, latent, frame_idx, vae=None, audio_vae=None, image=None, audio=None) -> io.NodeOutput:\n",
+            "        samples = latent[\"samples\"]\n",
+            "        if not samples.is_nested or len(samples.tensors) != 2 or samples.tensors[0].ndim != 5 or samples.tensors[0].shape[1] != 24:\n",
+            "            raise ValueError(\"MiniMaxH3AddGuide expects a MiniMax H3 AV latent\")\n",
+            "        if image is None and audio is None:\n",
+            "            raise ValueError(\"MiniMaxH3AddGuide needs an image or an audio to anchor\")\n",
+            "        video = samples.tensors[0]\n",
+            "        height = video.shape[3] * 16\n",
+            "        width = video.shape[4] * 16\n",
+            "        frame_count = sum(FRAME_PER_TOKEN[k % 5] for k in range(video.shape[2]))\n",
+            "\n",
+            "        guide_frames = 1\n",
+            "        if image is not None:\n",
+            "            if vae is None:\n",
+            "                raise ValueError(\"anchoring guide frames needs the vae input\")\n",
+            "            guide_frames = image.shape[0]\n",
+            "            if guide_frames < 5:\n",
+            "                guide_frames = 1\n",
+            "            else:\n",
+            "                while guide_frames % 17 != 5:\n",
+            "                    guide_frames -= 1\n",
+            "\n",
+            "        resolved_frame_index = frame_idx if frame_idx >= 0 else frame_count + frame_idx\n",
+            "        if resolved_frame_index < 0 or resolved_frame_index + guide_frames > frame_count:\n",
+            "            if guide_frames == 1:\n",
+            "                raise ValueError(\"frame_idx {} is outside the video's {} frames\".format(frame_idx, frame_count))\n",
+            "            raise ValueError(\"a {} frame guide clip at frame_idx {} does not fit in the video's {} frames\".format(\n",
+            "                guide_frames, frame_idx, frame_count))\n",
+            "\n",
+            "        keyframe = {\"resolved_frame_index\": resolved_frame_index}\n",
+            "        if image is not None:\n",
+            "            frames = _resize(image[:guide_frames], width, height, \"center\")\n",
+            "            keyframe[\"latent\"] = vae.encode(frames)\n",
+            "\n",
+            "        if audio is not None:\n",
+            "            if audio_vae is None:\n",
+            "                raise ValueError(\"anchoring guide audio needs the audio_vae input\")\n",
+            "            audio_latent, audio_rt = _encode_ref_audio(audio_vae, audio)\n",
+            "            # the streams share one time axis: FRAME_RESCALE per pixel frame, 1.0 per audio latent frame\n",
+            "            max_rt = math.floor(samples.tensors[1].shape[-1] - FRAME_RESCALE * resolved_frame_index)\n",
+            "            if max_rt < 1:\n",
+            "                raise ValueError(\"frame_idx {} is past the end of the video's audio track\".format(frame_idx))\n",
+            "            if audio_rt > max_rt:\n",
+            "                audio_latent = audio_latent[..., :max_rt].clone()\n",
+            "            keyframe[\"audio_latent\"] = audio_latent\n",
+            "\n",
+            "        keyframes = list(positive[0][1].get(\"minimax_keyframes\", []))\n",
+            "        keyframes.append(keyframe)\n",
+            "        positive = node_helpers.conditioning_set_values(positive, {\"minimax_keyframes\": keyframes})\n",
+            "        return io.NodeOutput(positive)\n"
+          ]
+        },
+        {
+          "start": 199,
+          "end": 209,
+          "lines": []
+        },
+        {
+          "start": 256,
+          "end": 257,
+          "lines": [
+            "                audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)\n"
+          ]
+        },
+        {
+          "start": 271,
+          "end": 272,
+          "lines": [
+            "            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)\n"
+          ]
+        },
+        {
+          "start": 330,
+          "end": 330,
+          "lines": [
+            "            MiniMaxH3AddGuide,\n"
+          ]
+        },
+        {
+          "start": 331,
+          "end": 332,
+          "lines": [
+            "            MiniMaxH3SigmaShift,\n"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -282,7 +282,7 @@
       "min_frame_rate": 24.0,
       "default_frame_rate": 24.0,
       "max_frame_rate": 24.0,
-      "max_reference_images": 2,
+      "max_reference_images": 9,
       "max_batch_size": 1,
       "output_prefix": "fake_ollama/minimax-h3",
       "context_ir_profile": "default",

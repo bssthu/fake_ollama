@@ -895,21 +895,21 @@
     els.uploadSection.hidden = !acceptsUploads;
     els.cameraSection.hidden = !operationSupportsLiveCamera(op);
     els.mediaQueueSection.hidden = !usesMediaQueue;
-    els.uploadLabel.textContent = isVideoAnalysis ? '待分析视频' : '参考图片';
+    els.uploadLabel.textContent = isVideoAnalysis ? '待分析视频' : (op && op.accepts_videos ? 'Reference images / videos' : '参考图片');
     els.uploadRequirement.textContent = isVideoAnalysis
       ? '文件模式需要 1 个；摄像头模式无需上传'
       : (op && (op.requires_images || op.requires_videos) ? '至少需要 1 个文件' : '可选');
-    els.fileInput.accept = isVideoAnalysis ? 'video/*' : 'image/*';
+    els.fileInput.accept = [op && op.accepts_images ? 'image/*' : '', op && op.accepts_videos ? 'video/*' : ''].filter(Boolean).join(',');
     els.fileInput.multiple = Boolean(op && (
       (op.accepts_images && op.multiple_images !== false)
       || (op.accepts_videos && op.multiple_videos === true)
     ));
     els.dropText.textContent = isVideoAnalysis
       ? '拖放或选择本地视频'
-      : '粘贴、拖放或选择图片';
+      : (op && op.accepts_videos ? 'Drop or select reference images / videos' : '粘贴、拖放或选择图片');
     els.dropHint.textContent = isVideoAnalysis
       ? '上传单个视频，或使用下方手机 / PC 摄像头持续分析'
-      : '支持多张参考图；点击这里选择文件';
+      : (op && op.accepts_videos ? 'Ref2VA: up to 9 images and 3 videos at 24 FPS; visual references only' : '支持多张参考图；点击这里选择文件');
     els.chatParams.hidden = !isChatRequest;
     els.mediaParams.hidden = !(isMedia || isVideoAnalysis);
     els.ttftMetric.hidden = !isChatRequest;
@@ -1167,6 +1167,15 @@
         updatePlannerProviderUi();
       });
       input.addEventListener('change', () => {
+        if (['video_mode', 'keyframes'].includes(spec.name)) {
+          const mode = state.parameterInputs.get('video_mode');
+          const guides = state.parameterInputs.get('keyframes');
+          const promptMode = state.parameterInputs.get('prompt_mode');
+          if (promptMode && ((mode && mode.input.value === 'ref2va')
+              || (guides && !['', '[]'].includes(guides.input.value.trim())))) {
+            setParameterValue(promptMode, 'raw');
+          }
+        }
         syncPresetSelection();
         updatePlannerProviderUi();
       });
@@ -1891,7 +1900,7 @@
       return;
     }
     const configuredLimit = op && op.limits && op.limits.max_reference_images;
-    const maxImages = configuredLimit || 12;
+    const maxImages = (configuredLimit || 12) + ((op.limits && op.limits.max_keyframes) || 0);
     const maxVideos = (op.limits && op.limits.max_videos) || 1;
     const maxVideoBytes = op.limits && Number(op.limits.max_video_bytes);
     for (const {file, kind} of candidates) {
@@ -2233,6 +2242,14 @@
       const value = readParameterValue(entry.spec, entry.input);
       if (value !== null) payload[name] = value;
     }
+    if (op.id === 'video_generation' && payload.keyframes) {
+      try {
+        payload.keyframes = JSON.parse(payload.keyframes);
+        if (!Array.isArray(payload.keyframes)) throw new Error('Expected an array');
+      } catch (error) {
+        throw new Error('Keyframes must be a JSON array.');
+      }
+    }
     Object.assign(payload, externalPlannerPayload(op));
     if (!Object.prototype.hasOwnProperty.call(payload, 'n')) payload.n = 1;
     return payload;
@@ -2359,9 +2376,9 @@
       });
     } else {
       const form = new FormData();
-      for (const [key, value] of Object.entries(payload)) form.append(key, String(value));
+      for (const [key, value] of Object.entries(payload)) form.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
       for (const attachment of plan.attachments) {
-        form.append('image[]', attachment.file, attachment.name);
+        form.append(attachment.kind === 'video' ? 'video[]' : 'image[]', attachment.file, attachment.name);
       }
       response = await fetch(op.endpoint, {
         method: 'POST',
@@ -2479,7 +2496,7 @@
       return;
     }
     const maxReferences = op.limits && op.limits.max_reference_images;
-    if (maxReferences && state.attachments.length > Number(maxReferences)) {
+    if (maxReferences && imageCount > Number(maxReferences) + Number(op.limits.max_keyframes || 0)) {
       showError(`当前能力最多接收 ${maxReferences} 张参考图片，请先移除多余图片。`);
       return;
     }

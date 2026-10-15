@@ -25,6 +25,7 @@ import httpx
 
 from .comfyui_presets import WorkflowSpec, nearest_ratio, resolve_workflows
 from .config import outbound_cycle_headers
+from .h3_media import add_keyframes, add_reference_inputs
 from .process_utils import create_managed_subprocess_shell, terminate_process_tree
 from .request_data_log import (
     body_from_bytes,
@@ -605,6 +606,7 @@ class ComfyUIClient:
         num_frames: int,
         frame_rate: float,
         prefetch_count: int,
+        negative_prompt: str = "",
         enable_tile: bool = False,
         enable_streaming: bool = False,
         estimated_vram_gb: Optional[float] = None,
@@ -617,6 +619,8 @@ class ComfyUIClient:
         filename: Optional[str] = None,
         image_inputs: Optional[List[Tuple[bytes, str]]] = None,
         video_mode: str = "auto",
+        video_inputs: Optional[List[Tuple[bytes, str]]] = None,
+        keyframe_inputs: Optional[List[Tuple[int, bytes, str]]] = None,
     ) -> List[ComfyUIImage]:
         ref_count = len(image_inputs) if image_inputs else int(image_bytes is not None)
         mode = self._select_video_workflow_mode(video_mode, ref_count)
@@ -636,6 +640,7 @@ class ComfyUIClient:
                 "denoise": denoise,
                 "num_frames": num_frames,
                 "frame_rate": frame_rate,
+                "negative_prompt": negative_prompt,
                 "prefetch_count": prefetch_count,
                 "enable_tile": enable_tile,
                 "enable_streaming": enable_streaming,
@@ -650,6 +655,8 @@ class ComfyUIClient:
             image_bytes=image_bytes,
             filename=filename,
             image_inputs=image_inputs,
+            video_inputs=video_inputs,
+            keyframe_inputs=keyframe_inputs,
         )
 
     def _select_video_workflow_mode(self, requested: str, ref_count: int) -> str:
@@ -672,6 +679,7 @@ class ComfyUIClient:
             "fl2va": "fl2va",
             "l2v": "l2va",
             "l2va": "l2va",
+            "ref2va": "ref2va",
         }
         if value == "auto":
             if ref_count >= 2 and self._workflows.get("fl2va") is not None:
@@ -681,7 +689,7 @@ class ComfyUIClient:
             return "video"
         if value not in aliases:
             raise ValueError(
-                "video_mode must be auto|t2va|i2va|fl2va|l2va"
+                "video_mode must be auto|t2va|i2va|fl2va|l2va|ref2va"
             )
         return aliases[value]
 
@@ -704,6 +712,8 @@ class ComfyUIClient:
         image_bytes: Optional[bytes] = None,
         filename: Optional[str] = None,
         image_inputs: Optional[List[Tuple[bytes, str]]] = None,
+        video_inputs: Optional[List[Tuple[bytes, str]]] = None,
+        keyframe_inputs: Optional[List[Tuple[int, bytes, str]]] = None,
     ) -> List[ComfyUIImage]:
         spec = self._workflows.get(mode)
         if spec is None:
@@ -719,6 +729,20 @@ class ComfyUIClient:
                 f"ComfyUI target {self.target_id} has no {verb} workflow configured"
             )
         n = max(1, int(n))
+        refs = list(image_inputs or [])
+        if not refs and image_bytes is not None:
+            refs = [(image_bytes, filename or "input.png")]
+        ref_limit = self._image_ref_limit(spec)
+        if ref_limit is not None and len(refs) > ref_limit:
+            if mode == "ref2va" or self._workflow_config.get("preset") == "minimax_h3":
+                raise ValueError(f"{mode} accepts at most {ref_limit} reference image(s)")
+            refs = refs[:ref_limit]
+        if video_inputs and not spec.binds("reference_videos"):
+            raise ValueError("reference videos require a Ref2VA workflow")
+        if len(video_inputs or []) > 3:
+            raise ValueError("Ref2VA accepts at most 3 reference videos")
+        if mode == "ref2va" and not (refs or video_inputs):
+            raise ValueError("Ref2VA requires at least one reference image or video")
         self._begin_request_lifecycle()
         try:
             scaled_headroom_gb, workload_key = self._vram_workload(
@@ -764,12 +788,15 @@ class ComfyUIClient:
                     self._mark_memory_reserved(model, estimated_memory_gb)
                     base: Dict[str, Any] = {**params, "prompt": prompt}
                     uploads: List[str] = []
-                    refs = list(image_inputs or [])
-                    if not refs and image_bytes is not None:
-                        refs = [(image_bytes, filename or "input.png")]
-                    ref_limit = self._image_ref_limit(spec)
-                    if ref_limit is not None:
-                        refs = refs[:ref_limit]
+                    if keyframe_inputs:
+                        info = await self._client.get(
+                            f"{self._base}/object_info/MiniMaxH3AddGuide", headers=self._headers()
+                        )
+                        info.raise_for_status()
+                        if "MiniMaxH3AddGuide" not in info.json():
+                            raise httpx.ProtocolError(
+                                "ComfyUI is missing MiniMaxH3AddGuide; install H3 guide support and restart ComfyUI"
+                            )
                     for idx, (ref_bytes, ref_name) in enumerate(refs, start=1):
                         uploads.append(
                             await self._upload_image(
@@ -780,8 +807,18 @@ class ComfyUIClient:
                         base["image"] = uploads[0]
                         base["images"] = uploads
                         base["image_count"] = len(uploads)
+                        base["reference_images"] = uploads
                         for idx, uploaded in enumerate(uploads, start=1):
                             base[f"image_{idx}"] = uploaded
+                    if video_inputs:
+                        base["reference_videos"] = [
+                            await self._upload_image(data, name) for data, name in video_inputs
+                        ]
+                    if keyframe_inputs:
+                        base["keyframes"] = [
+                            (index, await self._upload_image(data, name))
+                            for index, data, name in keyframe_inputs
+                        ]
                     images: List[ComfyUIImage] = []
                     if spec.binds("batch_size"):
                         # The workflow batches natively: one submission yields n.
@@ -826,7 +863,7 @@ class ComfyUIClient:
         default_height = max(1, int(self._workflow_config.get("default_height") or height))
         scale = max(1.0, (width * height) / (default_width * default_height))
         frames = max(1, int(params.get("num_frames") or 1))
-        if mode in {"video", "i2v", "fl2va", "l2va"}:
+        if mode in {"video", "i2v", "fl2va", "l2va", "ref2va"}:
             default_frames = max(
                 1, int(self._workflow_config.get("default_num_frames") or frames)
             )
@@ -884,7 +921,10 @@ class ComfyUIClient:
         return limit
 
     async def _upload_image(self, image_bytes: bytes, filename: str) -> str:
-        safe_name = Path(filename or "input.png").name or "input.png"
+        safe_name = Path((filename or "input.png").replace("\\", "/")).name or "input.png"
+        # Concurrent requests can use the same client filename. Keep each upload
+        # immutable until its queued prompt has consumed it (videos use this endpoint too).
+        safe_name = f"{uuid.uuid4().hex}-{safe_name}"
         content_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
         url = f"{self._base}/upload/image"
         headers = dict(outbound_cycle_headers())
@@ -952,7 +992,9 @@ class ComfyUIClient:
             )
         resp.raise_for_status()
         data = resp.json()
-        return str(data.get("name") or safe_name)
+        name = str(data.get("name") or safe_name)
+        subfolder = str(data.get("subfolder") or "").strip("/\\")
+        return f"{subfolder}/{name}" if subfolder else name
 
     async def _submit_and_collect(
         self,
@@ -1190,12 +1232,16 @@ class ComfyUIClient:
             if coerce is not None:
                 value = coerce(value)
             for node_id, input_name in places:
-                if param == "images" and isinstance(value, list):
+                if param in {"reference_images", "reference_videos"}:
+                    add_reference_inputs(workflow, node_id, input_name, value,
+                                         video=param == "reference_videos")
+                elif param == "images" and isinstance(value, list):
                     self._set_image_batch_input(
                         workflow, node_id, input_name, value
                     )
                 else:
                     self._set_input(workflow, node_id, input_name, value)
+        add_keyframes(workflow, params.get("keyframes") or [])
         return workflow
 
     def _set_image_batch_input(

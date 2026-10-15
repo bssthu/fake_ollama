@@ -68,6 +68,18 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.seed is not None:
         payload["seed"] = args.seed
+    if getattr(args, "video_mode", None):
+        payload["video_mode"] = args.video_mode
+    if getattr(args, "steps", None) is not None:
+        payload["steps"] = args.steps
+    if getattr(args, "video", None):
+        payload["videos"] = [encode_image(path) for path in args.video]
+        payload["video_filenames"] = [path.name for path in args.video]
+    if getattr(args, "keyframe", None):
+        payload["keyframes"] = [
+            {"frame_index": int(index), "image": encode_image(Path(path)), "filename": Path(path).name}
+            for index, path in args.keyframe
+        ]
     image_paths = image_paths_from_args(args)
     if image_paths:
         payload["images"] = [encode_image(path) for path in image_paths]
@@ -164,6 +176,11 @@ def parse_args() -> argparse.Namespace:
         help="H3 base workflow mode (default: auto by reference-image count).",
     )
     parser.add_argument("--size", default="256x256")
+    parser.add_argument("--video-mode", choices=("auto", "t2va", "i2va", "fl2va", "l2va", "ref2va"))
+    parser.add_argument("--video", type=Path, action="append", help="Ref2VA reference video at 24 FPS; repeat up to 3 times.")
+    parser.add_argument("--keyframe", nargs=2, action="append", metavar=("FRAME_INDEX", "IMAGE_PATH"),
+                        help="Anchor an image at a frame (negative counts from the end); requires --prompt-mode raw.")
+    parser.add_argument("--steps", type=int)
     parser.add_argument("--num-frames", type=int, default=17)
     parser.add_argument("--fps", type=float, default=8.0)
     parser.add_argument("--prefetch-count", type=int, default=1)

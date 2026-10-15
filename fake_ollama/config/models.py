@@ -933,6 +933,7 @@ class ComfyUITarget(BaseModel):
     image_to_video_workflow_path: Optional[str] = None
     first_last_to_video_workflow_path: Optional[str] = None
     last_to_video_workflow_path: Optional[str] = None
+    reference_to_video_workflow_path: Optional[str] = None
 
     # Optional prompt-planning stage run before video workflows.  The profile
     # itself is top-level so the same harness can be previewed in Playground
@@ -1251,6 +1252,7 @@ class ComfyUITarget(BaseModel):
             "image_to_video_workflow_path",
             "first_last_to_video_workflow_path",
             "last_to_video_workflow_path",
+            "reference_to_video_workflow_path",
             "diffusion_model",
             "diffusion_weight_dtype",
             "text_encoder_model",

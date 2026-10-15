@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import asyncio
 import time
 import base64
@@ -23,6 +24,8 @@ from starlette.requests import ClientDisconnect
 from . import __version__
 from .anthropic_client import AnthropicClient
 from .comfyui_client import ComfyUIClient
+from .comfyui_presets import resolve_workflows
+from .h3_media import video_media_from_request
 from .config import (
     FORWARDED_BY_HEADER,
     INSTANCE_ID,
@@ -909,6 +912,9 @@ def _playground_model_entry(
                         },
                     ]
                 )
+            if source.preset == "minimax_h3" and operation["id"] == "video_generation":
+                operation["parameters"] = [parameter for parameter in operation["parameters"]
+                                           if parameter["name"] != "context_ir_mode"]
     return {
         "id": public_id,
         "context_length": profile.context_length,
@@ -2047,6 +2053,8 @@ def _coerce_float_payload(
         out = float(value)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"{keys[0]} must be a number") from exc
+    if not math.isfinite(out):
+        raise HTTPException(status_code=400, detail=f"{keys[0]} must be finite")
     if out < minimum or (maximum is not None and out > maximum):
         upper = f" and <= {maximum}" if maximum is not None else ""
         raise HTTPException(
@@ -3004,24 +3012,55 @@ async def _handle_openai_video_generation(request: Request) -> Any:
     if iface is None:  # pragma: no cover - dispatch already requires an interface
         raise HTTPException(status_code=404, detail="unknown listener")
     target = backend.source
-    _enforce_reference_image_limit(target, "video_generation", image_inputs)
     params = _video_request_params(payload, target, app=app)
+    try:
+        image_inputs, video_inputs, keyframe_inputs = await video_media_from_request(
+            request, payload, image_inputs, frames=params["num_frames"], fps=params["frame_rate"]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _enforce_reference_image_limit(target, "video_generation", image_inputs)
     revised_prompt: Optional[str] = None
     context_ir_profile_name = getattr(target, "context_ir_profile", None)
     video_mode = "auto"
-    if context_ir_profile_name or getattr(target, "preset", "") == "minimax_h3":
+    requested_mode = str(payload.get("video_mode") or payload.get("context_ir_mode") or "auto").strip().lower()
+    legacy_mode = str(payload.get("context_ir_mode") or "auto").strip().lower()
+    if requested_mode != "auto" and legacy_mode not in ("auto", requested_mode):
+        raise HTTPException(status_code=400, detail="video_mode conflicts with context_ir_mode")
+    if requested_mode == "auto":
+        requested_mode = legacy_mode
+    raw_media = requested_mode == "ref2va" or bool(keyframe_inputs)
+    workflows = resolve_workflows(target.workflow_config())
+    if raw_media:
+        if getattr(target, "preset", "") != "minimax_h3":
+            raise HTTPException(status_code=400, detail="Ref2VA/keyframes require the minimax_h3 preset")
+        if str(payload.get("prompt_mode") or "").lower() != "raw":
+            raise HTTPException(status_code=400, detail="Ref2VA/keyframes require prompt_mode=raw; Context-IR supports base modes only")
+    if video_inputs and requested_mode != "ref2va":
+        raise HTTPException(status_code=400, detail="reference videos require video_mode=ref2va")
+    if requested_mode == "ref2va":
+        if workflows.get("ref2va") is None or not (image_inputs or video_inputs):
+            raise HTTPException(status_code=400, detail="Ref2VA requires a configured workflow and at least one reference image or video")
+        video_mode = "ref2va"
+    elif context_ir_profile_name or getattr(target, "preset", "") == "minimax_h3":
         try:
             video_mode = resolve_base_mode(
-                str(
-                    payload.get("context_ir_mode")
-                    or payload.get("video_mode")
-                    or "auto"
-                ),
+                requested_mode,
                 len(image_inputs),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if context_ir_profile_name:
+    elif requested_mode != "auto":
+        raise HTTPException(status_code=400, detail="video_mode is only supported for H3 targets")
+    if keyframe_inputs:
+        occupied = set()
+        if video_mode in {"i2va", "fl2va"}:
+            occupied.add(0)
+        if video_mode in {"l2va", "fl2va"}:
+            occupied.add(params["num_frames"] - 1)
+        if any(index in occupied for index, _, _ in keyframe_inputs):
+            raise HTTPException(status_code=400, detail="keyframe overlaps a first/last frame constraint")
+    if context_ir_profile_name and not raw_media:
         context_profile = settings.h3_context_ir_profile_by_name(
             context_ir_profile_name
         )
@@ -3086,6 +3125,8 @@ async def _handle_openai_video_generation(request: Request) -> Any:
             filename=filename,
             image_inputs=image_inputs or None,
             video_mode=video_mode,
+            video_inputs=video_inputs or None,
+            keyframe_inputs=keyframe_inputs or None,
             estimated_vram_gb=profile.estimated_vram_gb,
             estimated_memory_gb=profile.estimated_memory_gb,
             request_vram_headroom_gb=profile.request_vram_headroom_gb,
@@ -3094,6 +3135,8 @@ async def _handle_openai_video_generation(request: Request) -> Any:
             exclusive_gpu=profile.exclusive_gpu,
             **params,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
         _log_upstream_error(request, exc, payload)
         return _upstream_error(exc)

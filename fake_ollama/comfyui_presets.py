@@ -48,6 +48,8 @@ DYNAMIC_PARAMS: Tuple[str, ...] = (
     "batch_size",
     "image",
     "images",
+    "reference_images",
+    "reference_videos",
     "image_1",
     "image_2",
     "image_3",
@@ -106,6 +108,7 @@ class Preset:
     i2v: Optional[WorkflowSpec] = None
     fl2va: Optional[WorkflowSpec] = None
     l2va: Optional[WorkflowSpec] = None
+    ref2va: Optional[WorkflowSpec] = None
 
 
 WORKFLOW_MODES: Tuple[str, ...] = (
@@ -115,6 +118,7 @@ WORKFLOW_MODES: Tuple[str, ...] = (
     "i2v",
     "fl2va",
     "l2va",
+    "ref2va",
 )
 
 
@@ -348,6 +352,14 @@ _MINIMAX_H3_L2VA = _minimax_h3_spec(
     image_bindings={"image": [("20", "image")]},
     max_image_refs=1,
 )
+_MINIMAX_H3_REF2VA = _minimax_h3_spec(
+    "minimax_h3_ref2va.json",
+    image_bindings={
+        "reference_images": [("5", "ref_images")],
+        "reference_videos": [("5", "ref_videos")],
+    },
+    max_image_refs=9,
+)
 
 PRESETS: Dict[str, Preset] = {
     "qwen_image_edit_aio": Preset(
@@ -365,6 +377,7 @@ PRESETS: Dict[str, Preset] = {
         i2v=_MINIMAX_H3_I2V,
         fl2va=_MINIMAX_H3_FL2VA,
         l2va=_MINIMAX_H3_L2VA,
+        ref2va=_MINIMAX_H3_REF2VA,
     ),
 }
 
@@ -520,6 +533,7 @@ def resolve_workflows(
     i2v_path = fields.get("image_to_video_workflow_path")
     fl2va_path = fields.get("first_last_to_video_workflow_path")
     l2va_path = fields.get("last_to_video_workflow_path")
+    ref2va_path = fields.get("reference_to_video_workflow_path")
     max_image_refs = fields.get("max_reference_images")
 
     if preset_name in _FIELD_PRESETS:
@@ -533,6 +547,7 @@ def resolve_workflows(
             "i2v": preset.i2v,
             "fl2va": preset.fl2va,
             "l2va": preset.l2va,
+            "ref2va": preset.ref2va,
         }
     elif preset_name in _CUSTOM_PRESETS:
         base = {
@@ -566,6 +581,10 @@ def resolve_workflows(
                 if l2va_path
                 else None
             ),
+            "ref2va": (
+                WorkflowSpec(path=Path(ref2va_path), bindings={}, max_image_refs=9)
+                if ref2va_path else None
+            ),
         }
     else:
         raise ValueError(
@@ -591,13 +610,15 @@ def resolve_workflows(
             path = Path(fl2va_path)
         if mode == "l2va" and l2va_path:
             path = Path(l2va_path)
+        if mode == "ref2va" and ref2va_path:
+            path = Path(ref2va_path)
         static_inputs = _merge_static(spec.static_inputs, override_static.get(mode))
         # Output filename prefix is a per-target, non-request value; route it
         # to the SaveImage node uniformly across presets.
         if output_prefix is not None:
             output_node = (
                 str(fields.get("save_video_node_id") or "9")
-                if mode in {"video", "i2v", "fl2va", "l2va"}
+                if mode in {"video", "i2v", "fl2va", "l2va", "ref2va"}
                 else save_node
             )
             static_inputs = _merge_static(

@@ -70,6 +70,7 @@ def test_example_and_validation_scripts_use_layered_directories() -> None:
     examples = ROOT / "scripts" / "examples"
     validation = ROOT / "scripts" / "validation"
     assert {path.name for path in examples.glob("*.py")} == {
+        "build_h3_ref_workflow.py",
         "call_joyai_vl_recognition.py",
         "call_mage_vl_video.py",
         "call_video_generation.py",
