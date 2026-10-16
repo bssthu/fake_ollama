@@ -242,7 +242,7 @@ def _minimal_settings() -> Settings:
 def test_middleware_blocks_self_loop_with_508() -> None:
     from fake_ollama.server import create_app
 
-    app = create_app(_minimal_settings())
+    app = create_app(_minimal_settings(), test_listener_fallback=True)
     with TestClient(app) as client:
         resp = client.get(
             "/api/tags",
@@ -257,7 +257,7 @@ def test_middleware_blocks_self_loop_with_508() -> None:
 def test_middleware_passes_through_non_loop_requests() -> None:
     from fake_ollama.server import create_app
 
-    app = create_app(_minimal_settings())
+    app = create_app(_minimal_settings(), test_listener_fallback=True)
     with TestClient(app) as client:
         resp = client.get(
             "/api/tags",
@@ -270,7 +270,7 @@ def test_middleware_ignores_non_model_paths() -> None:
     """Dashboard / admin paths must not be subject to the loop check."""
     from fake_ollama.server import create_app
 
-    app = create_app(_minimal_settings())
+    app = create_app(_minimal_settings(), test_listener_fallback=True)
     with TestClient(app) as client:
         # Even with our own id in the header, a non /api|/v1 path is allowed.
         resp = client.get(

@@ -50,7 +50,7 @@ def test_request_data_log_records_http_and_backend_payloads(settings, tmp_path):
         )
 
     try:
-        app = create_app(settings)
+        app = create_app(settings, test_listener_fallback=True)
         transport = httpx.MockTransport(handler)
         app.state.clients = {
             up.name: AnthropicClient(
@@ -162,7 +162,7 @@ async def test_request_data_log_marks_routed_disconnect_499_cancelled(
 ):
     log_file = tmp_path / "fake_ollama.requests.jsonl"
     configure_request_data_logging(str(log_file))
-    app = create_app(settings)
+    app = create_app(settings, test_listener_fallback=True)
     messages = [
         {"type": "http.request", "body": b'{"model"', "more_body": True},
         {"type": "http.disconnect"},

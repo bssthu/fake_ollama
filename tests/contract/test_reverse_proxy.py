@@ -243,7 +243,7 @@ def _build_client(
 ) -> TestClient:
     from fake_ollama.anthropic_client import AnthropicClient
 
-    app = create_app(settings)
+    app = create_app(settings, test_listener_fallback=True)
     app.state.ollama_clients = (
         {tgt.name: fake_ollama for tgt in settings.ollama_targets}
         if fake_ollama is not None

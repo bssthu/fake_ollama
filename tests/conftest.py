@@ -6,12 +6,11 @@ import json
 import os
 
 import pytest
-from dotenv import load_dotenv
 
 from fake_ollama.config import Settings, get_settings, load_settings
 
-# Load .env early so integration skip-checks see FAKE_OLLAMA_TEST_*.
-load_dotenv()
+# Live tests opt in through explicit environment variables. Never load a
+# developer's .env (which can contain production credentials) during collection.
 
 
 def _write_default_config(path) -> None:

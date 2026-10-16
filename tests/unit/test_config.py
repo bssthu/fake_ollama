@@ -768,7 +768,7 @@ def test_routes_request_via_composite_id_through_app(monkeypatch, tmp_path):
             )
         return _h
 
-    app = create_app(s)
+    app = create_app(s, test_listener_fallback=True)
     app.state.clients = {
         "anthropic": AnthropicClient(
             "https://anthropic.example.com", "a-tok",

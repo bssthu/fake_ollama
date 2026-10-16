@@ -36,6 +36,7 @@ include = ["fake_ollama*"]
 fake_ollama = ["workflows/*.json", "static/*"]
 
 [tool.pytest.ini_options]
+addopts = '-m "not integration and not e2e and not gpu"'
 testpaths = ["tests", "services/mage_vl/tests"]
 pythonpath = [".", "services/mage_vl/src"]
 asyncio_mode = "auto"

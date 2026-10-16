@@ -205,7 +205,7 @@ class ForwardedCycleMiddleware:
             reset_inbound_forwarded_chain(token)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, test_listener_fallback: bool = False) -> FastAPI:
     settings = settings or get_settings()
 
     @asynccontextmanager
@@ -394,6 +394,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
     app.state.settings = settings
+    app.state.test_listener_fallback = test_listener_fallback
     app.state.shutdown_requested = False
     app.state.vram_coordinator = VramCoordinator()
     app.state.memory_coordinator = MemoryCoordinator()
@@ -496,9 +497,11 @@ def _interface_for(request: Request):
         for it in settings.api_interfaces:
             if it.port == local_port:
                 return it
-    # No matching listener (TestClient / ASGI direct call, or unknown port):
-    # best effort fallback so unit tests can hit /api/* and /v1/* without
-    # binding real sockets.
+    # An opt-in Python-only test hook; never infer test mode from a port/header.
+    if not getattr(request.app.state, "test_listener_fallback", False):
+        return None
+    if _has_path_prefix(request.scope["path"], _API_ONLY_PATH_PREFIXES) and settings.api_interfaces:
+        return settings.api_interfaces[0]
     if settings.ollama_interfaces:
         return settings.ollama_interfaces[0]
     if settings.api_interfaces:
@@ -1673,14 +1676,10 @@ def _install_port_router(app: FastAPI) -> None:
             shared_v1 = _has_path_prefix(path, _SHARED_V1_PATH_PREFIXES)
             ollama_only = _has_path_prefix(path, _OLLAMA_ONLY_PATH_PREFIXES)
 
-            # TestClient / ASGI direct calls present a synthetic local_port
-            # (e.g. 80 from Starlette TestClient) that won't match any
-            # configured listener. When no listener matches, fall back to
-            # a configured interface so unit tests can hit /api/* and /v1/*
-            # without binding real ports. Prefer an api_interface for
-            # api-only paths, otherwise the first ollama_interface.
+            # Synthetic ASGI callers must explicitly opt into the test hook.
             if (
-                not is_admin
+                getattr(request.app.state, "test_listener_fallback", False)
+                and not is_admin
                 and not is_dashboard
                 and not is_playground
                 and ollama_iface is None

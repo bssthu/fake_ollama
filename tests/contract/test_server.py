@@ -25,7 +25,7 @@ def _build_sse(events: List[Dict[str, Any]]) -> bytes:
 def _make_client(settings, transport: httpx.MockTransport) -> TestClient:
     from fake_ollama.anthropic_client import AnthropicClient
 
-    app = create_app(settings)
+    app = create_app(settings, test_listener_fallback=True)
     # Inject one mocked AnthropicClient per upstream BEFORE lifespan startup
     # so all routes share the same MockTransport.
     app.state.clients = {
@@ -49,7 +49,7 @@ def test_request_shutdown_rejects_new_requests(settings):
         def begin_shutdown(self) -> None:
             self.shutdown_requested = True
 
-    app = create_app(settings)
+    app = create_app(settings, test_listener_fallback=True)
     fake = FakeTargetClient()
     app.state.ollama_clients = {"local": fake}
     request_shutdown(app)
@@ -111,7 +111,7 @@ def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
              "exposed_models": [{"model": "claude-3-5-sonnet-20241022", "target": "default"}]}
         ],
     )
-    app = create_app(settings)
+    app = create_app(settings, test_listener_fallback=True)
     caplog.set_level(logging.INFO, logger="fake_ollama")
 
     with TestClient(app, base_url="http://testserver:21434") as ollama:
@@ -149,7 +149,7 @@ def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
 async def test_client_disconnect_is_logged_as_499(
     settings, caplog: pytest.LogCaptureFixture
 ):
-    app = create_app(settings)
+    app = create_app(settings, test_listener_fallback=True)
     caplog.set_level(logging.INFO, logger="fake_ollama")
 
     messages = [

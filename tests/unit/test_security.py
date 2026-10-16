@@ -196,7 +196,7 @@ def test_external_planner_urls_require_explicit_exact_authorization():
 def test_show_obeys_interface_visibility(settings):
     data = settings.model_dump()
     data["ollama_interfaces"][0]["exposed_models"] = [data["ollama_interfaces"][0]["exposed_models"][0]]
-    with TestClient(create_app(Settings.model_validate(data))) as client:
+    with TestClient(create_app(Settings.model_validate(data)), base_url="http://testserver:21434") as client:
         assert client.post("/api/show", json={"model": "llama-test@default"}).status_code == 404
 
 
