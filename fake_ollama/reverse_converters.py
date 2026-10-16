@@ -14,6 +14,8 @@ Scope (MVP):
 from __future__ import annotations
 
 import json
+
+from .protocol_tools import tool_arguments, UpstreamProtocolError
 import re
 import time
 import uuid
@@ -524,18 +526,13 @@ def ollama_chat_to_anthropic(
     tool_calls = msg.get("tool_calls") or []
 
     blocks: List[Dict[str, Any]] = []
+    if msg.get("thinking"):
+        blocks.append({"type": "thinking", "thinking": msg["thinking"]})
     if text:
         blocks.append({"type": "text", "text": text})
     for i, tc in enumerate(tool_calls):
         fn = (tc.get("function") if isinstance(tc, dict) else None) or {}
-        args = fn.get("arguments")
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {"_raw": args}
-        elif args is None:
-            args = {}
+        args = tool_arguments(fn.get("arguments"))
         blocks.append(
             {
                 "type": "tool_use",
@@ -546,7 +543,7 @@ def ollama_chat_to_anthropic(
         )
 
     done_reason = response.get("done_reason")
-    if not done_reason and tool_calls:
+    if tool_calls:
         done_reason = "tool_use"
     stop_reason = _DONE_REASON_TO_STOP.get(done_reason, "end_turn")
 
@@ -576,17 +573,7 @@ _OPENAI_FINISH_TO_STOP = {
 
 
 def _parse_openai_arguments(value: Any) -> Dict[str, Any]:
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value) if value else {}
-        except json.JSONDecodeError:
-            return {"_raw": value}
-        return parsed if isinstance(parsed, dict) else {"_value": parsed}
-    if isinstance(value, dict):
-        return value
-    if value is None:
-        return {}
-    return {"_value": value}
+    return tool_arguments(value)
 
 
 def openai_chat_to_anthropic(
@@ -697,6 +684,8 @@ async def openai_stream_to_anthropic_events(
         },
     )
 
+    saw_done = False
+    saw_finish = False
     next_index = 0
     text_index: Optional[int] = None
     thinking_index: Optional[int] = None
@@ -718,11 +707,16 @@ async def openai_stream_to_anthropic_events(
         else:
             continue
         if line == "[DONE]":
+            saw_done = True
             break
         try:
             chunk = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            yield stream_error("Invalid upstream stream JSON")
+            return
+        if chunk.get("error"):
+            yield stream_error("Upstream returned an error")
+            return
 
         usage = chunk.get("usage") or {}
         input_tokens = int(usage.get("prompt_tokens") or input_tokens)
@@ -735,6 +729,7 @@ async def openai_stream_to_anthropic_events(
         delta = choice.get("delta") or {}
         finish = choice.get("finish_reason")
         if finish:
+            saw_finish = True
             stop_reason = _OPENAI_FINISH_TO_STOP.get(finish, "end_turn")
 
         reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
@@ -811,6 +806,9 @@ async def openai_stream_to_anthropic_events(
             if fn.get("arguments"):
                 acc["arguments"] += fn["arguments"]
 
+    if not saw_done or not saw_finish:
+        yield stream_error("Upstream stream ended before completion")
+        return
     if thinking_open:
         yield (
             "content_block_stop",
@@ -834,7 +832,11 @@ async def openai_stream_to_anthropic_events(
         tool = pending_tools[idx]
         block_index = next_index
         next_index += 1
-        args = _parse_openai_arguments(tool.get("arguments"))
+        try:
+            args = _parse_openai_arguments(tool.get("arguments"))
+        except UpstreamProtocolError:
+            yield stream_error("Invalid or incomplete upstream tool arguments")
+            return
         yield (
             "content_block_start",
             {
@@ -875,159 +877,97 @@ async def openai_stream_to_anthropic_events(
     yield ("message_stop", {"type": "message_stop"})
 
 
+def stream_error(message):
+    return "error", {"type": "error", "error": {"type": "upstream_protocol_error", "message": message}}
+
+
 async def ollama_stream_to_anthropic_events(
-    lines: AsyncIterator[bytes],
-    *,
-    anthropic_model: str,
+    lines: AsyncIterator[bytes], *, anthropic_model: str,
 ) -> AsyncIterator[Tuple[str, Dict[str, Any]]]:
-    """Translate a stream of Ollama NDJSON lines into Anthropic event tuples."""
-    msg_id = _new_msg_id()
+    """Keep monotonic block indices across text, thinking and tool segments."""
+    yield "message_start", {"type": "message_start", "message": {
+        "id": _new_msg_id(), "type": "message", "role": "assistant", "content": [],
+        "model": anthropic_model, "stop_reason": None, "stop_sequence": None, "usage": {},
+    }}
+    next_index = 0
+    active = None
+    active_index = None
+    tools_seen = {}
 
-    # message_start
-    yield (
-        "message_start",
-        {
-            "type": "message_start",
-            "message": {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": anthropic_model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
-            },
-        },
-    )
+    def close():
+        nonlocal active
+        if active is None:
+            return []
+        active = None
+        return [("content_block_stop", {"type": "content_block_stop", "index": active_index})]
 
-    text_block_open = False
-    output_tokens = 0
-    input_tokens = 0
-    stop_reason = "end_turn"
-    pending_tool_calls: List[Dict[str, Any]] = []
+    def segment(kind, value):
+        nonlocal active, active_index, next_index
+        out = []
+        if active != kind:
+            out.extend(close())
+            active, active_index = kind, next_index
+            next_index += 1
+            out.append(("content_block_start", {"type": "content_block_start", "index": active_index,
+                       "content_block": {"type": kind, kind: ""}}))
+        out.append(("content_block_delta", {"type": "content_block_delta", "index": active_index,
+                   "delta": {"type": kind + "_delta", kind: value}}))
+        return out
 
     async for raw in lines:
         try:
             chunk = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-        except json.JSONDecodeError:
-            continue
-
-        msg = chunk.get("message") or {}
-        delta_text = msg.get("content") or ""
-        tool_calls_in_chunk = msg.get("tool_calls") or []
-
-        if delta_text:
-            if not text_block_open:
-                yield (
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                text_block_open = True
-            yield (
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": delta_text},
-                },
-            )
-
-        if tool_calls_in_chunk:
-            pending_tool_calls.extend(tool_calls_in_chunk)
-
-        if chunk.get("done"):
-            if text_block_open:
-                yield (
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": 0},
-                )
-                text_block_open = False
-
-            # Emit tool_use blocks (Ollama only delivers them whole, not
-            # streamed token-by-token).
-            base_idx = 1 if (msg.get("content") or "") else 0
-            for i, tc in enumerate(pending_tool_calls):
-                fn = (tc.get("function") if isinstance(tc, dict) else None) or {}
-                args = fn.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {"_raw": args}
-                elif args is None:
-                    args = {}
-                idx = base_idx + i
-                tu_id = tc.get("id") or f"call_{i}"
-                yield (
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tu_id,
-                            "name": fn.get("name", ""),
-                            "input": {},
-                        },
-                    },
-                )
-                yield (
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": json.dumps(args, ensure_ascii=False),
-                        },
-                    },
-                )
-                yield (
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": idx},
-                )
-
-            done_reason = chunk.get("done_reason")
-            if not done_reason and pending_tool_calls:
-                done_reason = "tool_use"
-            stop_reason = _DONE_REASON_TO_STOP.get(done_reason, "end_turn")
-            output_tokens = int(chunk.get("eval_count") or output_tokens)
-            input_tokens = int(chunk.get("prompt_eval_count") or input_tokens)
-
-            yield (
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                    },
-                },
-            )
-            yield ("message_stop", {"type": "message_stop"})
+        except (ValueError, UnicodeError):
+            yield stream_error("Invalid upstream stream JSON")
             return
-
-    # Stream ended without a `done` flag (defensive).
-    if text_block_open:
-        yield (
-            "content_block_stop",
-            {"type": "content_block_stop", "index": 0},
-        )
-    yield (
-        "message_delta",
-        {
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-        },
-    )
-    yield ("message_stop", {"type": "message_stop"})
+        if chunk.get("error"):
+            yield stream_error("Upstream returned an error")
+            return
+        msg = chunk.get("message") or {}
+        for kind, field in (("thinking", "thinking"), ("text", "content")):
+            if msg.get(field):
+                for event in segment(kind, msg[field]):
+                    yield event
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            key = tc.get("id") or fn.get("index")
+            if key is None:
+                key = "unindexed-" + str(len(tools_seen))
+            if key in tools_seen:
+                if tools_seen[key] != tc:
+                    yield stream_error("Conflicting duplicate upstream tool call")
+                    return
+                continue
+            try:
+                args = tool_arguments(fn.get("arguments"))
+            except UpstreamProtocolError:
+                yield stream_error("Invalid or incomplete upstream tool arguments")
+                return
+            if not fn.get("name"):
+                yield stream_error("Missing upstream tool name")
+                return
+            for event in close():
+                yield event
+            index = next_index
+            next_index += 1
+            tools_seen[key] = tc
+            yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": {
+                "type": "tool_use", "id": tc.get("id") or "call_" + uuid.uuid4().hex,
+                "name": fn["name"], "input": {},
+            }}
+            yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+                "type": "input_json_delta", "partial_json": json.dumps(args, ensure_ascii=False),
+            }}
+            yield "content_block_stop", {"type": "content_block_stop", "index": index}
+        if chunk.get("done"):
+            for event in close():
+                yield event
+            reason = "tool_use" if tools_seen else _DONE_REASON_TO_STOP.get(chunk.get("done_reason"), "end_turn")
+            usage = {dst: chunk[src] for src, dst in (("eval_count", "output_tokens"), ("prompt_eval_count", "input_tokens")) if chunk.get(src) is not None}
+            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": None}, "usage": usage}
+            yield "message_stop", {"type": "message_stop"}
+            return
+    yield stream_error("Upstream stream ended before completion")
 
 
 __all__ = [

@@ -68,6 +68,8 @@ from .generic_openai_client import GenericOpenAIClient
 from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
 from .thinking_cache import bind_scope as bind_thinking_scope
+from .stream_state import AnthropicStreamState, checked_openai_lines
+from .protocol_tools import UpstreamProtocolError
 from .security import RequestBodyLimitMiddleware, is_loopback_host, require_management_access
 from .request_data_log import RequestDataLogMiddleware
 from .vram import LocalTargetResourceError, MemoryCoordinator, VramCoordinator
@@ -397,6 +399,11 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
     app.state.settings = settings
     app.state.test_listener_fallback = test_listener_fallback
     app.state.thinking_cache_namespace = secrets.token_hex(16)
+    @app.exception_handler(UpstreamProtocolError)
+    async def protocol_error(request: Request, exc: UpstreamProtocolError):
+        if request.url.path.startswith("/v1/messages"):
+            return _anthropic_error_response(exc)
+        return _upstream_error(exc)
     app.state.shutdown_requested = False
     app.state.vram_coordinator = VramCoordinator()
     app.state.memory_coordinator = MemoryCoordinator()
@@ -1796,7 +1803,9 @@ def _register_routes(app: FastAPI) -> None:
     register_routes(app)
 
 
-def _read_error_text(exc: httpx.HTTPError) -> str:
+def _read_error_text(exc: Exception) -> str:
+    if not isinstance(exc, httpx.HTTPError):
+        return "Upstream stream failed (" + type(exc).__name__ + ")"
     if isinstance(exc, httpx.HTTPStatusError):
         try:
             return exc.response.text
@@ -3433,7 +3442,9 @@ async def _handle_ollama_via_openai_upstream(
             ):
                 for chunk in translator.feed_event(event_type, data):
                     yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
-        except httpx.HTTPError as exc:
+            for chunk in translator.finish():
+                yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
+        except Exception as exc:
             _log_upstream_error(request, exc, anthropic_payload)
             err_chunk = {
                 "model": ollama_model,
@@ -3530,7 +3541,9 @@ async def _handle(request: Request, *, mode: str) -> Any:
             async for event_type, data in client.stream_messages(upstream_payload):
                 for chunk in translator.feed_event(event_type, data):
                     yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
-        except httpx.HTTPError as exc:
+            for chunk in translator.finish():
+                yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
+        except Exception as exc:
             _log_upstream_error(request, exc, upstream_payload)
             err_chunk = {
                 "model": ollama_model,
@@ -3651,27 +3664,17 @@ async def _handle_openai_chat(request: Request) -> Any:
                         yield (
                             "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
                         ).encode("utf-8")
-            except httpx.HTTPError as exc:
+                for frame in translator.finish():
+                    yield ("data: " + json.dumps(frame, ensure_ascii=False) + "\n\n").encode("utf-8")
+            except Exception as exc:
+                translator._state.failed = True
                 _log_upstream_error(request, exc, ollama_payload)
-                err_frame = {
-                    "id": "chatcmpl-fake",
-                    "object": "chat.completion.chunk",
-                    "created": int(datetime.now(timezone.utc).timestamp()),
-                    "model": openai_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "content": f"[upstream error: {_read_error_text(exc)}]"
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
+                err_frame = {"error": {"type": "upstream_error", "message": _read_error_text(exc)}}
                 yield (
                     "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
                 ).encode("utf-8")
-            yield b"data: [DONE]\n\n"
+            if not translator._state.failed:
+                yield b"data: [DONE]\n\n"
 
         return StreamingResponse(body_local(), media_type="text/event-stream")
 
@@ -3708,36 +3711,22 @@ async def _handle_openai_chat(request: Request) -> Any:
 
         async def body_llama_openai() -> AsyncIterator[bytes]:
             try:
-                async for line in lc.stream_chat(
+                async for line in checked_openai_lines(lc.stream_chat(
                     llama_payload,
                     estimated_vram_gb=estimated_vram_gb,
                     estimated_memory_gb=estimated_memory_gb,
-                ):
+                )):
                     if line.startswith("data:"):
                         yield (line + "\n\n").encode("utf-8")
                     else:
                         yield ("data: " + line + "\n\n").encode("utf-8")
-            except httpx.HTTPError as exc:
+            except Exception as exc:
                 _log_upstream_error(request, exc, llama_payload)
-                err_frame = {
-                    "id": "chatcmpl-fake",
-                    "object": "chat.completion.chunk",
-                    "created": int(datetime.now(timezone.utc).timestamp()),
-                    "model": openai_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "content": f"[upstream error: {_read_error_text(exc)}]"
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
+                err_frame = {"error": {"type": "upstream_error", "message": _read_error_text(exc)}}
                 yield (
                     "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
                 ).encode("utf-8")
-                yield b"data: [DONE]\n\n"
+                return
 
         return StreamingResponse(body_llama_openai(), media_type="text/event-stream")
 
@@ -3776,36 +3765,22 @@ async def _handle_openai_chat(request: Request) -> Any:
 
         async def body_generic_openai() -> AsyncIterator[bytes]:
             try:
-                async for line in loc.stream_chat(
+                async for line in checked_openai_lines(loc.stream_chat(
                     forward_payload,
                     estimated_vram_gb=estimated_vram_gb,
                     estimated_memory_gb=estimated_memory_gb,
-                ):
+                )):
                     if line.startswith("data:"):
                         yield (line + "\n\n").encode("utf-8")
                     else:
                         yield ("data: " + line + "\n\n").encode("utf-8")
-            except httpx.HTTPError as exc:
+            except Exception as exc:
                 _log_upstream_error(request, exc, forward_payload)
-                err_frame = {
-                    "id": "chatcmpl-fake",
-                    "object": "chat.completion.chunk",
-                    "created": int(datetime.now(timezone.utc).timestamp()),
-                    "model": openai_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "content": f"[upstream error: {_read_error_text(exc)}]"
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
+                err_frame = {"error": {"type": "upstream_error", "message": _read_error_text(exc)}}
                 yield (
                     "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
                 ).encode("utf-8")
-                yield b"data: [DONE]\n\n"
+                return
 
         return StreamingResponse(body_generic_openai(), media_type="text/event-stream")
 
@@ -3831,32 +3806,18 @@ async def _handle_openai_chat(request: Request) -> Any:
 
         async def body_openai_upstream() -> AsyncIterator[bytes]:
             try:
-                async for line in oc_remote.stream_chat(forward_payload):
+                async for line in checked_openai_lines(oc_remote.stream_chat(forward_payload)):
                     if line.startswith("data:"):
                         yield (line + "\n\n").encode("utf-8")
                     else:
                         yield ("data: " + line + "\n\n").encode("utf-8")
-            except httpx.HTTPError as exc:
+            except Exception as exc:
                 _log_upstream_error(request, exc, forward_payload)
-                err_frame = {
-                    "id": "chatcmpl-fake",
-                    "object": "chat.completion.chunk",
-                    "created": int(datetime.now(timezone.utc).timestamp()),
-                    "model": openai_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "content": f"[upstream error: {_read_error_text(exc)}]"
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
+                err_frame = {"error": {"type": "upstream_error", "message": _read_error_text(exc)}}
                 yield (
                     "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
                 ).encode("utf-8")
-                yield b"data: [DONE]\n\n"
+                return
 
         return StreamingResponse(body_openai_upstream(), media_type="text/event-stream")
 
@@ -3901,25 +3862,17 @@ async def _handle_openai_chat(request: Request) -> Any:
                     yield (
                         "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
                     ).encode("utf-8")
-        except httpx.HTTPError as exc:
+            for frame in translator.finish():
+                yield ("data: " + json.dumps(frame, ensure_ascii=False) + "\n\n").encode("utf-8")
+        except Exception as exc:
+            translator._state.failed = True
             _log_upstream_error(request, exc, upstream_payload)
-            err_frame = {
-                "id": "chatcmpl-fake",
-                "object": "chat.completion.chunk",
-                "created": int(datetime.now(timezone.utc).timestamp()),
-                "model": openai_model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": f"[upstream error: {_read_error_text(exc)}]"},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
+            err_frame = {"error": {"type": "upstream_error", "message": _read_error_text(exc)}}
             yield (
                 "data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n"
             ).encode("utf-8")
-        yield b"data: [DONE]\n\n"
+        if not translator._state.failed:
+            yield b"data: [DONE]\n\n"
 
     return StreamingResponse(body(), media_type="text/event-stream")
 
@@ -4067,7 +4020,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                     lines, anthropic_model=anth_model
                 ):
                     yield chunk
-            except httpx.HTTPError as exc:
+            except Exception as exc:
                 _log_upstream_error(request, exc, ollama_payload)
                 error_type = (
                     exc.error_type
@@ -4136,7 +4089,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                     show_thinking=profile.show_thinking,
                 ):
                     yield chunk
-            except httpx.HTTPError as exc:
+            except Exception as exc:
                 _log_upstream_error(request, exc, llama_payload)
                 error_type = (
                     exc.error_type
@@ -4209,7 +4162,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                     show_thinking=profile.show_thinking,
                 ):
                     yield chunk
-            except httpx.HTTPError as exc:
+            except Exception as exc:
                 _log_upstream_error(request, exc, local_payload)
                 error_type = (
                     exc.error_type
@@ -4265,7 +4218,7 @@ async def _handle_anthropic_messages(request: Request) -> Any:
                     show_thinking=profile.show_thinking,
                 ):
                     yield _sse(event_type, data)
-            except httpx.HTTPError as exc:
+            except Exception as exc:
                 _log_upstream_error(request, exc, payload)
                 err = {
                     "type": "error",
@@ -4302,14 +4255,19 @@ async def _handle_anthropic_messages(request: Request) -> Any:
         return JSONResponse(data)
 
     async def body_passthrough() -> AsyncIterator[bytes]:
+        state = AnthropicStreamState()
         try:
             async for event_type, data in client.stream_messages(upstream_payload):
+                state.consume(event_type, data)
                 yield (
                     f"event: {event_type}\ndata: "
                     + json.dumps(data, ensure_ascii=False)
                     + "\n\n"
                 ).encode("utf-8")
-        except httpx.HTTPError as exc:
+                if state.terminal:
+                    return
+            raise UpstreamProtocolError("Upstream stream ended before completion")
+        except Exception as exc:
             _log_upstream_error(request, exc, upstream_payload)
             err = {
                 "type": "error",

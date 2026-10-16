@@ -485,7 +485,7 @@ def test_openai_chat_completions_streaming(settings):
     assert frames[-1]["choices"][0]["finish_reason"] == "stop"
 
 
-def test_openai_chat_streaming_upstream_disconnect_yields_error_choice(settings):
+def test_openai_chat_streaming_upstream_disconnect_yields_error_envelope(settings):
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.RemoteProtocolError(
             "Server disconnected without sending a response.",
@@ -506,17 +506,16 @@ def test_openai_chat_streaming_upstream_disconnect_yields_error_choice(settings)
             assert resp.status_code == 200
             raw = b"".join(resp.iter_bytes()).decode("utf-8")
 
-    assert raw.endswith("data: [DONE]\n\n")
+    assert "data: [DONE]" not in raw
     frames = [
         json.loads(line[len("data: "):])
         for line in raw.splitlines()
         if line.startswith("data: ") and not line.endswith("[DONE]")
     ]
     assert len(frames) == 1
-    choice = frames[0]["choices"][0]
-    assert choice["delta"]["content"].startswith("[upstream error:")
-    assert "Server disconnected without sending a response." in choice["delta"]["content"]
-    assert choice["finish_reason"] == "stop"
+    assert frames[0]["error"]["type"] == "upstream_error"
+    assert "Server disconnected without sending a response." in frames[0]["error"]["message"]
+    assert "choices" not in frames[0]
 
 
 def test_openai_chat_non_streaming_upstream_disconnect_returns_502(settings):
@@ -602,6 +601,7 @@ def test_openai_chat_streams_tool_calls(settings):
         {"type": "content_block_start", "data": {"index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}}},
         {"type": "content_block_delta", "data": {"index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}}},
         {"type": "content_block_delta", "data": {"index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"Paris\"}"}}},
+        {"type": "content_block_stop", "data": {"index": 0}},
         {"type": "message_delta", "data": {"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}}},
         {"type": "message_stop", "data": {}},
     ]
@@ -1135,6 +1135,7 @@ def test_thinking_streamed_to_openai_with_reasoning_content(monkeypatch):
         {"type": "content_block_stop", "data": {"index": 0}},
         {"type": "content_block_start", "data": {"index": 1, "content_block": {"type": "text", "text": ""}}},
         {"type": "content_block_delta", "data": {"index": 1, "delta": {"type": "text_delta", "text": "answer"}}},
+        {"type": "content_block_stop", "data": {"index": 1}},
         {"type": "message_delta", "data": {"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}},
         {"type": "message_stop", "data": {}},
     ]
@@ -1182,7 +1183,9 @@ def test_thinking_streamed_to_ollama_wraps_in_think_tags(monkeypatch):
         {"type": "content_block_start", "data": {"index": 0, "content_block": {"type": "thinking", "thinking": ""}}},
         {"type": "content_block_delta", "data": {"index": 0, "delta": {"type": "thinking_delta", "thinking": "reasoning"}}},
         {"type": "content_block_stop", "data": {"index": 0}},
+        {"type": "content_block_start", "data": {"index": 1, "content_block": {"type": "text", "text": ""}}},
         {"type": "content_block_delta", "data": {"index": 1, "delta": {"type": "text_delta", "text": "result"}}},
+        {"type": "content_block_stop", "data": {"index": 1}},
         {"type": "message_delta", "data": {"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}},
         {"type": "message_stop", "data": {}},
     ]

@@ -5,6 +5,9 @@ from __future__ import annotations
 import base64 as _b64
 import json
 import re
+
+from .protocol_tools import associate_ollama_results, tool_arguments, UpstreamProtocolError
+from .stream_state import AnthropicStreamState
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -203,8 +206,9 @@ def ollama_messages_to_anthropic(
     """Split Ollama messages into Anthropic (system, messages)."""
     system_parts: List[str] = []
     converted: List[Dict[str, Any]] = []
-    messages = list(messages)
-    set_history(messages)
+    original_messages = list(messages)
+    set_history(original_messages)
+    messages = associate_ollama_results(original_messages)
     for message_index, msg in enumerate(messages):
         role = msg.get("role", "user")
         if role == "system":
@@ -238,7 +242,7 @@ def ollama_messages_to_anthropic(
             inline_thoughts, text_clean = _split_thinking(text_raw)
             reasoning_text = msg.get("thinking") or msg.get("reasoning_content")
             cached_thinking = [] if (inline_thoughts or reasoning_text) else recall_thinking(
-                history=messages[:message_index], message=msg,
+                history=original_messages[:message_index], message=original_messages[message_index],
             )
         if role == "assistant" and msg.get("tool_calls"):
             blocks: List[Dict[str, Any]] = []
@@ -415,7 +419,7 @@ def _stop_reason_to_done(reason: Optional[str]) -> str:
         "end_turn": "stop",
         "stop_sequence": "stop",
         "max_tokens": "length",
-        "tool_use": "stop",
+        "tool_use": "tool_calls",
     }
     return mapping.get(reason or "", "stop")
 
@@ -438,9 +442,11 @@ def anthropic_to_ollama_chat(
                 tool_use_ids.append(block["id"])
             tool_calls.append(
                 {
+                    "id": block.get("id"),
                     "function": {
+                        "index": len(tool_calls),
                         "name": block.get("name", ""),
-                        "arguments": block.get("input") or {},
+                        "arguments": tool_arguments(block.get("input")),
                     }
                 }
             )
@@ -461,7 +467,7 @@ def anthropic_to_ollama_chat(
         "created_at": _now_iso(),
         "message": message,
         "done": True,
-        "done_reason": _stop_reason_to_done(response.get("stop_reason")),
+        "done_reason": _stop_reason_to_done("tool_use" if tool_calls else response.get("stop_reason")),
         "total_duration": 0,
         "load_duration": 0,
         "prompt_eval_count": int(usage.get("input_tokens") or 0),
@@ -514,6 +520,7 @@ class AnthropicStreamTranslator:
         self.model = ollama_model
         self.mode = mode
         self.show_thinking = show_thinking
+        self._state = AnthropicStreamState()
         self._event: Optional[str] = None
         self._input_tokens = 0
         self._output_tokens = 0
@@ -576,6 +583,34 @@ class AnthropicStreamTranslator:
     # -- public API ------------------------------------------------------
 
     def feed_event(self, event_type: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if self._state.terminal:
+            return []
+        try:
+            self._state.consume(event_type, data)
+            out = self._feed_event(event_type, data)
+            if event_type == "content_block_start":
+                block = data.get("content_block") or {}
+                kind = block.get("type")
+                if kind in ("text", "thinking") and block.get(kind):
+                    out.extend(self._feed_event("content_block_delta", {
+                        "index": data.get("index", 0),
+                        "delta": {"type": kind + "_delta", kind: block[kind]},
+                    }))
+            return out
+        except (UpstreamProtocolError, ValueError, TypeError, KeyError):
+            self._state.terminal = self._state.failed = True
+            return self._feed_event("error", {"error": {
+                "type": "upstream_protocol_error", "message": "Invalid or incomplete upstream stream",
+            }})
+
+    def finish(self) -> List[Dict[str, Any]]:
+        if self._state.terminal:
+            return []
+        return self.feed_event("error", {"error": {
+            "type": "upstream_protocol_error", "message": "Upstream stream ended before completion",
+        }})
+
+    def _feed_event(self, event_type: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Process a parsed SSE event and return zero or more Ollama chunks."""
         out: List[Dict[str, Any]] = []
         if event_type == "message_start":
@@ -603,6 +638,15 @@ class AnthropicStreamTranslator:
                     out.append(close)
         elif event_type == "content_block_stop":
             idx = int(data.get("index", 0))
+            if idx in self._state.tool_indices:
+                if self.mode != "chat":
+                    raise UpstreamProtocolError("Tool output is unsupported on generate")
+                block = self._state.blocks[idx]
+                chunk = self._text_chunk("")
+                chunk["message"]["tool_calls"] = [{"id": block["id"], "function": {
+                    "index": self._state.tool_indices[idx], "name": block["name"], "arguments": block["input"],
+                }}]
+                out.append(chunk)
             if idx in self._thinking_indices:
                 close = self._close_think_chunk()
                 if close is not None:
@@ -647,7 +691,7 @@ class AnthropicStreamTranslator:
                 # incrementally; capture it for thinking-block round-trip.
                 sig = delta.get("signature")
                 if sig:
-                    self._cur_thinking_signature = sig
+                    self._cur_thinking_signature = (self._cur_thinking_signature or "") + sig
             # input_json_delta etc. are ignored here (handled by OpenAI translator).
         elif event_type == "message_delta":
             delta = data.get("delta") or {}
@@ -663,10 +707,12 @@ class AnthropicStreamTranslator:
             # Cache thinking blocks so they can be echoed back next turn.
             if self._thinking_blocks:
                 remember_thinking(
-                    self._thinking_blocks,
+                    self._state.content,
                     tool_use_ids=self._tool_use_ids,
                     text="".join(self._final_text),
                 )
+            if self._state.tool_indices:
+                self._stop_reason = "tool_use"
             out.append(self._final_chunk())
         elif event_type == "error":
             err = data.get("error") or {}
@@ -960,6 +1006,7 @@ class OpenAIChatStreamTranslator:
     def __init__(self, openai_model: str, *, show_thinking: bool = True) -> None:
         self.model = openai_model
         self.show_thinking = show_thinking
+        self._state = AnthropicStreamState()
         self._created = int(datetime.now(timezone.utc).timestamp())
         self._id = "chatcmpl-fake"
         self._stop_reason: Optional[str] = None
@@ -998,6 +1045,34 @@ class OpenAIChatStreamTranslator:
         return None
 
     def feed_event(self, event_type: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if self._state.terminal:
+            return []
+        try:
+            self._state.consume(event_type, data)
+            out = self._feed_event(event_type, data)
+            if event_type == "content_block_start":
+                block = data.get("content_block") or {}
+                kind = block.get("type")
+                if kind in ("text", "thinking") and block.get(kind):
+                    out.extend(self._feed_event("content_block_delta", {
+                        "index": data.get("index", 0),
+                        "delta": {"type": kind + "_delta", kind: block[kind]},
+                    }))
+            return out
+        except (UpstreamProtocolError, ValueError, TypeError, KeyError):
+            self._state.terminal = self._state.failed = True
+            return self._feed_event("error", {"error": {
+                "type": "upstream_protocol_error", "message": "Invalid or incomplete upstream stream",
+            }})
+
+    def finish(self) -> List[Dict[str, Any]]:
+        if self._state.terminal:
+            return []
+        return self.feed_event("error", {"error": {
+            "type": "upstream_protocol_error", "message": "Upstream stream ended before completion",
+        }})
+
+    def _feed_event(self, event_type: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         if event_type == "message_start":
             msg = data.get("message") or {}
@@ -1013,12 +1088,8 @@ class OpenAIChatStreamTranslator:
                 self._tool_blocks[idx] = tool_idx
                 tid = block.get("id") or f"call_{tool_idx}"
                 self._tool_use_ids.append(tid)
-                import json as _json
-                # Emit the opening tool_call frame with id/name; arguments will
-                # stream in via subsequent input_json_delta events. Some tools
-                # have no inputs at all (input={}) and never emit a delta, so
-                # pre-seed arguments with the serialised initial input.
-                initial_args = _json.dumps(block.get("input") or {}) if block.get("input") else ""
+                # Arguments are emitted once after validation at block_stop.
+                initial_args = ""
                 out.append(
                     self._frame(
                         {
@@ -1047,6 +1118,12 @@ class OpenAIChatStreamTranslator:
                     out.append(close)
         elif event_type == "content_block_stop":
             idx = int(data.get("index", 0))
+            if idx in self._state.tool_indices:
+                out.append(self._frame({"tool_calls": [{
+                    "index": self._tool_blocks[idx], "function": {
+                        "arguments": json.dumps(self._state.blocks[idx]["input"], ensure_ascii=False),
+                    },
+                }]}))
             if idx in self._thinking_indices:
                 close = self._close_think_frame()
                 if close is not None:
@@ -1087,25 +1164,8 @@ class OpenAIChatStreamTranslator:
             elif dtype == "signature_delta":
                 sig = delta.get("signature")
                 if sig:
-                    self._cur_thinking_signature = sig
-            elif dtype == "input_json_delta":
-                idx = int(data.get("index", 0))
-                tool_idx = self._tool_blocks.get(idx)
-                if tool_idx is not None:
-                    partial = delta.get("partial_json", "")
-                    if partial:
-                        out.append(
-                            self._frame(
-                                {
-                                    "tool_calls": [
-                                        {
-                                            "index": tool_idx,
-                                            "function": {"arguments": partial},
-                                        }
-                                    ]
-                                }
-                            )
-                        )
+                    self._cur_thinking_signature = (self._cur_thinking_signature or "") + sig
+            # Tool fragments remain buffered until block_stop validates JSON.
         elif event_type == "message_delta":
             d = data.get("delta") or {}
             if "stop_reason" in d:
@@ -1126,7 +1186,7 @@ class OpenAIChatStreamTranslator:
             }.get(self._stop_reason or "", "stop")
             if self._thinking_blocks:
                 remember_thinking(
-                    self._thinking_blocks,
+                    self._state.content,
                     tool_use_ids=self._tool_use_ids,
                     text="".join(self._final_text),
                 )
@@ -1134,6 +1194,6 @@ class OpenAIChatStreamTranslator:
         elif event_type == "error":
             err = data.get("error") or {}
             out.append(
-                self._frame({"content": f"[upstream error: {err.get('message','')}]"}, finish="stop")
+                {"error": {"type": err.get("type", "upstream_error"), "message": err.get("message", "Upstream error")}}
             )
         return out
