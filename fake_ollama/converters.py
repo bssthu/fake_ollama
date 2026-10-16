@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import base64 as _b64
-import hashlib
 import json
 import re
-from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -128,130 +126,11 @@ _THINK_TAG_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 # the next request, otherwise they hard-fail with:
 #
 #     "content[].thinking in the thinking mode must be passed back to the API"
-#
-# OpenAI / Ollama clients (Copilot, Open WebUI, ...) do not preserve our
-# `thinking` blocks across turns -- at best they keep the visible text
-# (sometimes inside a <think>...</think> wrapper, often stripped entirely)
-# and they certainly do not preserve the upstream-provided cryptographic
-# `signature` field. So we cache the full thinking blocks server-side keyed
-# by stable identifiers we know the client WILL echo back: tool_use ids
-# (round-tripped as tool_call.id) and a hash of the visible assistant text.
-
-_THINKING_CACHE_MAX = 512
-_THINKING_CACHE: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
-
-
-def _normalise_thinking_blocks(
-    blocks: Iterable[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Keep only the fields Anthropic-compatible upstreams care about."""
-    out: List[Dict[str, Any]] = []
-    for b in blocks or []:
-        if not isinstance(b, dict) or b.get("type") != "thinking":
-            continue
-        text = b.get("thinking") or b.get("text") or ""
-        if not text:
-            continue
-        item: Dict[str, Any] = {"type": "thinking", "thinking": text}
-        sig = b.get("signature")
-        if sig:
-            item["signature"] = sig
-        out.append(item)
-    return out
-
-
-_WS_RE = re.compile(r"\s+")
-
-
-def _hash_text(text: str) -> str:
-    return hashlib.sha256(text.strip().encode("utf-8", errors="replace")).hexdigest()[:32]
-
-
-def _hash_text_normalised(text: str) -> str:
-    """Hash whitespace-collapsed lowercase text. Tolerant of reformatting."""
-    norm = _WS_RE.sub(" ", text).strip().lower()
-    return hashlib.sha256(norm.encode("utf-8", errors="replace")).hexdigest()[:32]
-
-
-def _hash_text_tail(text: str, n: int = 256) -> str:
-    """Hash the last ``n`` chars of normalised text. Tolerant of truncation."""
-    norm = _WS_RE.sub(" ", text).strip().lower()
-    return hashlib.sha256(norm[-n:].encode("utf-8", errors="replace")).hexdigest()[:32]
-
-
-def _text_keys(text: str) -> List[str]:
-    if not text or not text.strip():
-        return []
-    return [
-        f"tx:{_hash_text(text)}",
-        f"txn:{_hash_text_normalised(text)}",
-        f"txt:{_hash_text_tail(text)}",
-    ]
-
-
-def remember_thinking(
-    blocks: List[Dict[str, Any]],
-    *,
-    tool_use_ids: Optional[Iterable[str]] = None,
-    text: Optional[str] = None,
-) -> None:
-    """Cache thinking blocks under any provided keys."""
-    norm = _normalise_thinking_blocks(blocks)
-    if not norm:
-        return
-    keys: List[str] = []
-    for tid in tool_use_ids or []:
-        if tid:
-            keys.append(f"tu:{tid}")
-    if text:
-        keys.extend(_text_keys(text))
-    # Always remember the most recent entry under a wildcard sentinel so we
-    # can fall back to it when the client reformats the assistant text in a
-    # way that defeats every text-hash variant.
-    keys.append("__last__")
-    for key in keys:
-        _THINKING_CACHE[key] = list(norm)
-        _THINKING_CACHE.move_to_end(key)
-    while len(_THINKING_CACHE) > _THINKING_CACHE_MAX:
-        _THINKING_CACHE.popitem(last=False)
-
-
-def recall_thinking(
-    *,
-    tool_use_ids: Optional[Iterable[str]] = None,
-    text: Optional[str] = None,
-    allow_last_fallback: bool = True,
-) -> List[Dict[str, Any]]:
-    """Look up cached thinking blocks; tool ids take precedence over text.
-
-    When neither tool ids nor any text-hash variant matches, falls back to
-    the most recently cached entry (``__last__``) so DeepSeek's
-    "thinking ... must be passed back" requirement is satisfied even when
-    the client has reformatted the echoed assistant text.
-    """
-    for tid in tool_use_ids or []:
-        if not tid:
-            continue
-        cached = _THINKING_CACHE.get(f"tu:{tid}")
-        if cached:
-            _THINKING_CACHE.move_to_end(f"tu:{tid}")
-            return [dict(b) for b in cached]
-    if text and text.strip():
-        for key in _text_keys(text):
-            cached = _THINKING_CACHE.get(key)
-            if cached:
-                _THINKING_CACHE.move_to_end(key)
-                return [dict(b) for b in cached]
-    if allow_last_fallback:
-        cached = _THINKING_CACHE.get("__last__")
-        if cached:
-            return [dict(b) for b in cached]
-    return []
-
-
-def _clear_thinking_cache() -> None:
-    """Test helper."""
-    _THINKING_CACHE.clear()
+# Exact history recovery is explicitly bound to an authenticated request.
+from .thinking_cache import (
+    remember_thinking, recall_thinking, invalidate as _clear_thinking_cache,
+    set_history, apply_policy,
+)
 
 
 def _split_thinking(text: str) -> Tuple[List[str], str]:
@@ -324,7 +203,9 @@ def ollama_messages_to_anthropic(
     """Split Ollama messages into Anthropic (system, messages)."""
     system_parts: List[str] = []
     converted: List[Dict[str, Any]] = []
-    for msg in messages:
+    messages = list(messages)
+    set_history(messages)
+    for message_index, msg in enumerate(messages):
         role = msg.get("role", "user")
         if role == "system":
             text = msg.get("content", "")
@@ -356,10 +237,8 @@ def ollama_messages_to_anthropic(
             text_raw = msg.get("content") or ""
             inline_thoughts, text_clean = _split_thinking(text_raw)
             reasoning_text = msg.get("thinking") or msg.get("reasoning_content")
-            cached_thinking = recall_thinking(
-                tool_use_ids=[tc.get("id") for tc in (msg.get("tool_calls") or [])],
-                text=text_clean,
-                allow_last_fallback=not bool(inline_thoughts or reasoning_text),
+            cached_thinking = [] if (inline_thoughts or reasoning_text) else recall_thinking(
+                history=messages[:message_index], message=msg,
             )
         if role == "assistant" and msg.get("tool_calls"):
             blocks: List[Dict[str, Any]] = []
@@ -412,6 +291,7 @@ def ollama_messages_to_anthropic(
             role = "user"
         converted.append({"role": role, "content": _content_to_anthropic(msg)})
     system = "\n\n".join(system_parts) if system_parts else None
+    apply_policy(converted)
     return system, converted
 
 
@@ -849,7 +729,9 @@ def openai_chat_to_anthropic(
     """Build an Anthropic /v1/messages request from an OpenAI chat completion."""
     system_parts: List[str] = []
     messages: List[Dict[str, Any]] = []
-    for msg in payload.get("messages") or []:
+    raw_messages = payload.get("messages") or []
+    set_history(raw_messages)
+    for message_index, msg in enumerate(raw_messages):
         role = msg.get("role", "user")
         if role == "system" or role == "developer":
             content = msg.get("content", "")
@@ -909,21 +791,9 @@ def openai_chat_to_anthropic(
                         stripped.append(blk)
                 anth_content = stripped
             reasoning_text = msg.get("reasoning_content") or msg.get("reasoning")
-            # Look up any cached thinking blocks (by tool_call ids first,
-            # then by text hash). These blocks carry the upstream-issued
-            # `signature` field that DeepSeek requires.
-            assistant_text = ""
-            if isinstance(anth_content, str):
-                assistant_text = anth_content
-            elif isinstance(anth_content, list):
-                assistant_text = "".join(
-                    b.get("text", "") for b in anth_content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-            cached_thinking = recall_thinking(
-                tool_use_ids=[tc.get("id") for tc in (msg.get("tool_calls") or [])],
-                text=assistant_text,
-                allow_last_fallback=not bool(inline_thoughts or reasoning_text),
+            # Recover only an exact assistant turn in this credential/model scope.
+            cached_thinking = [] if (inline_thoughts or reasoning_text) else recall_thinking(
+                history=raw_messages[:message_index], message=msg,
             )
         if role == "assistant" and msg.get("tool_calls"):
             # Preserve tool_use blocks so subsequent tool_result messages
@@ -988,6 +858,7 @@ def openai_chat_to_anthropic(
             continue
         messages.append({"role": role, "content": anth_content})
 
+    apply_policy(messages)
     body: Dict[str, Any] = {
         "model": upstream_model,
         "messages": messages,

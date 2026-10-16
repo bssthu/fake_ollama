@@ -42,7 +42,7 @@ import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
@@ -410,6 +410,9 @@ class _SourceBase(BaseModel):
 
 class AnthropicUpstream(_SourceBase):
     """A single Anthropic Messages-compatible upstream endpoint."""
+
+    allow_unsigned_thinking: bool = False
+    missing_thinking_policy: Literal["omit", "error"] = "omit"
 
 
 # Back-compat alias for any external imports that still say ``Upstream``.

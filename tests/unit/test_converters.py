@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from fake_ollama.converters import (
     AnthropicStreamTranslator,
     anthropic_to_ollama_chat,
@@ -212,7 +214,7 @@ def test_openai_assistant_tool_calls_preserved_in_history():
     # tool_result must reference the same id
     assert body["messages"][2]["content"][0]["tool_use_id"] == "call_abc"
 
-def test_openai_assistant_think_tag_preserved_as_thinking_block():
+def test_openai_assistant_think_tag_preserved_as_thinking_block(compatible_thinking_scope):
     payload = {
         "model": "x",
         "messages": [
@@ -231,7 +233,7 @@ def test_openai_assistant_think_tag_preserved_as_thinking_block():
     assert text_blocks and text_blocks[0]["text"] == "Hello!"
 
 
-def test_openai_assistant_reasoning_content_field_preserved():
+def test_openai_assistant_reasoning_content_field_preserved(compatible_thinking_scope):
     payload = {
         "model": "x",
         "messages": [
@@ -249,10 +251,12 @@ def test_openai_assistant_reasoning_content_field_preserved():
     assert blocks[0] == {"type": "thinking", "thinking": "let me think"}
 
 
-def test_explicit_reasoning_takes_precedence_over_unrelated_cached_fallback():
+def test_explicit_reasoning_takes_precedence_over_unrelated_cached_fallback(compatible_thinking_scope):
     from fake_ollama.converters import _clear_thinking_cache, remember_thinking
 
     _clear_thinking_cache()
+    from fake_ollama.thinking_cache import bind_scope
+    bind_scope(principal="test", backend="test", model="m", configuration="test", allow_unsigned=True)
     remember_thinking(
         [{"type": "thinking", "thinking": "stale reasoning", "signature": "sig"}],
         text="unrelated answer",
@@ -279,7 +283,7 @@ def test_explicit_reasoning_takes_precedence_over_unrelated_cached_fallback():
     _clear_thinking_cache()
 
 
-def test_ollama_assistant_think_tag_preserved_as_thinking_block():
+def test_ollama_assistant_think_tag_preserved_as_thinking_block(compatible_thinking_scope):
     system, msgs = ollama_messages_to_anthropic(
         [
             {"role": "user", "content": "hi"},
@@ -292,7 +296,7 @@ def test_ollama_assistant_think_tag_preserved_as_thinking_block():
     assert blocks[0] == {"type": "thinking", "thinking": "reasoning"}
     assert any(b.get("type") == "text" and b.get("text") == "final" for b in blocks)
 
-def test_thinking_cache_reinjects_via_tool_use_id():
+def test_thinking_cache_reinjects_via_tool_use_id(compatible_thinking_scope):
     from fake_ollama.converters import (
         _clear_thinking_cache,
         anthropic_to_openai_chat,
@@ -311,6 +315,9 @@ def test_thinking_cache_reinjects_via_tool_use_id():
             {"type": "tool_use", "id": "call_abc", "name": "calc", "input": {"expr": "2+2"}},
         ],
     }
+    from fake_ollama.thinking_cache import bind_scope, set_history
+    bind_scope(principal="test", backend="test", model="m", configuration="test", allow_unsigned=True)
+    set_history([{"role": "user", "content": "what is 2+2?"}])
     anthropic_to_openai_chat(upstream_resp, openai_model="m", show_thinking=False)
 
     # Turn 2: the OpenAI client echoes the tool_calls back (without any
@@ -344,10 +351,8 @@ def test_thinking_cache_reinjects_via_tool_use_id():
     assert any(b.get("type") == "tool_use" and b.get("id") == "call_abc" for b in blocks)
 
 
-def test_thinking_cache_recall_tolerates_reformatted_text():
-    """Even when the client trims/lowercases/whitespace-collapses the
-    echoed assistant text, the cached thinking block must still come back.
-    """
+def test_thinking_cache_rejects_reformatted_text():
+    """Reformatted content must never recover another request's thinking."""
     from fake_ollama.converters import (
         _clear_thinking_cache,
         anthropic_to_openai_chat,
@@ -377,12 +382,10 @@ def test_thinking_cache_recall_tolerates_reformatted_text():
     }
     body = openai_chat_to_anthropic(payload, upstream_model="m", default_max_tokens=100)
     asst = body["messages"][1]
-    assert isinstance(asst["content"], list)
-    assert asst["content"][0]["type"] == "thinking"
-    assert asst["content"][0]["signature"] == "sigQ"
+    assert asst["content"] == "hello, world! this is a multi-line reply."
 
 
-def test_thinking_cache_last_fallback_when_text_completely_changed():
+def test_thinking_cache_rejects_completely_changed_text():
     from fake_ollama.converters import (
         _clear_thinking_cache,
         anthropic_to_openai_chat,
@@ -401,9 +404,7 @@ def test_thinking_cache_last_fallback_when_text_completely_changed():
     }
     anthropic_to_openai_chat(upstream_resp, openai_model="m", show_thinking=False)
 
-    # The client sent something completely unrelated as the assistant text
-    # (e.g. a heavily edited summary). Last-write fallback must still inject
-    # the cached thinking so DeepSeek does not 400.
+    # Unrelated text has no verifiable association with the earlier response.
     payload = {
         "model": "x",
         "messages": [
@@ -414,9 +415,7 @@ def test_thinking_cache_last_fallback_when_text_completely_changed():
     }
     body = openai_chat_to_anthropic(payload, upstream_model="m", default_max_tokens=100)
     asst = body["messages"][1]
-    assert isinstance(asst["content"], list)
-    assert asst["content"][0]["type"] == "thinking"
-    assert asst["content"][0]["signature"] == "sigZ"
+    assert asst["content"] == "totally different summary text"
 
 def test_openai_consecutive_tool_messages_merged_into_one_user_message():
     payload = {
@@ -442,3 +441,11 @@ def test_openai_consecutive_tool_messages_merged_into_one_user_message():
     assert last["role"] == "user"
     assert [b["type"] for b in last["content"]] == ["tool_result", "tool_result"]
     assert [b["tool_use_id"] for b in last["content"]] == ["call_1", "call_2"]
+
+
+@pytest.fixture
+def compatible_thinking_scope():
+    from fake_ollama.thinking_cache import bind_scope, reset_scope
+    token = bind_scope(principal="test", backend="test", model="m", configuration="test", allow_unsigned=True)
+    yield
+    reset_scope(token)

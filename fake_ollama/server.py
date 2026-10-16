@@ -67,6 +67,7 @@ from .h3_context_ir import (
 from .generic_openai_client import GenericOpenAIClient
 from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
+from .thinking_cache import bind_scope as bind_thinking_scope
 from .security import RequestBodyLimitMiddleware, is_loopback_host, require_management_access
 from .request_data_log import RequestDataLogMiddleware
 from .vram import LocalTargetResourceError, MemoryCoordinator, VramCoordinator
@@ -395,6 +396,7 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.state.test_listener_fallback = test_listener_fallback
+    app.state.thinking_cache_namespace = secrets.token_hex(16)
     app.state.shutdown_requested = False
     app.state.vram_coordinator = VramCoordinator()
     app.state.memory_coordinator = MemoryCoordinator()
@@ -557,6 +559,14 @@ def _dispatch(
     rid = getattr(request.state, "request_metric_id", None)
     if metrics is not None and rid is not None:
         metrics.set_target(rid, backend.name)
+    bind_thinking_scope(
+        principal=_bearer_or_api_key(request) if iface.auth_required else "anonymous:" + iface.name,
+        backend=backend.source.model_dump(mode="json"),
+        model=backend.source.resolve_model(model),
+        configuration=[request.app.state.thinking_cache_namespace, settings.model_dump(mode="json")],
+        allow_unsigned=getattr(backend.source, "allow_unsigned_thinking", backend.protocol == "openai"),
+        missing_policy=getattr(backend.source, "missing_thinking_policy", "omit"),
+    )
     return backend, model
 
 

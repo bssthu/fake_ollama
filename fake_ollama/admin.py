@@ -1054,6 +1054,8 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             memory_coordinator=memory_coordinator,
         )
 
+    from .thinking_cache import invalidate as invalidate_thinking
+    invalidate_thinking()
     app.state.settings = new_settings
     app.state.clients = new_clients
     app.state.ollama_clients = new_ollama
