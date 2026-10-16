@@ -271,6 +271,8 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
                 auto_start=tgt.auto_start,
                 start_command=tgt.start_command,
                 stop_command=tgt.stop_command,
+                manage_external_runtime=tgt.manage_external_runtime,
+                stop_timeout_seconds=tgt.stop_timeout_seconds,
                 idle_timeout_seconds=tgt.idle_timeout_seconds,
                 startup_timeout_seconds=tgt.startup_timeout_seconds,
                 health_path=tgt.health_path,
@@ -293,6 +295,8 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
                 start_command=tgt.start_command,
                 start_argv=tgt.synthesize_start_argv(),
                 stop_command=tgt.stop_command,
+                manage_external_runtime=tgt.manage_external_runtime,
+                stop_timeout_seconds=tgt.stop_timeout_seconds,
                 idle_timeout_seconds=tgt.idle_timeout_seconds,
                 startup_timeout_seconds=tgt.startup_timeout_seconds,
                 health_path=tgt.health_path,
@@ -316,6 +320,8 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
                 auto_start=tgt.auto_start,
                 start_command=tgt.start_command,
                 stop_command=tgt.stop_command,
+                manage_external_runtime=tgt.manage_external_runtime,
+                stop_timeout_seconds=tgt.stop_timeout_seconds,
                 idle_timeout_seconds=tgt.idle_timeout_seconds,
                 startup_timeout_seconds=tgt.startup_timeout_seconds,
                 health_path=tgt.health_path,
@@ -338,6 +344,8 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
                 auto_start=tgt.auto_start,
                 start_command=tgt.start_command,
                 stop_command=tgt.stop_command,
+                manage_external_runtime=tgt.manage_external_runtime,
+                stop_timeout_seconds=tgt.stop_timeout_seconds,
                 idle_timeout_seconds=tgt.idle_timeout_seconds,
                 startup_timeout_seconds=tgt.startup_timeout_seconds,
                 health_path=tgt.health_path,
@@ -417,7 +425,7 @@ def request_shutdown(app: FastAPI) -> None:
 
     Also schedules ``stop_if_owned`` for every owned local target client so
     in-flight requests against a still-loading llama.cpp / ollama child get
-    aborted (taskkill /T /F on Windows). Without this the upstream HTTP
+    aborted (owned Job Object on Windows). Without this the upstream HTTP
     connection from fake-ollama to the local server stays open until the
     huge model finishes loading, which prevents uvicorn from exiting after
     CTRL+C ("Waiting for connections to close").

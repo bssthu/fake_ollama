@@ -40,6 +40,8 @@ class RuntimeResources:
         return client
 
     def attach(self, client):
+        if hasattr(client, "_ownership"):
+            client._ownership.activate(client)
         if hasattr(client, "_vram_coordinator"):
             for field in ("vram_coordinator", "memory_coordinator"):
                 coordinator = self.app.state._state.get(field)
@@ -87,9 +89,11 @@ class RuntimeResources:
                         self.attach(replacement)
 
     async def retry_cleanup(self):
-        for state in self.retired.values():
+        for client, state in self.retired.items():
             if state["status"] == "cleanup_failed":
                 state["task"] = None
+                if hasattr(client, "_ownership"):
+                    client._ownership.shutdown_result = None
         await self.close_ready()
 
     def snapshots(self):

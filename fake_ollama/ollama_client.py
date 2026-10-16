@@ -14,6 +14,8 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 
+from . import runtime_ownership
+from .process_utils import run_stop_command
 from .config import outbound_cycle_headers
 from .process_utils import create_managed_subprocess_shell, terminate_process_tree
 from .request_data_log import (
@@ -55,6 +57,9 @@ class OllamaClient:
         auto_start: bool = False,
         start_command: Optional[str] = None,
         stop_command: Optional[str] = None,
+        manage_external_runtime: bool = False,
+        stop_timeout_seconds: float = 30.0,
+        ownership_active: bool = True,
         idle_timeout_seconds: Optional[float] = None,
         startup_timeout_seconds: float = 60.0,
         health_path: str = "/api/version",
@@ -70,6 +75,9 @@ class OllamaClient:
         self._auto_start = auto_start
         self._start_command = start_command
         self._stop_command = stop_command
+        self._manage_external_runtime = manage_external_runtime
+        self._stop_timeout = stop_timeout_seconds
+        self._used_since_last_stop = False
         self._idle_timeout = idle_timeout_seconds
         self._startup_timeout = startup_timeout_seconds
         self._health_path = health_path if health_path.startswith("/") else "/" + health_path
@@ -91,6 +99,8 @@ class OllamaClient:
         self._last_used = time.monotonic()
         self._loaded_models: dict[str, _LoadedModel] = {}
         self._shutdown_requested = False
+        self._ownership = runtime_ownership.register(self, group=getattr(self, "vram_runtime_group", None), active=ownership_active)
+        self._start_lock = self._ownership.lock
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
         if self._memory_coordinator is not None:
@@ -115,6 +125,7 @@ class OllamaClient:
         return bool(model and model in self._loaded_models)
 
     def _begin_request_lifecycle(self) -> None:
+        runtime_ownership.begin_request(self)
         self._request_refs += 1
 
     def _end_request_lifecycle(self) -> None:
@@ -235,13 +246,7 @@ class OllamaClient:
         self._shutdown_requested = True
 
     async def aclose(self) -> None:
-        if self._vram_coordinator is not None:
-            self._vram_coordinator.unregister(self)
-        if self._memory_coordinator is not None:
-            self._memory_coordinator.unregister(self)
-        if self._owns_client:
-            await self._client.aclose()
-        await self.stop_if_owned()
+        await runtime_ownership.close_client(self, terminate=terminate_process_tree, run_command=run_stop_command)
 
     async def _ensure_vram(
         self, model: Optional[str], estimated_vram_gb: Optional[float]
@@ -357,16 +362,19 @@ class OllamaClient:
                     "Ollama target is unavailable and fake-ollama is shutting down; "
                     "refusing auto-start"
                 )
-            if self._process is None or self._process.returncode is not None:
+            if self._ownership.process is None and not self._started_by_us:
                 logger.info("starting Ollama target: %s", self._start_command)
                 self._process = await create_managed_subprocess_shell(
                     self._start_command,
                     cwd=self._cwd,
                 )
                 self._started_by_us = True
+                self._ownership.capture(self)
 
             deadline = time.monotonic() + self._startup_timeout
             while time.monotonic() < deadline:
+                if self._shutdown_requested:
+                    raise httpx.ConnectError("Shutdown interrupted backend startup")
                 if await self._healthy():
                     logger.info("Ollama target ready at %s", self._base)
                     return
@@ -626,12 +634,12 @@ class OllamaClient:
             self._end_request_lifecycle()
 
     async def stop_if_idle(self) -> None:
-        if not self._idle_timeout or self._active or self._request_refs:
+        if not self._idle_timeout or self._ownership.busy():
             return
-        idle_for = time.monotonic() - self._last_used
+        idle_for = time.monotonic() - max(m._last_used for m in self._ownership.members)
         if idle_for < self._idle_timeout:
             return
-        if not (self._started_by_us or self._stop_command):
+        if not (self._ownership.can_manage()):
             return
         logger.info(
             "stopping idle Ollama target %s after %.1fs idle",
@@ -657,7 +665,7 @@ class OllamaClient:
             self._discard_vram_pending(model)
             self._discard_memory_pending(model)
             return True
-        if self._started_by_us or self._stop_command:
+        if self._ownership.can_manage():
             return await self.stop_if_owned()
         return False
 
@@ -689,34 +697,4 @@ class OllamaClient:
         return False
 
     async def stop_if_owned(self) -> bool:
-        if self._stop_command:
-            logger.info("stopping Ollama target with stop_command")
-            proc = await asyncio.create_subprocess_shell(
-                self._stop_command,
-                cwd=self._cwd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            returncode = await proc.wait()
-            if returncode == 0:
-                self._started_by_us = False
-                self._clear_all_vram_state()
-                return True
-            logger.warning("Ollama target stop_command exited with status %s", returncode)
-            return False
-
-        if self._process is not None and self._started_by_us:
-            if self._process.returncode is None:
-                logger.info("terminating owned Ollama target process tree")
-                if not await terminate_process_tree(self._process, timeout=10.0):
-                    logger.warning("failed to terminate owned Ollama target process tree")
-                    return False
-                self._started_by_us = False
-                self._clear_all_vram_state()
-                return True
-            logger.warning(
-                "owned Ollama target launcher process already exited; cannot stop "
-                "remaining detached server process without stop_command"
-            )
-            return False
-        return False
+        return await runtime_ownership.stop_owned(self, terminate=terminate_process_tree, run_command=run_stop_command)

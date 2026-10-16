@@ -433,6 +433,8 @@ class GenericOpenAITarget(_SourceBase):
     auto_start: bool = False
     start_command: Optional[str] = None
     stop_command: Optional[str] = None
+    manage_external_runtime: bool = False
+    stop_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     idle_timeout_seconds: Optional[float] = None
     startup_timeout_seconds: float = 120.0
     health_path: str = "/health"
@@ -466,6 +468,8 @@ class OllamaTarget(_SourceBase):
     auto_start: bool = False
     start_command: Optional[str] = None
     stop_command: Optional[str] = None
+    manage_external_runtime: bool = False
+    stop_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     idle_timeout_seconds: Optional[float] = None
     startup_timeout_seconds: float = 60.0
     health_path: str = "/api/version"
@@ -547,6 +551,8 @@ class LlamaCppTarget(BaseModel):
     auto_start: Optional[bool] = None
     start_command: Optional[str] = None
     stop_command: Optional[str] = None
+    manage_external_runtime: bool = False
+    stop_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     idle_timeout_seconds: Optional[float] = None
     startup_timeout_seconds: Optional[float] = None
     health_path: Optional[str] = None
@@ -913,6 +919,8 @@ class ComfyUITarget(BaseModel):
     auto_start: bool = False
     start_command: Optional[str] = None
     stop_command: Optional[str] = None
+    manage_external_runtime: bool = False
+    stop_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     idle_timeout_seconds: Optional[float] = None
     startup_timeout_seconds: float = 120.0
     health_path: str = "/system_stats"

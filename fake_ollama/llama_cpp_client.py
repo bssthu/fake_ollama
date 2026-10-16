@@ -22,6 +22,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from . import runtime_ownership
+from .process_utils import run_stop_command
 from .config import outbound_cycle_headers
 from .process_utils import (
     create_managed_subprocess_exec,
@@ -118,6 +120,9 @@ class LlamaCppClient:
         start_command: Optional[str] = None,
         start_argv: Optional[list] = None,
         stop_command: Optional[str] = None,
+        manage_external_runtime: bool = False,
+        stop_timeout_seconds: float = 30.0,
+        ownership_active: bool = True,
         idle_timeout_seconds: Optional[float] = None,
         startup_timeout_seconds: float = 120.0,
         health_path: str = "/health",
@@ -145,6 +150,9 @@ class LlamaCppClient:
         self._start_argv = list(start_argv) if start_argv else None
         self._start_command = start_command
         self._stop_command = stop_command
+        self._manage_external_runtime = manage_external_runtime
+        self._stop_timeout = stop_timeout_seconds
+        self._used_since_last_stop = False
         self._idle_timeout = idle_timeout_seconds
         self._startup_timeout = startup_timeout_seconds
         self._health_path = health_path if health_path.startswith("/") else "/" + health_path
@@ -202,18 +210,7 @@ class LlamaCppClient:
         self._process: Optional[asyncio.subprocess.Process] = None
         self._started_by_us = False
         self._start_lock = asyncio.Lock()
-        self._stop_lock = asyncio.Lock()
-        # A configured stop_command is allowed to manage a target that was
-        # already running before fake-ollama started, but only after this
-        # client has actually sent work to it.  Without this marker, shutting
-        # down after using an unrelated target stops every configured local
-        # backend (including WSL-backed targets that were never touched).
-        self._used_since_last_stop = False
-        # request_shutdown() and FastAPI lifespan cleanup can converge on the
-        # same client.  During shutdown, remember the first completed stop
-        # attempt so aclose() does not execute the command a second time.
-        self._shutdown_stop_attempted = False
-        self._shutdown_stop_result = False
+        # Process and stop ownership is shared across clients of this runtime.
         self._active = 0
         self._request_refs = 0
         self._last_used = time.monotonic()
@@ -226,6 +223,8 @@ class LlamaCppClient:
         # to discover the connection error). Lazily created on first use so
         # we don't bind to a loop at __init__ time.
         self._shutdown_event: Optional[asyncio.Event] = None
+        self._ownership = runtime_ownership.register(self, group=getattr(self, "vram_runtime_group", None), active=ownership_active)
+        self._start_lock = self._ownership.lock
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
         if self._memory_coordinator is not None:
@@ -307,6 +306,7 @@ class LlamaCppClient:
         return self._loaded_model is not None
 
     def _begin_request_lifecycle(self) -> None:
+        runtime_ownership.begin_request(self)
         self._used_since_last_stop = True
         self._request_refs += 1
 
@@ -321,7 +321,7 @@ class LlamaCppClient:
             return []
         if now - self._loaded_model.last_used_monotonic < idle_seconds:
             return []
-        if not (self._started_by_us or self._stop_command):
+        if not (self._ownership.can_manage()):
             return []
         loaded = self._loaded_model
         return [
@@ -339,7 +339,7 @@ class LlamaCppClient:
     ) -> list[VramReleaseCandidate]:
         if self._loaded_model is None:
             return []
-        if not (self._started_by_us or self._stop_command):
+        if not (self._ownership.can_manage()):
             return []
         loaded = self._loaded_model
         return [
@@ -361,7 +361,7 @@ class LlamaCppClient:
             return []
         if now - self._loaded_model.last_used_monotonic < idle_seconds:
             return []
-        if not (self._started_by_us or self._stop_command):
+        if not (self._ownership.can_manage()):
             return []
         loaded = self._loaded_model
         return [
@@ -379,7 +379,7 @@ class LlamaCppClient:
     ) -> list[MemoryReleaseCandidate]:
         if self._loaded_model is None or self._loaded_model.estimated_memory_gb <= 0:
             return []
-        if not (self._started_by_us or self._stop_command):
+        if not (self._ownership.can_manage()):
             return []
         loaded = self._loaded_model
         return [
@@ -412,7 +412,7 @@ class LlamaCppClient:
             idle_seconds = 0.0
         else:
             idle_seconds = max(0.0, now - loaded.last_used_monotonic)
-        can_stop = bool(self._started_by_us or self._stop_command)
+        can_stop = bool(self._ownership.can_manage())
         return [
             {
                 "backend": "llama.cpp",
@@ -458,13 +458,7 @@ class LlamaCppClient:
         return headers
 
     async def aclose(self) -> None:
-        if self._vram_coordinator is not None:
-            self._vram_coordinator.unregister(self)
-        if self._memory_coordinator is not None:
-            self._memory_coordinator.unregister(self)
-        if self._owns_client:
-            await self._client.aclose()
-        await self.stop_if_owned()
+        await runtime_ownership.close_client(self, terminate=terminate_process_tree, run_command=run_stop_command)
 
     async def _ensure_vram(
         self, model: Optional[str], estimated_vram_gb: Optional[float]
@@ -603,7 +597,7 @@ class LlamaCppClient:
                     "llama.cpp target is unavailable and fake-ollama is shutting down; "
                     "refusing auto-start"
                 )
-            if self._process is None or self._process.returncode is not None:
+            if self._ownership.process is None and not self._started_by_us:
                 stderr_log = self._stderr_log_path()
                 if stderr_log is not None:
                     logger.info(
@@ -631,6 +625,7 @@ class LlamaCppClient:
                         stderr=stderr_log,
                     )
                 self._started_by_us = True
+                self._ownership.capture(self)
 
             deadline = time.monotonic() + self._startup_timeout
             while time.monotonic() < deadline:
@@ -641,10 +636,9 @@ class LlamaCppClient:
                 # the full startup_timeout. Common causes: binary_path points
                 # to a directory, missing GGUF, port already bound, etc.
                 proc = self._process
-                if proc is not None and proc.returncode is not None:
+                if proc is not None and proc.returncode is not None and proc.returncode != 0:
                     rc = proc.returncode
-                    self._process = None
-                    self._started_by_us = False
+                    # Retain process-tree ownership even after launcher failure.
                     cmd_repr = (
                         " ".join(self._start_argv)
                         if self._start_argv
@@ -923,7 +917,7 @@ class LlamaCppClient:
             self._end_request_lifecycle()
 
     async def stop_if_idle(self) -> None:
-        if not self._idle_timeout or self._active or self._request_refs:
+        if not self._idle_timeout or self._ownership.busy():
             return
         # A successful stop_command clears _loaded_model and sets
         # _started_by_us=False. Do not keep re-running stop_command forever
@@ -935,10 +929,10 @@ class LlamaCppClient:
             if self._loaded_model is not None
             else self._last_used
         )
-        idle_for = time.monotonic() - last_used
+        idle_for = time.monotonic() - max(last_used, *(m._last_used for m in self._ownership.members))
         if idle_for < self._idle_timeout:
             return
-        if not (self._started_by_us or self._stop_command):
+        if not (self._ownership.can_manage()):
             return
         logger.info(
             "stopping idle %s target %s after %.1fs idle",
@@ -954,90 +948,12 @@ class LlamaCppClient:
     async def _release_server_for_vram(self, *, force: bool = False) -> bool:
         if not force and (self._active or self._request_refs):
             return False
-        if not (self._started_by_us or self._stop_command):
+        if not (self._ownership.can_manage()):
             return False
         return await self.stop_if_owned()
 
     async def stop_if_owned(self) -> bool:
-        async with self._stop_lock:
-            if self._shutdown_requested and self._shutdown_stop_attempted:
-                return self._shutdown_stop_result
-
-            # A stop_command makes an already-running target manageable for
-            # idle/VRAM reclaim after use; it must not make an untouched target
-            # owned merely because fake-ollama is exiting.
-            can_stop = self._started_by_us or bool(
-                self._stop_command and self._used_since_last_stop
-            )
-            if not can_stop:
-                return False
-
-            shutdown_attempt = self._shutdown_requested
-            if shutdown_attempt:
-                self._shutdown_stop_attempted = True
-
-            try:
-                if self._stop_command:
-                    logger.info(
-                        "stopping %s target %s with stop_command",
-                        self._target_log_label,
-                        self.target_id,
-                    )
-                    proc = await asyncio.create_subprocess_shell(
-                        self._stop_command,
-                        cwd=self._cwd,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    returncode = await proc.wait()
-                    if returncode == 0:
-                        self._started_by_us = False
-                        self._used_since_last_stop = False
-                        self._clear_all_vram_state()
-                        result = True
-                    else:
-                        logger.warning(
-                            "%s target %s stop_command exited with status %s",
-                            self._target_log_label,
-                            self.target_id,
-                            returncode,
-                        )
-                        result = False
-                elif self._process is not None and self._started_by_us:
-                    if self._process.returncode is None:
-                        logger.info(
-                            "terminating owned %s target process tree",
-                            self._target_log_label,
-                        )
-                        if not await terminate_process_tree(self._process, timeout=10.0):
-                            logger.warning(
-                                "failed to terminate owned %s target process tree",
-                                self._target_log_label,
-                            )
-                            result = False
-                        else:
-                            self._started_by_us = False
-                            self._used_since_last_stop = False
-                            self._clear_all_vram_state()
-                            result = True
-                    else:
-                        logger.warning(
-                            "owned llama.cpp target launcher process already exited; cannot stop "
-                            "remaining detached server process without stop_command"
-                        )
-                        result = False
-                else:
-                    result = False
-            except BaseException:
-                # If cancellation interrupted the stop itself, allow lifespan
-                # cleanup to make one replacement attempt.
-                if shutdown_attempt:
-                    self._shutdown_stop_attempted = False
-                raise
-
-            if shutdown_attempt:
-                self._shutdown_stop_result = result
-            return result
+        return await runtime_ownership.stop_owned(self, terminate=terminate_process_tree, run_command=run_stop_command)
 
     # ------------------------------------------------------------------
     # Dashboard telemetry

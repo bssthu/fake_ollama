@@ -469,7 +469,7 @@ async def test_concurrent_same_model_requests_share_startup(
         return _SlowProc()
 
     monkeypatch.setattr(
-        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
+        "fake_ollama.ollama_client.create_managed_subprocess_shell",
         fake_create_subprocess_shell,
     )
 
@@ -548,7 +548,7 @@ async def test_concurrent_different_model_clients_queue_via_coordinator(
         raise AssertionError("auto_start should not be triggered in this test")
 
     monkeypatch.setattr(
-        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
+        "fake_ollama.ollama_client.create_managed_subprocess_shell",
         fake_create_subprocess_shell,
     )
 
@@ -812,36 +812,5 @@ async def test_create_managed_subprocess_shell_normalizes_blank_cwd(
     when the shell is spawned."""
     from fake_ollama import process_utils
 
-    captured: dict = {}
-
-    async def fake_create(command: str, **kwargs):
-        captured.update(kwargs)
-
-        class _P:
-            returncode = 0
-
-            def terminate(self):
-                pass
-
-            def kill(self):
-                pass
-
-            async def wait(self):
-                return 0
-
-        return _P()
-
-    monkeypatch.setattr(
-        "fake_ollama.process_utils.asyncio.create_subprocess_shell", fake_create
-    )
-
-    await process_utils.create_managed_subprocess_shell("echo hi", cwd="")
-    assert captured["cwd"] is None
-
-    captured.clear()
-    await process_utils.create_managed_subprocess_shell("echo hi", cwd="   ")
-    assert captured["cwd"] is None
-
-    captured.clear()
-    await process_utils.create_managed_subprocess_shell("echo hi", cwd=None)
-    assert captured["cwd"] is None
+    for cwd in ("", "   ", None):
+        assert process_utils._common_kwargs(cwd, None, asyncio.subprocess.DEVNULL)["cwd"] is None

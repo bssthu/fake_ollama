@@ -178,3 +178,48 @@ tests are excluded by default; live tests require explicit environment variables
 - Remaining: stages 5–6. Tests use synthetic files and mock/ASGI transports.
   Real socket rebinding, upstream/GPU operation and browser visual acceptance
   were not run; socket changes require a process restart by design.
+
+## Stage 5 handoff
+
+- Files: shared `runtime_ownership.py`; three local clients (generic OpenAI
+  inherits the llama.cpp contract); `process_utils.py`, `windows_job.py`,
+  `posix_process.py`, `posix_guardian.py`; config/admin schemas, startup/reload
+  plumbing, lifecycle regressions and isolated process acceptance.
+- Local clients distinguish external, gateway-owned and explicitly managed
+  runtimes. `manage_external_runtime=false` is the default; a configured stop
+  command alone never owns an external service. Explicit management also requires
+  actual use. Endpoint aliases and ComfyUI runtime groups share ownership and
+  start/stop serialization. Closing one client transfers ownership to registered
+  siblings; prepared reload clients register only after conflicting generations
+  drain. Closing the last owner stops before closing HTTP or unregistering state.
+- Stop commands use `stop_timeout_seconds` (default 30, range 0 < value <= 300),
+  verify exit status and clean their own process tree on timeout/cancellation.
+  Failed closure retains ownership/resources and raises a recoverable error.
+  Repeated cancellation joins tracked finite cleanup. Shared active requests
+  block ordinary idle/stop operations; whole-app shutdown remains explicit.
+- Windows starts hidden/suspended, assigns a non-breakaway Job Object with
+  kill-on-close, then resumes the owned thread. Termination checks both job
+  accounting and member process handles; launcher exit is not tree completion.
+  No process-name kill or recycled-PID tree traversal is used. A job-assignment
+  failure kills the still-suspended child and fails startup.
+- POSIX uses a private group anchor and control pipe. Only the living anchor
+  signals its own group, including TERM-ignoring descendants; parent EOF also
+  initiates cleanup. Live-member verification excludes zombies. POSIX behavior
+  is **NOT RUN on this Windows host**. Backends deliberately escaping their POSIX
+  session need an explicitly authorized stop command; arbitrary external service
+  process trees are not claimed as owned.
+- Red: `test_runtime_ownership.py`: **7 failed**. Isolated process tests against
+  the old implementation: **1 failed, 1 passed, 1 skipped**, proving a live child
+  survived a reported successful cleanup after the launcher exited.
+- Full offline command with `--basetemp=.tmp/rectify-s5-full -p no:cacheprovider
+  --tb=short`: **629 passed, 8 deselected** (615 + 14 unit cases; 3 isolated process
+  cases were then excluded). Two more isolated exit-code cases were added later.
+- Explicit isolated acceptance: `.venv/Scripts/python -m pytest -q
+  tests/unit/test_owned_process_tree.py -m e2e
+  --basetemp=.tmp/rectify-s5-process-final -p no:cacheprovider --tb=short`:
+  **4 passed, 1 skipped**. These short-lived Python processes launch no model,
+  GPU runtime, external service, or user command. Normal exit, nonzero exit,
+  parent-first exit and repeated cleanup are covered; unit barriers additionally
+  cover stop timeout, repeated cancellation, failed cleanup and two-client use.
+- Reference: [Microsoft Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
+- Remaining: stage 6; real backend/GPU and POSIX acceptance remain NOT RUN.

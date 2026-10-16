@@ -122,7 +122,7 @@ async def test_ollama_client_auto_starts_before_chat(monkeypatch: pytest.MonkeyP
         return _FakeProcess()
 
     monkeypatch.setattr(
-        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
+        "fake_ollama.ollama_client.create_managed_subprocess_shell",
         fake_create_subprocess_shell,
     )
     monkeypatch.setattr(
@@ -174,7 +174,7 @@ async def test_ollama_client_does_not_start_when_disabled(monkeypatch: pytest.Mo
         return _FakeProcess()
 
     monkeypatch.setattr(
-        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
+        "fake_ollama.ollama_client.create_managed_subprocess_shell",
         fake_create_subprocess_shell,
     )
 
@@ -207,7 +207,7 @@ async def test_ollama_client_does_not_auto_start_during_shutdown(monkeypatch: py
         return _FakeProcess()
 
     monkeypatch.setattr(
-        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
+        "fake_ollama.ollama_client.create_managed_subprocess_shell",
         fake_create_subprocess_shell,
     )
 
@@ -241,7 +241,7 @@ async def test_llama_cpp_client_does_not_auto_start_during_shutdown(monkeypatch:
         return _FakeProcess()
 
     monkeypatch.setattr(
-        "fake_ollama.process_utils.asyncio.create_subprocess_shell",
+        "fake_ollama.ollama_client.create_managed_subprocess_shell",
         fake_create_subprocess_shell,
     )
 
@@ -421,17 +421,19 @@ async def test_llama_cpp_idle_stop_command_does_not_repeat_after_success(
         calls.append(command)
         proc = _FakeProcess()
         proc.returncode = 0
-        return proc
+        return True
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    monkeypatch.setattr("fake_ollama.llama_cpp_client.run_stop_command", fake_create_subprocess_shell)
     client = LlamaCppClient(
         "http://127.0.0.1:21436",
         stop_command="stop-vllm",
+        manage_external_runtime=True,
         idle_timeout_seconds=1.0,
     )
     client._mark_vram_reserved("qwen", 4.0)
     assert client._loaded_model is not None
     client._loaded_model.last_used_monotonic = time.monotonic() - 60.0
+    client._last_used = client._loaded_model.last_used_monotonic
 
     try:
         await client.stop_if_idle()
@@ -462,13 +464,15 @@ async def test_shutdown_stop_command_is_not_repeated_by_concurrent_close(
 
     async def fake_create_subprocess_shell(command: str, **kwargs: Any) -> _FailingStopProcess:
         calls.append(command)
-        return _FailingStopProcess()
+        await _FailingStopProcess().wait()
+        return False
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    monkeypatch.setattr("fake_ollama.llama_cpp_client.run_stop_command", fake_create_subprocess_shell)
     client = GenericOpenAIClient(
         "http://127.0.0.1:8062",
         target_name="used-wsl-target",
         stop_command="wsl -d Ubuntu-24.04 -- bash stop.sh",
+        manage_external_runtime=True,
     )
     client._begin_request_lifecycle()
     client._end_request_lifecycle()
@@ -481,7 +485,11 @@ async def test_shutdown_stop_command_is_not_repeated_by_concurrent_close(
     finish_stop.set()
 
     assert await signal_stop is False
-    await lifespan_close
+    with pytest.raises(Exception, match="cleanup"):
+        await lifespan_close
+    client._ownership.authorized = False
+    client._used_since_last_stop = False
+    await client.aclose()
     assert calls == ["wsl -d Ubuntu-24.04 -- bash stop.sh"]
 
 
@@ -501,11 +509,13 @@ async def test_llama_cpp_client_keeps_vram_reservation_when_process_tree_stop_fa
     try:
         stopped_ok = await client.stop_if_owned()
     finally:
-        client._started_by_us = False
+        assert client.has_vram_reservation("qwen") is True
+        monkeypatch.setattr("fake_ollama.llama_cpp_client.terminate_process_tree",
+                            lambda process, **kwargs: _async_true())
         await client.aclose()
 
     assert stopped_ok is False
-    assert client.has_vram_reservation("qwen") is True
+    assert client.has_vram_reservation("qwen") is False
 
 
 @pytest.mark.asyncio

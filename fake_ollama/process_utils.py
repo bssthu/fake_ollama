@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
+import json
+import sys
+import time
 import subprocess
 from pathlib import Path
 from typing import IO, Optional, Sequence, Tuple, Union
+
+from .lifecycle import finish_cleanup
 
 StderrTarget = Union[None, str, os.PathLike, int, IO]
 
@@ -51,125 +55,109 @@ def _common_kwargs(
     if env is not None:
         kwargs["env"] = env
     if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x4  # CREATE_SUSPENDED
     else:
         kwargs["start_new_session"] = True
     return kwargs
 
 
-async def create_managed_subprocess_shell(
-    command: str,
-    *,
-    cwd: Optional[str] = None,
-    env: Optional[dict] = None,
-    stderr: StderrTarget = None,
-) -> asyncio.subprocess.Process:
+async def _spawn(command, *, shell, cwd=None, env=None, stderr=None):
     stderr_value, owned = _resolve_stderr(stderr)
     kwargs = _common_kwargs(cwd, env, stderr_value)
+    async def launch():
+        if os.name == "nt":
+            from .windows_job import WindowsJob
+            job = WindowsJob()
+            process = None
+            try:
+                process = (await asyncio.create_subprocess_shell(command, **kwargs) if shell
+                           else await asyncio.create_subprocess_exec(*command, **kwargs))
+                job.assign_and_resume(process.pid)
+                process._managed_job = job
+                return process
+            except BaseException:
+                # The process is still suspended if job assignment failed.
+                # kill() uses its retained process handle, never a name/PID tree.
+                if process is not None:
+                    process.kill()
+                    await process.wait()
+                job.close()
+                raise
+        from .posix_process import PosixProcess
+        kwargs["stdin"] = asyncio.subprocess.PIPE
+        kwargs["stdout"] = asyncio.subprocess.PIPE
+        guardian = await asyncio.create_subprocess_exec(sys.executable, "-u",
+            str(Path(__file__).with_name("posix_guardian.py")),
+            json.dumps({"command": command, "shell": shell}), **kwargs)
+        return PosixProcess(guardian)
+    task = asyncio.create_task(launch())
     try:
-        return await asyncio.create_subprocess_shell(command, **kwargs)
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        async def cleanup_spawn():
+            process = await task
+            if not await terminate_process_tree(process):
+                raise OSError("Cancelled process spawn cleanup failed")
+        await finish_cleanup(cleanup_spawn())
+        raise
     finally:
-        # The child has inherited the underlying fd; the parent no longer
-        # needs its own handle. Closing here avoids leaking one file
-        # descriptor per server restart.
         if owned is not None:
             owned.close()
 
 
-async def create_managed_subprocess_exec(
-    argv: Sequence[str],
-    *,
-    cwd: Optional[str] = None,
-    env: Optional[dict] = None,
-    stderr: StderrTarget = None,
-) -> asyncio.subprocess.Process:
-    """Spawn a process directly (no shell wrapper).
+async def create_managed_subprocess_shell(command, *, cwd=None, env=None, stderr=None):
+    return await _spawn(command, shell=True, cwd=cwd, env=env, stderr=stderr)
 
-    Prefer this over ``create_managed_subprocess_shell`` whenever the caller
-    holds the argv list, because the captured ``Process`` is the actual
-    target program. With the shell variant on Windows the captured PID is
-    the ``cmd.exe`` wrapper, whose lifetime is decoupled from the child;
-    once the wrapper exits we can no longer reliably terminate the real
-    child via ``taskkill /T /F`` (its parent is gone), so resource cleanup
-    silently fails.
-    """
+
+async def create_managed_subprocess_exec(argv, *, cwd=None, env=None, stderr=None):
     if not argv:
         raise ValueError("argv must not be empty")
-    stderr_value, owned = _resolve_stderr(stderr)
-    kwargs = _common_kwargs(cwd, env, stderr_value)
-    try:
-        return await asyncio.create_subprocess_exec(*argv, **kwargs)
-    finally:
-        if owned is not None:
-            owned.close()
+    return await _spawn(list(argv), shell=False, cwd=cwd, env=env, stderr=stderr)
 
 
-async def terminate_process_tree(
-    process: asyncio.subprocess.Process,
-    *,
-    timeout: float = 10.0,
-) -> bool:
-    if process.returncode is not None:
-        return True
-    if os.name == "nt":
-        return await _terminate_windows_process_tree(process, timeout=timeout)
-    return await _terminate_posix_process_group(process, timeout=timeout)
+async def terminate_process_tree(process, *, timeout=10.0):
+    """Confirm the owned tree is empty, including after launcher completion.
 
-
-async def _terminate_windows_process_tree(
-    process: asyncio.subprocess.Process,
-    *,
-    timeout: float,
-) -> bool:
-    killer = await asyncio.create_subprocess_exec(
-        "taskkill",
-        "/PID",
-        str(process.pid),
-        "/T",
-        "/F",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        await asyncio.wait_for(killer.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        killer.kill()
-        await killer.wait()
-
-    try:
-        await asyncio.wait_for(process.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        process.kill()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+    Unknown process objects have no tree identity and fail closed. Cancellation
+    joins the finite cleanup instead of leaving a separate killer unobserved.
+    """
+    async def terminate():
+        if os.name != "nt":
+            method = getattr(process, "terminate_tree", None)
+            return await method(timeout) if method is not None else False
+        job = getattr(process, "_managed_job", None)
+        if job is None:
             return False
-    return process.returncode is not None
-
-
-async def _terminate_posix_process_group(
-    process: asyncio.subprocess.Process,
-    *,
-    timeout: float,
-) -> bool:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        process.terminate()
-
-    try:
-        await asyncio.wait_for(process.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
+        handles = []
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            handles = job.process_handles()
+            if job.active():
+                job.terminate()
+            deadline = time.monotonic() + timeout
+            while job.active() or any(job.kernel.WaitForSingleObject(handle, 0) != 0 for handle in handles):
+                if time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(.01)
+            await asyncio.wait_for(process.wait(), max(.1, timeout))
+            job.close()
             return True
-        except OSError:
-            process.kill()
+        except (OSError, asyncio.TimeoutError):
+            return False
+        finally:
+            for handle in handles:
+                job.kernel.CloseHandle(handle)
+    return await finish_cleanup(terminate())
+
+
+async def run_stop_command(command, *, cwd=None, timeout=30.0):
+    """Bound command lifetime and always reclaim its owned process tree."""
+    process = await create_managed_subprocess_shell(command, cwd=cwd)
+    try:
         try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
+            code = await asyncio.wait_for(process.wait(), timeout)
         except asyncio.TimeoutError:
             return False
-    return process.returncode is not None
+        return code == 0
+    finally:
+        if not await finish_cleanup(terminate_process_tree(process, timeout=min(10.0, timeout))):
+            raise OSError("Stop command process tree cleanup failed")

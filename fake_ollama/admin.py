@@ -129,6 +129,10 @@ LOCAL_OPENAI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "Run start_command when a request arrives and health check is not ready."},
     {"key": "start_command", "type": "string", "default": None,
      "description": "Command that starts the generic OpenAI-compatible server."},
+    {"key": "manage_external_runtime", "type": "bool", "default": False,
+     "description": "Explicitly allow management of an external runtime after use. A stop command alone does not grant ownership."},
+    {"key": "stop_timeout_seconds", "type": "float", "default": 30.0,
+     "description": "Maximum stop-command wait in seconds (0 < value <= 300); failed cleanup retains ownership."},
     {"key": "stop_command", "type": "string", "default": None,
      "description": "Optional command used to stop the server."},
     {"key": "idle_timeout_seconds", "type": "float", "default": None,
@@ -158,6 +162,10 @@ OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "请求到来且 health 检查失败时，是否执行 start_command 启动 Ollama daemon"},
     {"key": "start_command", "type": "string", "default": None,
      "description": "可选：启动 Ollama daemon 的命令，例如完整路径的 ollama.exe serve"},
+    {"key": "manage_external_runtime", "type": "bool", "default": False,
+     "description": "Explicitly allow management of an external runtime after use. A stop command alone does not grant ownership."},
+    {"key": "stop_timeout_seconds", "type": "float", "default": 30.0,
+     "description": "Maximum stop-command wait in seconds (0 < value <= 300); failed cleanup retains ownership."},
     {"key": "stop_command", "type": "string", "default": None,
      "description": "可选：停止命令。未配置时，仅会回收 fake-ollama 自己启动的进程"},
     {"key": "idle_timeout_seconds", "type": "float", "default": None,
@@ -188,6 +196,10 @@ LLAMA_CPP_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "可选覆盖全局 llama_cpp_defaults.auto_start；请求到来且 health 检查失败时，是否执行 start_command 启动 llama.cpp"},
     {"key": "start_command", "type": "string", "default": None,
       "description": "可选：启动该模型专属 llama.cpp server 的命令；长驻进程会由 fake-ollama 持有。如果留空，会用下面的 binary_path / model_path 等字段自动拼装命令"},
+    {"key": "manage_external_runtime", "type": "bool", "default": False,
+     "description": "Explicitly allow management of an external runtime after use. A stop command alone does not grant ownership."},
+    {"key": "stop_timeout_seconds", "type": "float", "default": 30.0,
+     "description": "Maximum stop-command wait in seconds (0 < value <= 300); failed cleanup retains ownership."},
     {"key": "stop_command", "type": "string", "default": None,
      "description": "可选：停止命令。未配置时，仅会回收 fake-ollama 自己启动的进程"},
     {"key": "binary_path", "type": "string", "default": None,
@@ -291,6 +303,10 @@ COMFYUI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
      "description": "health 检查失败时，是否执行 start_command 启动 ComfyUI"},
     {"key": "start_command", "type": "string", "default": None,
      "description": "启动 ComfyUI 的命令"},
+    {"key": "manage_external_runtime", "type": "bool", "default": False,
+     "description": "Explicitly allow management of an external runtime after use. A stop command alone does not grant ownership."},
+    {"key": "stop_timeout_seconds", "type": "float", "default": 30.0,
+     "description": "Maximum stop-command wait in seconds (0 < value <= 300); failed cleanup retains ownership."},
     {"key": "stop_command", "type": "string", "default": None,
      "description": "可选：停止 ComfyUI 的命令"},
     {"key": "idle_timeout_seconds", "type": "float", "default": None,
@@ -822,6 +838,8 @@ def _ollama_client_matches(
         and getattr(client, "_auto_start", None) == target.auto_start
         and getattr(client, "_start_command", None) == target.start_command
         and getattr(client, "_stop_command", None) == target.stop_command
+        and getattr(client, "_manage_external_runtime", False) == target.manage_external_runtime
+        and getattr(client, "_stop_timeout", None) == target.stop_timeout_seconds
         and getattr(client, "_idle_timeout", None) == target.idle_timeout_seconds
         and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
         and getattr(client, "_health_path", None) == target.health_path
@@ -847,6 +865,8 @@ def _llama_cpp_client_matches(
             list(expected_argv) if expected_argv is not None else None
         )
         and getattr(client, "_stop_command", None) == target.stop_command
+        and getattr(client, "_manage_external_runtime", False) == target.manage_external_runtime
+        and getattr(client, "_stop_timeout", None) == target.stop_timeout_seconds
         and getattr(client, "_idle_timeout", None) == target.idle_timeout_seconds
         and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
         and getattr(client, "_health_path", None) == target.health_path
@@ -874,6 +894,8 @@ def _generic_openai_client_matches(
         and getattr(client, "_start_command", None) == target.start_command
         and getattr(client, "_start_argv", None) is None
         and getattr(client, "_stop_command", None) == target.stop_command
+        and getattr(client, "_manage_external_runtime", False) == target.manage_external_runtime
+        and getattr(client, "_stop_timeout", None) == target.stop_timeout_seconds
         and getattr(client, "_idle_timeout", None) == target.idle_timeout_seconds
         and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
         and getattr(client, "_health_path", None) == target.health_path
@@ -902,6 +924,8 @@ def _comfyui_client_matches(
         and getattr(client, "_auto_start", None) == target.auto_start
         and getattr(client, "_start_command", None) == target.start_command
         and getattr(client, "_stop_command", None) == target.stop_command
+        and getattr(client, "_manage_external_runtime", False) == target.manage_external_runtime
+        and getattr(client, "_stop_timeout", None) == target.stop_timeout_seconds
         and getattr(client, "_idle_timeout", None) == target.idle_timeout_seconds
         and getattr(client, "_startup_timeout", None) == target.startup_timeout_seconds
         and getattr(client, "_health_path", None) == target.health_path
@@ -965,6 +989,9 @@ def _prepare_pools(app, new_settings, created):
             auto_start=tgt.auto_start,
             start_command=tgt.start_command,
             stop_command=tgt.stop_command,
+            manage_external_runtime=tgt.manage_external_runtime,
+            stop_timeout_seconds=tgt.stop_timeout_seconds,
+            ownership_active=False,
             idle_timeout_seconds=tgt.idle_timeout_seconds,
             startup_timeout_seconds=tgt.startup_timeout_seconds,
             health_path=tgt.health_path,
@@ -993,6 +1020,9 @@ def _prepare_pools(app, new_settings, created):
             start_command=tgt.start_command,
             start_argv=tgt.synthesize_start_argv(),
             stop_command=tgt.stop_command,
+            manage_external_runtime=tgt.manage_external_runtime,
+            stop_timeout_seconds=tgt.stop_timeout_seconds,
+            ownership_active=False,
             idle_timeout_seconds=tgt.idle_timeout_seconds,
             startup_timeout_seconds=tgt.startup_timeout_seconds,
             health_path=tgt.health_path,
@@ -1022,6 +1052,9 @@ def _prepare_pools(app, new_settings, created):
             auto_start=tgt.auto_start,
             start_command=tgt.start_command,
             stop_command=tgt.stop_command,
+            manage_external_runtime=tgt.manage_external_runtime,
+            stop_timeout_seconds=tgt.stop_timeout_seconds,
+            ownership_active=False,
             idle_timeout_seconds=tgt.idle_timeout_seconds,
             startup_timeout_seconds=tgt.startup_timeout_seconds,
             health_path=tgt.health_path,
@@ -1050,6 +1083,9 @@ def _prepare_pools(app, new_settings, created):
             auto_start=tgt.auto_start,
             start_command=tgt.start_command,
             stop_command=tgt.stop_command,
+            manage_external_runtime=tgt.manage_external_runtime,
+            stop_timeout_seconds=tgt.stop_timeout_seconds,
+            ownership_active=False,
             idle_timeout_seconds=tgt.idle_timeout_seconds,
             startup_timeout_seconds=tgt.startup_timeout_seconds,
             health_path=tgt.health_path,

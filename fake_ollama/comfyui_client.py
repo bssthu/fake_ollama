@@ -24,6 +24,8 @@ from urllib.parse import urlparse
 import httpx
 
 from .comfyui_presets import WorkflowSpec, nearest_ratio, resolve_workflows
+from . import runtime_ownership
+from .process_utils import run_stop_command
 from .config import outbound_cycle_headers
 from .h3_media import add_keyframes, add_reference_inputs
 from .comfyui_jobs import PromptRecord, runtime_for, recover
@@ -108,6 +110,9 @@ class ComfyUIClient:
         auto_start: bool = False,
         start_command: Optional[str] = None,
         stop_command: Optional[str] = None,
+        manage_external_runtime: bool = False,
+        stop_timeout_seconds: float = 30.0,
+        ownership_active: bool = True,
         idle_timeout_seconds: Optional[float] = None,
         startup_timeout_seconds: float = 120.0,
         health_path: str = "/system_stats",
@@ -127,6 +132,9 @@ class ComfyUIClient:
         self._auto_start = auto_start
         self._start_command = start_command
         self._stop_command = stop_command
+        self._manage_external_runtime = manage_external_runtime
+        self._stop_timeout = stop_timeout_seconds
+        self._used_since_last_stop = False
         self._idle_timeout = idle_timeout_seconds
         self._startup_timeout = startup_timeout_seconds
         self._health_path = health_path if health_path.startswith("/") else "/" + health_path
@@ -163,6 +171,8 @@ class ComfyUIClient:
         self._recovery_timeout_seconds = 30.0
         self._recovery_poll_seconds = 0.5
         self._shutdown_requested = False
+        self._ownership = runtime_ownership.register(self, group=getattr(self, "vram_runtime_group", None), active=ownership_active)
+        self._start_lock = self._ownership.lock
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
         if self._memory_coordinator is not None:
@@ -190,13 +200,7 @@ class ComfyUIClient:
     async def aclose(self) -> None:
         if not await self.recover_pending_prompts():
             raise LocalTargetResourceError("ComfyUI cleanup is unconfirmed; client retained for recovery", error_type="runtime_quarantined")
-        if self._vram_coordinator is not None:
-            self._vram_coordinator.unregister(self)
-        if self._memory_coordinator is not None:
-            self._memory_coordinator.unregister(self)
-        if self._owns_client:
-            await self._client.aclose()
-        await self.stop_if_owned()
+        await runtime_ownership.close_client(self, terminate=terminate_process_tree, run_command=run_stop_command)
 
     def has_vram_reservation(self, model: str) -> bool:
         loaded = self._loaded_model
@@ -225,6 +229,7 @@ class ComfyUIClient:
                 self._loaded_model = None
 
     def _begin_request_lifecycle(self) -> None:
+        runtime_ownership.begin_request(self)
         self._request_refs += 1
 
     def _end_request_lifecycle(self) -> None:
@@ -258,6 +263,7 @@ class ComfyUIClient:
     ) -> None:
         if not model or estimated_vram_gb is None:
             return
+        self._used_since_last_stop = True
         existing = self._loaded_model
         self._loaded_model = _LoadedModel(
             model=model,
@@ -473,7 +479,7 @@ class ComfyUIClient:
                     "ComfyUI target is unavailable and fake-ollama is shutting down; "
                     "refusing auto-start"
             )
-            if self._process is None or self._process.returncode is not None:
+            if self._ownership.process is None and not self._started_by_us:
                 logger.info("starting ComfyUI target: %s", self._start_command)
                 stderr_log = self._stderr_log_path()
                 if stderr_log is not None:
@@ -484,9 +490,12 @@ class ComfyUIClient:
                     stderr=stderr_log,
                 )
                 self._started_by_us = True
+                self._ownership.capture(self)
 
             deadline = time.monotonic() + self._startup_timeout
             while time.monotonic() < deadline:
+                if self._shutdown_requested:
+                    raise httpx.ConnectError("Shutdown interrupted backend startup")
                 if await self._healthy():
                     logger.info("ComfyUI target ready at %s", self._base)
                     return
@@ -1416,6 +1425,8 @@ class ComfyUIClient:
         inputs[input_name] = value
 
     def _runtime_in_use(self, *, allow_admission: bool = False) -> bool:
+        if any(member is not self and member._active for member in self._ownership.members):
+            return True
         if self._runtime.pending:
             return True
         busy = bool(
@@ -1442,14 +1453,11 @@ class ComfyUIClient:
                 last_used,
                 self._vram_coordinator.runtime_group_last_used(self.vram_runtime_group),
             )
-        idle_for = time.monotonic() - last_used
+        idle_for = time.monotonic() - max(last_used, *(m._last_used for m in self._ownership.members))
         if idle_for < self._idle_timeout:
             return
-        if self._process is not None and self._process.returncode is not None:
-            self._started_by_us = False
         if not (
-            self._started_by_us
-            or (self._stop_command and self._loaded_model is not None)
+            self._ownership.can_manage()
         ):
             return
         logger.info(
@@ -1472,7 +1480,7 @@ class ComfyUIClient:
             return True
         if await self._free_memory():
             return True
-        if self._started_by_us or self._stop_command:
+        if self._ownership.can_manage():
             return await self.stop_if_owned()
         return False
 
@@ -1485,7 +1493,7 @@ class ComfyUIClient:
             return True
         if await self._free_memory():
             return True
-        if self._started_by_us or self._stop_command:
+        if self._ownership.can_manage():
             return await self.stop_if_owned()
         return False
 
@@ -1562,36 +1570,4 @@ class ComfyUIClient:
             self.invalidate_memory_reservation()
 
     async def stop_if_owned(self) -> bool:
-        if self._runtime.pending:
-            return False
-        if self._stop_command:
-            logger.info("stopping ComfyUI target with stop_command")
-            proc = await asyncio.create_subprocess_shell(
-                self._stop_command,
-                cwd=self._cwd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            returncode = await proc.wait()
-            if returncode == 0:
-                self._started_by_us = False
-                self._invalidate_runtime_resources(full=True)
-                return True
-            logger.warning("ComfyUI target stop_command exited with status %s", returncode)
-            return False
-
-        if self._process is not None and self._started_by_us:
-            if self._process.returncode is None:
-                logger.info("terminating owned ComfyUI target process tree")
-                if not await terminate_process_tree(self._process, timeout=10.0):
-                    logger.warning("failed to terminate owned ComfyUI target process tree")
-                    return False
-                self._started_by_us = False
-                self._invalidate_runtime_resources(full=True)
-                return True
-            logger.warning(
-                "owned ComfyUI target launcher process already exited; cannot stop "
-                "remaining detached server process without stop_command"
-            )
-            return False
-        return False
+        return await runtime_ownership.stop_owned(self, terminate=terminate_process_tree, run_command=run_stop_command)

@@ -33,7 +33,7 @@ async def test_shared_comfy_idle_timeout_waits_for_sibling_requests_and_activity
         ComfyUIClient(
             "http://comfy.test:8188", target_name=name,
             vram_coordinator=coordinator, idle_timeout_seconds=60,
-            stop_command="configured-stop", client=httpx.AsyncClient(),
+            stop_command="configured-stop", manage_external_runtime=True, client=httpx.AsyncClient(),
         )
         for name in ("base", "turbo")
     ]
@@ -80,7 +80,7 @@ async def test_shared_comfy_idle_timeout_waits_for_sibling_requests_and_activity
 @pytest.mark.asyncio
 async def test_comfy_idle_timeout_does_not_wait_for_another_runtime(monkeypatch):
     coordinator = VramCoordinator(provider=_constant(20 * 1024.0))
-    own = ComfyUIClient("http://comfy.test:8188", target_name="own", vram_coordinator=coordinator, idle_timeout_seconds=60, stop_command="stop", client=httpx.AsyncClient())
+    own = ComfyUIClient("http://comfy.test:8188", target_name="own", vram_coordinator=coordinator, idle_timeout_seconds=60, stop_command="stop", manage_external_runtime=True, client=httpx.AsyncClient())
     other = ComfyUIClient("http://comfy.test:8189", target_name="other", vram_coordinator=coordinator, client=httpx.AsyncClient())
     stopped = []
 
