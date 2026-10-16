@@ -1142,6 +1142,20 @@ def register_admin_routes(app: FastAPI) -> None:
     async def admin_get_config(request: Request) -> JSONResponse:
         return JSONResponse(_settings_to_dict(request.app.state.settings))
 
+    @router.post("/admin/recover-runtime", include_in_schema=False)
+    async def admin_recover_runtime(request: Request) -> JSONResponse:
+        body = await request.json()
+        name = body.get("target") if isinstance(body, dict) else None
+        client = getattr(request.app.state, "comfyui_clients", {}).get(name)
+        if client is None:
+            raise HTTPException(404, "Unknown ComfyUI target")
+        recovered = await client.recover_pending_prompts()
+        coordinator = getattr(request.app.state, "vram_coordinator", None)
+        if recovered and coordinator is not None:
+            recovered = await coordinator.recover_runtime(client.vram_runtime_group)
+        return JSONResponse({"recovered": recovered, "pending_prompts": client.prompt_snapshots()},
+                            status_code=200 if recovered else 503)
+
     @router.put("/admin/config", include_in_schema=False)
     async def admin_put_config(request: Request) -> PlainTextResponse:
         try:

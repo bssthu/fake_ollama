@@ -26,6 +26,7 @@ import httpx
 from .comfyui_presets import WorkflowSpec, nearest_ratio, resolve_workflows
 from .config import outbound_cycle_headers
 from .h3_media import add_keyframes, add_reference_inputs
+from .comfyui_jobs import PromptRecord, runtime_for, recover
 from .process_utils import create_managed_subprocess_shell, terminate_process_tree
 from .request_data_log import (
     body_from_bytes,
@@ -158,6 +159,9 @@ class ComfyUIClient:
         self._last_used = time.monotonic()
         self._loaded_model: Optional[_LoadedModel] = None
         self._active_prompt_ids: set[str] = set()
+        self._runtime = runtime_for(self._base)
+        self._recovery_timeout_seconds = 30.0
+        self._recovery_poll_seconds = 0.5
         self._shutdown_requested = False
         if self._vram_coordinator is not None:
             self._vram_coordinator.register(self)
@@ -184,6 +188,8 @@ class ComfyUIClient:
         self._shutdown_requested = True
 
     async def aclose(self) -> None:
+        if not await self.recover_pending_prompts():
+            raise LocalTargetResourceError("ComfyUI cleanup is unconfirmed; client retained for recovery", error_type="runtime_quarantined")
         if self._vram_coordinator is not None:
             self._vram_coordinator.unregister(self)
         if self._memory_coordinator is not None:
@@ -716,6 +722,7 @@ class ComfyUIClient:
         keyframe_inputs: Optional[List[Tuple[int, bytes, str]]] = None,
     ) -> List[ComfyUIImage]:
         spec = self._workflows.get(mode)
+        self._runtime.check()
         if spec is None:
             verb = {
                 "t2i": "text-to-image",
@@ -1002,17 +1009,57 @@ class ComfyUIClient:
         *,
         operation: str,
     ) -> List[ComfyUIImage]:
-        prompt_id = await self._queue_prompt(workflow, operation=operation)
-        self._active_prompt_ids.add(prompt_id)
+        self._runtime.check()
+        record = PromptRecord()
+        record.tracking = self._active_prompt_ids
+        key = record.prompt_id
+        self._active_prompt_ids.add(key)
         try:
+            prompt_id = await self._queue_prompt(workflow, operation=operation, record=record)
+            self._active_prompt_ids.discard(key)
+            key = prompt_id
+            self._active_prompt_ids.add(key)
+            record.prompt_id = prompt_id
+            record.uncertain = False
+            record.status = "accepted"
             history = await self._wait_for_history(prompt_id, operation=operation)
+            record.status = "finished"
             return await self._collect_outputs(history, operation=operation)
+        except BaseException as exc:
+            if record.status != "finished":
+                # A rejected request is known not to be queued; other transport
+                # failures (including lost acknowledgement) remain uncertain.
+                rejected = record.status == "submitting" and isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500
+                if not rejected:
+                    self._runtime.pending[key] = record
+                    if self._vram_coordinator is not None:
+                        async def confirmed_idle():
+                            return not self._runtime.pending
+                        self._vram_coordinator.quarantine_runtime(self.vram_runtime_group, "unconfirmed ComfyUI prompt", verify=confirmed_idle)
+                    record.recovery_task = asyncio.create_task(recover(self, key, record), name=f"comfy-recover-{record.prompt_id}")
+                    raise
+            self._active_prompt_ids.discard(key)
+            raise
         finally:
-            self._active_prompt_ids.discard(prompt_id)
+            if key not in self._runtime.pending:
+                self._active_prompt_ids.discard(key)
 
-    async def _queue_prompt(self, workflow: Dict[str, Any], *, operation: str) -> str:
+    async def recover_pending_prompts(self) -> bool:
+        """Bounded retry; unresolved records and admission protection persist."""
+        for key, record in list(self._runtime.pending.items()):
+            if record.recovery_task is None or record.recovery_task.done():
+                record.recovery_task = asyncio.create_task(recover(self, key, record))
+            await asyncio.shield(record.recovery_task)
+        return not self._runtime.pending
+
+    def prompt_snapshots(self):
+        return [{"prompt_id": r.prompt_id, "status": r.status} for r in self._runtime.pending.values()]
+
+    async def _queue_prompt(self, workflow: Dict[str, Any], *, operation: str, record: PromptRecord | None = None) -> str:
+        self._runtime.check()
+        record = record or PromptRecord()
         url = f"{self._base}/prompt"
-        body = {"prompt": workflow, "client_id": self._client_id}
+        body = {"prompt": workflow, "client_id": record.client_id, "prompt_id": record.prompt_id}
         headers = self._headers()
         if request_data_logging_enabled():
             log_data_event(
@@ -1369,6 +1416,8 @@ class ComfyUIClient:
         inputs[input_name] = value
 
     def _runtime_in_use(self, *, allow_admission: bool = False) -> bool:
+        if self._runtime.pending:
+            return True
         busy = bool(
             self.request_refs
             or (
@@ -1415,6 +1464,8 @@ class ComfyUIClient:
         return await self._release_for_vram()
 
     async def _release_for_vram(self, *, force: bool = False) -> bool:
+        if self._runtime.pending:
+            return False
         if not force and self._runtime_in_use(allow_admission=True):
             return False
         if self._loaded_model is None or self._loaded_model.estimated_vram_gb <= 0:
@@ -1426,6 +1477,8 @@ class ComfyUIClient:
         return False
 
     async def _release_for_memory(self, *, force: bool = False) -> bool:
+        if self._runtime.pending:
+            return False
         if not force and self._runtime_in_use(allow_admission=True):
             return False
         if self._loaded_model is None or self._loaded_model.estimated_memory_gb <= 0:
@@ -1437,6 +1490,8 @@ class ComfyUIClient:
         return False
 
     async def _free_memory(self) -> bool:
+        if self._runtime.pending:
+            return False
         try:
             resp = await self._client.post(
                 f"{self._base}/free",
@@ -1461,7 +1516,7 @@ class ComfyUIClient:
     async def _adaptive_unload_gpu(self) -> bool:
         """Unload runtime GPU weights without resetting ComfyUI's object cache."""
 
-        if self._active:
+        if self._active or self._runtime.pending:
             return False
         if (
             self._vram_coordinator is not None
@@ -1507,6 +1562,8 @@ class ComfyUIClient:
             self.invalidate_memory_reservation()
 
     async def stop_if_owned(self) -> bool:
+        if self._runtime.pending:
+            return False
         if self._stop_command:
             logger.info("stopping ComfyUI target with stop_command")
             proc = await asyncio.create_subprocess_shell(

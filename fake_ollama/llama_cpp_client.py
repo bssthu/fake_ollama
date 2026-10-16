@@ -44,6 +44,8 @@ from .vram import (
     VramReleaseCandidate,
 )
 
+from .lifecycle import BackendShuttingDownError, finish_cleanup
+
 logger = logging.getLogger("fake_ollama")
 
 
@@ -257,128 +259,46 @@ class LlamaCppClient:
     @asynccontextmanager
     async def _concurrency_slot(self):
         sem = self._request_semaphore
+        if self._shutdown_requested:
+            raise BackendShuttingDownError(self.target_id)
         if sem is None:
-            if self._shutdown_requested:
-                raise asyncio.CancelledError(
-                    f"{self.target_id} shutting down"
-                )
             yield
             return
-        if self._shutdown_requested:
-            raise asyncio.CancelledError(
-                f"{self.target_id} shutting down"
-            )
-        # Fast path: if a slot is immediately available, don't bother logging
-        # — this is the common case under low load and we want zero noise.
-        if sem.locked() or self._queued > 0:
-            logger.info(
-                "[%s] queueing request (active=%d queued=%d -> %d, cap=%d)",
-                self.target_id,
-                self._active,
-                self._queued,
-                self._queued + 1,
-                self._max_concurrent_requests or 0,
-            )
-            queued_log = True
-        else:
-            queued_log = False
         self._queued += 1
+        queued = True
         t0 = time.monotonic()
         pending_id = self._wait_next_id
         self._wait_next_id += 1
         self._wait_pending[pending_id] = t0
         shutdown_event = self._get_shutdown_event()
-        acquire_task = asyncio.ensure_future(sem.acquire())
-        shutdown_task = asyncio.ensure_future(shutdown_event.wait())
+        acquire_task = asyncio.create_task(sem.acquire())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
         try:
-            try:
-                done, _pending = await asyncio.wait(
-                    {acquire_task, shutdown_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            except BaseException:
-                acquire_task.cancel()
-                shutdown_task.cancel()
-                self._queued -= 1
-                self._wait_pending.pop(pending_id, None)
-                if queued_log:
-                    logger.info(
-                        "[%s] queue exit (cancelled before slot, waited=%.2fs, queued=%d)",
-                        self.target_id,
-                        time.monotonic() - t0,
-                        self._queued,
-                    )
-                raise
-            if acquire_task in done and not acquire_task.cancelled():
-                # We won the race. If shutdown also fired we still hand the
-                # slot back immediately — no point starting new upstream work.
-                shutdown_task.cancel()
-                if shutdown_event.is_set():
-                    sem.release()
-                    self._queued -= 1
-                    self._wait_pending.pop(pending_id, None)
-                    if queued_log:
-                        logger.info(
-                            "[%s] queue exit (shutdown after slot, waited=%.2fs, queued=%d)",
-                            self.target_id,
-                            time.monotonic() - t0,
-                            self._queued,
-                        )
-                    raise asyncio.CancelledError(
-                        f"{self.target_id} shutting down"
-                    )
-            else:
-                # shutdown won. Cancel the pending acquire; if it already
-                # acquired between wait() returning and us cancelling, give
-                # the slot back so the next waiter (also being cancelled)
-                # doesn't get blocked.
-                if acquire_task.cancel() is False and not acquire_task.cancelled():
-                    try:
-                        await acquire_task
-                    except BaseException:
-                        pass
-                    else:
-                        sem.release()
-                self._queued -= 1
-                self._wait_pending.pop(pending_id, None)
-                if queued_log:
-                    logger.info(
-                        "[%s] queue exit (shutdown, waited=%.2fs, queued=%d)",
-                        self.target_id,
-                        time.monotonic() - t0,
-                        self._queued,
-                    )
-                raise asyncio.CancelledError(
-                    f"{self.target_id} shutting down"
-                )
-        finally:
-            if not shutdown_task.done():
-                shutdown_task.cancel()
-        self._queued -= 1
-        self._wait_pending.pop(pending_id, None)
-        # Record the completed wait. Only acquisitions that actually proceed
-        # past the gate land here — cancellations / shutdowns are excluded so
-        # the percentiles reflect "real" queue latency.
-        self._wait_history.append((time.time(), time.monotonic() - t0))
-        if queued_log:
-            logger.info(
-                "[%s] slot acquired (waited=%.2fs, active=%d queued=%d)",
-                self.target_id,
-                time.monotonic() - t0,
-                self._active + 1,
-                self._queued,
-            )
-        try:
+            await asyncio.wait({acquire_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED)
+            if shutdown_event.is_set():
+                raise BackendShuttingDownError(self.target_id)
+            await acquire_task
+            self._queued -= 1
+            queued = False
+            self._wait_pending.pop(pending_id, None)
+            self._wait_history.append((time.time(), time.monotonic() - t0))
             yield
         finally:
-            sem.release()
-            if queued_log:
-                logger.info(
-                    "[%s] slot released (active=%d queued=%d)",
-                    self.target_id,
-                    self._active,
-                    self._queued,
-                )
+            # The acquire task owns the permit until this join. Cancellation
+            # after acquisition cannot erase that ownership or release twice.
+            async def cleanup():
+                nonlocal queued
+                for task in (acquire_task, shutdown_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(acquire_task, shutdown_task, return_exceptions=True)
+                if not acquire_task.cancelled() and acquire_task.exception() is None and acquire_task.result():
+                    sem.release()
+                if queued:
+                    self._queued -= 1
+                    queued = False
+                self._wait_pending.pop(pending_id, None)
+            await finish_cleanup(cleanup())
 
     def has_vram_reservation(self, model: str) -> bool:
         return self._loaded_model is not None

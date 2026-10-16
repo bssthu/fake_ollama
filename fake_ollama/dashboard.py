@@ -668,6 +668,11 @@ class DashboardState:
             "gpu_execution_leases": (
                 coordinator.execution_snapshots() if coordinator is not None else []
             ),
+            "pending_comfyui_prompts": [
+                {"target": name, **snapshot}
+                for name, client in getattr(app.state, "comfyui_clients", {}).items()
+                for snapshot in (client.prompt_snapshots() if hasattr(client, "prompt_snapshots") else [])
+            ],
             "gpu_observed_headroom": (
                 coordinator.observed_headroom_snapshots()
                 if coordinator is not None

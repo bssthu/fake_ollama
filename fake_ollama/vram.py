@@ -882,6 +882,10 @@ class VramCoordinator(_ResourceCoordinator):
         )
         self._execution_condition = asyncio.Condition()
         self._execution_leases: dict[int, _ExecutionLeaseState] = {}
+        self._execution_releases: dict[int, asyncio.Task] = {}
+        self._cleanup_tasks: dict[str, asyncio.Task] = {}
+        self._quarantined: dict[str, dict] = {}
+        self._cleanup_timeout_seconds = 30.0
         self._next_execution_lease_id = 1
         self._observed_headroom_mib: dict[str, float] = {}
 
@@ -971,9 +975,11 @@ class VramCoordinator(_ResourceCoordinator):
                 "minimum_free_mib": state.minimum_free_mib,
                 "exclusive": state.exclusive,
                 "breached": state.breached,
+                "status": "releasing" if state.lease_id in self._execution_releases else "active",
             }
             for state in self._execution_leases.values()
-        ]
+        ] + [{"runtime_group": group, "status": "quarantined", "reason": record["reason"]}
+             for group, record in self._quarantined.items()]
 
     def _effective_free_mib(
         self, free_mib: float, *, exclude_key: Optional[tuple[str, str]] = None
@@ -1033,6 +1039,7 @@ class VramCoordinator(_ResourceCoordinator):
 
         async with self._execution_condition:
             while True:
+                self._check_quarantine()
                 if exclusive and any(
                     int(getattr(participant, "active_requests", 0) or 0) > 0
                     and participant.target_id != requester.target_id
@@ -1225,69 +1232,92 @@ class VramCoordinator(_ResourceCoordinator):
         except asyncio.CancelledError:
             raise
 
+    def quarantine_runtime(self, runtime_group: str, reason: str, *, verify=None) -> None:
+        self._quarantined[runtime_group] = {"reason": reason, "verify": verify}
+
+    def _check_quarantine(self):
+        if self._quarantined:
+            raise LocalTargetResourceError("GPU runtime awaits confirmed cleanup; new admission is paused", error_type="runtime_quarantined")
+
+    async def _bounded_cleanup(self, runtime_group, callback):
+        previous = self._cleanup_tasks.get(runtime_group)
+        if previous is not None and not previous.done():
+            done, _ = await asyncio.wait({previous}, timeout=self._cleanup_timeout_seconds)
+            if not done:
+                return False
+        task = asyncio.create_task(callback())
+        self._cleanup_tasks[runtime_group] = task
+        task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+        done, _ = await asyncio.wait({task}, timeout=self._cleanup_timeout_seconds)
+        if not done:
+            # Do not wait unboundedly for a callback that suppresses cancellation.
+            # It stays tracked and prevents a conflicting retry until it exits.
+            task.cancel()
+            return False
+        return bool(task.result())
+
+    async def recover_runtime(self, runtime_group: str) -> bool:
+        record = self._quarantined.get(runtime_group)
+        if record is None:
+            return True
+        verify = record.get("verify")
+        if verify is None:
+            return False
+        try:
+            confirmed = await self._bounded_cleanup(runtime_group, verify)
+        except Exception:
+            return False
+        if confirmed and self._quarantined.get(runtime_group) is record:
+            del self._quarantined[runtime_group]
+            async with self._execution_condition:
+                self._execution_condition.notify_all()
+            return True
+        return False
+
     async def release_execution(self, lease_id: int) -> None:
+        # Publish one cleanup owner without awaiting IO under the condition.
+        # Callers may leave; the task remains tracked until it records a result.
         async with self._execution_condition:
+            task = self._execution_releases.get(lease_id)
             state = self._execution_leases.get(lease_id)
-            if state is None:
-                return
-            monitor = state.monitor_task
-            if monitor is not None:
-                monitor.cancel()
-                try:
-                    await monitor
-                except asyncio.CancelledError:
-                    pass
+            if task is None and state is not None:
+                task = asyncio.create_task(self._release_execution_owned(state), name=f"vram-release-{lease_id}")
+                self._execution_releases[lease_id] = task
+        if task is not None:
+            await asyncio.shield(task)
 
+    async def _cleanup_execution(self, state) -> bool:
+        if state.cleanup is None or not await state.cleanup():
+            return False
+        threshold = max(state.min_free_mib, state.reload_vram_mib)
+        available = await self._wait_for_raw_available_after_release(threshold)
+        return threshold <= 0 or (available is not None and available >= threshold)
+
+    async def _release_execution_owned(self, state) -> None:
+        failed = False
+        try:
+            if state.monitor_task is not None:
+                state.monitor_task.cancel()
+                await asyncio.gather(state.monitor_task, return_exceptions=True)
             if state.resident_at_start:
-                observed_mib = max(
-                    0.0, state.baseline_free_mib - state.minimum_free_mib
-                )
-                if observed_mib > 0:
-                    # Keep a small allocator/sampling margin. Learned values
-                    # only move upward and never weaken an explicit profile.
-                    learned_mib = observed_mib + 256.0
-                    previous_mib = self._observed_headroom_mib.get(
-                        state.workload_key, 0.0
+                observed = max(0.0, state.baseline_free_mib - state.minimum_free_mib)
+                if observed:
+                    self._observed_headroom_mib[state.workload_key] = max(
+                        self._observed_headroom_mib.get(state.workload_key, 0.0), observed + 256.0,
                     )
-                    if learned_mib > previous_mib:
-                        self._observed_headroom_mib[state.workload_key] = learned_mib
-
-            if state.breached and state.cleanup is not None:
-                try:
-                    cleaned = bool(await state.cleanup())
-                    if cleaned:
-                        # ComfyUI's /free response can arrive before CUDA/WDDM
-                        # publishes the reclaimed memory through NVML.  Keep the
-                        # execution lease (and therefore the next request) held
-                        # until the model can actually be admitted again.
-                        threshold_mib = max(
-                            state.min_free_mib, state.reload_vram_mib
-                        )
-                        available_mib = await self._wait_for_raw_available_after_release(
-                            threshold_mib
-                        )
-                        if (
-                            threshold_mib > 0
-                            and (
-                                available_mib is None
-                                or available_mib < threshold_mib
-                            )
-                        ):
-                            logger.warning(
-                                "GPU VRAM cleanup for %s completed but reclamation "
-                                "has not reached the next-admission threshold: "
-                                "available %s, threshold %s",
-                                state.model,
-                                _fmt_gib(available_mib or 0.0),
-                                _fmt_gib(threshold_mib),
-                            )
-                except Exception:
-                    logger.warning(
-                        "failed to clean runtime after GPU VRAM floor crossing",
-                        exc_info=True,
-                    )
-            self._execution_leases.pop(lease_id, None)
-            self._execution_condition.notify_all()
+            if state.breached:
+                failed = not await self._bounded_cleanup(state.runtime_group, lambda: self._cleanup_execution(state))
+        except (Exception, asyncio.CancelledError):
+            failed = True
+        finally:
+            if failed:
+                self.quarantine_runtime(state.runtime_group, "execution cleanup not confirmed",
+                                        verify=lambda: self._cleanup_execution(state))
+                logger.warning("GPU runtime %s quarantined after unconfirmed cleanup", state.runtime_group)
+            async with self._execution_condition:
+                self._execution_leases.pop(state.lease_id, None)
+                self._execution_releases.pop(state.lease_id, None)
+                self._execution_condition.notify_all()
 
     async def free_vram_mib(self) -> Optional[float]:
         return await self._free_mib()
@@ -1302,6 +1332,7 @@ class VramCoordinator(_ResourceCoordinator):
         model: str = "",
         estimated_vram_gb: Optional[float] = None,
     ) -> None:
+        self._check_quarantine()
         blocking = next(
             (
                 state

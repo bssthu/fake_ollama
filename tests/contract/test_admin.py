@@ -36,6 +36,24 @@ def _admin_client(settings: Settings) -> TestClient:
     return TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)})
 
 
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_recover_runtime_reports_confirmed_state_only(admin_settings, confirmed):
+    class PendingRuntime:
+        vram_runtime_group = "synthetic"
+        idle_timeout_seconds = None
+        async def recover_pending_prompts(self):
+            return confirmed
+        def prompt_snapshots(self):
+            return [] if confirmed else [{"prompt_id": "owned", "status": "quarantined"}]
+    client = _admin_client(admin_settings)
+    client.app.state.comfyui_clients = {"synthetic": PendingRuntime()}
+    with client:
+        response = client.post("/admin/recover-runtime", json={"target": "synthetic"})
+    assert response.status_code == (200 if confirmed else 503)
+    assert response.json()["recovered"] is confirmed
+    assert bool(response.json()["pending_prompts"]) is not confirmed
+
+
 @pytest.fixture
 def admin_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
     cfg_path = tmp_path / "config.json"

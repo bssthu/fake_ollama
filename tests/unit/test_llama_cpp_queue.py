@@ -18,6 +18,7 @@ import pytest
 
 from fake_ollama.config import LlamaCppDefaults, LlamaCppTarget
 from fake_ollama.llama_cpp_client import LlamaCppClient
+from fake_ollama.lifecycle import BackendShuttingDownError
 
 
 def _mock_client(handler) -> httpx.AsyncClient:
@@ -595,7 +596,7 @@ async def test_begin_shutdown_releases_all_queued_requests_at_once():
 
     Reproduces the slow-exit symptom: with cap=1 and ~20 queued requests,
     a single ``begin_shutdown()`` call should fail every waiter immediately
-    with ``CancelledError`` and bring ``queued_requests`` to 0 without
+    with ``BackendShuttingDownError`` and bring ``queued_requests`` to 0 without
     needing the in-flight request to finish or the upstream to die.
     """
     held = asyncio.Event()
@@ -632,14 +633,14 @@ async def test_begin_shutdown_releases_all_queued_requests_at_once():
         results = await asyncio.wait_for(
             asyncio.gather(*waiters, return_exceptions=True), timeout=2.0
         )
-        assert all(isinstance(r, asyncio.CancelledError) for r in results), results
+        assert all(isinstance(r, BackendShuttingDownError) for r in results), results
         assert client.queued_requests == 0
         # Head request should still be alive — shutdown does not abort the
         # request currently holding the slot (the process-kill path does).
         assert not head.done()
 
         # New requests after shutdown should also bail immediately.
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(BackendShuttingDownError):
             await asyncio.wait_for(
                 client.chat({"model": "m", "messages": []}), timeout=2.0
             )
@@ -662,7 +663,7 @@ async def test_begin_shutdown_is_idempotent_without_queue():
     try:
         client.begin_shutdown()
         client.begin_shutdown()  # second call is a no-op
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(BackendShuttingDownError):
             await client.chat({"model": "m", "messages": []})
     finally:
         await client.aclose()

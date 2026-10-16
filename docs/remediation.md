@@ -13,7 +13,7 @@ tests are excluded by default; live tests require explicit environment variables
 | 0 | Unknown/retired ports borrowed the first interface; nine new tests failed against the old implementation | Both router and interface lookup fail closed. Python-only `create_app(test_listener_fallback=True)` explicitly enables synthetic test routing and uses the correct surface's auth. Ten added tests | Real socket rebinding and listener snapshots belong to stage 4 |
 | 1 | Global thinking cache used text/tool ID and last-entry fallback; two revised negative tests failed on old code | Full normalized history + assistant content, scoped to credential/backend/wire model/config; explicit reasoning wins; bounded TTL/LRU; reload invalidates pending writers; signature policy | Exact replay within the same identity/history is intentionally the same association; truncated/edited history cannot recover thinking |
 | 2 | Tools were dropped, result IDs mismatched, indices collided, errors/EOF became success; 14 new regressions failed on old code | Ordered result association; complete tool arguments/IDs/indices; monotonic reverse indices; thinking preservation; explicit terminal/error state | Live provider versions NOT RUN; tool JSON is buffered until validated |
-| 3 | Cancellation / orphan prompt / execution lease ownership | Pending | Deterministic barriers and mocked ComfyUI |
+| 3 | Acquired semaphore leaked on cancellation; cleanup held coordinator lock; cancelled ComfyUI prompt lost its owner | Joined permit cleanup; dedicated shutdown error; shielded bounded lease cleanup; prompt reconciliation and shared runtime/GPU quarantine | An unreachable runtime stays quarantined until verified recovery; no real GPU run |
 | 4 | Reload publication, drain, actual listener security, atomic persistence | Pending | Resource generations and rollback |
 | 5 | Backend and process-tree ownership | Pending | Windows execution; report POSIX skips |
 | 6 | Tool controls, usage, bounded module extraction and documentation | Pending | Public compatibility |
@@ -101,3 +101,44 @@ tests are excluded by default; live tests require explicit environment variables
   [Anthropic streaming](https://platform.claude.com/docs/en/build-with-claude/streaming),
   [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
 - Remaining: stages 3–6; actual network/GPU execution is NOT RUN.
+
+## Stage 3 handoff
+
+- Files: `llama_cpp_client.py`, `comfyui_client.py`, `comfyui_jobs.py`,
+  `lifecycle.py`, `vram.py`, `admin.py`, `dashboard.py`; queue tests plus new
+  cancellation/prompt-ownership tests and a recovery endpoint contract.
+- Semaphore cleanup cancels AND joins both child tasks, observes successful
+  acquisition and releases exactly once. Shutdown uses a dedicated 503 resource
+  exception, while actual task cancellation remains `CancelledError`.
+- Execution cleanup has one shielded owner, performs IO outside the condition,
+  and is bounded to 30 seconds. Failures remove the execution lease but retain
+  GPU quarantine. Callbacks ignoring cancellation stay tracked and prevent
+  concurrent cleanup retries. Dashboard snapshots show releasing/quarantined state.
+- ComfyUI assigns a unique request client ID and proposed prompt ID. On uncertainty,
+  the endpoint is quarantined across clients and reloads; GPU load and execution
+  admission also pause. Recovery queries history/queue, deletes only a matching
+  queued prompt and rechecks running/pending state. Running work is observed to
+  completion without `/interrupt`. Lost acknowledgement on older servers that ignore
+  proposed IDs can be reconciled via the unique client ID in queue/history.
+- Recovery attempts are bounded to 30 seconds. Failure retains records and HTTP
+  resources. An authenticated `POST /admin/recover-runtime` with
+  `{"target":"configured-comfyui-target-name"}` retries verification and returns
+  `recovered=true` only after confirmation; otherwise 503 and pending prompt status.
+  Dashboard data includes `pending_comfyui_prompts` and GPU quarantine snapshots.
+- Read-only local protocol verification: ComfyUI source HEAD
+  `491e8454c105910d69dce830771f2748a17983d8`, `server.py` accepts client-provided
+  prompt IDs, `/queue` supports ID deletion, and `/interrupt` includes a targeted
+  option implemented via a global processing interrupt after an ID check. This
+  implementation deliberately avoids that interrupt path for shared-runtime safety.
+  No ComfyUI process was started or mutated during verification.
+- Red: `test_cancellation_ownership.py`: **2 failed, 1 passed**; prompt ownership:
+  **1 failed**. The subsequent cancellation test additionally verifies cleanup is
+  executed once rather than restarted after cancellation.
+- Full offline command with `--basetemp=.tmp/rectify-s3-all -p no:cacheprovider
+  --tb=short`: **589 passed, 5 deselected** (575 + 14).
+- Additional focused run with `test_cancellation_ownership.py`,
+  `test_comfyui_prompt_ownership.py`, `test_dashboard.py`, `test_admin.py`:
+  **51 passed**, including two added bounded/repeated-cancellation tests.
+- Remaining: stages 4–6. Unreachable or purged history cannot prove completion:
+  quarantine intentionally persists. Actual GPU, networking and process teardown
+  acceptance is NOT RUN.
