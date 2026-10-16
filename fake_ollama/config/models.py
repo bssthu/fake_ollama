@@ -1740,6 +1740,25 @@ class Settings(BaseModel):
     playground_enabled: bool = False
     playground_host: str = "127.0.0.1"
     playground_port: Optional[int] = 21431
+    playground_trusted_proxy_ips: List[str] = Field(default_factory=list)
+    playground_allowed_origins: List[str] = Field(default_factory=list)
+
+    @field_validator("playground_trusted_proxy_ips")
+    @classmethod
+    def _proxy_ips(cls, values: List[str]) -> List[str]:
+        return [str(ipaddress.ip_address(value)) for value in values]
+
+    @field_validator("playground_allowed_origins")
+    @classmethod
+    def _proxy_origins(cls, values: List[str]) -> List[str]:
+        from urllib.parse import urlsplit
+        for value in values:
+            url = urlsplit(value)
+            if (url.scheme not in ("http", "https") or not url.hostname or url.username or url.password
+                    or url.path or url.query or url.fragment):
+                raise ValueError("playground origins must be exact http(s) origins without paths")
+            _ = url.port
+        return list(dict.fromkeys(values))
 
     # -- Meta ------------------------------------------------------------
     config_path: str = ""

@@ -70,7 +70,8 @@ from .openai_client import OpenAIClient
 from .thinking_cache import bind_scope as bind_thinking_scope
 from .stream_state import AnthropicStreamState, checked_openai_lines
 from .protocol_tools import UpstreamProtocolError
-from .security import RequestBodyLimitMiddleware, is_loopback_host, require_management_access
+from .runtime_state import RuntimeState, RuntimeResources, RuntimeSnapshotMiddleware
+from .security import RequestBodyLimitMiddleware, is_loopback_host, require_management_access, playground_anonymous_allowed
 from .request_data_log import RequestDataLogMiddleware
 from .vram import LocalTargetResourceError, MemoryCoordinator, VramCoordinator
 from .dashboard import DashboardState, RequestMetrics, run_runtime_monitor
@@ -349,6 +350,10 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
                 memory_coordinator=app.state.memory_coordinator,
             )
             owned_comfyui_names.append(tgt.name)
+        for pool, names in (("clients", owned_names), ("openai_clients", owned_openai_names),
+                            ("ollama_clients", owned_target_names), ("llama_cpp_clients", owned_llama_cpp_names),
+                            ("generic_openai_clients", owned_generic_openai_names), ("comfyui_clients", owned_comfyui_names)):
+            app.state.runtime_resources.managed.update(getattr(app.state, pool)[name] for name in names)
         _sync_local_target_idle_monitor(app)
         _sync_runtime_monitor(app)
         try:
@@ -370,32 +375,19 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
                 except asyncio.CancelledError:
                     pass
                 app.state.local_target_idle_monitor = None
-            for name in owned_names:
-                client = app.state.clients.pop(name, None)
-                if client is not None:
-                    await client.aclose()
-            for name in owned_target_names:
-                oc = app.state.ollama_clients.pop(name, None)
-                if oc is not None:
-                    await oc.aclose()
-            for name in owned_llama_cpp_names:
-                lc = app.state.llama_cpp_clients.pop(name, None)
-                if lc is not None:
-                    await lc.aclose()
-            for name in owned_generic_openai_names:
-                lc2 = app.state.generic_openai_clients.pop(name, None)
-                if lc2 is not None:
-                    await lc2.aclose()
-            for name in owned_openai_names:
-                oc2 = app.state.openai_clients.pop(name, None)
-                if oc2 is not None:
-                    await oc2.aclose()
-            for name in owned_comfyui_names:
-                cc = app.state.comfyui_clients.pop(name, None)
-                if cc is not None:
-                    await cc.aclose()
+            manager = app.state.runtime_resources
+            await manager.retire(set(manager.managed))
+            for name in ("clients", "openai_clients", "ollama_clients", "llama_cpp_clients", "generic_openai_clients", "comfyui_clients"):
+                pool = getattr(app.state, name, {})
+                for key, client in list(pool.items()):
+                    if client not in manager.managed and getattr(client, "_owns_client", False):
+                        pool.pop(key, None)
 
     app = FastAPI(title="fake-ollama", version=__version__, lifespan=lifespan)
+    app.state = RuntimeState()
+    app.state.runtime_resources = RuntimeResources(app)
+    app.state.actual_listener_settings = settings.model_copy(deep=True)
+    app.state.desired_settings = settings
     app.state.settings = settings
     app.state.test_listener_fallback = test_listener_fallback
     app.state.thinking_cache_namespace = secrets.token_hex(16)
@@ -415,6 +407,7 @@ def create_app(settings: Settings | None = None, *, test_listener_fallback: bool
     app.add_middleware(RequestBodyLimitMiddleware)
     _install_port_router(app)
     app.add_middleware(ForwardedCycleMiddleware)
+    app.add_middleware(RuntimeSnapshotMiddleware)
     _register_routes(app)
     return app
 
@@ -589,16 +582,11 @@ def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-de
     if backend.protocol == "anthropic":
         client = app.state.clients.get(backend.name)
         if client is None:
-            # Fall back to the first available client, mirroring the
-            # legacy ``_client_for`` behaviour used by some tests.
-            clients = app.state.clients
-            if clients:
-                return next(iter(clients.values()))
             raise HTTPException(
                 status_code=503,
                 detail=f"anthropic upstream '{backend.name}' is not initialised",
             )
-        return client
+        return app.state.runtime_resources.check(client)
     if backend.protocol == "openai" and backend.kind == "remote":
         return _openai_client_for(app, backend.name)
     if backend.protocol == "ollama":
@@ -608,7 +596,7 @@ def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-de
                 status_code=503,
                 detail=f"ollama_target '{backend.name}' is not initialised",
             )
-        return client
+        return app.state.runtime_resources.check(client)
     if backend.protocol == "openai" and backend.kind == "local":
         if isinstance(backend.source, GenericOpenAITarget):
             client = app.state.generic_openai_clients.get(backend.name)
@@ -621,7 +609,7 @@ def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-de
                 status_code=503,
                 detail=f"{label} '{backend.name}' is not initialised",
             )
-        return client
+        return app.state.runtime_resources.check(client)
     if backend.protocol == "comfyui":
         client = app.state.comfyui_clients.get(backend.name)
         if client is None:
@@ -629,7 +617,7 @@ def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-de
                 status_code=503,
                 detail=f"comfyui_target '{backend.name}' is not initialised",
             )
-        return client
+        return app.state.runtime_resources.check(client)
     raise HTTPException(
         status_code=500,
         detail=f"no client wiring for backend {backend.name!r} ({backend.protocol}/{backend.kind})",
@@ -1461,7 +1449,7 @@ def _playground_interface_for(request: Request, settings: Settings):
             if iface.auth_required and iface.is_valid_token(token):
                 return iface
         raise HTTPException(401, "invalid api token")
-    if is_loopback_host(settings.playground_host):
+    if playground_anonymous_allowed(request):
         for iface in candidates:
             if not iface.auth_required and is_loopback_host(iface.host):
                 return iface

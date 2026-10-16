@@ -36,6 +36,37 @@ def token_matches(token: str, candidates) -> bool:
     )
 
 
+def playground_anonymous_allowed(request: Request) -> bool:
+    """Verify the actual binding, direct peer and browser authority boundary."""
+    settings = request.app.state.settings
+    actual = getattr(request.app.state, "actual_listener_settings", settings)
+    server, peer = request.scope.get("server"), request.scope.get("client")
+    host = request.headers.get("host", "")
+    origin = request.headers.get("origin")
+    try:
+        authority = urlsplit("http://" + host)
+        if not authority.hostname or authority.username or authority.password or authority.path or authority.query or authority.fragment:
+            return False
+        port = authority.port or (443 if request.scope.get("scheme") == "https" else 80)
+    except ValueError:
+        return False
+    if not actual.playground_listener_enabled or not server or server[1] != actual.playground_port or not peer:
+        return False
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        return False
+    expected = request.scope.get("scheme", "http") + "://" + host
+    if (is_loopback_host(actual.playground_host) and is_loopback_host(server[0])
+            and is_loopback_host(peer[0]) and is_loopback_host(authority.hostname)
+            and port == actual.playground_port and (origin is None or origin == expected)):
+        return True
+    # Reverse proxies must be explicitly trusted by direct peer IP and exact
+    # public origin. Forwarded/X-Forwarded-* headers confer no authority.
+    allowed = getattr(settings, "playground_allowed_origins", [])
+    if peer[0] not in getattr(settings, "playground_trusted_proxy_ips", []):
+        return False
+    return (origin or expected) in allowed and urlsplit(origin or expected).netloc == host
+
+
 def management_session_token(app) -> str:
     # Separate from model credentials, never persisted, and invalidated by a
     # management credential change as well as by a process restart.

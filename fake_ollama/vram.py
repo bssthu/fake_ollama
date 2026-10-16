@@ -428,7 +428,8 @@ class _ResourceCoordinator:
         self._participants[participant.target_id] = participant
 
     def unregister(self, participant: Any) -> None:
-        self._participants.pop(participant.target_id, None)
+        if self._participants.get(participant.target_id) is participant:
+            self._participants.pop(participant.target_id, None)
 
     async def _free_mib(self) -> Optional[float]:
         return await self._provider()

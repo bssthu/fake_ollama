@@ -23,6 +23,7 @@ management requires separately configured management_access_tokens.
 from __future__ import annotations
 
 import json
+import asyncio
 import secrets
 from copy import deepcopy
 from pathlib import Path
@@ -35,6 +36,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from .security import management_page, require_management_access
 
 from .anthropic_client import AnthropicClient
+from .openai_client import OpenAIClient
+from .runtime_state import POOL_NAMES, REQUEST_SNAPSHOT
+from .listener_state import effective_settings, listener_signature
+from .config_persistence import atomic_save
 from .comfyui_client import ComfyUIClient
 from .config import (
     ApiInterface,
@@ -627,6 +632,10 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
   {"key": "memory_low_free_threshold_mib", "type": "float", "default": 2048.0, "group": "dashboard",
    "description": "当可用系统内存低于该 MiB threshold 时，可释放符合条件的 idle models（仅释放声明了 estimated_memory_gb 的模型）"},
 
+  {"key": "playground_trusted_proxy_ips", "type": "string_list", "default": [], "group": "playground",
+   "description": "Direct proxy IPs authorized for anonymous Playground access; also requires an allowed origin"},
+  {"key": "playground_allowed_origins", "type": "string_list", "default": [], "group": "playground",
+   "description": "Exact public origins for trusted proxies, such as https://play.example; forwarded headers are not trusted"},
   {"key": "playground_enabled", "type": "bool", "default": False, "group": "playground",
    "description": "模型调试页的实际启用开关。修改后请点击顶部 Save & Reload，再重启 fake-ollama"},
   {"key": "playground_host", "type": "string", "default": "127.0.0.1", "group": "playground",
@@ -904,26 +913,42 @@ def _comfyui_client_matches(
     )
 
 
-async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
-    """Atomically replace app.state.settings and rebuild client pools."""
-    old_clients: Dict[str, AnthropicClient] = dict(getattr(app.state, "clients", {}))
-    old_ollama: Dict[str, OllamaClient] = dict(getattr(app.state, "ollama_clients", {}))
-    old_llama_cpp: Dict[str, LlamaCppClient] = dict(getattr(app.state, "llama_cpp_clients", {}))
-    old_generic_openai: Dict[str, GenericOpenAIClient] = dict(
-        getattr(app.state, "generic_openai_clients", {})
-    )
-    old_comfyui: Dict[str, ComfyUIClient] = dict(getattr(app.state, "comfyui_clients", {}))
-    vram_coordinator = getattr(app.state, "vram_coordinator", None)
-    memory_coordinator = getattr(app.state, "memory_coordinator", None)
+def _remote_client_matches(client, settings, upstream):
+    return (getattr(client, "base_url", None) == upstream.base_url
+            and getattr(client, "auth_token", None) == upstream.auth_token
+            and getattr(client, "_timeout", None) == settings.timeout_seconds
+            and getattr(client, "_trust_env", None) == settings.use_system_proxy)
 
+
+def _prepare_pools(app, new_settings, created):
+    old_clients = dict(getattr(app.state, "clients", {}))
+    old_openai = dict(getattr(app.state, "openai_clients", {}))
+    old_ollama = dict(getattr(app.state, "ollama_clients", {}))
+    old_llama_cpp = dict(getattr(app.state, "llama_cpp_clients", {}))
+    old_generic_openai = dict(getattr(app.state, "generic_openai_clients", {}))
+    old_comfyui = dict(getattr(app.state, "comfyui_clients", {}))
     new_clients: Dict[str, AnthropicClient] = {}
     for up in new_settings.anthropic_upstreams:
+        existing = old_clients.get(up.name)
+        if existing is not None and _remote_client_matches(existing, new_settings, up):
+            new_clients[up.name] = existing
+            continue
         new_clients[up.name] = AnthropicClient(
             up.base_url,
             up.auth_token,
             timeout=new_settings.timeout_seconds,
             trust_env=new_settings.use_system_proxy,
         )
+        created.append(new_clients[up.name])
+    new_openai = {}
+    for up in new_settings.openai_upstreams:
+        existing = old_openai.get(up.name)
+        if existing is not None and _remote_client_matches(existing, new_settings, up):
+            new_openai[up.name] = existing
+            continue
+        new_openai[up.name] = OpenAIClient(up.base_url, auth_token=up.auth_token,
+            timeout=new_settings.timeout_seconds, trust_env=new_settings.use_system_proxy, upstream_name=up.name)
+        created.append(new_openai[up.name])
     new_ollama: Dict[str, OllamaClient] = {}
     remaining_ollama = dict(old_ollama)
     for tgt in new_settings.ollama_targets:
@@ -933,11 +958,6 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
         ):
             new_ollama[tgt.name] = existing
             continue
-        if existing is not None:
-            try:
-                await existing.aclose()
-            except Exception:  # pragma: no cover
-                pass
         new_ollama[tgt.name] = OllamaClient(
             tgt.base_url,
             timeout=new_settings.timeout_seconds,
@@ -950,9 +970,10 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             health_path=tgt.health_path,
             cwd=tgt.cwd,
             target_name=tgt.name,
-            vram_coordinator=vram_coordinator,
-            memory_coordinator=memory_coordinator,
+            vram_coordinator=None,
+            memory_coordinator=None,
         )
+        created.append(new_ollama[tgt.name])
     new_llama_cpp: Dict[str, LlamaCppClient] = {}
     remaining_llama_cpp = dict(old_llama_cpp)
     for raw_tgt in new_settings.llama_cpp_targets:
@@ -963,11 +984,6 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
         ):
             new_llama_cpp[tgt.name] = existing
             continue
-        if existing is not None:
-            try:
-                await existing.aclose()
-            except Exception:  # pragma: no cover
-                pass
         new_llama_cpp[tgt.name] = LlamaCppClient(
             tgt.base_url,
             auth_token=tgt.auth_token,
@@ -983,11 +999,12 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             cwd=tgt.cwd,
             launch_env=tgt.effective_env(),
             target_name=tgt.name,
-            vram_coordinator=vram_coordinator,
-            memory_coordinator=memory_coordinator,
+            vram_coordinator=None,
+            memory_coordinator=None,
             max_concurrent_requests=tgt.effective_max_concurrent_requests,
             request_read_timeout_seconds=tgt.request_read_timeout_seconds,
         )
+        created.append(new_llama_cpp[tgt.name])
     new_generic_openai: Dict[str, GenericOpenAIClient] = {}
     remaining_generic_openai = dict(old_generic_openai)
     for tgt in new_settings.generic_openai_targets:
@@ -997,11 +1014,6 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
         ):
             new_generic_openai[tgt.name] = existing
             continue
-        if existing is not None:
-            try:
-                await existing.aclose()
-            except Exception:  # pragma: no cover
-                pass
         new_generic_openai[tgt.name] = GenericOpenAIClient(
             tgt.base_url,
             auth_token=tgt.auth_token,
@@ -1015,11 +1027,12 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             health_path=tgt.health_path,
             cwd=tgt.cwd,
             target_name=tgt.name,
-            vram_coordinator=vram_coordinator,
-            memory_coordinator=memory_coordinator,
+            vram_coordinator=None,
+            memory_coordinator=None,
             max_concurrent_requests=tgt.max_concurrent_requests,
             request_read_timeout_seconds=tgt.request_read_timeout_seconds,
         )
+        created.append(new_generic_openai[tgt.name])
     new_comfyui: Dict[str, ComfyUIClient] = {}
     remaining_comfyui = dict(old_comfyui)
     for tgt in new_settings.comfyui_targets:
@@ -1029,11 +1042,6 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
         ):
             new_comfyui[tgt.name] = existing
             continue
-        if existing is not None:
-            try:
-                await existing.aclose()
-            except Exception:  # pragma: no cover
-                pass
         new_comfyui[tgt.name] = ComfyUIClient(
             tgt.base_url,
             auth_token=tgt.auth_token,
@@ -1050,66 +1058,68 @@ async def _swap_settings(app: FastAPI, new_settings: Settings) -> None:
             runtime_group=tgt.vram_runtime_group,
             gpu_device=tgt.gpu_device,
             workflow_config=tgt.workflow_config(),
-            vram_coordinator=vram_coordinator,
-            memory_coordinator=memory_coordinator,
+            vram_coordinator=None,
+            memory_coordinator=None,
         )
+        created.append(new_comfyui[tgt.name])
 
-    from .thinking_cache import invalidate as invalidate_thinking
-    invalidate_thinking()
-    app.state.settings = new_settings
-    app.state.clients = new_clients
-    app.state.ollama_clients = new_ollama
-    app.state.llama_cpp_clients = new_llama_cpp
-    app.state.generic_openai_clients = new_generic_openai
-    app.state.comfyui_clients = new_comfyui
-    ensure_idle_monitor = getattr(app.state, "ensure_local_target_idle_monitor", None)
-    if ensure_idle_monitor is not None:
-        ensure_idle_monitor(app)
-    ensure_runtime_monitor = getattr(app.state, "ensure_runtime_monitor", None)
-    if ensure_runtime_monitor is not None:
-        ensure_runtime_monitor(app)
+    return dict(clients=new_clients, openai_clients=new_openai, ollama_clients=new_ollama,
+                llama_cpp_clients=new_llama_cpp, generic_openai_clients=new_generic_openai,
+                comfyui_clients=new_comfyui)
 
-    for c in old_clients.values():
-        try:
-            await c.aclose()
-        except Exception:  # pragma: no cover
-            pass
-    for c in old_ollama.values():
-        if c in new_ollama.values():
-            continue
-        if c not in remaining_ollama.values():
-            continue
-        try:
-            await c.aclose()
-        except Exception:  # pragma: no cover
-            pass
-    for c in old_llama_cpp.values():
-        if c in new_llama_cpp.values():
-            continue
-        if c not in remaining_llama_cpp.values():
-            continue
-        try:
-            await c.aclose()
-        except Exception:  # pragma: no cover
-            pass
-    for c in old_generic_openai.values():
-        if c in new_generic_openai.values():
-            continue
-        if c not in remaining_generic_openai.values():
-            continue
-        try:
-            await c.aclose()
-        except Exception:  # pragma: no cover
-            pass
-    for c in old_comfyui.values():
-        if c in new_comfyui.values():
-            continue
-        if c not in remaining_comfyui.values():
-            continue
-        try:
-            await c.aclose()
-        except Exception:  # pragma: no cover
-            pass
+
+async def _swap_settings(app: FastAPI, new_settings: Settings, *, save_path=None):
+    manager = app.state.runtime_resources
+    token = REQUEST_SNAPSHOT.set(None)
+    try:
+        async with manager.lock:
+            previous = app.state.settings
+            created = []
+            try:
+                pools = _prepare_pools(app, new_settings, created)
+                effective = effective_settings(app.state.actual_listener_settings, previous, new_settings)
+                restart = listener_signature(app.state.actual_listener_settings) != listener_signature(new_settings)
+                if save_path is not None:
+                    atomic_save(save_path, new_settings)
+            except BaseException:
+                # Prepared clients have never started a backend or registered
+                # with coordinators. Dispose only their new HTTP transports.
+                for client in created:
+                    if getattr(client, "_owns_client", False):
+                        await client._client.aclose()
+                raise
+            old_clients = {c for name in POOL_NAMES for c in getattr(app.state, name, {}).values()}
+            new_clients = {c for pool in pools.values() for c in pool.values()}
+            retiring = old_clients - new_clients
+            local_new = {c for name, pool in pools.items() if name not in ("clients", "openai_clients") for c in pool.values()}
+            for client in created:
+                if client in local_new:
+                    dependencies = {old for old in (retiring | set(manager.retired)) if hasattr(old, "_base") and
+                                    (old._base == client._base or getattr(old, "target_id", None) == getattr(client, "target_id", None))}
+                    if dependencies:
+                        manager.blocked[client] = dependencies
+                    else:
+                        manager.attach(client)
+            # Publication is one event-loop turn: no request can observe half
+            # the settings/pool set; existing requests hold immutable mappings.
+            from .thinking_cache import invalidate as invalidate_thinking
+            invalidate_thinking()
+            app.state.settings = effective
+            app.state.desired_settings = new_settings
+            for name, pool in pools.items():
+                setattr(app.state, name, pool)
+            manager.version += 1
+            manager.managed.update(created)
+            app.state.reload_status = {"saved": save_path is not None, "applied": True,
+                                       "restart_required": restart, "generation": manager.version}
+            for name in ("ensure_local_target_idle_monitor", "ensure_runtime_monitor"):
+                callback = getattr(app.state, name, None)
+                if callback is not None:
+                    callback(app)
+            await manager.retire(retiring)
+            return app.state.reload_status
+    finally:
+        REQUEST_SNAPSHOT.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -1140,7 +1150,7 @@ def register_admin_routes(app: FastAPI) -> None:
 
     @router.get("/admin/config", include_in_schema=False)
     async def admin_get_config(request: Request) -> JSONResponse:
-        return JSONResponse(_settings_to_dict(request.app.state.settings))
+        return JSONResponse(_settings_to_dict(getattr(request.app.state, "desired_settings", request.app.state.settings)))
 
     @router.post("/admin/recover-runtime", include_in_schema=False)
     async def admin_recover_runtime(request: Request) -> JSONResponse:
@@ -1156,8 +1166,20 @@ def register_admin_routes(app: FastAPI) -> None:
         return JSONResponse({"recovered": recovered, "pending_prompts": client.prompt_snapshots()},
                             status_code=200 if recovered else 503)
 
+    @router.get("/admin/runtime", include_in_schema=False)
+    async def admin_runtime(request: Request) -> JSONResponse:
+        return JSONResponse({"reload": getattr(request.app.state, "reload_status", {}),
+                             "retired": request.app.state.runtime_resources.snapshots()})
+
+    @router.post("/admin/retry-cleanup", include_in_schema=False)
+    async def admin_retry_cleanup(request: Request) -> JSONResponse:
+        manager = request.app.state.runtime_resources
+        async with manager.lock:
+            await manager.retry_cleanup()
+        return JSONResponse({"retired": manager.snapshots()})
+
     @router.put("/admin/config", include_in_schema=False)
-    async def admin_put_config(request: Request) -> PlainTextResponse:
+    async def admin_put_config(request: Request) -> JSONResponse:
         try:
             data = await request.json()
         except json.JSONDecodeError as exc:
@@ -1170,19 +1192,18 @@ def register_admin_routes(app: FastAPI) -> None:
         try:
             new_settings = Settings(**data)
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"invalid config: {exc}") from exc
+            # Pydantic's string representation includes input values, which
+            # can contain credentials. Never reflect the submitted config.
+            raise HTTPException(status_code=400, detail="invalid config; check field types and routing constraints") from exc
 
         save_path = _resolve_save_path(request.app.state.settings)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        on_disk = new_settings.model_dump()
-        on_disk.pop("config_path", None)
-        save_path.write_text(
-            json.dumps(on_disk, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
         new_settings = new_settings.model_copy(update={"config_path": str(save_path)})
-
-        await _swap_settings(request.app, new_settings)
-        return PlainTextResponse(f"saved to {save_path}")
+        try:
+            result = await _swap_settings(request.app, new_settings, save_path=save_path)
+        except (OSError, ValueError):
+            return JSONResponse({"saved": False, "applied": False,
+                                 "error": "Configuration preparation or atomic save failed; previous runtime remains active"}, status_code=500)
+        return JSONResponse(result)
 
     @router.post("/admin/probe-models", include_in_schema=False)
     async def admin_probe_models(request: Request) -> JSONResponse:

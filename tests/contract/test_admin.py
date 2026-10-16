@@ -486,8 +486,11 @@ def test_admin_put_config_persists_and_reloads(admin_settings, tmp_path: Path):
     with client:
         resp = client.put("/admin/config", json=new_cfg)
         assert resp.status_code == 200, resp.text
-        # In-memory settings reflect the change.
-        assert app.state.settings.ollama_interfaces[0].port == 21999
+        # The desired port is saved, but no socket was rebound by a reload.
+        assert app.state.desired_settings.ollama_interfaces[0].port == 21999
+        assert app.state.settings.ollama_interfaces == []
+        assert resp.json()["saved"] and resp.json()["applied"]
+        assert resp.json()["restart_required"]
         assert app.state.settings.anthropic_upstreams[0].name == "newup"
         assert "newup" in app.state.clients
         assert "local" in app.state.ollama_clients

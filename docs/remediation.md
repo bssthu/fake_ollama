@@ -142,3 +142,39 @@ tests are excluded by default; live tests require explicit environment variables
 - Remaining: stages 4–6. Unreachable or purged history cannot prove completion:
   quarantine intentionally persists. Actual GPU, networking and process teardown
   acceptance is NOT RUN.
+
+## Stage 4 handoff
+
+- Files: `runtime_state.py`, `listener_state.py`, `config_persistence.py`,
+  `admin.py`, `server.py`, `security.py`, remote clients, config/schema and
+  management UI; `test_reload_safety.py` and updated listener fixtures.
+- Reload commits are serialized. Requests pin a complete settings/pool snapshot
+  through response completion; unchanged remote transports are reused, including
+  the separate remote OpenAI pool. Old resources close only after references drain.
+- Local replacements on the same endpoint/target stay unavailable (503) until
+  every conflicting retired generation has closed. A long stream can continue;
+  after 30 seconds its retirement reports `waiting_for_requests`, and conflicting
+  new work remains rejected. Close attempts wait at most 30 seconds per batch;
+  pending/failed cleanup remains tracked, never reported as released.
+- `GET /admin/runtime` exposes reload/retirement states. Authenticated
+  `POST /admin/retry-cleanup` retries failed closure. It does not terminate an
+  active stream or override a ComfyUI quarantine.
+- Desired configuration is saved using same-directory temporary + fsync +
+  `os.replace`. Construction/write failures preserve the previous file/runtime
+  and close prepared HTTP transports. Responses separate `saved`, `applied`,
+  `restart_required`, and generation. Validation errors omit submitted values.
+- Listener bindings are immutable until restart. Removed/moved model ports fail
+  closed; management remains on its bound port; Playground port moves disable the
+  old route. A host change cannot weaken authentication on the existing socket.
+- Anonymous Playground requires actual loopback binding, loopback server/peer,
+  loopback Host with correct port and same Origin. Explicit proxy IP + exact
+  allowed-origin lists support trusted proxies; forwarded headers confer no trust.
+- Initial regressions against stage 3: **3 failed** (unrelated Anthropic reload,
+  missing remote OpenAI pool, public Playground host downgrade).
+- Full command: `.venv/Scripts/python -m pytest -q --basetemp=.tmp/rectify-s4-full
+  -p no:cacheprovider --tb=short`: **613 passed, 5 deselected**. Added deterministic
+  stream barriers, concurrent commits, transport changes, rollback and boundary
+  checks. Two additional tests cover multi-generation local drain and cleanup retry.
+- Remaining: stages 5–6. Tests use synthetic files and mock/ASGI transports.
+  Real socket rebinding, upstream/GPU operation and browser visual acceptance
+  were not run; socket changes require a process restart by design.

@@ -47,7 +47,7 @@ def _settings() -> Settings:
 
 def test_playground_static_page_and_security_headers():
     app = create_app(_settings())
-    with TestClient(app, base_url="http://testserver:21431") as client:
+    with TestClient(app, base_url="http://127.0.0.1:21431", client=("127.0.0.1", 50000)) as client:
         response = client.get("/playground/")
         css = client.get("/playground/playground.css")
         js = client.get("/playground/playground.js")
@@ -162,7 +162,7 @@ def test_playground_static_page_and_security_headers():
 
 def test_playground_port_only_exposes_playground_and_model_surfaces():
     app = create_app(_settings())
-    with TestClient(app, base_url="http://testserver:21431") as client:
+    with TestClient(app, base_url="http://127.0.0.1:21431", client=("127.0.0.1", 50000)) as client:
         root = client.get("/", follow_redirects=False)
         admin = client.get("/admin/")
         dashboard = client.get("/dashboard/")
@@ -177,7 +177,7 @@ def test_playground_port_only_exposes_playground_and_model_surfaces():
 
 def test_playground_api_key_selects_the_matching_interface_models():
     app = create_app(_settings())
-    with TestClient(app, base_url="http://testserver:21431") as client:
+    with TestClient(app, base_url="http://127.0.0.1:21431", client=("127.0.0.1", 50000)) as client:
         missing = client.get("/playground/api/models")
         first = client.get(
             "/playground/api/models",
@@ -239,7 +239,7 @@ def test_video_understanding_has_single_turn_upload_operation():
         }
     )
     app = create_app(settings)
-    with TestClient(app, base_url="http://testserver:21431") as client:
+    with TestClient(app, base_url="http://127.0.0.1:21431", client=("127.0.0.1", 50000)) as client:
         response = client.get(
             "/playground/api/models", headers={"Authorization": "Bearer key-a"}
         )
@@ -274,7 +274,7 @@ def test_video_understanding_has_single_turn_upload_operation():
 def test_disabled_playground_does_not_register_static_route():
     settings = _settings().model_copy(update={"playground_enabled": False})
     app = create_app(settings)
-    with TestClient(app, base_url="http://testserver:21431") as client:
+    with TestClient(app, base_url="http://127.0.0.1:21431", client=("127.0.0.1", 50000)) as client:
         assert client.get("/playground/").status_code == 404
         assert client.get(
             "/playground/api/models", headers={"x-api-key": "key-a"}

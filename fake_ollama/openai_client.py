@@ -49,6 +49,7 @@ class OpenAIClient:
         self.base_url = base_url.rstrip("/")
         self.auth_token = auth_token
         self._timeout = timeout
+        self._trust_env = trust_env
         self.target_id = f"openai:{upstream_name}"
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout, trust_env=trust_env)
