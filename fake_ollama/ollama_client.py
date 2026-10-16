@@ -15,7 +15,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 import httpx
 
 from . import runtime_ownership
-from .process_utils import run_stop_command
+from .process_utils import run_stop_command, process_tree_running
 from .config import outbound_cycle_headers
 from .process_utils import create_managed_subprocess_shell, terminate_process_tree
 from .request_data_log import (
@@ -362,6 +362,7 @@ class OllamaClient:
                     "Ollama target is unavailable and fake-ollama is shutting down; "
                     "refusing auto-start"
                 )
+            await runtime_ownership.discard_finished_process(self, inspect=process_tree_running, terminate=terminate_process_tree)
             if self._ownership.process is None and not self._started_by_us:
                 logger.info("starting Ollama target: %s", self._start_command)
                 self._process = await create_managed_subprocess_shell(

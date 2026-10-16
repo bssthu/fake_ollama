@@ -5,18 +5,21 @@ then stages 1–6, with a separate local commit for each completed stage.
 Production `config.json`, its backups, paid services and GPU workloads are excluded.
 Tests use synthetic configuration and mocked upstreams. Integration, e2e and GPU
 tests are excluded by default; live tests require explicit environment variables.
+Only the isolated Python process-tree tests were explicitly selected separately.
+Historical handoffs below retain their original red/green results and then-current
+remaining work; the checklist and final verification describe the completed state.
 
 ## Stage checklist
 
 | Stage | Issue / evidence | Repair and regression evidence | Remaining boundary |
 | --- | --- | --- | --- |
-| 0 | Unknown/retired ports borrowed the first interface; nine new tests failed against the old implementation | Both router and interface lookup fail closed. Python-only `create_app(test_listener_fallback=True)` explicitly enables synthetic test routing and uses the correct surface's auth. Ten added tests | Real socket rebinding and listener snapshots belong to stage 4 |
+| 0 | Unknown/retired ports borrowed the first interface; nine new tests failed against the old implementation | Both router and interface lookup fail closed. Python-only `create_app(test_listener_fallback=True)` explicitly enables synthetic test routing and uses the correct surface's auth. Ten added tests | Actual bindings remain authoritative until restart; real socket rebinding NOT RUN |
 | 1 | Global thinking cache used text/tool ID and last-entry fallback; two revised negative tests failed on old code | Full normalized history + assistant content, scoped to credential/backend/wire model/config; explicit reasoning wins; bounded TTL/LRU; reload invalidates pending writers; signature policy | Exact replay within the same identity/history is intentionally the same association; truncated/edited history cannot recover thinking |
 | 2 | Tools were dropped, result IDs mismatched, indices collided, errors/EOF became success; 14 new regressions failed on old code | Ordered result association; complete tool arguments/IDs/indices; monotonic reverse indices; thinking preservation; explicit terminal/error state | Live provider versions NOT RUN; tool JSON is buffered until validated |
 | 3 | Acquired semaphore leaked on cancellation; cleanup held coordinator lock; cancelled ComfyUI prompt lost its owner | Joined permit cleanup; dedicated shutdown error; shielded bounded lease cleanup; prompt reconciliation and shared runtime/GPU quarantine | An unreachable runtime stays quarantined until verified recovery; no real GPU run |
-| 4 | Reload publication, drain, actual listener security, atomic persistence | Pending | Resource generations and rollback |
-| 5 | Backend and process-tree ownership | Pending | Windows execution; report POSIX skips |
-| 6 | Tool controls, usage, bounded module extraction and documentation | Pending | Public compatibility |
+| 4 | Old clients closed before publication, missing remote OpenAI pool, unsynchronized reload and listener auth downgrade | Serialized prepare/publish; request-pinned generations; reference-counted drain; rollback and atomic save; actual listener/peer security. `test_reload_safety.py` and CLI transport regression | Long streams retain old resources; conflicting local starts return 503. Socket changes require restart; real sockets/browser NOT RUN |
+| 5 | External/shared services stopped by ordinary close; launcher exit mistaken for tree completion | Shared ownership and bounded stop commands; Windows Job Object with process-handle verification; cleanup failure retained. `test_runtime_ownership.py`, isolated `test_owned_process_tree.py` | Windows isolated processes passed; POSIX skipped. Deliberately session-escaping POSIX daemons need an explicitly authorized stop command |
+| 6 | Tool constraints dropped, unknown usage reported as zero, oversized server module | Bidirectional tool controls, explicit unsupported-constraint 400, usage-only chunks and partial counts; thin routes and bounded module extraction. 32 converter/control tests + 55 HTTP contracts; 11 lifecycle/security follow-ups | Live providers/GPU NOT RUN; incompatible controls rejected; unknown usage remains absent/null |
 
 ## Stage 0 handoff
 
@@ -223,3 +226,119 @@ tests are excluded by default; live tests require explicit environment variables
   cover stop timeout, repeated cancellation, failed cleanup and two-client use.
 - Reference: [Microsoft Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
 - Remaining: stage 6; real backend/GPU and POSIX acceptance remain NOT RUN.
+
+## Stage 6 handoff
+
+- Protocol files: `protocol_controls.py`, `protocol_usage.py`, `protocol_tools.py`,
+  `converters.py`, `reverse_converters.py`, and the extracted protocol handlers.
+  OpenAI `none/auto/required/named function` maps to Anthropic
+  `none/auto/any/tool`; `parallel_tool_calls` maps to the inverse
+  `disable_parallel_tool_use`. Reverse mapping preserves both constraints.
+  Native Ollama can honor `none` by removing tools and accepts `auto`; forced
+  choices or a single-call guarantee it cannot express return an explanatory 400.
+  Unsupported tool types, choices and conversion-specific streaming options
+  are rejected rather than silently discarded. Native passthrough is preserved.
+- OpenAI streaming honors `stream_options.include_usage`: regular chunks carry
+  `usage: null`, and a final `choices: []` usage chunk precedes `[DONE]`.
+  The reverse adapter requests upstream usage and accepts a usage-only chunk
+  after the finish reason. Unknown counts stay absent/null, a known zero remains
+  zero, and a total is calculated only when both components are known. Ollama
+  and Anthropic conversions follow the same known/unknown rules. Malformed or
+  missing Anthropic `count_tokens` output returns 502 instead of a fabricated zero.
+- The final consistency audit also validates non-stream Anthropic tool IDs,
+  names and argument objects, rejects malformed OpenAI history argument JSON,
+  and gives missing native Ollama response IDs a response-unique identity.
+  Tool presence determines tool completion semantics in non-stream output too.
+- Architecture: `server.py` is now a 169-line composition root retaining old helper
+  exports. `api/routes.py` delegates directly to bounded handlers. Startup and
+  monitors live in `app_lifecycle.py`; listener/auth/dispatch in `routing.py`;
+  chat orchestration in `protocol_handlers.py`; media/H3 orchestration in
+  `media_handlers.py`; validation in `request_validation.py`; Playground support
+  in `playground_support.py` and routes in `playground.py`; model metadata and
+  shared error handling in `model_catalog.py` and `proxy_errors.py`.
+  Existing Base/FL2VA/Ref2VA selection and public route compatibility are retained.
+  This extraction adds no backend framework or common inheritance hierarchy.
+- Lifecycle follow-up: all three local clients can restart after their previously
+  owned process tree is confirmed dead. A live or unknown tree continues to block
+  a duplicate start. Failed Windows termination retains process handles so a
+  retry cannot lose evidence of surviving members. Process inspection is tested
+  for all three states, including launcher-first exit in isolated Windows tests.
+- Listener follow-up: the CLI sets `proxy_headers=False` on every Uvicorn listener,
+  preventing ASGI peer/scheme rewriting before admission checks. The regression
+  runs the real Uvicorn middleware stack with forged forwarding headers and no
+  network socket. Explicit HTTPS proxy origins also support browser navigation
+  without Origin, using the configured authority and trusted direct peer. An
+  unlisted supplied Origin is still rejected. Custom ASGI deployments must also
+  disable proxy-header rewriting as documented in README.
+- Red evidence: the initial 26 protocol control/usage cases all failed against
+  stage 5; six additional non-stream consistency cases failed before their fix;
+  missing count-token output returned 200 instead of 502; three restart cases
+  failed before dead-tree ownership was cleared. The final transport/proxy run
+  (`--basetemp=.tmp/rectify-s6-peer-red2`, selecting `cli_listeners or explicit_proxy`)
+  reported **2 failed, 3 passed, 19 deselected** before repair. Its full focused
+  rerun reported **24 passed**. These red results are retained as audit history.
+- Added protocol verification: `test_protocol_controls_usage.py` has 32 cases;
+  `test_controls_usage_http.py` has 55 cases, using ASGI and mocked upstreams to
+  inspect actual payloads/output across six adaptation directions, streamed and
+  non-streamed. Unknown, partial, zero and complete counts are covered, along
+  with control mapping, explicit rejection and usage-only framing. Nine restart
+  cases and two transport/proxy cases complete the 98 new default cases in this stage.
+- Official references: [OpenAI Chat Completions request and stream options](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
+  [Anthropic tool definitions and tool choice](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools),
+  [Anthropic parallel tool use](https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use).
+  Provider/model-specific thinking restrictions are not flattened into a blanket
+  gateway rule; upstream validation still applies.
+
+## Final verification and commits
+
+All commands ran from the repository root using the existing virtual environment.
+The full offline run used synthetic configuration and mock transports:
+
+```powershell
+.venv\Scripts\python -m pytest -q --basetemp=.tmp/rectify-s6-delivery -p no:cacheprovider --tb=short
+```
+
+Result: **727 passed, 10 deselected, 3 warnings in 35.28 seconds**. The warnings
+are dependency deprecations: the existing Starlette/httpx warning, plus two
+Uvicorn/websockets warnings newly exercised by the real middleware-stack test.
+No test failed. Default coverage increased by **242 cases from the 485 baseline**:
+
+| Stage | Added default cases | Cumulative default cases | Local commit |
+| --- | ---: | ---: | --- |
+| 0: listener boundary and offline defaults | 10 | 495 | `dc25884` |
+| 1: thinking isolation | 32 | 527 | `49cf8b7` |
+| 2: tools and stream completion | 48 | 575 | `753960d` |
+| 3: cancellation and prompt ownership | 18 | 593 | `d0c57f2` |
+| 4: consistent reload and listener security | 22 | 615 | `91c72fe` |
+| 5: shared runtime and process-tree ownership | 14 | 629 | `ba31bfa` |
+| 6: controls, usage, extraction and final follow-ups | 98 | 727 | This stage's commit |
+
+Cumulative counts include the focused additions recorded in each historical
+handoff, not an invented full-suite run at every intermediate count. The default
+deselection count rose from 5 to 10 because five isolated process-tree cases
+were added; existing default cases were retained.
+
+Separate Windows process verification after the final lifecycle changes:
+
+```powershell
+.venv\Scripts\python -m pytest -q tests/unit/test_owned_process_tree.py -m e2e --basetemp=.tmp/rectify-s6-process-final -p no:cacheprovider --tb=short
+```
+
+Result: **4 passed, 1 skipped**. The skipped case is POSIX-only. The four passing
+cases execute real isolated Python process trees; they do not start model services.
+
+Remaining acceptance boundaries:
+
+- **NOT RUN:** paid/real provider calls, live ComfyUI/GPU workloads, real listener
+  rebinding/restart and browser visual checks. Use a separate synthetic config
+  and explicitly authorized services for such acceptance; never use production
+  configuration as a test fixture. Exercise a long stream during reload and
+  inspect `/admin/runtime`; restart to verify socket changes on the network.
+- **NOT RUN:** POSIX process behavior. Run the scoped process-tree command above
+  in a POSIX environment with its Python dependencies to execute the skipped
+  TERM-ignoring child case; Windows evidence cannot substitute for that run.
+- Unknown ComfyUI completion or failed process cleanup intentionally retains
+  quarantine/ownership. Explicit recovery verifies completion; it does not
+  forcibly admit work or interrupt unrelated runtime jobs.
+- Commits are local only. Production `config.json`, backups, credentials and
+  unrelated working data were not modified or committed.

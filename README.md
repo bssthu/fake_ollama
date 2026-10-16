@@ -35,7 +35,7 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-- 每个 `ollama_interfaces[*]` / `api_interfaces[*]` 都是独立的 uvicorn 监听。你可以同时开多个 Ollama 接口（例如本机 21434 + 局域网 0.0.0.0:21434），每个挂不同的白名单和 token。
+- 每个 `ollama_interfaces[*]` / `api_interfaces[*]` 都是独立的 uvicorn 监听。你可以同时开多个 Ollama 接口（例如本机 21434 + 局域网 0.0.0.0:21437），每个挂不同的白名单和 token，端口不能重复。
 - `access_tokens` 为空 = 该接口不需鉴权；非空 = 该接口的所有请求都必须带 `x-api-key` 或 `Authorization: Bearer`。
 - `exposed_models` 是该接口允许看到 / 请求的模型列表，元素是 `{model, target, alias?}` 三元组；不在白名单里的模型在该接口上 404。
 - admin 接口（`admin_host` / `admin_port`）只服务 `/admin/*`，**不会**出现在任何 `ollama_interfaces` / `api_interfaces` 上；同样，`/api/*` 与 `/v1/*` 也**不会**出现在 admin 端口。
@@ -57,8 +57,32 @@
 - **本地内存预检**：部分模型（如 SenseNova / JoyAI 这类会把一部分计算 offload 到内存的 workflow）除显存外还需占用大量主机内存，可在 `model_profiles` 里填 `estimated_memory_gb`；逻辑与显存预检一致，启动前评估可用系统内存并尝试回收空闲模型
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP）
 - **零依赖 Web 编辑器**：按「Forward / Reverse / Shared / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
-- **网络错误安全降级**：上游连接断开 / 超时统一返回 502 / 流式错误帧
+- **明确的失败状态**：连接失败 / 超时返回 502；响应已经开始时发送协议错误帧。上游错误或缺少结束标志不会伪装成正常完成；上游 HTTP 错误保留状态码。
 - `pytest` + `httpx.MockTransport` 离线单测
+
+## 热重载与运行时安全
+
+Admin 的 Save & Reload 返回 `saved`、`applied`、`restart_required` 和配置代次。保存使用同目录临时文件、刷新落盘和原子替换；准备资源或替换文件失败时，旧文件和旧运行配置继续使用。请求从开始到流结束固定使用同一代配置与客户端，无关配置保存会复用原有连接。
+
+| 变更 | 生效方式 |
+| --- | --- |
+| 模型白名单、profile、上游 URL/token、超时、系统代理 | 新请求使用新代配置；已有请求继续使用旧代 |
+| 监听 host、port、接口名称/角色、新增监听 | 需重启才能绑定新 socket；不能通过保存把旧公网监听变成本机免鉴权 |
+| 移除或改动模型接口端口 | 旧端口立即拒绝模型请求；新端口在重启后监听 |
+| Admin/Dashboard 端口 | 重启前保留实际管理端口；Playground 改端口则关闭旧路由 |
+| 相同端点的本地后端换代 | 旧代请求结束且清理完成前，新代返回 503，避免重叠启动 |
+
+旧代长流不会被强行截断；30 秒后退休状态显示 `waiting_for_requests`。一批关闭操作最多等待 30 秒，未完成或失败的清理继续被跟踪。管理鉴权保护的 `GET /admin/runtime` 可查看状态，`POST /admin/retry-cleanup` 可重试失败的关闭。
+
+本地服务区分外部实例、本进程启动的实例和明确授权管理的外部实例。单独配置 `stop_command` 不代表拥有服务；若需要管理外部服务，显式设置 target 的 `manage_external_runtime: true`，且仅在实际使用后才执行停止。`stop_timeout_seconds` 默认 30 秒（大于 0、最多 300）。同端点及 ComfyUI `runtime_group` 的客户端共享所有权；关闭一个客户端会保留其他客户端仍在使用的服务。停止失败保留资源用于恢复。Windows 使用 Job Object 跟踪子进程，包括启动器提前退出的情况；不会按进程名全局终止服务。
+
+ComfyUI 请求取消、超时或提交应答丢失后，会核查 `/history` 和 `/queue`。只删除本请求仍在队列中的 prompt；正在运行的 prompt 等待确认完成，不调用全局 interrupt。无法确认时保留 prompt 记录并隔离 runtime/GPU，拒绝冲突新工作。可通过 Dashboard 状态及 `POST /admin/recover-runtime`（`{"target":"配置中的名称"}`）观察、重试恢复；无法访问或历史已被清理时，不会猜测任务已停止。
+
+匿名 Playground 同时检查实际 loopback 监听、连接来源、Host 端口与同源 Origin，忽略伪造的 forwarded 头。合法反代可同时配置 `playground_trusted_proxy_ips`（直接代理 IP）和 `playground_allowed_origins`（完整 http(s) origin，无路径）；代理需保留公开 Host，页面导航不带 Origin 时仍检查该 Host 是否属于允许的 origin。内置启动器关闭 Uvicorn 的代理头改写；自行部署 ASGI 时也应使用 `--no-proxy-headers`，保留直接连接来源。公网监听默认仍需模型接口 token；修改 host 为 `127.0.0.1` 不能降低旧 socket 的鉴权要求。
+
+Thinking 回查仅匹配同一凭据主体、后端、上游模型和完整规范化历史中的确切 assistant 轮次；不会用“最近一条”或相似文本补齐。明确提供的 reasoning 优先。缓存最多 512 项、保留 15 分钟，重载即失效。Anthropic 来源默认 `allow_unsigned_thinking: false`、`missing_thinking_policy: "omit"`；需要无签名 reasoning 的兼容端应显式开启前者，也可将缺失策略设为 `"error"`。网关保留收到的 signature，但不会伪造 signature。
+
+整改证据、逐阶段测试和残余边界见 [整改清单](docs/remediation.md)。默认测试排除 integration/e2e/gpu；Windows 隔离进程测试另行运行。真实 GPU、付费上游、POSIX 进程树及本轮浏览器视觉验收未执行。
 
 ## 快速开始
 
@@ -225,7 +249,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 ```
 
 - `auto_start: false`：fake-ollama 只转发，不接管 daemon。
-- `auto_start: true`：health check 失败时执行 `start_command`；`stop_command` / `idle_timeout_seconds` 控制空闲回收。
+- `auto_start: true`：health check 失败时执行 `start_command`；`stop_command` / `idle_timeout_seconds` 控制具有所有权的实例回收。管理外部实例还需 `manage_external_runtime: true`；停止命令受 `stop_timeout_seconds` 限制。
 - 模型名匹配按 Ollama 规则：`foo` 与 `foo:latest` 等价；省略 tag 只代表 `latest`。
 - 每个本地模型的显存估算在 `model_profiles[*].estimated_vram_gb` 里配置。请求触发模型加载前，fake-ollama 调用 `nvidia-smi` 检查可用显存；不足时按 LRU 卸载其他空闲超过 60 秒的本地模型，每轮重新读真实 free VRAM。
 - 媒体模型可再配置 `request_vram_headroom_gb`（已驻留模型的单次推理瞬时余量）、`min_free_vram_gb`（请求准入及运行观测下限）、`vram_cleanup_policy=keep|adaptive|unload` 和 `exclusive_gpu`。余量会按实际分辨率、视频帧数及 workflow 原生 batch 放大；非原生 batch 的串行循环不会重复放大。运行中会持续记录最低空闲显存；越过观测下限时不抢在 ComfyUI DynamicVRAM 分配器之前中断健康 prompt，而是在当前任务完成后清理运行时。真实 CUDA OOM 或 ComfyUI workflow 错误仍会使请求失败。
@@ -877,12 +901,14 @@ settings.resolve_request("deepseek-r1", interface_name="api")
 - 命中 anthropic_upstreams / openai_upstreams 提供的模型 → 透传到该上游（带鉴权壳）。
 - 未命中 / 未在白名单 → 404 `model '...' is not exposed on interface 'xxx'`。
 
-`POST /v1/messages/count_tokens` 命中本地 target 时用本地估算；命中外露 upstream 时透传。
+`POST /v1/messages/count_tokens` 命中 Anthropic 来源时转发其计数接口；其他后端使用本地估算。Anthropic 上游缺少有效计数时返回 502，不报告虚假的 0。
 
 支持的转换：
 
 - 文本消息、`system`、`max_tokens` / `temperature` / `top_p` / `top_k` / `stop_sequences`
-- **工具调用**：`tools` + `tool_use` + `tool_result`（流式与非流式都支持）
+- **工具调用**：流式与非流式都保留名称、参数、ID 和结束原因。Ollama 输出包含 `function.index`；回传 `role=tool/tool_name` 按调用顺序关联，同名多次调用受支持。数量、顺序或名称冲突返回 400。流式工具 JSON 在校验完整后发出；不完整 JSON、上游错误或提前 EOF 输出错误，不报告成功。
+- **工具控制**：OpenAI `none/auto/required/指定函数` 对应 Anthropic `none/auto/any/tool`；`parallel_tool_calls` 与 `disable_parallel_tool_use` 互相映射。原生 Ollama 无法表达强制或仅单次调用时返回 400；`none` 通过不提供工具实现。其他无法表达的 tool_choice 形式明确拒绝。
+- **用量**：转换后的 OpenAI 流支持 `stream_options: {"include_usage": true}`，结束前发出 `choices: []` 的 usage 帧，其他帧 `usage: null`。转向 OpenAI 上游的流主动请求用量。未知计数省略，已知的 0 保留；只有输入、输出均已知才计算总数。全部未知时最终 OpenAI usage 为 null；流中断不会补造用量。原生 OpenAI 直通保留上游行为。
 - Anthropic base64 `image` 块：转到 Ollama 时变成 `images` 数组；转到 llama.cpp 时变成 OpenAI `image_url` data URI
 
 让 Claude Code 走它：
@@ -923,14 +949,18 @@ claude
 ```powershell
 pip install -e ".[test]"
 
-# 离线单测
+# 默认离线单元和契约测试，排除 integration/e2e/gpu
 pytest
 
-# live 集成测试（需要 .env 里有 FAKE_OLLAMA_TEST_BASE_URL / FAKE_OLLAMA_TEST_AUTH_TOKEN）
+# 单独运行隔离进程树测试；只启动短生命周期 Python 子进程
+pytest tests/unit/test_owned_process_tree.py -m e2e
+
+# live 集成测试需明确授权，并在当前进程环境中设置
+# FAKE_OLLAMA_TEST_BASE_URL / FAKE_OLLAMA_TEST_AUTH_TOKEN
 pytest -m integration
 ```
 
-`tests/conftest.py` 在缺少凭据时自动跳过 `@pytest.mark.integration` 用例。
+`tests/conftest.py` 不读取开发机 `.env`，在缺少环境凭据时自动跳过 `@pytest.mark.integration` 用例。普通测试使用临时合成配置，不读取项目根目录的真实 `config.json`。
 
 ## 手动验证示例
 
@@ -1000,9 +1030,9 @@ python -m fake_ollama --no-request-data-log
 - **启动报端口冲突**：两个 interface（或与 admin / dashboard）共用了同一个 host:port。
 - **找不到日志文件**：默认相对 CWD：`logs/fake_ollama.log` 与 `logs/fake_ollama.requests.jsonl`。在项目根目录启动，或显式 `--log-file` / `--request-data-log-file`。
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`。
-- **503 `Insufficient GPU VRAM`**：某个本地模型在 `model_profiles` 里配了 `estimated_vram_gb`，但 `nvidia-smi` 显示当前可用显存不足；fake-ollama 已尝试回收空闲超过 60 秒的模型仍不够。降低估算、等模型空闲、配 `stop_command`，或手动释放显存。
+- **503 `Insufficient GPU VRAM`**：某个本地模型在 `model_profiles` 里配了 `estimated_vram_gb`，但可用显存不足。核对估算、等待模型空闲或手动释放显存；若需用停止命令管理外部服务，还须显式设置 `manage_external_runtime`。prompt 失联或关闭失败导致的隔离应先通过管理恢复接口核查，不能用降低估算绕过。
 - **503 `Insufficient system RAM`**：某个本地模型配了 `estimated_memory_gb`，但当前可用系统内存不足；处理方式同上（降低估算、等模型空闲、释放内存）。
-- **400 thinking content must be passed back**（DeepSeek）：某轮启用 thinking 但下一轮历史没把 `thinking` 块带回。fake-ollama 已做缓存回查 + auto+show_thinking=false 时注入 disabled；要 thinking 请显式 `"thinking_mode": "enabled"`。
+- **缺少 thinking / signature**：回传完整、未编辑的历史或明确携带 reasoning；截断、改写的历史不会命中缓存。兼容端需要无签名 thinking 时显式配置 `allow_unsigned_thinking`；官方 Anthropic 的签名要求不能用这项配置绕过。
 
 ## 参考文档
 

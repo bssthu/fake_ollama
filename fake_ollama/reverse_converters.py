@@ -27,6 +27,9 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 
+from .protocol_controls import anthropic_tool_controls
+from .protocol_usage import known_counts, token_count
+
 def _strip_data_uri(value: str) -> str:
     if value.startswith("data:") and "," in value:
         return value.split(",", 1)[1]
@@ -228,6 +231,7 @@ def anthropic_to_ollama_chat(
         body["options"] = options
     if tools_out:
         body["tools"] = tools_out
+    anthropic_tool_controls(payload, body, ollama=True)
     return body
 
 
@@ -304,22 +308,6 @@ def _tool_use_to_openai_call(block: Dict[str, Any], index: int) -> Dict[str, Any
             "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
         },
     }
-
-
-def _anthropic_tool_choice_to_openai(value: Any) -> Any:
-    if not isinstance(value, dict):
-        return value
-    kind = value.get("type")
-    if kind == "auto":
-        return "auto"
-    if kind == "any":
-        return "required"
-    if kind == "tool":
-        return {
-            "type": "function",
-            "function": {"name": value.get("name", "")},
-        }
-    return value
 
 
 def anthropic_to_openai_chat(
@@ -401,8 +389,6 @@ def anthropic_to_openai_chat(
             body[dst] = payload[src]
     if payload.get("stop_sequences"):
         body["stop"] = payload["stop_sequences"]
-    if payload.get("tool_choice") is not None:
-        body["tool_choice"] = _anthropic_tool_choice_to_openai(payload["tool_choice"])
 
     tools_out: List[Dict[str, Any]] = []
     for t in payload.get("tools") or []:
@@ -420,6 +406,9 @@ def anthropic_to_openai_chat(
         )
     if tools_out:
         body["tools"] = tools_out
+    anthropic_tool_controls(payload, body)
+    if body["stream"]:
+        body["stream_options"] = {"include_usage": True}
     return body
 
 
@@ -536,7 +525,7 @@ def ollama_chat_to_anthropic(
         blocks.append(
             {
                 "type": "tool_use",
-                "id": tc.get("id") or f"call_{i}",
+                "id": tc.get("id") or "call_" + uuid.uuid4().hex,
                 "name": fn.get("name", ""),
                 "input": args,
             }
@@ -555,10 +544,7 @@ def ollama_chat_to_anthropic(
         "content": blocks,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": int(response.get("prompt_eval_count") or 0),
-            "output_tokens": int(response.get("eval_count") or 0),
-        },
+        "usage": known_counts(response, (("prompt_eval_count", "input_tokens"), ("eval_count", "output_tokens"))),
     }
 
 
@@ -605,8 +591,6 @@ def openai_chat_to_anthropic(
         )
 
     usage = response.get("usage") or {}
-    prompt_tokens = int(usage.get("prompt_tokens") or 0)
-    completion_tokens = int(usage.get("completion_tokens") or 0)
     stop_reason = _OPENAI_FINISH_TO_STOP.get(choice.get("finish_reason"), "end_turn")
     if tool_calls:
         stop_reason = "tool_use"
@@ -618,10 +602,7 @@ def openai_chat_to_anthropic(
         "content": blocks,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": prompt_tokens,
-            "output_tokens": completion_tokens,
-        },
+        "usage": known_counts(usage, (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"))),
     }
 
 
@@ -679,7 +660,7 @@ async def openai_stream_to_anthropic_events(
                 "model": anthropic_model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {},
             },
         },
     )
@@ -693,8 +674,8 @@ async def openai_stream_to_anthropic_events(
     thinking_open = False
     pending_tools: Dict[int, Dict[str, Any]] = {}
     stop_reason = "end_turn"
-    input_tokens = 0
-    output_tokens = 0
+    input_tokens = None
+    output_tokens = None
     hidden_reasoning_parts: List[str] = []
 
     async for raw in lines:
@@ -719,8 +700,10 @@ async def openai_stream_to_anthropic_events(
             return
 
         usage = chunk.get("usage") or {}
-        input_tokens = int(usage.get("prompt_tokens") or input_tokens)
-        output_tokens = int(usage.get("completion_tokens") or output_tokens)
+        if "prompt_tokens" in usage:
+            input_tokens = token_count(usage["prompt_tokens"])
+        if "completion_tokens" in usage:
+            output_tokens = token_count(usage["completion_tokens"])
 
         choices = chunk.get("choices") or []
         if not choices:
@@ -871,7 +854,7 @@ async def openai_stream_to_anthropic_events(
         {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "usage": known_counts({"in": input_tokens, "out": output_tokens}, (("in", "input_tokens"), ("out", "output_tokens"))),
         },
     )
     yield ("message_stop", {"type": "message_stop"})

@@ -34,6 +34,7 @@ class ThreadEntry(ctypes.Structure):
 
 class WindowsJob:
     def __init__(self):
+        self._retained_process_handles = {}
         self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         signatures = {
             "CreateJobObjectW": ([ctypes.c_void_p, w.LPCWSTR], w.HANDLE),
@@ -109,7 +110,11 @@ class WindowsJob:
 
     def process_handles(self):
         if not self.handle:
-            return []
+            return list(self._retained_process_handles.values())
+        for pid, handle in list(self._retained_process_handles.items()):
+            if self.kernel.WaitForSingleObject(handle, 0) == 0:
+                self.kernel.CloseHandle(handle)
+                del self._retained_process_handles[pid]
         capacity = 16
         while True:
             data = ctypes.create_string_buffer(8 + capacity * ctypes.sizeof(ctypes.c_size_t))
@@ -120,21 +125,31 @@ class WindowsJob:
             capacity *= 2
         count = w.DWORD.from_buffer(data, 4).value
         pids = (ctypes.c_size_t * count).from_buffer(data, 8)
-        handles = []
+        handles = {}
         try:
             for pid in pids:
+                if pid in self._retained_process_handles:
+                    continue
                 handle = self.kernel.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
                 if handle:
-                    handles.append(handle)
+                    handles[pid] = handle
                 elif ctypes.get_last_error() != 87:  # already exited
                     raise ctypes.WinError(ctypes.get_last_error())
-            return handles
+            self._retained_process_handles.update(handles)
+            return list(self._retained_process_handles.values())
         except BaseException:
-            for handle in handles:
+            for handle in handles.values():
                 self.kernel.CloseHandle(handle)
             raise
 
+    def running(self):
+        return bool(self.active() or any(self.kernel.WaitForSingleObject(handle, 0) != 0
+                    for handle in self._retained_process_handles.values()))
+
     def close(self):
+        for handle in getattr(self, "_retained_process_handles", {}).values():
+            self.kernel.CloseHandle(handle)
+        self._retained_process_handles = {}
         if getattr(self, "handle", None):
             self.kernel.CloseHandle(self.handle)
             self.handle = None

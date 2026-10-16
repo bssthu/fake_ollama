@@ -125,3 +125,25 @@ async def test_unknown_process_identity_never_means_tree_is_gone():
     from fake_ollama.process_utils import terminate_process_tree
     process = type("Unknown", (), {"returncode": 0, "pid": 1})()
     assert not await terminate_process_tree(process)
+
+
+@pytest.mark.parametrize("kind", [OllamaClient, LlamaCppClient, ComfyUIClient])
+@pytest.mark.parametrize("running", [False, True, None])
+async def test_auto_start_replaces_only_a_confirmed_empty_owned_tree(kind, running, monkeypatch):
+    old = type("OldProcess", (), {"returncode": 0})()
+    new = type("NewProcess", (), {"returncode": None})()
+    spawn = AsyncMock(return_value=new)
+    monkeypatch.setattr(kind.__module__ + ".create_managed_subprocess_shell", spawn)
+    monkeypatch.setattr(kind.__module__ + ".process_tree_running", AsyncMock(return_value=running))
+    monkeypatch.setattr(kind.__module__ + ".terminate_process_tree", AsyncMock(return_value=True))
+    client = kind("http://restart.test", auto_start=True, start_command="synthetic-start", startup_timeout_seconds=0)
+    client._process, client._started_by_us = old, True
+    client._ownership.capture(client)
+    monkeypatch.setattr(client, "_healthy", AsyncMock(return_value=False))
+    try:
+        with pytest.raises(httpx.ConnectError):
+            await client._ensure_ready()
+        assert spawn.await_count == (1 if running is False else 0)
+        assert client._ownership.process is (new if running is False else old)
+    finally:
+        await client.aclose()

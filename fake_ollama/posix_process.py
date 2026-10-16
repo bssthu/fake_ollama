@@ -49,9 +49,11 @@ class PosixProcess:
             return False
 
 
-async def group_has_live_members(pgid):
+async def group_has_live_members(pgid, *, exclude=()):
     if Path("/proc/self/stat").exists():
         for path in Path("/proc").glob("[0-9]*/stat"):
+            if int(path.parent.name) in exclude:
+                continue
             try:
                 fields = path.read_text().rsplit(")", 1)[1].split()
                 if int(fields[2]) == pgid and fields[0] != "Z":
@@ -62,7 +64,7 @@ async def group_has_live_members(pgid):
                 return True
         return False
     # BSD/macOS: inspect state without signalling any PID. Failure is unsafe.
-    process = await asyncio.create_subprocess_exec("ps", "-axo", "pgid=,stat=", stdout=asyncio.subprocess.PIPE)
+    process = await asyncio.create_subprocess_exec("ps", "-axo", "pid=,pgid=,stat=", stdout=asyncio.subprocess.PIPE)
     try:
         output, _ = await asyncio.wait_for(process.communicate(), 2)
     except asyncio.TimeoutError:
@@ -71,5 +73,5 @@ async def group_has_live_members(pgid):
         return True
     if process.returncode:
         return True
-    return any(parts and int(parts[0]) == pgid and not parts[1].startswith("Z")
-               for line in output.decode().splitlines() if len(parts := line.split()) >= 2)
+    return any(int(parts[1]) == pgid and int(parts[0]) not in exclude and not parts[2].startswith("Z")
+               for line in output.decode().splitlines() if len(parts := line.split()) >= 3)

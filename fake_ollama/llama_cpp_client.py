@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 import httpx
 
 from . import runtime_ownership
-from .process_utils import run_stop_command
+from .process_utils import run_stop_command, process_tree_running
 from .config import outbound_cycle_headers
 from .process_utils import (
     create_managed_subprocess_exec,
@@ -597,6 +597,7 @@ class LlamaCppClient:
                     "llama.cpp target is unavailable and fake-ollama is shutting down; "
                     "refusing auto-start"
                 )
+            await runtime_ownership.discard_finished_process(self, inspect=process_tree_running, terminate=terminate_process_tree)
             if self._ownership.process is None and not self._started_by_us:
                 stderr_log = self._stderr_log_path()
                 if stderr_log is not None:

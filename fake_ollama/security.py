@@ -64,7 +64,11 @@ def playground_anonymous_allowed(request: Request) -> bool:
     allowed = getattr(settings, "playground_allowed_origins", [])
     if peer[0] not in getattr(settings, "playground_trusted_proxy_ips", []):
         return False
-    return (origin or expected) in allowed and urlsplit(origin or expected).netloc == host
+    if origin is not None:
+        return origin in allowed and urlsplit(origin).netloc == host
+    # Browser navigations may omit Origin, and TLS may end at the proxy. Use
+    # the explicitly configured public authority without trusting forwarded data.
+    return any(urlsplit(public_origin).netloc == host for public_origin in allowed)
 
 
 def management_session_token(app) -> str:

@@ -6,7 +6,9 @@ import base64 as _b64
 import json
 import re
 
-from .protocol_tools import associate_ollama_results, tool_arguments, UpstreamProtocolError
+from .protocol_tools import associate_ollama_results, tool_arguments, UpstreamProtocolError, validate_tool_blocks
+from .protocol_controls import openai_tool_controls
+from .protocol_usage import known_counts, openai_usage, token_count
 from .stream_state import AnthropicStreamState
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -24,6 +26,7 @@ _OPTION_MAP = {
     "max_tokens": "max_tokens",
     "stop": "stop_sequences",
 }
+
 
 
 def _now_iso() -> str:
@@ -432,6 +435,7 @@ def anthropic_to_ollama_chat(
 ) -> Dict[str, Any]:
     usage = response.get("usage") or {}
     blocks = response.get("content") or []
+    validate_tool_blocks(blocks)
     text = _extract_text(blocks)
     thinking = _extract_thinking(blocks) if show_thinking else ""
     tool_calls: List[Dict[str, Any]] = []
@@ -470,9 +474,8 @@ def anthropic_to_ollama_chat(
         "done_reason": _stop_reason_to_done("tool_use" if tool_calls else response.get("stop_reason")),
         "total_duration": 0,
         "load_duration": 0,
-        "prompt_eval_count": int(usage.get("input_tokens") or 0),
+        **known_counts(usage, (("input_tokens", "prompt_eval_count"), ("output_tokens", "eval_count"))),
         "prompt_eval_duration": 0,
-        "eval_count": int(usage.get("output_tokens") or 0),
         "eval_duration": 0,
     }
 
@@ -494,9 +497,8 @@ def anthropic_to_ollama_generate(
         "done_reason": chat["done_reason"],
         "total_duration": 0,
         "load_duration": 0,
-        "prompt_eval_count": chat["prompt_eval_count"],
+        **{key: chat[key] for key in ("prompt_eval_count", "eval_count") if key in chat},
         "prompt_eval_duration": 0,
-        "eval_count": chat["eval_count"],
         "eval_duration": 0,
         "context": [],
     }
@@ -522,8 +524,8 @@ class AnthropicStreamTranslator:
         self.show_thinking = show_thinking
         self._state = AnthropicStreamState()
         self._event: Optional[str] = None
-        self._input_tokens = 0
-        self._output_tokens = 0
+        self._input_tokens = None
+        self._output_tokens = None
         self._stop_reason: Optional[str] = None
         # Tracks which content_block indices correspond to thinking blocks
         # and whether we've emitted the opening <think> tag yet.
@@ -568,9 +570,8 @@ class AnthropicStreamTranslator:
             "done_reason": _stop_reason_to_done(self._stop_reason),
             "total_duration": 0,
             "load_duration": 0,
-            "prompt_eval_count": self._input_tokens,
+            **known_counts({"in": self._input_tokens, "out": self._output_tokens}, (("in", "prompt_eval_count"), ("out", "eval_count"))),
             "prompt_eval_duration": 0,
-            "eval_count": self._output_tokens,
             "eval_duration": 0,
         }
         if self.mode == "chat":
@@ -615,8 +616,8 @@ class AnthropicStreamTranslator:
         out: List[Dict[str, Any]] = []
         if event_type == "message_start":
             usage = (data.get("message") or {}).get("usage") or {}
-            self._input_tokens = int(usage.get("input_tokens") or 0)
-            self._output_tokens = int(usage.get("output_tokens") or 0)
+            self._input_tokens = token_count(usage.get("input_tokens"))
+            self._output_tokens = token_count(usage.get("output_tokens"))
         elif event_type == "content_block_start":
             block = data.get("content_block") or {}
             idx = int(data.get("index", 0))
@@ -699,7 +700,9 @@ class AnthropicStreamTranslator:
                 self._stop_reason = delta.get("stop_reason")
             usage = data.get("usage") or {}
             if "output_tokens" in usage:
-                self._output_tokens = int(usage["output_tokens"])
+                self._output_tokens = token_count(usage["output_tokens"])
+            if "input_tokens" in usage:
+                self._input_tokens = token_count(usage["input_tokens"])
         elif event_type == "message_stop":
             close = self._close_think_chunk()
             if close is not None:
@@ -773,6 +776,8 @@ def openai_chat_to_anthropic(
     default_max_tokens: int,
 ) -> Dict[str, Any]:
     """Build an Anthropic /v1/messages request from an OpenAI chat completion."""
+    controls = {}
+    openai_tool_controls(payload, controls)
     system_parts: List[str] = []
     messages: List[Dict[str, Any]] = []
     raw_messages = payload.get("messages") or []
@@ -853,14 +858,7 @@ def openai_chat_to_anthropic(
                 blocks.extend(anth_content)
             for tc in msg.get("tool_calls") or []:
                 fn = tc.get("function") or {}
-                args = fn.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args) if args else {}
-                    except json.JSONDecodeError:
-                        args = {"_raw": args}
-                elif args is None:
-                    args = {}
+                args = tool_arguments(fn.get("arguments"), upstream=False)
                 blocks.append(
                     {
                         "type": "tool_use",
@@ -935,6 +933,7 @@ def openai_chat_to_anthropic(
         if anth_tools:
             body["tools"] = anth_tools
 
+    body.update(controls)
     return body
 
 
@@ -946,6 +945,7 @@ def anthropic_to_openai_chat(
 ) -> Dict[str, Any]:
     usage = response.get("usage") or {}
     blocks = response.get("content") or []
+    validate_tool_blocks(blocks)
     text = _extract_text(blocks)
     thinking = _extract_thinking(blocks) if show_thinking else ""
     finish = {
@@ -966,7 +966,7 @@ def anthropic_to_openai_chat(
     for i, block in enumerate(blocks):
         if isinstance(block, dict) and block.get("type") == "tool_use":
             import json as _json
-            tid = block.get("id") or f"call_{i}"
+            tid = block["id"]
             tool_use_ids.append(tid)
             tool_calls.append(
                 {
@@ -980,6 +980,7 @@ def anthropic_to_openai_chat(
             )
     if tool_calls:
         message["tool_calls"] = tool_calls
+        finish = "tool_calls"
     # Cache full thinking blocks (with signature) for next-turn echo back.
     remember_thinking(blocks, tool_use_ids=tool_use_ids, text=text)
 
@@ -991,21 +992,18 @@ def anthropic_to_openai_chat(
         "choices": [
             {"index": 0, "message": message, "finish_reason": finish}
         ],
-        "usage": {
-            "prompt_tokens": int(usage.get("input_tokens") or 0),
-            "completion_tokens": int(usage.get("output_tokens") or 0),
-            "total_tokens": int(usage.get("input_tokens") or 0)
-            + int(usage.get("output_tokens") or 0),
-        },
+        "usage": openai_usage(usage),
     }
 
 
 class OpenAIChatStreamTranslator:
     """Translate Anthropic SSE events into OpenAI chat.completion.chunk frames."""
 
-    def __init__(self, openai_model: str, *, show_thinking: bool = True) -> None:
+    def __init__(self, openai_model: str, *, show_thinking: bool = True, include_usage: bool = False) -> None:
         self.model = openai_model
         self.show_thinking = show_thinking
+        self.include_usage = include_usage
+        self._usage = {}
         self._state = AnthropicStreamState()
         self._created = int(datetime.now(timezone.utc).timestamp())
         self._id = "chatcmpl-fake"
@@ -1033,6 +1031,7 @@ class OpenAIChatStreamTranslator:
             "object": "chat.completion.chunk",
             "created": self._created,
             "model": self.model,
+            **({"usage": None} if self.include_usage else {}),
             "choices": [
                 {"index": 0, "delta": delta, "finish_reason": finish}
             ],
@@ -1076,6 +1075,7 @@ class OpenAIChatStreamTranslator:
         out: List[Dict[str, Any]] = []
         if event_type == "message_start":
             msg = data.get("message") or {}
+            self._usage.update(msg.get("usage") or {})
             self._id = msg.get("id") or self._id
             out.append(self._frame({"role": "assistant", "content": ""}))
             self._sent_role = True
@@ -1167,6 +1167,7 @@ class OpenAIChatStreamTranslator:
                     self._cur_thinking_signature = (self._cur_thinking_signature or "") + sig
             # Tool fragments remain buffered until block_stop validates JSON.
         elif event_type == "message_delta":
+            self._usage.update(data.get("usage") or {})
             d = data.get("delta") or {}
             if "stop_reason" in d:
                 self._stop_reason = d.get("stop_reason")
@@ -1191,6 +1192,11 @@ class OpenAIChatStreamTranslator:
                     text="".join(self._final_text),
                 )
             out.append(self._frame({}, finish=finish))
+            if self.include_usage:
+                frame = self._frame({})
+                frame["choices"] = []
+                frame["usage"] = openai_usage(self._usage) or None
+                out.append(frame)
         elif event_type == "error":
             err = data.get("error") or {}
             out.append(

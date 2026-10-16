@@ -72,6 +72,19 @@ def begin_request(client):
     client._used_since_last_stop = True
 
 
+async def discard_finished_process(client, *, inspect, terminate):
+    """Called under the shared start lock; launcher exit alone is insufficient."""
+    owner = client._ownership
+    owner.can_manage()
+    if owner.process is None or await inspect(owner.process) is not False:
+        return
+    if not await terminate(owner.process, timeout=min(10.0, client._stop_timeout)):
+        raise LocalTargetResourceError("Previous process tree cleanup failed", error_type="runtime_quarantined")
+    owner.process, owner.command, owner.shutdown_result = None, None, None
+    for member in owner.members:
+        member._process, member._started_by_us = None, False
+
+
 async def _stop_locked(client, terminate, run_command):
     owner = client._ownership
     if not owner.can_manage():

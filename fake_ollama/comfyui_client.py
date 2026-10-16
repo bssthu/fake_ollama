@@ -25,7 +25,7 @@ import httpx
 
 from .comfyui_presets import WorkflowSpec, nearest_ratio, resolve_workflows
 from . import runtime_ownership
-from .process_utils import run_stop_command
+from .process_utils import run_stop_command, process_tree_running
 from .config import outbound_cycle_headers
 from .h3_media import add_keyframes, add_reference_inputs
 from .comfyui_jobs import PromptRecord, runtime_for, recover
@@ -479,6 +479,7 @@ class ComfyUIClient:
                     "ComfyUI target is unavailable and fake-ollama is shutting down; "
                     "refusing auto-start"
             )
+            await runtime_ownership.discard_finished_process(self, inspect=process_tree_running, terminate=terminate_process_tree)
             if self._ownership.process is None and not self._started_by_us:
                 logger.info("starting ComfyUI target: %s", self._start_command)
                 stderr_log = self._stderr_log_path()

@@ -192,6 +192,9 @@ def main() -> None:
             log_level=args.log_level,
             log_config=None,
             access_log=False,
+            # Admission checks need the real socket peer and transport scheme.
+            # Explicit Playground proxy trust is enforced by the application.
+            proxy_headers=False,
         )
         configs.append((label, host, port, cfg))
 

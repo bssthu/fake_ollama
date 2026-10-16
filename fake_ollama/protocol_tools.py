@@ -28,6 +28,21 @@ def tool_arguments(value, *, upstream=True):
     return result
 
 
+def validate_tool_blocks(blocks):
+    """Non-stream Anthropic tools obey the same identity rules as SSE."""
+    ids = set()
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        identifier, name = block.get("id"), block.get("name")
+        if not isinstance(identifier, str) or not identifier or not isinstance(name, str) or not name:
+            raise UpstreamProtocolError("Upstream tool call requires ID and name")
+        if identifier in ids:
+            raise UpstreamProtocolError("Duplicate upstream tool ID")
+        ids.add(identifier)
+        tool_arguments(block.get("input"))
+
+
 def associate_ollama_results(messages):
     """Assign request-unique IDs; same-name calls are paired in protocol order."""
     result = deepcopy(list(messages))

@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from fake_ollama.process_utils import create_managed_subprocess_exec, terminate_process_tree
+from fake_ollama.process_utils import create_managed_subprocess_exec, terminate_process_tree, process_tree_running
 
 
 def alive(pid):
@@ -54,8 +54,10 @@ async def test_tree_termination_survives_launcher_exit(tmp_path, parent_exits):
         assert alive(pid)
         if parent_exits:
             await asyncio.wait_for(process.wait(), 5)
+        assert await process_tree_running(process) is True
         assert await terminate_process_tree(process, timeout=.3)
         assert not alive(pid), "child survived despite successful tree termination"
+        assert await process_tree_running(process) is False
         assert await terminate_process_tree(process, timeout=.3)
     finally:
         stop.touch()

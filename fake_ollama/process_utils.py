@@ -143,10 +143,21 @@ async def terminate_process_tree(process, *, timeout=10.0):
             return True
         except (OSError, asyncio.TimeoutError):
             return False
-        finally:
-            for handle in handles:
-                job.kernel.CloseHandle(handle)
     return await finish_cleanup(terminate())
+
+
+async def process_tree_running(process):
+    """True/False for a verified owned identity, None if status is uncertain."""
+    try:
+        if os.name == "nt":
+            job = getattr(process, "_managed_job", None)
+            return job.running() if job is not None else None
+        from .posix_process import PosixProcess, group_has_live_members
+        if isinstance(process, PosixProcess):
+            return await group_has_live_members(process.pid, exclude={process.pid})
+    except OSError:
+        pass
+    return None
 
 
 async def run_stop_command(command, *, cwd=None, timeout=30.0):

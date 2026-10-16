@@ -67,6 +67,7 @@ def test_playground_anonymous_checks_connection_and_browser(settings, host, peer
 
 @pytest.mark.parametrize("peer,origin,allowed", [
     ("192.0.2.10", "https://play.example", True),
+    ("192.0.2.10", None, True),
     ("192.0.2.11", "https://play.example", False),
     ("192.0.2.10", "https://evil.example", False),
 ])
@@ -74,7 +75,7 @@ def test_explicit_proxy_boundary(settings, peer, origin, allowed):
     app = create_app(settings.model_copy(update={"playground_enabled": True, "playground_host": "0.0.0.0",
         "playground_trusted_proxy_ips": ["192.0.2.10"], "playground_allowed_origins": ["https://play.example"]}))
     request = Request({"type": "http", "app": app, "scheme": "http", "server": ("0.0.0.0", 21431),
-        "client": (peer, 50000), "headers": [(b"host", b"play.example"), (b"origin", origin.encode())]})
+        "client": (peer, 50000), "headers": [(b"host", b"play.example")] + ([(b"origin", origin.encode())] if origin else [])})
     assert playground_anonymous_allowed(request) is allowed
 
 
