@@ -266,10 +266,11 @@
         </div>
 
         <div class="composer">
+          <div id="composerAttachmentSummary" class="composer-attachment-summary" role="status" aria-live="polite" aria-atomic="true" hidden></div>
           <div class="composer-box">
             <label id="decisionStateLabel" class="decision-state-label" for="prompt" hidden>State · 本次决策的状态 / 背景</label>
             <textarea id="prompt" placeholder="输入要发送给模型的内容…"
-                      aria-label="提示词"></textarea>
+                      aria-label="提示词" aria-describedby="composerAttachmentSummary"></textarea>
             <div class="composer-actions">
               <span id="shortcut" class="shortcut">Enter 执行 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片</span>
               <div class="actions">

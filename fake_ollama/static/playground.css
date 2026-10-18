@@ -634,6 +634,7 @@ details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px
 .media-meta a { color: var(--accent-dark); text-decoration: none; font-weight: 700; }
 
 .composer { padding: 16px 20px 19px; border-top: 1px solid var(--line); background: rgba(255,255,255,0.42); }
+.composer-attachment-summary { max-width: 1000px; margin: 0 auto 8px; color: var(--accent-dark); font-size: 12px; font-weight: 600; }
 .composer-box { max-width: 1000px; margin: 0 auto; border: 1px solid var(--line-strong); border-radius: 14px; background: #fff; box-shadow: 0 8px 24px rgba(48,43,35,0.05); overflow: hidden; }
 #prompt { min-height: 104px; max-height: 260px; resize: vertical; padding: 14px 15px 8px; border: 0; border-radius: 0; box-shadow: none; line-height: 1.55; }
 .composer-actions { padding: 9px 10px 10px 14px; gap: 12px; }

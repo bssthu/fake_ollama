@@ -19,6 +19,7 @@
     dropText: $('dropText'),
     dropHint: $('dropHint'),
     attachmentList: $('attachmentList'),
+    composerAttachmentSummary: $('composerAttachmentSummary'),
     cameraSection: $('cameraSection'),
     cameraStatus: $('cameraStatus'),
     cameraPreview: $('cameraPreview'),
@@ -1985,6 +1986,13 @@
   }
 
   function renderAttachments() {
+    const imageCount = state.attachments.filter((attachment) => attachment.kind === 'image').length;
+    const videoCount = state.attachments.filter((attachment) => attachment.kind === 'video').length;
+    const summary = [];
+    if (imageCount) summary.push(`${imageCount} 张图片`);
+    if (videoCount) summary.push(`${videoCount} 个视频`);
+    els.composerAttachmentSummary.textContent = summary.length ? `已附带 ${summary.join('、')}` : '';
+    els.composerAttachmentSummary.hidden = !summary.length;
     els.attachmentList.replaceChildren();
     state.attachments.forEach((attachment, index) => {
       const wrap = document.createElement('div');
