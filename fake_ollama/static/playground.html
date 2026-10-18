@@ -57,6 +57,36 @@
           <div id="operationHint" class="help">能力由 Playground 专用发现接口返回，不按模型名称猜测。</div>
         </div>
 
+        <section id="decisionSection" class="decision-section" hidden aria-label="决策请求">
+          <div class="section-title"><h2>结构化决策</h2><span class="help">独立请求</span></div>
+          <div class="field">
+            <label for="decisionDialect">API 格式</label>
+            <select id="decisionDialect"></select>
+            <div id="decisionDialectHint" class="help"></div>
+          </div>
+          <div class="field">
+            <label for="decisionStateFormat">State 输入格式</label>
+            <select id="decisionStateFormat">
+              <option value="text">文本</option>
+              <option value="json">JSON 对象 / 数组</option>
+            </select>
+            <div class="help">在右侧输入本次状态。JSON 在 OpenAI Decisions 格式中编码为文本。</div>
+          </div>
+          <div id="decisionCapabilityHint" class="help"></div>
+          <div id="decisionQuestionList" class="decision-question-list"></div>
+          <button id="decisionAddQuestion" class="secondary" type="button">＋ 添加问题</button>
+          <div id="decisionThinkField" class="field" hidden>
+            <label for="decisionThinkMode">Think mode（后端扩展）</label>
+            <select id="decisionThinkMode"></select>
+            <div class="help">只发送后端明确声明支持的扩展。</div>
+          </div>
+          <details class="decision-raw">
+            <summary>原始请求预览</summary>
+            <pre id="decisionRequestPreview"></pre>
+          </details>
+          <div class="help">概率和评分按后端返回展示；不同模型的概率与 confidence 不保证等价或校准。</div>
+        </section>
+
         <section id="uploadSection" class="upload-section" hidden>
           <div class="label-row">
             <span id="uploadLabel" class="label">参考图片</span>
@@ -237,6 +267,7 @@
 
         <div class="composer">
           <div class="composer-box">
+            <label id="decisionStateLabel" class="decision-state-label" for="prompt" hidden>State · 本次决策的状态 / 背景</label>
             <textarea id="prompt" placeholder="输入要发送给模型的内容…"
                       aria-label="提示词"></textarea>
             <div class="composer-actions">

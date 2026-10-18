@@ -7,7 +7,7 @@ import time
 from fastapi import HTTPException
 from starlette.datastructures import State
 
-POOL_NAMES = ("clients", "openai_clients", "ollama_clients", "llama_cpp_clients", "generic_openai_clients", "comfyui_clients")
+POOL_NAMES = ("clients", "openai_clients", "ollama_clients", "llama_cpp_clients", "generic_openai_clients", "decision_clients", "comfyui_clients")
 SNAPSHOT_FIELDS = ("settings", "desired_settings", *POOL_NAMES)
 REQUEST_SNAPSHOT = ContextVar("runtime_snapshot", default=None)
 logger = logging.getLogger("fake_ollama")

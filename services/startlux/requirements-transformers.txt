@@ -1,0 +1,3 @@
+# Optional reference engine, separate environment only. Official source 1.1.0.
+# Select the appropriate PyTorch build for your hardware before installation.
+startlux-decide[transformers] @ git+https://github.com/StartLuxLabs/StartLux-Decision.git@83fe6c7d61a687a6e17f118b4f7d8f429f5d3a01

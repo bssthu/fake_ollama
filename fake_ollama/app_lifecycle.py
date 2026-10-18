@@ -11,6 +11,7 @@ from .comfyui_client import ComfyUIClient
 from .config import Settings
 from .llama_cpp_client import LlamaCppClient
 from .generic_openai_client import GenericOpenAIClient
+from .decision_client import DecisionClient
 from .ollama_client import OllamaClient
 from .openai_client import OpenAIClient
 from .vram import MemoryCoordinator, VramCoordinator
@@ -26,6 +27,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     owned_target_names: list[str] = []
     owned_llama_cpp_names: list[str] = []
     owned_generic_openai_names: list[str] = []
+    owned_decision_names: list[str] = []
     owned_openai_names: list[str] = []
     owned_comfyui_names: list[str] = []
     if not getattr(app.state, "clients", None):
@@ -36,6 +38,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.llama_cpp_clients = {}
     if not getattr(app.state, "generic_openai_clients", None):
         app.state.generic_openai_clients = {}
+    if not getattr(app.state, "decision_clients", None):
+        app.state.decision_clients = {}
     if not getattr(app.state, "openai_clients", None):
         app.state.openai_clients = {}
     if not getattr(app.state, "comfyui_clients", None):
@@ -141,6 +145,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             request_read_timeout_seconds=tgt.request_read_timeout_seconds,
         )
         owned_generic_openai_names.append(tgt.name)
+    for tgt in app.state.settings.decision_targets:
+        if tgt.name in app.state.decision_clients:
+            continue
+        app.state.decision_clients[tgt.name] = DecisionClient(
+            tgt, timeout=app.state.settings.timeout_seconds,
+            trust_env=app.state.settings.use_system_proxy,
+            vram_coordinator=app.state.vram_coordinator,
+            memory_coordinator=app.state.memory_coordinator,
+        )
+        owned_decision_names.append(tgt.name)
     for tgt in app.state.settings.comfyui_targets:
         if tgt.name in app.state.comfyui_clients:
             continue
@@ -168,7 +182,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owned_comfyui_names.append(tgt.name)
     for pool, names in (("clients", owned_names), ("openai_clients", owned_openai_names),
                         ("ollama_clients", owned_target_names), ("llama_cpp_clients", owned_llama_cpp_names),
-                        ("generic_openai_clients", owned_generic_openai_names), ("comfyui_clients", owned_comfyui_names)):
+                        ("generic_openai_clients", owned_generic_openai_names), ("decision_clients", owned_decision_names), ("comfyui_clients", owned_comfyui_names)):
         app.state.runtime_resources.managed.update(getattr(app.state, pool)[name] for name in names)
     _sync_local_target_idle_monitor(app)
     _sync_runtime_monitor(app)
@@ -193,7 +207,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.local_target_idle_monitor = None
         manager = app.state.runtime_resources
         await manager.retire(set(manager.managed))
-        for name in ("clients", "openai_clients", "ollama_clients", "llama_cpp_clients", "generic_openai_clients", "comfyui_clients"):
+        for name in ("clients", "openai_clients", "ollama_clients", "llama_cpp_clients", "generic_openai_clients", "decision_clients", "comfyui_clients"):
             pool = getattr(app.state, name, {})
             for key, client in list(pool.items()):
                 if client not in manager.managed and getattr(client, "_owns_client", False):
@@ -218,6 +232,7 @@ def request_shutdown(app: FastAPI) -> None:
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
         getattr(app.state, "generic_openai_clients", {}),
+        getattr(app.state, "decision_clients", {}),
         getattr(app.state, "comfyui_clients", {}),
     ):
         for client in list(client_group.values()):
@@ -262,6 +277,7 @@ async def _local_target_idle_monitor(app: FastAPI) -> None:
                 getattr(app.state, "ollama_clients", {}),
                 getattr(app.state, "llama_cpp_clients", {}),
                 getattr(app.state, "generic_openai_clients", {}),
+                getattr(app.state, "decision_clients", {}),
                 getattr(app.state, "comfyui_clients", {}),
             )
             for clients in client_groups:
@@ -287,6 +303,7 @@ def _sync_local_target_idle_monitor(app: FastAPI) -> None:
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
         getattr(app.state, "generic_openai_clients", {}),
+        getattr(app.state, "decision_clients", {}),
         getattr(app.state, "comfyui_clients", {}),
     )
     needs_monitor = any(

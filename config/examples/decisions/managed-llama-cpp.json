@@ -1,0 +1,23 @@
+{
+  "_": "Supply your own existing llama-server executable and locally downloaded GGUF. Built-in launchers never download model files.",
+  "decision_targets": [{
+    "name": "managed-decision", "base_url": "http://127.0.0.1:8010",
+    "runtime": "llama_cpp", "dialect": "systemone", "auto_start": true,
+    "binary_path": "/absolute/path/to/llama-server",
+    "model_path": "/absolute/path/to/user-downloaded/model.gguf",
+    "models": [{"name": "local-decision-model", "alias": "decider"}],
+    "start_args": ["--ctx-size", "4096", "--gpu-layers", "99"],
+    "max_concurrent_requests": 1,
+    "startup_timeout_seconds": 180,
+    "idle_timeout_seconds": 300,
+    "decision_capabilities": {"question_types": ["predicate", "choice", "score"], "modalities": ["text"], "extensions": [], "think_modes": []}
+  }],
+  "model_profiles": {"decider@managed-decision": {"estimated_vram_gb": 4, "estimated_memory_gb": 8}},
+  "ollama_interfaces": [],
+  "api_interfaces": [{
+    "name": "api", "host": "127.0.0.1", "port": 21435,
+    "access_tokens": ["replace-with-a-long-random-token"],
+    "exposed_models": [{"target": "managed-decision", "model": "decider", "alias": "decision"}]
+  }],
+  "playground_enabled": true
+}

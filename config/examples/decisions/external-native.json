@@ -1,0 +1,35 @@
+{
+  "_": "Native decision endpoints. Start servers separately; fake_ollama does not install runtimes or download weights.",
+  "decision_targets": [
+    {
+      "name": "native-systemone",
+      "base_url": "http://127.0.0.1:8010",
+      "runtime": "llama_cpp",
+      "dialect": "systemone",
+      "auto_start": false,
+      "models": [{"name": "local-decision-model", "alias": "decider", "upstream_id": "local-decision-model"}],
+      "decision_capabilities": {"question_types": ["predicate", "choice", "score"], "modalities": ["text"], "extensions": [], "think_modes": []},
+      "source_url": "https://github.com/ggml-org/llama.cpp",
+      "license": "Set the model's actual license separately from the runtime's license"
+    },
+    {
+      "name": "native-openai-decisions",
+      "base_url": "http://127.0.0.1:8011",
+      "runtime": "external",
+      "dialect": "openai_decisions",
+      "auto_start": false,
+      "models": [{"name": "your-upstream-decision-model", "alias": "decider-openai"}],
+      "decision_capabilities": {"question_types": ["predicate", "choice", "score"], "modalities": ["text"], "extensions": [], "think_modes": []}
+    }
+  ],
+  "ollama_interfaces": [],
+  "api_interfaces": [{
+    "name": "api", "host": "127.0.0.1", "port": 21435,
+    "access_tokens": ["replace-with-a-long-random-token"],
+    "exposed_models": [
+      {"target": "native-systemone", "model": "decider", "alias": "decision"},
+      {"target": "native-openai-decisions", "model": "decider-openai", "alias": "decision-openai"}
+    ]
+  }],
+  "playground_enabled": true
+}

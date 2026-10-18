@@ -68,7 +68,9 @@ def register_playground_routes(app: FastAPI) -> None:
     async def playground_models(request: Request) -> JSONResponse:
         settings, iface = routing._model_interface_for_request(request)
         models = [
-            playground_support._playground_model_entry(settings, iface, name)
+            playground_support._playground_model_entry(
+                settings, iface, name, getattr(request.app.state, "decision_clients", {})
+            )
             for name in routing._public_model_ids(iface)
         ]
         models.extend(

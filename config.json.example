@@ -13,6 +13,7 @@
   "playground_enabled": false,
   "playground_host": "127.0.0.1",
   "playground_port": 21431,
+  "decision_targets": [],
   "anthropic_upstreams": [
     {
       "name": "anthropic",

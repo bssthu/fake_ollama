@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from .config import ComfyUITarget, H3ContextIRProfile, H3ContextIRProvider, Settings, outbound_cycle_headers
+from .config import ComfyUITarget, DecisionTarget, H3ContextIRProfile, H3ContextIRProvider, Settings, outbound_cycle_headers
 from .media_operations import describe_comfyui_operation
 from .routing import (
     _listener_name,
@@ -71,16 +71,46 @@ class ExternalPlannerConnection:
 
 
 def _playground_model_entry(
-    settings: Settings, iface: Any, public_id: str
+    settings: Settings, iface: Any, public_id: str, decision_clients: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Describe one model for fake-ollama's versioned Playground API."""
 
     profile = _profile_for_public_id(settings, iface, public_id)
     exposure = iface.exposure_for_public_id(public_id) if iface is not None else None
     source = settings.source_by_name(exposure.target) if exposure is not None else None
-    capabilities = list(profile.capabilities)
+    capabilities = ["decision"] if isinstance(source, DecisionTarget) else list(profile.capabilities)
     capability_set = set(capabilities)
     operations: List[Dict[str, Any]] = []
+    if isinstance(source, DecisionTarget):
+        # Public wire formats are distinct codecs, never aliases. Images remain
+        # native-dialect only until an explicit multimodal conversion exists.
+        metadata = source.capability_metadata()
+        client = (decision_clients or {}).get(source.name)
+        if client is not None:
+            # Discovery is read-only and never starts/probes a provider. Observed
+            # restrictions can narrow declared features, but cannot expand them.
+            observed = client.capability_snapshot()
+            for field in ("question_types", "modalities", "extensions", "think_modes"):
+                if field in observed:
+                    metadata[field] = [item for item in metadata.get(field, []) if item in observed[field]]
+            for field in ("version", "endpoint_verified", "status", "warnings", "errors", "runtime_metadata"):
+                if field in observed:
+                    metadata[field] = observed[field]
+        operations.append({
+            **metadata,
+            "id": "decision",
+            "endpoint": "/v1/systemone" if source.dialect == "systemone" else "/v1/decisions",
+            "dialects": [
+                {"id": "systemone", "label": "TypeSafe SystemOne", "endpoint": "/v1/systemone"},
+                {"id": "openai_decisions", "label": "OpenAI Decisions", "endpoint": "/v1/decisions"},
+            ],
+            "stream": False,
+            "history_mode": "single_turn",
+            "accepts_images": "image" in metadata.get("modalities", []),
+            "multiple_images": True,
+            "image_dialect": source.dialect,
+            "parameters": [],
+        })
     if capability_set.intersection({"completion", "tools", "vision"}):
         operations.append(
             {

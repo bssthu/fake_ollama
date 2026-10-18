@@ -169,6 +169,16 @@ def register_routes(app: FastAPI) -> None:
     async def openai_chat_completions(request: Request) -> Any:
         return await protocol_handlers._handle_openai_chat(request)
 
+    @app.post("/v1/systemone")
+    async def systemone(request: Request) -> Any:
+        from ..decision_handlers import handle_decision
+        return await handle_decision(request, "systemone")
+
+    @app.post("/v1/decisions")
+    async def decisions(request: Request) -> Any:
+        from ..decision_handlers import handle_decision
+        return await handle_decision(request, "openai_decisions")
+
     @app.post("/v1/images/generations")
     async def openai_image_generations(request: Request) -> Any:
         return await media_handlers._handle_openai_image_generation(request)

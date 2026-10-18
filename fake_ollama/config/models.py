@@ -423,6 +423,122 @@ class OpenAIUpstream(_SourceBase):
     """An OpenAI Chat Completions-compatible upstream endpoint."""
 
 
+class DecisionTarget(_SourceBase):
+    """A typed decision endpoint, independent of chat-completion sources.
+
+    Built-in launchers use only user-supplied local weights. ``external`` also
+    supports an explicitly configured companion command (for example Laya).
+    Capability declarations describe the configured deployment, never a model
+    name heuristic or a promise that its scores are calibrated.
+    """
+
+    base_url: str = "http://127.0.0.1:8010"
+    dialect: Literal["systemone", "openai_decisions"] = "systemone"
+    runtime: Literal["external", "llama_cpp", "vllm", "startlux"] = "external"
+    endpoint_path: Optional[str] = None
+    decision_capabilities: Dict[str, Any] = Field(default_factory=lambda: {
+        "question_types": ["predicate", "choice", "score"],
+        "modalities": ["text"], "extensions": [], "think_modes": [],
+    })
+    source_url: Optional[str] = None
+    license: Optional[str] = None
+    auto_start: bool = False
+    start_command: Optional[str] = None
+    stop_command: Optional[str] = None
+    manage_external_runtime: bool = False
+    stop_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    idle_timeout_seconds: Optional[float] = Field(default=None, gt=0)
+    startup_timeout_seconds: float = Field(default=120.0, gt=0)
+    health_path: str = "/health"
+    cwd: Optional[str] = None
+    max_concurrent_requests: Optional[int] = Field(default=None, ge=0)
+    request_read_timeout_seconds: Optional[float] = None
+    model_path: Optional[str] = None
+    binary_path: Optional[str] = None
+    python_path: Optional[str] = None
+    runtime_backend: Literal["vllm", "transformers"] = "vllm"
+    start_args: List[str] = Field(default_factory=list)
+    probe_interval_seconds: float = Field(default=300.0, gt=0)
+
+    @field_validator("health_path", "endpoint_path")
+    @classmethod
+    def _decision_path(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not value or not value.startswith("/") or value.startswith("//") or "?" in value or "#" in value:
+            raise ValueError("decision endpoint and health paths must be absolute URL paths")
+        return value
+
+    @field_validator("decision_capabilities")
+    @classmethod
+    def _decision_capabilities(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {"question_types", "modalities", "extensions", "think_modes", "image_format"}
+        if set(value) - allowed:
+            raise ValueError("unknown decision capability fields: " + ", ".join(sorted(set(value) - allowed)))
+        result = {"question_types": ["predicate", "choice", "score"], "modalities": ["text"], "extensions": [], "think_modes": []}
+        result.update(value)
+        for key, items in result.items():
+            if key == "image_format":
+                if not isinstance(items, str) or items not in {"typesafe_assets", "startlux_images", "openai_input_image"}:
+                    raise ValueError("decision_capabilities.image_format must be typesafe_assets, startlux_images, or openai_input_image")
+                continue
+            if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+                raise ValueError(f"decision_capabilities.{key} must be a list of strings")
+        if set(result["question_types"]) - {"predicate", "choice", "score"}:
+            raise ValueError("decision question_types must use predicate, choice, or score")
+        if set(result["modalities"]) - {"text", "image"}:
+            raise ValueError("decision modalities must use text or image")
+        return result
+
+    @model_validator(mode="after")
+    def _validate_decision(self) -> "DecisionTarget":
+        if not self.models:
+            raise ValueError("Each decision_target must declare at least one model")
+        if self.runtime == "startlux" and self.dialect != "systemone":
+            raise ValueError("StartLux uses the SystemOne state/questions dialect, including at /v1/decisions")
+        image_format = self.decision_capabilities.get("image_format")
+        if image_format and ((self.dialect == "openai_decisions") != (image_format == "openai_input_image")):
+            raise ValueError("decision image_format must match its native wire dialect")
+        if self.runtime == "startlux" and image_format not in {None, "startlux_images"}:
+            raise ValueError("StartLux uses image_format=startlux_images")
+        parsed = urlparse(self.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("decision base_url must be an HTTP(S) server URL without credentials, query, or fragment")
+        if self.auto_start and self.runtime != "external":
+            if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                raise ValueError("managed decision runtimes must use a loopback base_url")
+            if parsed.scheme != "http" or parsed.path not in {"", "/"} or parsed.port is None:
+                raise ValueError("managed decision runtimes require a loopback HTTP base_url with an explicit port and no path")
+            if not self.model_path:
+                raise ValueError("managed decision runtimes require a local model_path; download weights separately")
+            if self.start_command:
+                raise ValueError("built-in decision runtimes use argv launchers; use runtime=external for a custom start_command")
+            if self.runtime == "llama_cpp" and not self.binary_path:
+                raise ValueError("managed llama_cpp decisions require binary_path")
+            if self.runtime == "llama_cpp" and len({entry.wire_id for entry in self.models}) > 1:
+                raise ValueError("one managed llama_cpp model_path has one wire model; aliases must share upstream_id")
+            forbidden = {"--model", "-m", "--hf-repo", "-hf", "--hf-file", "-hff", "--hf-token", "-hft", "--model-url", "-mu", "--download-dir", "--tokenizer", "--tokenizer-revision", "--host", "--port", "--served-model-name", "--alias", "-a", "--config"}
+            flags = [arg.split("=", 1)[0] for arg in self.start_args]
+            if any(flag in forbidden or (flag.startswith("--") and any(item.startswith(flag) for item in forbidden)) for flag in flags):
+                raise ValueError("decision start_args cannot override runtime bind/model identity or request downloads")
+        if self.auto_start and self.runtime == "external" and not self.start_command:
+            raise ValueError("auto_start external decision targets require start_command")
+        return self
+
+    @property
+    def effective_endpoint_path(self) -> str:
+        return self.endpoint_path or ("/v1/decisions" if self.runtime == "startlux" else
+                                     "/v1/systemone" if self.dialect == "systemone" else "/v1/decisions")
+
+    def capability_metadata(self) -> Dict[str, Any]:
+        return {**self.decision_capabilities, "dialect": self.dialect, "runtime": self.runtime,
+                "image_format": self.decision_capabilities.get("image_format") or (
+                    "startlux_images" if self.runtime == "startlux" else
+                    "openai_input_image" if self.dialect == "openai_decisions" else "typesafe_assets"),
+                "endpoint": self.effective_endpoint_path, "source_url": self.source_url,
+                "license": self.license, "confidence_semantics": "provider_reported"}
+
+
 class GenericOpenAITarget(_SourceBase):
     """A lifecycle-managed generic OpenAI Chat Completions-compatible server."""
 
@@ -1697,6 +1813,7 @@ class Settings(BaseModel):
     openai_upstreams: List[OpenAIUpstream] = Field(default_factory=list)
     ollama_targets: List[OllamaTarget] = Field(default_factory=list)
     generic_openai_targets: List[GenericOpenAITarget] = Field(default_factory=list)
+    decision_targets: List[DecisionTarget] = Field(default_factory=list)
     llama_cpp_defaults: LlamaCppDefaults = Field(default_factory=LlamaCppDefaults)
     llama_cpp_targets: List[LlamaCppTarget] = Field(default_factory=list)
     comfyui_targets: List[ComfyUITarget] = Field(default_factory=list)
@@ -1883,7 +2000,7 @@ class Settings(BaseModel):
         if dupes:
             raise ValueError(
                 f"Duplicate source names across anthropic_upstreams/openai_upstreams/"
-                f"ollama_targets/generic_openai_targets/llama_cpp_targets/"
+                f"ollama_targets/generic_openai_targets/decision_targets/llama_cpp_targets/"
                 f"comfyui_targets: {dupes}. Source names are used as "
                 f"the right side of composite model ids and must be globally unique."
             )
@@ -1912,10 +2029,10 @@ class Settings(BaseModel):
                         f"{provider.name!r} references unknown target "
                         f"{provider.target!r}"
                     )
-                if isinstance(source, ComfyUITarget):
+                if isinstance(source, (ComfyUITarget, DecisionTarget)):
                     raise ValueError(
                         f"H3 Context-IR provider {provider.name!r} cannot use "
-                        "a ComfyUI target as its planning model"
+                        "a ComfyUI or decision target as its planning model"
                     )
                 if not source.serves(provider.model):
                     raise ValueError(
@@ -2044,6 +2161,7 @@ class Settings(BaseModel):
             *self.ollama_targets,
             *self.llama_cpp_targets,
             *self.generic_openai_targets,
+            *self.decision_targets,
             *self.comfyui_targets,
             *self.openai_upstreams,
             *self.anthropic_upstreams,
@@ -2321,6 +2439,9 @@ class Settings(BaseModel):
 
     def profile_for(self, key: str) -> ModelProfile:
         """Look up a profile by ``model@target`` then fall back to bare name."""
+        source = self.source_by_name(key.rpartition("@")[2]) if "@" in key else None
+        def profile(data: Dict[str, Any]) -> ModelProfile:
+            return ModelProfile.from_dict({**data, "capabilities": ["decision"]} if isinstance(source, DecisionTarget) else data)
         candidates: List[str] = [key]
         if "@" in key:
             display, _, _ = key.rpartition("@")
@@ -2332,12 +2453,12 @@ class Settings(BaseModel):
             candidates.append(_model_base(key))
         for k in candidates:
             if k in self.model_profiles:
-                return ModelProfile.from_dict(self.model_profiles[k])
+                return profile(self.model_profiles[k])
             match = _find_configured_model(k, self.model_profiles.keys())
             if match is not None:
-                return ModelProfile.from_dict(self.model_profiles[match])
+                return profile(self.model_profiles[match])
         return ModelProfile(
-            capabilities=list(DEFAULT_CAPABILITIES),
+            capabilities=["decision"] if isinstance(source, DecisionTarget) else list(DEFAULT_CAPABILITIES),
             context_length=DEFAULT_CONTEXT_LENGTH,
             max_output_tokens=None,
         )
@@ -2380,6 +2501,10 @@ class Backend:
 
     @classmethod
     def from_source(cls, src: Any, settings: Settings) -> "Backend":
+        if isinstance(src, DecisionTarget):
+            return cls(name=src.name, protocol="decision",
+                       kind="local" if src.auto_start or src.manage_external_runtime else "remote",
+                       base_url=src.base_url, auth_token=src.auth_token, source=src)
         if isinstance(src, AnthropicUpstream):
             return cls(
                 name=src.name,

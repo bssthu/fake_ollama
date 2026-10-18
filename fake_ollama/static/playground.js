@@ -30,6 +30,17 @@
     cameraLiveText: $('cameraLiveText'),
     mediaQueueSection: $('mediaQueueSection'),
     generationCount: $('generationCount'),
+    decisionSection: $('decisionSection'),
+    decisionDialect: $('decisionDialect'),
+    decisionDialectHint: $('decisionDialectHint'),
+    decisionStateFormat: $('decisionStateFormat'),
+    decisionStateLabel: $('decisionStateLabel'),
+    decisionCapabilityHint: $('decisionCapabilityHint'),
+    decisionQuestionList: $('decisionQuestionList'),
+    decisionAddQuestion: $('decisionAddQuestion'),
+    decisionThinkField: $('decisionThinkField'),
+    decisionThinkMode: $('decisionThinkMode'),
+    decisionRequestPreview: $('decisionRequestPreview'),
     chatParams: $('chatParams'),
     mediaParams: $('mediaParams'),
     operationPresetField: $('operationPresetField'),
@@ -76,6 +87,7 @@
 
   const OP_LABELS = {
     chat: '聊天 / 文本补全',
+    decision: '结构化决策 / Decision',
     image_generation: '图片生成',
     image_edit: '图片编辑',
     video_generation: '视频生成',
@@ -84,7 +96,7 @@
   };
   const KNOWN_CAPABILITIES = new Set([
     'completion', 'tools', 'vision', 'image_generation', 'image_edit',
-    'video_generation', 'video_understanding', 'h3_context_ir',
+    'video_generation', 'video_understanding', 'h3_context_ir', 'decision',
   ]);
   const CONTEXT_THRESHOLD_RATIO = 0.9;
   const DISCOVERY_SCHEMA_VERSION = 1;
@@ -98,9 +110,12 @@
   const state = {
     models: new Map(),
     interactionHistories: new Map(),
+    decisionForms: new Map(),
+    activeDecisionModelId: null,
     loadedCredential: null,
     attachments: [],
     controller: null,
+    requestDiscarded: false,
     startedAt: 0,
     firstTokenAt: 0,
     timer: null,
@@ -254,7 +269,16 @@
 
   function selectedOperation() {
     const info = selectedModel();
-    return modelOperations(info).find((op) => op.id === els.operation.value) || null;
+    const op = modelOperations(info).find((item) => item.id === els.operation.value) || null;
+    if (!op || op.id !== 'decision') return op;
+    const form = state.decisionForms.get(els.model.value);
+    const dialect = form ? form.dialect : op.dialect;
+    const wire = decisionDialects(op).find((item) => item.id === dialect);
+    const format = op.image_format || (op.dialect === 'openai_decisions' ? 'openai_input_image' : 'typesafe_assets');
+    const compatibleFormat = dialect === 'systemone'
+      ? ['typesafe_assets', 'startlux_images'].includes(format) : format === 'openai_input_image';
+    return {...op, image_format: format, endpoint: wire ? wire.endpoint : op.endpoint,
+      accepts_images: Boolean(op.accepts_images && dialect === op.image_dialect && compatibleFormat)};
   }
 
   function operationHistoryMode(op) {
@@ -508,6 +532,8 @@
       appendMessageElement(wrap, turn.user, 'user', {parameters: turn.parameters});
       if (turn.assistant) {
         appendMessageElement(wrap, turn.assistant, 'assistant', {reasoning: turn.reasoning});
+      } else if (turn.decision) {
+        appendDecisionResultElement(wrap, turn.decision);
       } else if (turn.media) {
         appendMediaResultElement(wrap, turn.media, op);
       }
@@ -877,13 +903,16 @@
     const isVideoGeneration = op && op.id === 'video_generation';
     const isVideoAnalysis = op && op.id === 'video_analysis';
     const isContextIR = op && op.id === 'h3_context_ir';
-    const isMedia = op && !isChatRequest;
+    const isDecision = op && op.id === 'decision';
+    const isMedia = op && !isChatRequest && !isDecision;
     const usesMediaQueue = operationUsesMediaQueue(op);
     const acceptsUploads = op && (op.accepts_images || op.accepts_videos);
 
+    const preserveDecisionImages = isDecision && state.activeDecisionModelId === els.model.value;
+    state.activeDecisionModelId = isDecision ? els.model.value : null;
     if (op) {
       const compatible = state.attachments.filter((attachment) => (
-        (attachment.kind === 'image' && op.accepts_images)
+        (attachment.kind === 'image' && (op.accepts_images || preserveDecisionImages))
         || (attachment.kind === 'video' && op.accepts_videos)
       ));
       if (compatible.length !== state.attachments.length) {
@@ -892,14 +921,20 @@
         renderAttachments();
       }
     }
-    els.uploadSection.hidden = !acceptsUploads;
+    syncDecisionForm(op);
+    const hasDecisionImages = isDecision && state.attachments.some((attachment) => attachment.kind === 'image');
+    els.uploadSection.hidden = !acceptsUploads && !hasDecisionImages;
+    els.dropZone.disabled = Boolean(isDecision && !acceptsUploads);
+    els.fileInput.disabled = Boolean(isDecision && !acceptsUploads);
     els.cameraSection.hidden = !operationSupportsLiveCamera(op);
     els.mediaQueueSection.hidden = !usesMediaQueue;
     els.uploadLabel.textContent = isVideoAnalysis ? '待分析视频' : (op && op.accepts_videos ? 'Reference images / videos' : '参考图片');
     els.uploadRequirement.textContent = isVideoAnalysis
       ? '文件模式需要 1 个；摄像头模式无需上传'
       : (op && (op.requires_images || op.requires_videos) ? '至少需要 1 个文件' : '可选');
-    els.fileInput.accept = [op && op.accepts_images ? 'image/*' : '', op && op.accepts_videos ? 'video/*' : ''].filter(Boolean).join(',');
+    els.fileInput.accept = isDecision && op.image_format === 'typesafe_assets'
+      ? 'image/png,image/jpeg'
+      : [op && op.accepts_images ? 'image/*' : '', op && op.accepts_videos ? 'video/*' : ''].filter(Boolean).join(',');
     els.fileInput.multiple = Boolean(op && (
       (op.accepts_images && op.multiple_images !== false)
       || (op.accepts_videos && op.multiple_videos === true)
@@ -910,14 +945,23 @@
     els.dropHint.textContent = isVideoAnalysis
       ? '上传单个视频，或使用下方手机 / PC 摄像头持续分析'
       : (op && op.accepts_videos ? 'Ref2VA: up to 9 images and 3 videos at 24 FPS; visual references only' : '支持多张参考图；点击这里选择文件');
+    if (isDecision && op.accepts_images) {
+      els.dropHint.textContent = op.image_format === 'startlux_images'
+        ? '图片按后端声明写入顶层 images 数组，原始 State 保持不变。'
+        : (op.image_format === 'typesafe_assets' ? 'PNG / JPEG；自动写入 assets，并在 State.images 中引用。' : '图片通过原生 input_image 内容发送。');
+    }
+    if (hasDecisionImages && !acceptsUploads) {
+      els.dropHint.textContent = '当前格式不支持这些图片。请切回后端原生格式或移除图片；不会自动转换或丢弃。';
+    }
     els.chatParams.hidden = !isChatRequest;
+    els.chatParams.closest('.advanced').hidden = Boolean(isDecision);
     els.mediaParams.hidden = !(isMedia || isVideoAnalysis);
     els.ttftMetric.hidden = !isChatRequest;
-    els.resultTitle.textContent = isChat
+    els.resultTitle.textContent = isDecision ? '决策结果' : isChat
       ? '连续对话'
       : (isVideoAnalysis ? '视频分析记录' : (isContextIR ? 'H3 Prompt 增强记录' : (op ? '连续调试' : '交互记录')));
     els.clear.textContent = '清空记录';
-    els.shortcut.textContent = isVideoAnalysis
+    els.shortcut.textContent = isDecision ? 'Enter 运行决策 · Ctrl / ⌘ + Enter 换行' : isVideoAnalysis
       ? 'Enter 分析 · Ctrl / ⌘ + Enter 换行 · 可拖放视频'
       : (isChat
         ? 'Enter 发送 · Ctrl / ⌘ + Enter 换行 · 可直接粘贴图片'
@@ -969,7 +1013,8 @@
         : (isChat
           ? (op.accepts_images ? '输入问题；也可以粘贴或上传图片…' : '输入要发送给模型的内容…')
           : (isContextIR ? '用自然语言描述要生成的 H3 视频…' : (isVideoGeneration ? '描述要生成的视频…' : (isImageEdit ? '描述希望怎样编辑图片…' : '描述要生成的图片…'))));
-      els.send.textContent = isVideoAnalysis
+      if (isDecision) els.prompt.placeholder = '输入本次决策的状态 / 背景，或选择 JSON 后输入对象 / 数组…';
+      els.send.textContent = isDecision ? '运行决策 →' : isVideoAnalysis
         ? '分析视频 →'
         : (isChat ? '发送请求 →' : (isContextIR ? '增强 H3 Prompt →' : (isVideoGeneration ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →'))));
     }
@@ -1201,8 +1246,13 @@
     );
     els.send.disabled = Boolean(state.controller) || cameraBusy || !selectedModel() || !op
       || !credentialReady || op.configured === false
-      || !els.prompt.value.trim() || missingRequiredMedia || !externalPlannerReady;
+      || (op.id !== 'decision' && !els.prompt.value.trim()) || missingRequiredMedia || !externalPlannerReady
+      || (op.id === 'decision' && hasImage && !op.accepts_images);
     els.generationCount.disabled = Boolean(state.controller) || !operationUsesMediaQueue(op);
+    for (const input of els.decisionSection.querySelectorAll('input, select, textarea, button')) {
+      input.disabled = Boolean(state.controller) || (input.classList.contains('decision-remove') && decisionForm(op)?.questions.length <= 1);
+    }
+    updateDecisionPreview();
     syncCameraControls();
   }
 
@@ -1252,7 +1302,7 @@
     if (operationUsesChatEndpoint(op)) {
       els.answerText.classList.add('cursor');
     } else {
-      els.answerText.textContent = op.id === 'h3_context_ir'
+      els.answerText.textContent = op.id === 'decision' ? '正在评估决策问题…' : op.id === 'h3_context_ir'
         ? '正在规划并校验 H3 Prompt…'
         : (op.id === 'video_generation'
           ? `正在生成第 1/${(plan && plan.runCount) || 1} 份视频…`
@@ -1425,8 +1475,9 @@
     els.systemPrompt.disabled = cameraBusy;
     els.temperature.disabled = cameraBusy;
     els.maxTokens.disabled = cameraBusy;
-    els.fileInput.disabled = cameraBusy;
-    els.dropZone.disabled = cameraBusy;
+    const decisionUploadsBlocked = op && op.id === 'decision' && (requestBusy || !op.accepts_images);
+    els.fileInput.disabled = cameraBusy || decisionUploadsBlocked;
+    els.dropZone.disabled = cameraBusy || decisionUploadsBlocked;
     els.clear.disabled = cameraBusy;
     for (const entry of state.parameterInputs.values()) {
       entry.input.disabled = cameraBusy;
@@ -2000,6 +2051,7 @@
         : [];
       if (state.loadedCredential !== null && state.loadedCredential !== credential) {
         state.interactionHistories.clear();
+        state.decisionForms.clear();
       }
       state.loadedCredential = credential;
       state.models.clear();
@@ -2478,9 +2530,420 @@
     els.prompt.focus();
   }
 
+  const DECISION_QUESTION_LABELS = {
+    predicate: '布尔概率 · P(true)',
+    choice: '选项概率 · Choice',
+    score: '有序等级 · Ordinal score',
+  };
+
+  function decisionForm(op = selectedOperation()) {
+    if (!op || op.id !== 'decision') return null;
+    const key = els.model.value;
+    let form = state.decisionForms.get(key);
+    if (!form) {
+      const types = op.question_types || [];
+      form = {
+        dialect: op.dialect || 'systemone', stateFormat: 'text', thinkMode: '',
+        questions: [{name: 'question_1', type: types[0] || 'predicate', instructions: '', criteria: ''}],
+      };
+      state.decisionForms.set(key, form);
+    }
+    return form;
+  }
+
+  function decisionDialects(op) {
+    return Array.isArray(op.dialects) ? op.dialects : [];
+  }
+
+  function syncDecisionForm(op) {
+    const visible = Boolean(op && op.id === 'decision');
+    els.decisionSection.hidden = !visible;
+    els.decisionStateLabel.hidden = !visible;
+    if (!visible) return;
+    const form = decisionForm(op);
+    const dialects = decisionDialects(op);
+    if (!dialects.some((item) => item.id === form.dialect)) form.dialect = dialects[0]?.id || '';
+    els.decisionDialect.replaceChildren();
+    for (const dialect of dialects) {
+      els.decisionDialect.append(new Option(dialect.label || dialect.id, dialect.id));
+    }
+    els.decisionDialect.value = form.dialect;
+    els.decisionStateFormat.value = form.stateFormat;
+    const dialect = dialects.find((item) => item.id === form.dialect);
+    els.decisionDialectHint.textContent = dialect
+      ? `${dialect.endpoint} · 两种格式使用各自的请求与响应结构。`
+      : '没有可用的决策 API 格式。';
+    const types = op.question_types || [];
+    const modalities = op.modalities || ['text'];
+    const hints = [
+      `问题：${types.map((type) => DECISION_QUESTION_LABELS[type] || type).join(' / ') || '未声明'}`,
+      `输入：${modalities.join(' / ')}`,
+    ];
+    if (modalities.includes('image') && form.dialect !== op.image_dialect) {
+      hints.push('图片需要切换到后端原生 API 格式');
+    }
+    if (op.image_format && modalities.includes('image')) hints.push(`图片格式：${op.image_format}`);
+    if (op.runtime) hints.push(`运行方式：${op.runtime}`);
+    if (op.version) hints.push(`版本：${op.version}`);
+    if (op.status) hints.push(`端点：${op.endpoint_verified ? '已验证' : '尚未验证'}`);
+    if (Array.isArray(op.warnings) && op.warnings.length) hints.push(op.warnings.join('；'));
+    els.decisionCapabilityHint.textContent = hints.join(' · ');
+    const thinkModes = Array.isArray(op.think_modes) ? op.think_modes : [];
+    const supportsThink = (op.extensions || []).includes('think_mode') && thinkModes.length > 0;
+    els.decisionThinkField.hidden = !supportsThink;
+    els.decisionThinkMode.replaceChildren(new Option('后端默认（不发送）', ''));
+    if (supportsThink) {
+      for (const mode of thinkModes) els.decisionThinkMode.append(new Option(mode, mode));
+    }
+    if (!supportsThink || (form.thinkMode && !thinkModes.includes(form.thinkMode))) form.thinkMode = '';
+    els.decisionThinkMode.value = form.thinkMode;
+    renderDecisionQuestions(op);
+    updateDecisionPreview();
+  }
+
+  function decisionField(labelText, input) {
+    const field = document.createElement('div');
+    field.className = 'field';
+    const label = document.createElement('label');
+    label.htmlFor = input.id;
+    label.textContent = labelText;
+    field.append(label, input);
+    return field;
+  }
+
+  function renderDecisionQuestions(op = selectedOperation()) {
+    const form = decisionForm(op);
+    if (!form) return;
+    els.decisionQuestionList.replaceChildren();
+    const types = op.question_types || [];
+    form.questions.forEach((question, index) => {
+      const group = document.createElement('fieldset');
+      group.className = 'decision-question';
+      const legend = document.createElement('legend');
+      legend.textContent = `问题 ${index + 1}`;
+      group.append(legend);
+      const head = document.createElement('div');
+      head.className = 'decision-question-head';
+      const name = document.createElement('input');
+      name.id = `decision-question-${index}-name`;
+      name.className = 'control';
+      name.value = question.name;
+      name.placeholder = '问题名称（可留空）';
+      name.setAttribute('aria-label', `问题 ${index + 1} 名称`);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'secondary decision-remove';
+      remove.textContent = '移除';
+      remove.disabled = form.questions.length <= 1;
+      remove.setAttribute('aria-label', `移除问题 ${index + 1}`);
+      remove.addEventListener('click', () => {
+        form.questions.splice(index, 1);
+        renderDecisionQuestions(op);
+        updateDecisionPreview();
+      });
+      head.append(name, remove);
+      const type = document.createElement('select');
+      type.id = `decision-question-${index}-type`;
+      for (const value of types) type.append(new Option(DECISION_QUESTION_LABELS[value] || value, value));
+      type.value = question.type;
+      // Keep unsupported saved questions visible, rather than changing their meaning silently.
+      if (!types.includes(question.type)) {
+        type.append(new Option(`${question.type}（当前后端未声明支持）`, question.type));
+        type.value = question.type;
+      }
+      const instructions = document.createElement('textarea');
+      instructions.id = `decision-question-${index}-instructions`;
+      instructions.rows = 2;
+      instructions.value = question.instructions;
+      instructions.placeholder = '要根据当前状态判断什么？';
+      group.append(head, decisionField('类型', type), decisionField('问题 / Instructions', instructions));
+      const criteria = document.createElement('textarea');
+      criteria.id = `decision-question-${index}-criteria`;
+      criteria.rows = 3;
+      criteria.value = question.criteria;
+      criteria.placeholder = question.type === 'score' ? '低\n中\n高' : '接受\n拒绝';
+      const criteriaField = decisionField(
+        question.type === 'score' ? '等级（每行一个，由低到高；索引从 0 开始）' : '选项（每行一个）',
+        criteria,
+      );
+      criteriaField.hidden = question.type === 'predicate';
+      group.append(criteriaField);
+      for (const [input, key] of [[name, 'name'], [instructions, 'instructions'], [criteria, 'criteria']]) {
+        input.addEventListener('input', () => {
+          question[key] = input.value;
+          updateDecisionPreview();
+        });
+      }
+      type.addEventListener('change', () => {
+        question.type = type.value;
+        renderDecisionQuestions(op);
+        updateDecisionPreview();
+      });
+      els.decisionQuestionList.append(group);
+    });
+  }
+
+  function prepareDecisionRequest(op) {
+    const form = decisionForm(op);
+    const dialect = decisionDialects(op).find((item) => item.id === form.dialect);
+    if (!dialect) throw new Error('请选择受支持的决策 API 格式。');
+    let context = els.prompt.value.trim();
+    if (form.stateFormat === 'json') {
+      try { context = JSON.parse(context); } catch (_) { throw new Error('State 不是有效的 JSON。'); }
+      if (context === null || typeof context !== 'object') throw new Error('JSON State 必须是对象或数组。');
+    }
+    if (!form.questions.length) throw new Error('至少添加一个问题。');
+    const seen = new Set();
+    const questions = form.questions.map((question, index) => {
+      const name = question.name.trim();
+      if (form.dialect === 'systemone' && seen.has(name)) throw new Error(`SystemOne 问题 ${index + 1} 需要唯一名称。`);
+      seen.add(name);
+      if (!(op.question_types || []).includes(question.type)) throw new Error(`后端没有声明支持问题类型 ${question.type}。`);
+      const instructions = question.instructions.trim();
+      const criteria = question.criteria.split('\n').map((line) => line.trim()).filter(Boolean);
+      const minimum = question.type === 'choice' && form.dialect === 'systemone' ? 1 : 2;
+      if (question.type !== 'predicate' && criteria.length < minimum) throw new Error(`问题 ${index + 1} 至少需要 ${minimum} 个选项或等级。`);
+      if (question.type === 'choice' && new Set(criteria).size !== criteria.length) throw new Error(`问题 ${index + 1} 的选项不能重复。`);
+      return {name, type: question.type, instructions, criteria};
+    });
+    const images = state.attachments.filter((attachment) => attachment.kind === 'image');
+    if (images.length && !op.accepts_images) throw new Error('当前 API 格式没有声明图片支持。请切回后端原生格式或移除图片；不支持跨格式图片转换。');
+    let payload;
+    const extraHeaders = {};
+    if (form.dialect === 'systemone') {
+      payload = {model: els.model.value, state: context, questions: Object.fromEntries(questions.map((question) => {
+        const value = {type: question.type === 'predicate' ? 'noul' : question.type, instructions: question.instructions};
+        if (question.type === 'choice') value.criteria = Object.fromEntries(question.criteria.map((label) => [label, null]));
+        if (question.type === 'score') value.criteria = question.criteria;
+        return [question.name, value];
+      }))};
+      if (images.length && op.image_format === 'startlux_images') {
+        payload.images = images.map((attachment) => attachment.dataUrl);
+      } else if (images.length && op.image_format === 'typesafe_assets') {
+        const assets = {};
+        images.forEach((attachment, index) => {
+          const match = /^data:image\/(png|jpe?g);base64,(.+)$/i.exec(attachment.dataUrl);
+          if (!match) throw new Error('TypeSafe 图片仅支持 PNG 和 JPEG。');
+          const reference = `playground_image_${index + 1}`;
+          assets[reference] = {type: 'image', format: match[1].toLowerCase(), data_base64: match[2]};
+        });
+        payload.assets = assets;
+        payload.state = {context, images: Object.keys(assets)};
+        extraHeaders['TypeSafe-Danger-Zone-Images'] = 'true';
+      }
+    } else if (form.dialect === 'openai_decisions') {
+      const text = typeof context === 'string' ? context : JSON.stringify(context);
+      payload = {
+        model: els.model.value,
+        input: images.length ? [{role: 'user', content: [
+          {type: 'input_text', text},
+          ...images.map((attachment) => ({type: 'input_image', image_url: attachment.dataUrl})),
+        ]}] : text,
+        questions: questions.map((question) => {
+          const value = {type: question.type, name: question.name, instructions: question.instructions};
+          if (question.type === 'choice') value.choices = question.criteria.map((label) => ({value: label}));
+          if (question.type === 'score') value.levels = question.criteria.map((label) => ({label}));
+          return value;
+        }),
+      };
+    } else {
+      throw new Error(`不支持的决策 API 格式：${form.dialect}`);
+    }
+    if (form.thinkMode) {
+      if (!(op.extensions || []).includes('think_mode') || !(op.think_modes || []).includes(form.thinkMode)) {
+        throw new Error('当前后端没有声明支持此 Think mode。');
+      }
+      payload.think_mode = form.thinkMode;
+    }
+    return {
+      modelId: els.model.value, operationId: op.id, dialect: form.dialect,
+      endpoint: dialect.endpoint, payload, extraHeaders, questions,
+      userMessage: {role: 'user', content: typeof context === 'string' ? context : JSON.stringify(context, null, 2)},
+    };
+  }
+
+  function updateDecisionPreview() {
+    const op = selectedOperation();
+    if (!op || op.id !== 'decision') return;
+    try {
+      const plan = prepareDecisionRequest(op);
+      const headerLines = Object.entries(plan.extraHeaders).map(([key, value]) => `${key}: ${value}`).join('\n');
+      els.decisionRequestPreview.textContent = `POST ${plan.endpoint}\n${headerLines ? `${headerLines}\n` : ''}${JSON.stringify(plan.payload, null, 2)}`;
+    } catch (error) {
+      els.decisionRequestPreview.textContent = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  function appendDecisionRaw(parent, label, value) {
+    const details = document.createElement('details');
+    details.className = 'decision-raw';
+    const summary = document.createElement('summary');
+    summary.textContent = label;
+    const pre = document.createElement('pre');
+    pre.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    details.append(summary, pre);
+    parent.append(details);
+  }
+
+  function appendDecisionProbabilities(parent, rows) {
+    if (!rows.length) return;
+    const table = document.createElement('table');
+    table.className = 'decision-probabilities';
+    const head = document.createElement('thead');
+    const header = document.createElement('tr');
+    for (const title of ['选项 / 等级', '后端返回概率']) {
+      const cell = document.createElement('th');
+      cell.scope = 'col';
+      cell.textContent = title;
+      header.append(cell);
+    }
+    head.append(header);
+    const body = document.createElement('tbody');
+    for (const row of rows) {
+      const tr = document.createElement('tr');
+      const label = document.createElement('td');
+      label.textContent = String(row.label);
+      const value = document.createElement('td');
+      const cell = document.createElement('div');
+      cell.className = 'decision-probability-cell';
+      const number = document.createElement('span');
+      if (typeof row.probability === 'number' && Number.isFinite(row.probability) && row.probability >= 0 && row.probability <= 1) {
+        const bar = document.createElement('progress');
+        bar.max = 1;
+        bar.value = row.probability;
+        bar.setAttribute('aria-label', `${row.label} 概率`);
+        number.textContent = `${(row.probability * 100).toFixed(2)}%`;
+        number.title = String(row.probability);
+        cell.append(bar);
+      } else {
+        number.textContent = '未提供';
+      }
+      cell.append(number);
+      value.append(cell);
+      tr.append(label, value);
+      body.append(tr);
+    }
+    table.append(head, body);
+    parent.append(table);
+  }
+
+  function appendDecisionResultElement(parent, result) {
+    const article = document.createElement('article');
+    article.className = 'message assistant decision-result';
+    const response = result.response;
+    const answers = response && response.answers;
+    const entries = result.dialect === 'systemone'
+      ? Object.entries(answers && !Array.isArray(answers) ? answers : {})
+      : (Array.isArray(answers) ? answers : []).map((answer, index) => [answer.name || result.questions[index]?.name || `问题 ${index + 1}`, answer]);
+    entries.forEach(([name, answer], index) => {
+      if (!answer || typeof answer !== 'object') return;
+      const section = document.createElement('section');
+      section.className = 'decision-answer';
+      const heading = document.createElement('h3');
+      heading.textContent = name || `问题 ${index + 1}`;
+      section.append(heading);
+      const question = result.dialect === 'systemone'
+        ? result.questions.find((item) => item.name === name) : result.questions[index];
+      const instructions = document.createElement('p');
+      instructions.textContent = question?.instructions || '';
+      section.append(instructions);
+      let rows = [];
+      const summary = document.createElement('p');
+      if (['noul', 'predicate'].includes(answer.type)) {
+        rows = [{label: 'P(true)', probability: answer.type === 'noul' ? answer.noul : answer.probability}];
+      } else if (answer.type === 'choice' || answer.type === 'score') {
+        if (Array.isArray(answer.probabilities)) {
+          rows = answer.probabilities.map((item) => ({label: item.label ?? item.value, probability: item.probability}));
+        } else if (answer.probabilities && typeof answer.probabilities === 'object') {
+          rows = Object.entries(answer.probabilities).map(([value, probability]) => ({
+            label: answer.legend?.[value] ?? value, probability,
+          }));
+        }
+        if (answer.type === 'score' && typeof answer.score === 'number') {
+          summary.textContent = `期望等级分数（从 0 开始）：${answer.score}`;
+        } else if (answer.type === 'choice' && answer.choice != null) {
+          summary.textContent = `选择：${String(answer.choice)}`;
+        } else if (answer.type === 'choice' && answer.choice === null) {
+          summary.textContent = '未选择任何列出的选项（none-of-the-above）。';
+        }
+      } else if (answer.type === 'refusal') {
+        summary.textContent = '后端拒绝回答此问题。';
+      }
+      if (summary.textContent) section.append(summary);
+      appendDecisionProbabilities(section, rows);
+      if (!rows.length && !summary.textContent) {
+        const unknown = document.createElement('p');
+        unknown.textContent = '后端未返回可展示的概率或评分；请查看原始响应。';
+        section.append(unknown);
+      }
+      if (answer.none_probability != null) {
+        const alarm = document.createElement('p');
+        alarm.className = 'decision-result-meta decision-none-alarm';
+        alarm.textContent = `后端 none_probability 警报分数：${String(answer.none_probability)}（未校准；独立于列出选项的归一化概率分布）`;
+        section.append(alarm);
+      }
+      if (answer.confidence != null) {
+        const confidence = document.createElement('p');
+        confidence.className = 'decision-result-meta';
+        confidence.textContent = `后端 confidence：${String(answer.confidence)}（按后端语义，不等同于校准概率）`;
+        section.append(confidence);
+      }
+      article.append(section);
+    });
+    if (result.error) {
+      const error = document.createElement('div');
+      error.className = 'decision-error';
+      error.textContent = result.error;
+      article.append(error);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'decision-result-meta';
+    const facts = [`POST ${result.endpoint}`, result.elapsedMs != null ? `耗时 ${(result.elapsedMs / 1000).toFixed(2)}s` : '请求中…'];
+    if (result.status) facts.push(`HTTP ${result.status}`);
+    meta.textContent = facts.join(' · ');
+    article.append(meta);
+    if (response && response.usage != null) appendDecisionRaw(article, 'Usage（后端返回）', response.usage);
+    if (response && response.decision_metadata != null) appendDecisionRaw(article, '来源与概率语义', response.decision_metadata);
+    appendDecisionRaw(article, '原始请求（不含认证信息）', result.request);
+    if (result.response !== undefined) appendDecisionRaw(article, '原始响应', result.response);
+    parent.append(article);
+  }
+
+  async function runDecision(op, plan) {
+    const result = {
+      dialect: plan.dialect, endpoint: plan.endpoint, request: plan.payload,
+      questions: plan.questions, elapsedMs: null,
+    };
+    const interaction = interactionFor(plan.modelId, plan.operationId);
+    interaction.turns.push({user: plan.userMessage, decision: result});
+    renderInteractionHistory();
+    try {
+      const response = await fetch(plan.endpoint, {
+        method: 'POST', headers: {...authHeaders(true), ...plan.extraHeaders},
+        body: JSON.stringify(plan.payload), signal: state.controller.signal,
+      });
+      result.status = response.status;
+      const text = await response.text();
+      try { result.response = JSON.parse(text); } catch (_) { result.response = text; }
+      if (!response.ok) throw new Error(formatError(result.response, `${response.status} ${response.statusText}`));
+      if (!result.response || typeof result.response !== 'object' || !result.response.answers) {
+        throw new Error('决策接口没有返回 answers；原始响应已保留。');
+      }
+    } catch (error) {
+      result.error = error && error.name === 'AbortError' ? '请求已停止。' : (error instanceof Error ? error.message : String(error));
+      throw error;
+    } finally {
+      result.elapsedMs = performance.now() - state.startedAt;
+      els.answerText.textContent = '';
+      els.answer.classList.remove('active');
+      renderInteractionHistory();
+    }
+  }
+
   async function runRequest() {
     const op = selectedOperation();
-    if (state.controller || !op || !els.prompt.value.trim()) return;
+    if (state.controller || !op || (op.id !== 'decision' && !els.prompt.value.trim())) return;
+    if (op.id === 'decision' && state.loadedCredential !== els.apiKey.value.trim()) return;
     const imageCount = state.attachments.filter(
       (attachment) => attachment.kind === 'image',
     ).length;
@@ -2509,19 +2972,20 @@
     try {
       plan = operationUsesChatEndpoint(op)
         ? prepareChatRequest(op)
-        : prepareMediaRequest(op);
+        : (op.id === 'decision' ? prepareDecisionRequest(op) : prepareMediaRequest(op));
     } catch (error) {
       showError(error instanceof Error ? error.message : String(error));
       return;
     }
 
     state.controller = new AbortController();
+    state.requestDiscarded = false;
     state.activePlannerChoice = effectivePlannerChoice(op);
     state.activePlannerHasImages = imageCount > 0;
     state.startedAt = performance.now();
     state.firstTokenAt = 0;
     beginRequest(op, plan);
-    clearComposerInput();
+    if (op.id !== 'decision') clearComposerInput();
     els.prompt.focus();
     syncSendState();
     state.timer = window.setInterval(() => {
@@ -2529,10 +2993,13 @@
     }, 100);
     try {
       if (operationUsesChatEndpoint(op)) await runChat(op, plan);
+      else if (op.id === 'decision') await runDecision(op, plan);
       else if (op.id === 'h3_context_ir') await runContextIR(op, plan);
       else await runMedia(op, plan);
     } catch (error) {
-      if (error && error.name === 'AbortError') {
+      if (state.requestDiscarded) {
+        // Clear cancels this decision without repopulating the cleared view.
+      } else if (error && error.name === 'AbortError') {
         showRequestError(
           op,
           plan && plan.runCount > 1
@@ -2546,6 +3013,33 @@
       finishRequest();
     }
   }
+
+  els.decisionAddQuestion.addEventListener('click', () => {
+    const op = selectedOperation();
+    const form = decisionForm(op);
+    if (!form || state.controller) return;
+    let number = form.questions.length + 1;
+    while (form.questions.some((question) => question.name === `question_${number}`)) number += 1;
+    form.questions.push({name: `question_${number}`, type: (op.question_types || [])[0] || 'predicate', instructions: '', criteria: ''});
+    renderDecisionQuestions(op);
+    updateDecisionPreview();
+  });
+  els.decisionDialect.addEventListener('change', () => {
+    const form = decisionForm();
+    if (!form) return;
+    form.dialect = els.decisionDialect.value;
+    syncOperation();
+  });
+  els.decisionStateFormat.addEventListener('change', () => {
+    const form = decisionForm();
+    if (form) form.stateFormat = els.decisionStateFormat.value;
+    updateDecisionPreview();
+  });
+  els.decisionThinkMode.addEventListener('change', () => {
+    const form = decisionForm();
+    if (form) form.thinkMode = els.decisionThinkMode.value;
+    updateDecisionPreview();
+  });
 
   els.toggleKey.addEventListener('click', () => {
     const showing = els.apiKey.type === 'text';
@@ -2643,8 +3137,11 @@
   els.cameraStart.addEventListener('click', startCameraAnalysis);
   els.cameraStop.addEventListener('click', () => stopCameraAnalysis());
   els.clear.addEventListener('click', () => {
-    if (state.controller) state.controller.abort();
     const op = selectedOperation();
+    if (state.controller) {
+      if (op && op.id === 'decision') state.requestDiscarded = true;
+      state.controller.abort();
+    }
     if (op) {
       state.interactionHistories.delete(interactionKey(els.model.value, op.id));
     }

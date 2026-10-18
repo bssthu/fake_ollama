@@ -47,6 +47,7 @@ from .config import (
     ComfyUITarget,
     ExposureEntry,
     GenericOpenAITarget,
+    DecisionTarget,
     H3ContextIRProfile,
     H3ContextIRProvider,
     LlamaCppDefaults,
@@ -59,6 +60,7 @@ from .config import (
 )
 from .llama_cpp_client import LlamaCppClient
 from .generic_openai_client import GenericOpenAIClient
+from .decision_client import DecisionClient
 from .ollama_client import OllamaClient
 
 
@@ -148,6 +150,25 @@ LOCAL_OPENAI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "request_read_timeout_seconds", "type": "float", "default": None,
      "description": "Optional read-timeout override; <=0 disables read timeout."},
 ]
+
+DECISION_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
+    *[dict(item) for item in LOCAL_OPENAI_TARGET_ITEM_SCHEMA],
+    {"key": "dialect", "type": "string", "default": "systemone", "description": "Wire dialect: systemone or openai_decisions. These are different schemas."},
+    {"key": "runtime", "type": "string", "default": "external", "description": "external, llama_cpp, vllm, or optional official startlux"},
+    {"key": "endpoint_path", "type": "string", "default": None, "description": "Native POST route; defaults to /v1/systemone or /v1/decisions. StartLux uses systemone at /v1/decisions."},
+    {"key": "decision_capabilities", "type": "json", "default": {}, "description": "Explicit question_types, modalities, extensions, think_modes. No model-name guessing; Instant should not advertise think_mode."},
+    {"key": "model_path", "type": "string", "default": None, "description": "User-downloaded local model file/folder required for built-in managed runtimes. No weights downloaded."},
+    {"key": "binary_path", "type": "string", "default": None, "description": "llama-server executable for managed llama_cpp decisions"},
+    {"key": "python_path", "type": "string", "default": None, "description": "Python interpreter in the optional runtime's isolated environment"},
+    {"key": "runtime_backend", "type": "string", "default": "vllm", "description": "Optional StartLux engine: vllm or transformers"},
+    {"key": "start_args", "type": "string_list", "default": [], "description": "Extra argv arguments; built-in local model/download settings cannot be overridden"},
+    {"key": "probe_interval_seconds", "type": "float", "default": 300.0, "description": "Refresh native schema/version capability probes on use"},
+    {"key": "source_url", "type": "string", "default": None, "description": "Model or runtime upstream source URL"},
+    {"key": "license", "type": "string", "default": None, "description": "License metadata supplied by the operator; no calibration claims"},
+]
+for _item in DECISION_TARGET_ITEM_SCHEMA:
+    if _item["key"] == "models":
+        _item["description"] = "Typed decision models, separate from chat targets"
 
 OLLAMA_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "name", "type": "string", "default": "", "required": True,
@@ -563,6 +584,10 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "nav_label_keys": ["name"],
    "description": "Lifecycle-managed generic OpenAI-compatible servers such as vLLM, SGLang, TGI, or adapters."},
 
+  {"key": "decision_targets", "type": "object_list", "default": [], "group": "model_sources_decision",
+   "item_schema": DECISION_TARGET_ITEM_SCHEMA, "nav_label_keys": ["name"],
+   "description": "Native typed-decision endpoints and optional managed runtimes. Weights are installed separately."},
+
   {"key": "ollama_targets", "type": "object_list", "default": [], "group": "model_sources_ollama",
    "item_schema": OLLAMA_TARGET_ITEM_SCHEMA,
    "detect_models": "ollama",
@@ -684,6 +709,7 @@ def _sync_ui_schema_defaults() -> None:
         (UPSTREAM_ITEM_SCHEMA, AnthropicUpstream),
         (OPENAI_UPSTREAM_ITEM_SCHEMA, OpenAIUpstream),
         (LOCAL_OPENAI_TARGET_ITEM_SCHEMA, GenericOpenAITarget),
+        (DECISION_TARGET_ITEM_SCHEMA, DecisionTarget),
         (OLLAMA_TARGET_ITEM_SCHEMA, OllamaTarget),
         (LLAMA_CPP_TARGET_ITEM_SCHEMA, LlamaCppTarget),
         (LLAMA_CPP_DEFAULTS_SCHEMA, LlamaCppDefaults),
@@ -713,6 +739,7 @@ _sync_ui_schema_defaults()
 
 GROUP_LABELS: List[Dict[str, str]] = [
   {"key": "model_sources_remote", "label": "Remote Sources", "hint": "远端模型来源：Anthropic / OpenAI 兼容上游", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
+  {"key": "model_sources_decision", "label": "Decision Sources", "hint": "SystemOne and OpenAI Decisions native endpoints with explicit capabilities", "section": "model_sources", "section_label": "Model Sources", "section_hint": "Typed decision sources"},
   {"key": "model_sources_generic_openai", "label": "Generic OpenAI Sources", "hint": "Lifecycle-managed generic OpenAI-compatible servers such as vLLM, SGLang, TGI, or adapters", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
   {"key": "model_sources_ollama", "label": "Ollama Sources", "hint": "本机或内网 Ollama 服务", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
   {"key": "model_sources_llama_cpp", "label": "llama.cpp Sources", "hint": "本机 llama.cpp server 进程", "section": "model_sources", "section_label": "Model Sources", "section_hint": "配置可被路由的模型来源（source / target）"},
@@ -908,6 +935,11 @@ def _generic_openai_client_matches(
     )
 
 
+def _decision_client_matches(client: DecisionClient, *, settings: Settings, target: DecisionTarget) -> bool:
+    return isinstance(client, DecisionClient) and client.matches(target, timeout=settings.timeout_seconds,
+                                                                 trust_env=settings.use_system_proxy)
+
+
 def _comfyui_client_matches(
     client: ComfyUIClient,
     *,
@@ -950,6 +982,7 @@ def _prepare_pools(app, new_settings, created):
     old_ollama = dict(getattr(app.state, "ollama_clients", {}))
     old_llama_cpp = dict(getattr(app.state, "llama_cpp_clients", {}))
     old_generic_openai = dict(getattr(app.state, "generic_openai_clients", {}))
+    old_decision = dict(getattr(app.state, "decision_clients", {}))
     old_comfyui = dict(getattr(app.state, "comfyui_clients", {}))
     new_clients: Dict[str, AnthropicClient] = {}
     for up in new_settings.anthropic_upstreams:
@@ -1066,6 +1099,15 @@ def _prepare_pools(app, new_settings, created):
             request_read_timeout_seconds=tgt.request_read_timeout_seconds,
         )
         created.append(new_generic_openai[tgt.name])
+    new_decision: Dict[str, DecisionClient] = {}
+    for tgt in new_settings.decision_targets:
+        existing = old_decision.get(tgt.name)
+        if existing is not None and _decision_client_matches(existing, settings=new_settings, target=tgt):
+            new_decision[tgt.name] = existing
+            continue
+        new_decision[tgt.name] = DecisionClient(tgt, timeout=new_settings.timeout_seconds,
+            trust_env=new_settings.use_system_proxy, ownership_active=False)
+        created.append(new_decision[tgt.name])
     new_comfyui: Dict[str, ComfyUIClient] = {}
     remaining_comfyui = dict(old_comfyui)
     for tgt in new_settings.comfyui_targets:
@@ -1101,7 +1143,7 @@ def _prepare_pools(app, new_settings, created):
 
     return dict(clients=new_clients, openai_clients=new_openai, ollama_clients=new_ollama,
                 llama_cpp_clients=new_llama_cpp, generic_openai_clients=new_generic_openai,
-                comfyui_clients=new_comfyui)
+                decision_clients=new_decision, comfyui_clients=new_comfyui)
 
 
 async def _swap_settings(app: FastAPI, new_settings: Settings, *, save_path=None):

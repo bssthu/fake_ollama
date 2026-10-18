@@ -138,6 +138,7 @@ def test_admin_schema(admin_settings):
         "anthropic_upstreams",
         "openai_upstreams",
         "generic_openai_targets",
+        "decision_targets",
         "ollama_targets",
         "llama_cpp_defaults",
         "llama_cpp_targets",
@@ -207,6 +208,12 @@ def test_admin_schema(admin_settings):
         "max_concurrent_requests",
         "request_read_timeout_seconds",
     } <= generic_openai_item_keys
+
+    decisions = next(f for f in fields if f["key"] == "decision_targets")
+    assert decisions["type"] == "object_list"
+    decision_keys = {f["key"] for f in decisions["item_schema"]}
+    assert {"dialect", "runtime", "endpoint_path", "decision_capabilities", "model_path",
+            "python_path", "binary_path", "start_args", "license", "source_url"} <= decision_keys
 
     ollama = next(f for f in fields if f["key"] == "ollama_targets")
     ollama_item_keys = {f["key"] for f in ollama["item_schema"]}
@@ -333,6 +340,7 @@ def test_admin_schema(admin_settings):
     group_order = [g["key"] for g in schema["groups"]]
     assert group_order == [
         "model_sources_remote",
+        "model_sources_decision",
         "model_sources_generic_openai",
         "model_sources_ollama",
         "model_sources_llama_cpp",

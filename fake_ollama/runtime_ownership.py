@@ -19,6 +19,7 @@ class RuntimeOwner:
         self.authorized = False
         self.stopping = False
         self.shutdown_result = None
+        self.uncertain_decisions = False
 
     def capture(self, client):
         if client._started_by_us and client._process is not None:
@@ -69,6 +70,11 @@ def register(client, *, group=None, active=True):
 def begin_request(client):
     if client._closed or not client._ownership_active or client._ownership.stopping:
         raise BackendShuttingDownError(client.target_id)
+    if client._ownership.uncertain_decisions:
+        raise LocalTargetResourceError(
+            "A decision request lost its transport before completion; upstream execution is unconfirmed. "
+            "Stop the owned runtime to confirm cleanup. For an external service, verify completion or "
+            "restart it before restarting the gateway.", error_type="runtime_quarantined")
     client._used_since_last_stop = True
 
 
@@ -81,8 +87,13 @@ async def discard_finished_process(client, *, inspect, terminate):
     if not await terminate(owner.process, timeout=min(10.0, client._stop_timeout)):
         raise LocalTargetResourceError("Previous process tree cleanup failed", error_type="runtime_quarantined")
     owner.process, owner.command, owner.shutdown_result = None, None, None
+    owner.uncertain_decisions = False
     for member in owner.members:
         member._process, member._started_by_us = None, False
+        if hasattr(member, "_invalidate_runtime_resources"):
+            member._invalidate_runtime_resources(full=True)
+        elif hasattr(member, "_clear_all_vram_state"):
+            member._clear_all_vram_state()
 
 
 async def _stop_locked(client, terminate, run_command):
@@ -109,6 +120,7 @@ async def _stop_locked(client, terminate, run_command):
             result = await terminate(owner.process, timeout=min(10.0, client._stop_timeout))
         if result:
             owner.process, owner.command, owner.authorized = None, None, False
+            owner.uncertain_decisions = False
             for member in list(owner.members):
                 member._started_by_us = False
                 member._process = None
@@ -140,9 +152,15 @@ async def close_client(client, *, terminate, run_command):
             # retires. Prepared reload replacements register only after drain.
             siblings = set(owner.members) - {client}
             owner.can_manage()
-            if not siblings and (owner.process is not None or (owner.authorized and owner.command)):
+            # Unconfirmed decision execution quarantines every sibling. Verified
+            # owned cleanup may resolve it collectively once known requests have
+            # drained; refusing to close every sibling would strand the process.
+            if (not siblings or owner.uncertain_decisions) and (owner.process is not None or (owner.authorized and owner.command)):
                 if not await _stop_locked(client, terminate, run_command):
                     raise LocalTargetResourceError("Backend stop cleanup failed; resources retained", error_type="runtime_quarantined")
+            if owner.uncertain_decisions:
+                raise LocalTargetResourceError("Decision execution is unconfirmed; runtime resources retained until verified cleanup",
+                                               error_type="runtime_quarantined")
             if client._owns_client:
                 await client._client.aclose()
             for field in ("_vram_coordinator", "_memory_coordinator"):

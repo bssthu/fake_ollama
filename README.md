@@ -1056,3 +1056,7 @@ python -m fake_ollama --no-request-data-log
 ## License
 
 MIT — 详见 [LICENSE](./LICENSE)。
+
+## Typed decision models
+
+Dedicated `decision_targets` support SystemOne (`/v1/systemone`) and OpenAI Decisions (`/v1/decisions`) with explicit typed codecs, native runtime capability checks, and managed local lifecycles. See [decision configuration and examples](docs/decisions.md) and [optional official StartLux setup](docs/decision-startlux.md). Runtimes and model weights are prepared separately by the operator; this project has no model-download feature.

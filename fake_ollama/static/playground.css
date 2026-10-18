@@ -666,3 +666,30 @@ details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px
   .model-chip { max-width: 43vw; }
   .shortcut { display: none; }
 }
+
+
+/* Typed decision requests remain separate from chat and media controls. */
+.decision-section, .decision-question-list { display: grid; gap: 13px; }
+.decision-section { border-top: 1px solid var(--line); padding-top: 16px; }
+.decision-question { min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: #faf8f3; display: grid; gap: 9px; }
+.decision-question legend { padding: 0 5px; font-size: 12px; font-weight: 700; }
+.decision-question textarea { padding: 9px 10px; resize: vertical; min-height: 68px; font-size: 12px; }
+.decision-question .decision-question-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+.decision-question .decision-remove { min-height: 36px; padding: 5px 9px; }
+.decision-raw { min-width: 0; margin-top: 9px; }
+.decision-raw summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.decision-raw pre { max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.decision-state-label { display: block; padding: 11px 15px 0; font-size: 12px; font-weight: 700; color: var(--muted); }
+.decision-result { display: grid; gap: 12px; }
+.decision-result h3 { margin: 0; font-size: 13px; }
+.decision-answer { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.decision-answer p { font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.decision-probabilities { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+.decision-probabilities th { color: var(--muted); text-align: left; font-size: 10px; }
+.decision-probabilities td, .decision-probabilities th { padding: 6px 4px; overflow-wrap: anywhere; vertical-align: middle; }
+.decision-probabilities th:last-child { width: 60%; }
+.decision-probability-cell { display: grid; grid-template-columns: minmax(30px, 1fr) 65px; align-items: center; gap: 9px; }
+.decision-probability-cell progress { width: 100%; height: 10px; accent-color: var(--accent); }
+.decision-probability-cell span { text-align: right; font-variant-numeric: tabular-nums; }
+.decision-result-meta { color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.decision-error { color: var(--danger); font-size: 12px; white-space: pre-wrap; }

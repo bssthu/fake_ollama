@@ -47,10 +47,12 @@ def _collect_model_snapshots(app: FastAPI) -> list[dict[str, object]]:
         getattr(settings, "dashboard_reclaim_idle_seconds", 20.0) or 20.0
     )
     snapshots: list[dict[str, object]] = []
+    physical_models: dict[tuple[object, str], dict[str, object]] = {}
     for clients in (
         getattr(app.state, "ollama_clients", {}),
         getattr(app.state, "llama_cpp_clients", {}),
         getattr(app.state, "generic_openai_clients", {}),
+        getattr(app.state, "decision_clients", {}),
         getattr(app.state, "comfyui_clients", {}),
     ):
         for client in list(clients.values()):
@@ -59,6 +61,19 @@ def _collect_model_snapshots(app: FastAPI) -> list[dict[str, object]]:
                 continue
             for raw in getter(now=now, idle_reclaim_seconds=idle_reclaim_seconds):
                 snap = dict(raw)
+                owner = getattr(client, "_ownership", client)
+                identity = (owner, str(snap.get("model") or ""))
+                previous = physical_models.get(identity)
+                if previous is not None:
+                    previous.setdefault("shared_target_ids", [previous["target_id"]]).append(snap["target_id"])
+                    for field in ("estimated_vram_gb", "estimated_vram_mib", "estimated_memory_gb", "estimated_memory_mib"):
+                        previous[field] = max(float(previous.get(field) or 0), float(snap.get(field) or 0))
+                    for field in ("active_requests", "queued_requests", "request_refs"):
+                        previous[field] = int(previous.get(field) or 0) + int(snap.get(field) or 0)
+                    previous["idle_seconds"] = min(float(previous.get("idle_seconds") or 0), float(snap.get("idle_seconds") or 0))
+                    previous["reclaimable"] = bool(previous.get("reclaimable") and snap.get("reclaimable"))
+                    continue
+                physical_models[identity] = snap
                 snap["key"] = _model_key(snap)
                 snapshots.append(snap)
     snapshots.sort(key=lambda item: str(item.get("key") or ""))
@@ -81,6 +96,7 @@ async def _collect_target_telemetry(app: FastAPI) -> List[Dict[str, Any]]:
     clients = {
         **(getattr(app.state, "llama_cpp_clients", None) or {}),
         **(getattr(app.state, "generic_openai_clients", None) or {}),
+        **(getattr(app.state, "decision_clients", None) or {}),
     }
     if not clients:
         return []
@@ -138,6 +154,7 @@ async def _collect_target_telemetry(app: FastAPI) -> List[Dict[str, Any]]:
             "queue": queue,
             "slots": slots_payload,
             "stderr": stderr_payload,
+            **({"decision_capabilities": client.capability_snapshot()} if callable(getattr(client, "capability_snapshot", None)) else {}),
         }
 
     results = await asyncio.gather(

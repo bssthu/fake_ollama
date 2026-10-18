@@ -174,6 +174,11 @@ def _dispatch(
         ):
             raise HTTPException(status_code=404, detail=msg) from exc
         raise HTTPException(status_code=400, detail=msg) from exc
+    if backend.protocol == "decision" and request.url.path in {
+        "/api/chat", "/api/generate", "/v1/chat/completions",
+        "/v1/messages", "/v1/messages/count_tokens",
+    }:
+        raise HTTPException(400, "Decision models use /v1/systemone or /v1/decisions")
     metrics: Optional[RequestMetrics] = getattr(
         request.app.state, "request_metrics", None
     )
@@ -230,6 +235,11 @@ def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-de
                 status_code=503,
                 detail=f"{label} '{backend.name}' is not initialised",
             )
+        return app.state.runtime_resources.check(client)
+    if backend.protocol == "decision":
+        client = getattr(app.state, "decision_clients", {}).get(backend.name)
+        if client is None:
+            raise HTTPException(503, f"decision_target '{backend.name}' is not initialised")
         return app.state.runtime_resources.check(client)
     if backend.protocol == "comfyui":
         client = app.state.comfyui_clients.get(backend.name)
@@ -320,6 +330,8 @@ _API_ONLY_PATH_PREFIXES = (
     "/v1/models",
     "/v1/images",
     "/v1/videos",
+    "/v1/systemone",
+    "/v1/decisions",
 )
 
 
@@ -368,6 +380,8 @@ def _request_surface(path: str) -> str:
     if path == "/v1/messages/count_tokens" or path.startswith("/v1/messages/count_tokens/"):
         return "anthropic-count-tokens"
     if _has_path_prefix(path, _API_ONLY_PATH_PREFIXES):
+        if path.startswith(("/v1/systemone", "/v1/decisions")):
+            return "decisions"
         if path.startswith("/v1/images"):
             return "images"
         if path.startswith("/v1/videos"):
@@ -572,7 +586,7 @@ def _install_port_router(app: FastAPI) -> None:
                 if path == "/":
                     return _finish(RedirectResponse("/playground/"))
                 playground_media = _has_path_prefix(
-                    path, ("/v1/images", "/v1/videos")
+                    path, ("/v1/images", "/v1/videos", "/v1/systemone", "/v1/decisions")
                 )
                 model_discovery = _has_path_prefix(path, ("/v1/models",))
                 if (

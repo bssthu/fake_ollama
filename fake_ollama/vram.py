@@ -463,6 +463,25 @@ class _ResourceCoordinator:
         if entry.confirmed_loaded_at is None:
             entry.confirmed_loaded_at = time.monotonic()
 
+    def _runtime_siblings(self, requester: Any):
+        """Physical ownership is shared across chat and decision transports."""
+        owner = getattr(requester, "_ownership", None)
+        if owner is not None:
+            for participant in self._participants.values():
+                if participant is not requester and getattr(participant, "_ownership", None) is owner:
+                    yield participant
+
+    def _sibling_has_model(self, participant: Any, model: str) -> bool:
+        if isinstance(getattr(participant, "_loaded_models", None), dict):
+            return self._spec.reservation(participant, model)
+        # Single-model clients historically answer has_*_reservation for any
+        # model name. Do not let a different model on a shared server bypass
+        # admission; multi-model clients already perform an exact lookup.
+        loaded = getattr(participant, "_loaded_model", None)
+        if loaded is not None and getattr(loaded, "model", None) != model:
+            return False
+        return self._spec.reservation(participant, model)
+
     async def _ensure_available(
         self,
         requester: Any,
@@ -482,6 +501,29 @@ class _ResourceCoordinator:
                 return
             if reserve and self._spec.reservation(requester, model):
                 return
+
+            if reserve:
+                siblings = list(self._runtime_siblings(requester))
+                for sibling in siblings:
+                    pending = self._pending.get((sibling.target_id, model))
+                    if pending is None:
+                        continue
+                    # Each transport owns an alias, not an independent load.
+                    # Removing a canceled request's alias cannot remove a
+                    # sibling's pending startup reservation.
+                    additional_mib = max(0.0, required_mib - _gb_to_mib(pending.estimated_gb))
+                    if additional_mib and pending.confirmed_loaded_at is None:
+                        available_mib = await self._provider()
+                        effective_free = self._effective_free_mib(available_mib or 0.0)
+                        if available_mib is None or effective_free < additional_mib:
+                            raise self._insufficient_error(requester, model=model,
+                                required_mib=additional_mib, available_mib=effective_free,
+                                reclaimable_mib=0.0)
+                        pending.estimated_gb = max(pending.estimated_gb, estimated_gb)
+                    self._pending[key] = pending
+                    return
+                if any(self._sibling_has_model(sibling, model) for sibling in siblings):
+                    return
 
             available_mib = await self._provider()
             if available_mib is None:
@@ -689,8 +731,13 @@ class _ResourceCoordinator:
                 )
             )
             for candidate in candidates:
-                if candidate.owner_id != target_id or candidate.model != model:
+                if candidate.model != model:
                     continue
+                if candidate.owner_id != target_id:
+                    requested_owner = getattr(self._participants.get(target_id), "_ownership", None)
+                    candidate_owner = getattr(self._participants.get(candidate.owner_id), "_ownership", None)
+                    if requested_owner is None or requested_owner is not candidate_owner:
+                        continue
 
                 released = await candidate.release()
                 if released:
@@ -721,7 +768,7 @@ class _ResourceCoordinator:
                     reason = "release_failed"
 
                 result: dict[str, object] = {
-                    "target_id": candidate.owner_id,
+                    "target_id": target_id,
                     "model": candidate.model,
                     self._spec.amount_key: candidate.estimated_gb,
                     "released": released,
@@ -755,8 +802,10 @@ class _ResourceCoordinator:
         now = time.monotonic()
         total = 0.0
         stale: list[tuple[str, str]] = []
+        counted: set[int] = set()
+        excluded = self._pending.get(exclude_key) if exclude_key is not None else None
         for k, entry in self._pending.items():
-            if k == exclude_key:
+            if entry is excluded:
                 continue
             if (
                 entry.confirmed_loaded_at is not None
@@ -765,7 +814,9 @@ class _ResourceCoordinator:
                 # The live reading should have caught up; drop the bookkeeping.
                 stale.append(k)
                 continue
-            total += _gb_to_mib(entry.estimated_gb)
+            if id(entry) not in counted:
+                total += _gb_to_mib(entry.estimated_gb)
+                counted.add(id(entry))
         for k in stale:
             self._pending.pop(k, None)
         return total
@@ -818,12 +869,22 @@ class _ResourceCoordinator:
         for participant in self._participants.values():
             if participant.active_requests:
                 continue
+            owner = getattr(participant, "_ownership", None)
+            if owner is not None and owner.busy():
+                # ComfyUI's execution lease permits its admitting task to
+                # unload idle models on the same runtime before submitting
+                # work. Its backend hook understands that narrow exception;
+                # queued request references alone must not defeat admission.
+                in_use = getattr(participant, "_runtime_in_use", None)
+                if not callable(in_use) or in_use(allow_admission=True):
+                    continue
             for candidate in self._spec.release_candidates(
                 participant, now, idle_seconds
             ):
                 if not include_same_model and candidate.model == requested_model:
                     continue
                 candidates.append(candidate)
+        candidates = self._deduplicate_candidates(candidates)
         candidates.sort(
             key=lambda item: (item.last_used_monotonic, item.owner_id, item.model)
         )
@@ -834,10 +895,23 @@ class _ResourceCoordinator:
         candidates: list = []
         for participant in self._participants.values():
             candidates.extend(self._spec.force_candidates(participant, now))
+        candidates = self._deduplicate_candidates(candidates)
         candidates.sort(
             key=lambda item: (item.last_used_monotonic, item.owner_id, item.model)
         )
         return candidates
+
+    def _deduplicate_candidates(self, candidates: list) -> list:
+        """A physical model can be reclaimed once despite multiple protocols."""
+        unique = {}
+        for candidate in candidates:
+            participant = self._participants.get(candidate.owner_id)
+            owner = getattr(participant, "_ownership", None)
+            key = (owner if owner is not None else candidate.owner_id, candidate.model)
+            previous = unique.get(key)
+            if previous is None or candidate.estimated_gb > previous.estimated_gb:
+                unique[key] = candidate
+        return list(unique.values())
 
     def _insufficient_error(
         self,
