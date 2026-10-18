@@ -92,6 +92,20 @@ def main(argv: list[str] | None = None) -> int:
     options, official_args = wrapper.parse_known_args(sys.argv[1:] if argv is None else argv)
     try:
         cli, report = inspect_official_package(official_args)
+        if not options.check and report["backend"] == "transformers" and report["kind"] == "instant" and sys.platform == "win32":
+            if __package__:
+                from .startlux_windows import configure_windows_attention
+            else:
+                from startlux_windows import configure_windows_attention
+            try:
+                configured = configure_windows_attention()
+            except ImportError as exc:
+                raise StartLuxSetupError(
+                    f"Windows Instant requires the optional Transformers/CUDA dependencies ({exc.name}); "
+                    "see services/startlux/requirements-windows-cu128.txt."
+                ) from exc
+            if configured:
+                report["runtime_compatibility"] = "Windows fused attention: equivalent repeated K/V heads for bidirectional GQA; official self-checks enabled"
         print(json.dumps(report, ensure_ascii=False), file=sys.stdout if options.check else sys.stderr, flush=True)
         if options.check:
             return 0

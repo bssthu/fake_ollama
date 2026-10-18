@@ -174,10 +174,31 @@ def test_check_uses_official_metadata_without_inference(local_model, official_mo
     official_mock[1].load_model_folder.assert_called_once_with(str(local_model))
 
 
-def test_actual_serving_delegates_exactly_to_official_cli(local_model, official_mock):
+def test_actual_serving_delegates_exactly_to_official_cli(local_model, official_mock, monkeypatch):
+    from fake_ollama import startlux_windows
+    monkeypatch.setattr(startlux_windows, "configure_windows_attention", Mock(return_value=True))
     argv = ["serve", "--model", str(local_model), "--backend", "transformers"]
     assert startlux_companion.main(argv) == 0
     official_mock[0].main.assert_called_once_with(argv)
+
+
+@pytest.mark.parametrize("check,kind,platform,expected", [
+    (True, "instant", "win32", False),
+    (False, "auto_think", "win32", False),
+    (False, "instant", "linux", False),
+    (False, "instant", "win32", True),
+])
+def test_windows_adapter_is_only_loaded_for_actual_instant_serving(
+    local_model, official_mock, monkeypatch, check, kind, platform, expected,
+):
+    from fake_ollama import startlux_windows
+    configure = Mock(return_value=True)
+    monkeypatch.setattr(startlux_windows, "configure_windows_attention", configure)
+    monkeypatch.setattr(startlux_companion.sys, "platform", platform)
+    official_mock[1].load_model_folder.return_value.kind = kind
+    argv = ["serve", "--model", str(local_model), "--backend", "transformers"]
+    assert startlux_companion.main((["--check"] if check else []) + argv) == 0
+    assert configure.call_count == int(expected)
 
 
 def test_missing_optional_package_is_actionable_without_import(monkeypatch, capsys):

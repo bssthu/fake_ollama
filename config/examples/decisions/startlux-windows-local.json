@@ -1,0 +1,170 @@
+{
+  "_": "Windows CUDA BF16 example. Merge targets, profiles and exposed_models into your existing configuration; adjust local paths. Install services/startlux requirements separately.",
+  "decision_targets": [
+    {
+      "name": "startlux-decision-v1.1-4b-instant",
+      "base_url": "http://127.0.0.1:21461",
+      "runtime": "startlux",
+      "runtime_backend": "transformers",
+      "dialect": "systemone",
+      "endpoint_path": "/v1/decisions",
+      "auto_start": true,
+      "python_path": "I:\\Projects\\fake_ollama\\services\\startlux\\.venv\\Scripts\\python.exe",
+      "model_path": "J:/Projects/LLM_Models/StartLux/StartLux-Decision-v1.1-4B-Instant",
+      "cwd": "I:\\Projects\\fake_ollama",
+      "startup_timeout_seconds": 600,
+      "request_read_timeout_seconds": 300,
+      "stop_timeout_seconds": 60,
+      "idle_timeout_seconds": 300,
+      "max_concurrent_requests": 1,
+      "models": [
+        {
+          "name": "startlux-decision-v1.1-4b-instant"
+        }
+      ],
+      "start_args": [
+        "--device",
+        "cuda:0",
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "4096",
+        "--max-inflight",
+        "1",
+        "--max-images",
+        "2",
+        "--max-pixels",
+        "262144"
+      ],
+      "decision_capabilities": {
+        "question_types": [
+          "predicate",
+          "choice",
+          "score"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "image_format": "startlux_images",
+        "extensions": [
+          "think_mode"
+        ],
+        "think_modes": [
+          "never"
+        ]
+      },
+      "source_url": "https://huggingface.co/startlux-models/StartLux-Decision-v1.1-4B-Instant",
+      "license": "Official code: Apache-2.0; v1.1 weights: CC-BY-NC-4.0"
+    },
+    {
+      "name": "startlux-decision-v1.1-4b-autothink",
+      "base_url": "http://127.0.0.1:21462",
+      "runtime": "startlux",
+      "runtime_backend": "transformers",
+      "dialect": "systemone",
+      "endpoint_path": "/v1/decisions",
+      "auto_start": true,
+      "python_path": "I:\\Projects\\fake_ollama\\services\\startlux\\.venv\\Scripts\\python.exe",
+      "model_path": "J:/Projects/LLM_Models/StartLux/StartLux-Decision-v1.1-4B-AutoThink",
+      "cwd": "I:\\Projects\\fake_ollama",
+      "startup_timeout_seconds": 600,
+      "request_read_timeout_seconds": 300,
+      "stop_timeout_seconds": 60,
+      "idle_timeout_seconds": 300,
+      "max_concurrent_requests": 1,
+      "models": [
+        {
+          "name": "startlux-decision-v1.1-4b-autothink"
+        }
+      ],
+      "start_args": [
+        "--device",
+        "cuda:0",
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "4096",
+        "--max-inflight",
+        "1",
+        "--max-images",
+        "2",
+        "--max-pixels",
+        "262144",
+        "--think-budget",
+        "512",
+        "--max-think-budget",
+        "1024"
+      ],
+      "decision_capabilities": {
+        "question_types": [
+          "predicate",
+          "choice",
+          "score"
+        ],
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "image_format": "startlux_images",
+        "extensions": [
+          "think_mode"
+        ],
+        "think_modes": [
+          "never",
+          "auto",
+          "always"
+        ]
+      },
+      "source_url": "https://huggingface.co/startlux-models/StartLux-Decision-v1.1-4B-AutoThink",
+      "license": "Official code: Apache-2.0; v1.1 weights: CC-BY-NC-4.0"
+    }
+  ],
+  "model_profiles": [
+    {
+      "model": "startlux-decision-v1.1-4b-instant",
+      "target": "startlux-decision-v1.1-4b-instant",
+      "capabilities": [
+        "decision"
+      ],
+      "context_length": 4096,
+      "estimated_vram_gb": 12,
+      "estimated_memory_gb": 16
+    },
+    {
+      "model": "startlux-decision-v1.1-4b-autothink",
+      "target": "startlux-decision-v1.1-4b-autothink",
+      "capabilities": [
+        "decision"
+      ],
+      "context_length": 4096,
+      "estimated_vram_gb": 12,
+      "estimated_memory_gb": 16
+    }
+  ],
+  "ollama_interfaces": [],
+  "api_interfaces": [
+    {
+      "name": "api",
+      "host": "127.0.0.1",
+      "port": 21435,
+      "access_tokens": [
+        "replace-with-a-long-random-token"
+      ],
+      "exposed_models": [
+        {
+          "model": "startlux-decision-v1.1-4b-instant",
+          "target": "startlux-decision-v1.1-4b-instant",
+          "alias": "startlux-decision-v1.1-4b-instant"
+        },
+        {
+          "model": "startlux-decision-v1.1-4b-autothink",
+          "target": "startlux-decision-v1.1-4b-autothink",
+          "alias": "startlux-decision-v1.1-4b-autothink"
+        }
+      ]
+    }
+  ],
+  "playground_enabled": true,
+  "playground_host": "127.0.0.1"
+}

@@ -1,0 +1,9 @@
+# Tested native Windows CUDA environment (Python 3.13, RTX 4090).
+# Keep this separate from the gateway's virtual environment.
+--extra-index-url https://download.pytorch.org/whl/cu128
+-r requirements-transformers.txt
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+transformers==5.8.1
+accelerate==1.15.0
+pillow==12.3.0

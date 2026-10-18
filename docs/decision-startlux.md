@@ -21,6 +21,8 @@ services/startlux/.venv/bin/python -m pip freeze > services/startlux/installed-p
 
 如果使用官方 transformers 参考后端，改装 `requirements-transformers.txt`，目标设置 `runtime_backend: "transformers"`。可按硬件明确添加 `start_args: ["--device", "cpu", "--dtype", "float32"]`；CPU 可运行不代表速度或内存满足你的模型需求。
 
+Windows CUDA 的 v1.1 4B Instant / AutoThink 已有[独立部署说明和配置](decision-startlux-windows.md)，包含固定依赖、图片验证和官方 Instant 的 Windows GQA 张量布局兼容适配。
+
 如果从已安装的 fake-ollama wheel 使用，可在任意独立环境执行同等的固定来源安装命令：
 
 ```sh
