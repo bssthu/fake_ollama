@@ -9,7 +9,7 @@
 
 ## 架构概览
 
-监听被拆成三组：admin、Ollama 兼容入口（多实例数组）、API 接口（多实例数组）。这三组在配置里是独立的，安全边界、监听端口、白名单、token 都各自配置。
+监听分为 Admin、Dashboard、Playground、Ollama 兼容入口和 API 接口五类。前三类各有独立端口，后两类支持多实例数组。Admin / Dashboard 共用独立的管理凭据；模型接口各自配置白名单和 token，Playground 按所选接口的权限提供模型调试。
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -17,6 +17,12 @@
 │                                                                  │
 │  admin listener          (默认 127.0.0.1:21433)                  │
 │    /admin/*          Web 配置编辑器（独立管理凭据）              │
+│                                                                  │
+│  dashboard listener      (默认 127.0.0.1:21432)                  │
+│    /dashboard/*      资源监控与回收（管理凭据）                  │
+│                                                                  │
+│  playground listener     (默认关闭；启用后 127.0.0.1:21431)     │
+│    /playground/*、/v1/*   模型调试与调用                         │
 │                                                                  │
 │  ollama_interfaces[*]    （数组，可 0..N 个；典型: 21434）       │
 │    /                 ping                                        │
@@ -29,16 +35,19 @@
 │    /v1/chat/completions   OpenAI 兼容                            │
 │    /v1/images/generations OpenAI Images 兼容                      │
 │    /v1/images/edits       OpenAI Images 兼容                      │
-│    /v1/embeddings    OpenAI 兼容                                 │
+│    /v1/videos/generations 视频生成                               │
+│    /v1/systemone、/v1/decisions  类型化决策                       │
+│    /v1/embeddings    暂未实现，返回 501                          │
 │    /v1/models                                                    │
 │    每个实例可独立配置 host / port / access_tokens / exposed_models│
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 - 每个 `ollama_interfaces[*]` / `api_interfaces[*]` 都是独立的 uvicorn 监听。你可以同时开多个 Ollama 接口（例如本机 21434 + 局域网 0.0.0.0:21437），每个挂不同的白名单和 token，端口不能重复。
-- `access_tokens` 为空 = 该接口不需鉴权；非空 = 该接口的所有请求都必须带 `x-api-key` 或 `Authorization: Bearer`。
+- `access_tokens` 为空 = 模型请求无需 token，但仍校验 Host、实际端口及浏览器来源；非空 = 模型请求必须带 `x-api-key` 或 `Authorization: Bearer`。管理凭据独立配置，见[安全提示](#安全提示)。
 - `exposed_models` 是该接口允许看到 / 请求的模型列表，元素是 `{model, target, alias?}` 三元组；不在白名单里的模型在该接口上 404。
 - admin 接口（`admin_host` / `admin_port`）只服务 `/admin/*`，**不会**出现在任何 `ollama_interfaces` / `api_interfaces` 上；同样，`/api/*` 与 `/v1/*` 也**不会**出现在 admin 端口。
+- Embeddings 尚未实现：`/api/embed`、`/api/embeddings` 和 `/v1/embeddings` 返回 501，不会转发到后端。
 - Model Playground 默认关闭。启用后使用独立端口，按 `/playground/api/models` 返回的 capabilities/operations 调用聊天、视觉、视频分析、图片生成/编辑与视频生成接口；支持图片粘贴/拖放、本地视频选择，以及手机或 PC 摄像头的分窗近实时分析。API key 与交互记录仅保存在当前浏览器页面内存中。
 - 想让别的机器访问某个接口：把对应实例的 `host` 改成 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
 
@@ -48,15 +57,15 @@
 - **结构化模型标识 `{model, target}`**：每条暴露条目显式声明「上游显示名 + 来源 target 名」，相同名字但来源不同的模型不会再混淆；可选 `alias` 字段在客户端可见的公开 ID 上替换全名
 - **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限——key 支持 `model@target`（最优先）、裸 `model`、tagless base 三级回退
 - **按接口多实例暴露**：`ollama_interfaces[*]` 与 `api_interfaces[*]` 是独立数组，每个实例自带 `host` / `port` / `access_tokens` / `exposed_models`
-- **来源命名清晰区分**：`anthropic_upstreams` / `openai_upstreams`（远端）+ `ollama_targets` / `llama_cpp_targets` / `comfyui_targets`（本机）
-- **循环引用检测**：`anthropic_upstreams[*].base_url` 若指向 fake_ollama 自己的某个监听端口，启动时直接报错，避免转发死循环
+- **来源命名清晰区分**：远端 `anthropic_upstreams` / `openai_upstreams`，本地 `ollama_targets` / `llama_cpp_targets` / `generic_openai_targets` / `comfyui_targets`，以及独立协议的 `decision_targets`
+- **循环引用检测**：按模型转发图拒绝实际循环；允许最终落到外部上游的无环回指，并发出提示
 - **本地 target 生命周期接管**：Ollama / llama.cpp / ComfyUI 都可配置 health check、按需启动脚本、启动超时、空闲回收
 - **H3 Context-IR harness**：把自然语言和最多两张参考图转换成 MiniMax H3 Base Prompt；规划器可在本地纯文字/多模态模型与第三方 API 之间切换，并可串到 ComfyUI 视频生成之前
 - **ComfyUI 图片后端**：可把 Z-Image-Turbo / Qwen-Image-Edit / SenseNova-U1 等 ComfyUI API workflow 暴露为 OpenAI 兼容图片生成 / 图片编辑接口。采用声明式 `preset` + bindings 结构，接入新模型只改配置 + JSON；多个图片模型可共用一个 ComfyUI 实例并由 VRAM 协调器互斥换出，避免爆显存。
 - **本地显存治理**：`estimated_vram_gb` 控制模型加载准入；媒体模型还可配置请求瞬时余量、安全下限、自适应 GPU 权重卸载和全程独占租约。相同模型连续运行也会重新检查实时显存
 - **本地内存预检**：部分模型（如 SenseNova / JoyAI 这类会把一部分计算 offload 到内存的 workflow）除显存外还需占用大量主机内存，可在 `model_profiles` 里填 `estimated_memory_gb`；逻辑与显存预检一致，启动前评估可用系统内存并尝试回收空闲模型
 - **图片输入**：自动嗅探 base64 magic bytes（PNG/JPEG/GIF/WEBP）
-- **零依赖 Web 编辑器**：按「Forward / Reverse / Shared / Admin UI」分组，字段说明、默认值回退、上游 detect-models、`model_profiles` key 自动补全
+- **无需额外前端依赖的 Web 编辑器**：按模型来源、接口、运行时和管理页面分组，提供字段说明、默认值回退、模型探测和 profile 自动补全
 - **明确的失败状态**：连接失败 / 超时返回 502；响应已经开始时发送协议错误帧。上游错误或缺少结束标志不会伪装成正常完成；上游 HTTP 错误保留状态码。
 - `pytest` + `httpx.MockTransport` 离线单测
 
@@ -108,9 +117,12 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 
 > 注：CLI 不再有 `--host` / `--port` / `--external-host` / `--external-port`，因为 `ollama_interfaces` / `api_interfaces` 是数组，命令行无法表达；都在 `config.json` 里配置。
 
+完整的命令行参数、日志选项和重启规则见 [CLI 使用说明](docs/cli.md)。示例中的上游模型名和凭据都是占位值，须换成实际可用的模型和 token。
+
 启动后：
 - Ollama 客户端连 `ollama_interfaces[*].host:port`（典型 `http://127.0.0.1:21434`）
 - 浏览器打开 <http://127.0.0.1:21433/admin>
+- Dashboard 默认位于 <http://127.0.0.1:21432/dashboard/>；Playground 需先启用，再打开 <http://127.0.0.1:21431/playground/>
 - Anthropic / OpenAI 客户端连 `api_interfaces[*].host:port`（典型 `http://127.0.0.1:21435`），带对应 `access_tokens`
 
 ## 配置（config.json）
@@ -119,8 +131,9 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 
 1. 代码默认值
 2. `config.json`（路径优先级：`--config` > `$FAKE_OLLAMA_CONFIG` > `./config.json`）
+3. CLI 明确传入的 Admin / Dashboard / Playground 监听覆盖值（命令本身不写回文件，后续 Admin 保存以提交值为准）
 
-运行期只读一个环境变量：`FAKE_OLLAMA_CONFIG`，用于选中配置文件路径。所有 token / host / port / 白名单等都只能写在 `config.json`（或 Admin UI）里。
+主服务配置加载器通过 `FAKE_OLLAMA_CONFIG` 选择 JSON 文件，不从环境变量读取接口 token 或模型白名单，也不自动加载 `.env`。模型接口 host / port 在 JSON 中设置；管理页面监听可由上述 CLI 参数覆盖。伴生服务和显式启用的系统代理有各自的环境变量，见对应文档。
 
 完整示例见 [config.json.example](./config.json.example)。下面分章节描述每块。
 
@@ -157,6 +170,8 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 
   // 本机 backends
   "ollama_targets":      [ /* … */ ],
+  "generic_openai_targets": [ /* … */ ],
+  "decision_targets":    [ /* … */ ],
   "llama_cpp_defaults":  { /* … */ },
   "llama_cpp_targets":   [ /* … */ ],
   "comfyui_targets":     [ /* … */ ],
@@ -167,13 +182,13 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
   "api_interfaces":      [ /* … */ ],
 
   // 每模型 profile
-  "model_profiles":      { /* … */ }
+  "model_profiles":      [ /* … */ ]
 }
 ```
 
 ### Sources（远端与本机的模型来源）
 
-四种 source，每一项有唯一 `name`（**不能包含 `@`**，且 4 张表里的 name 不能冲突）。每个 source 的 `models` 是 `ModelEntry` 列表，每条只表达「上游真实模型名 + 可选 alias」：
+共有下表七类 source，`name` 在所有来源表之间唯一且不能包含 `@`。多模型来源使用 `models` 列表，每项包含 `name`、可选的源级 `alias` 和可选的 `upstream_id`。llama.cpp / ComfyUI 单模型 target 使用 `model` / `alias` 表达同样的显示关系。
 
 ```jsonc
 {
@@ -181,25 +196,28 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
   "base_url": "https://api.deepseek.com",
   "auth_token": "sk-...",
   "models": [
-    { "name": "deepseek-chat" },                            // 公开 ID 默认 = "deepseek-chat@deepseek_remote"
-    { "name": "deepseek-reasoner", "alias": "deepseek-r1" } // 公开 ID = "deepseek-r1"；wire 还是 "deepseek-reasoner"
+    { "name": "deepseek-chat" },                            // 暴露后默认公开 ID = "deepseek-chat@deepseek_remote"
+    { "name": "deepseek-reasoner", "alias": "deepseek-r1" } // 源级显示名是 deepseek-r1；wire 仍是 deepseek-reasoner
   ]
 }
 ```
 
-- **公开 ID（public_id）规则**：当 `alias` 为空时是复合 `name@source.name`；当 `alias` 非空时**就是** `alias`（不再带 `@target` 后缀）。alias 必须全局唯一，不能包含 `@`，也不能与其他 source 的 `name` / `alias` 冲突。
-- **wire 名**：实际发给上游时永远是 `ModelEntry.name`，alias 只影响对外可见 ID。
-- **`model_map` 已移除**：旧版的「显示名 → 上游真实名」映射改用 alias 直接挂在 models 列表里。
+- **源级显示名**：`ModelEntry.alias` 有值时使用它，否则使用 `name`；`exposed_models[*].model` 和 profile 引用这个显示名。显示名在同一来源内唯一，可以在不同来源重复。
+- **公开 ID**：由接口 exposure 决定，默认为 `显示名@target`；只有 `exposed_models[*].alias` 才会把整个公开 ID 替换成简短别名。公开 ID 在同一接口内唯一。例如上述第二项默认是 `deepseek-r1@deepseek_remote`；要用裸 `deepseek-r1` 请求，还需在 exposure 设置同名 alias。
+- **wire 名**：实际发给上游的是 `ModelEntry.upstream_id`，未设置时使用 `name`；源级和接口级 alias 都不改写 wire 名。
+- **`model_map` 已移除**：使用 `models` 中的 `name` / `alias` / `upstream_id` 配置显示名与上游 ID。
 
-四张表的差异：
+各来源表的用途：
 
 | 表名 | 协议 | 用途 |
 | --- | --- | --- |
 | `anthropic_upstreams` | Anthropic Messages | 远端 Anthropic 兼容 API（含 DeepSeek Anthropic 通道、claude-relay-service 等） |
 | `openai_upstreams`    | OpenAI Chat Completions | 远端 OpenAI 兼容 API（DeepSeek OpenAI 通道、Together、Groq、自建网关等） |
 | `ollama_targets`      | Ollama `/api/chat` | 本机或局域网 Ollama daemon；可生命周期接管 |
+| `generic_openai_targets` | OpenAI Chat Completions | 带生命周期管理的 vLLM、SGLang、TGI 或 Mage-VL 等 adapter |
+| `decision_targets`   | SystemOne / OpenAI Decisions | 原生类型化决策服务；独立于 Chat Completions |
 | `llama_cpp_targets`   | OpenAI Chat Completions（llama.cpp server） | 一项 = 一个 llama.cpp server 进程 / 一个模型 / 一个端口 |
-| `comfyui_targets`     | OpenAI Images（ComfyUI workflow） | 一项 = 一个 ComfyUI server / 一个图片模型 workflow target |
+| `comfyui_targets`     | 图片 / 视频生成（ComfyUI workflow） | 一个模型 workflow target；多个 target 可以共用同一 ComfyUI 服务 |
 
 #### anthropic_upstreams
 
@@ -248,7 +266,7 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 }
 ```
 
-- `auto_start: false`：fake-ollama 只转发，不接管 daemon。
+- `auto_start: false`：fake-ollama 不自动启动 daemon。是否允许停止已存在的外部实例，另由 `manage_external_runtime` 与实际使用 / 所有权决定。
 - `auto_start: true`：health check 失败时执行 `start_command`；`stop_command` / `idle_timeout_seconds` 控制具有所有权的实例回收。管理外部实例还需 `manage_external_runtime: true`；停止命令受 `stop_timeout_seconds` 限制。
 - 模型名匹配按 Ollama 规则：`foo` 与 `foo:latest` 等价；省略 tag 只代表 `latest`。
 - 每个本地模型的显存估算在 `model_profiles[*].estimated_vram_gb` 里配置。请求触发模型加载前，fake-ollama 调用 `nvidia-smi` 检查可用显存；不足时按 LRU 卸载其他空闲超过 60 秒的本地模型，每轮重新读真实 free VRAM。
@@ -256,6 +274,16 @@ python -m fake_ollama --config ./config.json --admin-host 127.0.0.1 --admin-port
 - ComfyUI target 默认以 `gpu_device + base_url` 作为运行时分组，也可用 `vram_runtime_group` 显式覆盖。组内 `/free`、进程退出和健康检查失败会使所有 sibling target 的显存/内存 reservation 一起失效。
 - 多 GPU 主机不会把各卡空闲显存相加后做准入；默认协调器使用最紧张设备的读数并采用全局保守租约，避免“总空闲够、单卡放不下”仍启动任务。`gpu_device` 当前用于隔离运行时状态，不负责跨卡调度。
 - 主机内存估算在 `model_profiles[*].estimated_memory_gb` 里配置，由独立的内存协调器按同样逻辑准入与回收：加载前读取系统可用内存，不足时卸载其他声明了 `estimated_memory_gb` 的空闲模型。Dashboard 的「Model Estimated Memory」面板与 Current Models 表里的 Est. Memory 列展示该维度。
+
+#### generic_openai_targets 与 decision_targets
+
+`generic_openai_targets` 用于带生命周期管理的 OpenAI-compatible 聊天 / 多模态 adapter。每项至少设置 `name`、`base_url` 和 `models`；`auth_token` 是网关到该 adapter 的出站凭据，与接口的 `access_tokens` 分开。
+
+可配置 `auto_start`、`start_command`、`stop_command`、`cwd` 和空闲回收；默认 `startup_timeout_seconds=120`、`health_path="/health"`、`stop_timeout_seconds=30`。`max_concurrent_requests` 大于 0 时启用网关队列；`request_read_timeout_seconds` 留空沿用全局超时，非正值关闭出站读取超时。服务所有权仍遵循[生命周期规则](#热重载与运行时安全)。
+
+Mage-VL 的安装、路径、请求大小限制及自动停机鉴权见[伴生服务说明](services/mage_vl/README.md)。将 [Windows 本地配置示例](config/examples/config.windows-local.json) 中相关 target、profile 和 exposure 合并进自己的配置，替换路径和凭据；最小 `config.json.example` 不包含本地模型服务。
+
+`decision_targets` 使用独立的 `/v1/systemone` 或 `/v1/decisions` 协议，不能通过聊天端点调用。配置、原生运行时能力和生命周期边界见[决策模型说明](docs/decisions.md)；[StartLux Windows 示例](docs/decision-startlux-windows.md)和 [Laya 伴生服务](services/laya/README.md)分别说明其部署方式。
 
 #### llama_cpp_targets
 
@@ -291,7 +319,7 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 }
 ```
 
-`LlamaCppTarget.alias` 语义：当 `alias` 非空时，**它就是公开 display name**（替换 `model`），仍然作为模型在白名单里的 display；发给 llama.cpp 的 wire name 始终是 `model` 字段。
+`LlamaCppTarget.alias` 是源级显示名，替换白名单和 profile 引用中的 `model`；公开 ID 仍由 exposure 决定。发给 llama.cpp 的 wire 名为 `upstream_id`，未设置时使用 `model`。
 
 #### comfyui_targets
 
@@ -326,7 +354,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 | `qwen_image_edit_aio` | Qwen-Image-Edit 整合检查点（如 Qwen-Rapid-AIO） | `CheckpointLoaderSimple` 一次加载 UNet+CLIP+VAE；文生图用 `CLIPTextEncode`，图生图用 `TextEncodeQwenImageEditPlus`（参考图经 conditioning 注入，编辑 `denoise=1.0`） |
 | `sensenova_u1` | SenseNova-U1-8B（自定义节点 `ComfyUI_SenseNova_U1`） | 融合模型节点 + 融合采样节点；分辨率走 `target_pixels` 比例桶（请求 `size` 映射到最近比例，实际输出为该桶原生尺寸） |
 | `joyai_echo` | JoyAI Echo（自定义节点 `ComfyUI_JoyAI_Echo`） | 内置 T2V + 多参考图 I2V；公开尺寸、seed、帧数、FPS、prefetch、分块解码与模型流式加载；默认使用 256² / 17 帧安全调试预设 |
-| `minimax_h3` | MiniMax H3 Base | 官方核心节点；内置 T2V、首帧 I2V、首尾帧 FL2VA、末帧 L2VA 四套 API workflow；固定使用 Pruned INT8 ConvRot DiT + Qwen3-VL-32B NVFP4-AWQ |
+| `minimax_h3` | MiniMax H3 Base / Ref2VA | 内置 T2V、首帧 I2V、首尾帧 FL2VA、末帧 L2VA 和 Ref2VA；Base / Ref2VA 使用各自的 Pruned INT8 ConvRot DiT，共用 Qwen3-VL-32B NVFP4-AWQ |
 
 当前内置模型的推荐公开参数如下；表中默认值来自对应 target 配置，因而 API 缺省行为、
 `/playground/api/models` 和 Playground 使用同一个值：
@@ -352,7 +380,7 @@ Seed 时仍由 target 的 `seed_mode` 决定。H3 `prompt_mode=auto` 若首份�
 > 修复，会分别表现为勾选分块解码仍发生显存不足，或报
 > `unsupported operand type(s) for +: 'generator' and 'int'`。
 
-图片 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` / `<preset>_i2i.json`，视频则对应 T2V / I2V / FL2VA / L2VA workflow。要接入**其它** ComfyUI 模型，提供 API 格式 workflow JSON，再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可；支持 `t2i`、`i2i`、`video`、`i2v`、`fl2va`、`l2va` 六种模式。
+图片 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` / `<preset>_i2i.json`，视频则对应 T2V / I2V / FL2VA / L2VA / Ref2VA workflow。要接入**其它** ComfyUI 模型，提供 API 格式 workflow JSON，再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可；支持 `t2i`、`i2i`、`video`、`i2v`、`fl2va`、`l2va`、`ref2va` 七种绑定模式。
 
 > **客户端可能按模型名判断是否图片模型**：部分客户端（如 CherryStudio）靠模型 id 的正则/子串匹配来决定走聊天接口还是 `/v1/images/*`——只认 `z-image*` / `qwen-image*` / `flux*` / `sd*` 等已知图片模型名。若把图片模型暴露成它不认识的名字（如 `sensenova`），它会当普通聊天模型发到 `/v1/chat/completions`，被 fake_ollama 以 400「use /v1/images/...」拒绝。对策：在 `exposed_models[*].alias` 里给这类模型起一个**包含已知图片模型关键词的别名**（例如 `sensenova-z-image`）；这只改客户端看到的 id，后端 target 与 `model_profiles` 仍按真实模型名匹配，不受影响。
 
@@ -729,10 +757,12 @@ Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 
 关键帧既可用于 Ref2VA，也可用于四种 Base 模式。例如：
 
 ```json
-"keyframes": [
-  {"time_seconds": 1.5, "image_index": 1},
-  {"frame_index": -1, "image": "data:image/png;base64,...", "filename": "end.png"}
-]
+{
+  "keyframes": [
+    {"time_seconds": 1.5, "image_index": 1},
+    {"frame_index": -1, "image": "data:image/png;base64,...", "filename": "end.png"}
+  ]
+}
 ```
 
 每项使用 `frame_index` 或 `time_seconds` 二选一；帧号从 0 开始，负数从片尾倒数，秒数四舍五入到最近帧。
@@ -774,7 +804,7 @@ Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 
       "port": 21435,
       "access_tokens": [ "tk-..." ],
       "exposed_models": [
-        { "model": "llama3.1",  "target": "local" },
+        { "model": "llama3.1",  "target": "local", "alias": "llama3.1" },
         { "model": "qwen3.6-27b-iq4xs", "target": "qwen3.6-27b-iq4xs", "alias": "qwen-vision" }
       ]
     }
@@ -786,22 +816,22 @@ Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `name` | string | 接口唯一标识，仅用于日志 / Admin UI |
+| `name` | string | 接口标识，用于日志、Admin 和运行时路由；修改监听器身份需重启 |
 | `host` | string | 监听 host（`127.0.0.1` 或 `0.0.0.0`） |
-| `port` | int | 监听端口；启动时若与其他接口或 admin 端口冲突会报错 |
-| `access_tokens` | string[] | 该接口的 token 池；空 = 该接口不鉴权 |
+| `port` | int | 所有启用的监听器必须使用不同端口，包括 Admin、Dashboard、Playground；即使 host 不同也不允许复用端口 |
+| `access_tokens` | string[] | 该接口的 token 池；空 = 无需 token，仍须通过匿名请求的 Host / 来源校验 |
 | `exposed_models` | array of `ExposureEntry` | 该接口允许看到 / 请求的模型 |
 
 每个 `ExposureEntry` 字段：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `model` | string | source 里的 `ModelEntry.name`，必须与某个 source 的 `models[*].name` 完全匹配 |
+| `model` | string | source 的显示名：源级 `alias`，未设置时为 `name`；单模型 target 对应 `alias` 或 `model` |
 | `target` | string | source 的 `name`，决定路由到哪 |
 | `alias` | string? | 可选；非空时**作为该 exposure 的公开 ID**，替换 `model@target` 复合形式 |
 
-- 公开 ID 优先级：`exposure.alias` > `model_entry.alias` > `"{model}@{target}"`
-- 客户端必须用「公开 ID」请求；裸 model 名（无 `@`）会在做 tagless 匹配后路由（见下），仍找不到时 400。
+- 公开 ID：`exposure.alias` 有值时使用它，否则使用 `"{exposure.model}@{exposure.target}"`。
+- 客户端使用接口列出的公开 ID；没有 `@` 的裸名字只有显式 exposure alias 才能匹配，不会自动补 target。未暴露或未匹配返回 404。
 - 同一个模型可以在多个接口里同时暴露，alias 可以不同。
 - `/api/tags`（Ollama）与 `/v1/models`（OpenAI）只列出当前接口的公开 ID。
 - mismatch 警告：Admin UI 会在你勾的 `exposed_models` 引用了不存在的 source / model 时高亮提示。
@@ -815,9 +845,11 @@ Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `default_max_tokens` | int | `4096` | 客户端没传时的默认输出上限 |
-| `timeout_seconds` | float | `300` | 所有出站 HTTP 请求超时 |
+| `timeout_seconds` | float | `300` | 默认出站 HTTP 超时；可被 target 的读取超时等专用设置覆盖 |
 | `use_system_proxy` | bool | `false` | 出站是否走系统代理 |
 | `enforce_context_limit` | bool | `true` | 估算 token 超 `context_length` 直接 400 |
+| `max_request_body_bytes` | int | `67108864` | 整个入口请求体上限（64 MiB）；包括 base64 与 JSON 开销，分块上传同样受限 |
+| `request_body_timeout_seconds` | float | `60` | 接收请求体的时间上限，不限制后续推理时间 |
 | `advertised_version` | string | `0.6.4` | 仅用于 Ollama 接口的 `/api/version` |
 | `model_profiles` | list | `[]` | 每模型 capabilities / 上下文 / 思维链等。每项写 `model`（必填）+ 可选 `target`，两者拼起来作为最终 key：填 `target` 时为 `model@target` 仅覆盖该 target，不填则裸 `model` 适用于所有 target。查找时三级回退：`model@target` > 裸 `model` > tagless base。旧的 `{ "model@target": {...} }` dict 写法仍兼容 |
 
@@ -840,6 +872,7 @@ Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `admin_enabled` | bool | `true` | 是否注册 `/admin` |
+| `management_access_tokens` | string[] | `[]` | Admin / Dashboard 的独立管理凭据；空列表仅允许受来源校验保护的本机页面免登录 |
 | `admin_host` | string | `127.0.0.1` | admin listener 地址；远程管理需独立凭据 |
 | `admin_port` | int | `21433` | admin listener 端口 |
 | `dashboard_enabled` | bool | `true` | 是否启用资源监控 dashboard |
@@ -847,7 +880,7 @@ Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 
 | `dashboard_sample_interval_seconds` | float | `10.0` | 采样间隔 |
 | `dashboard_retention_seconds` | float | `604800.0` | 历史保留窗口 |
 | `dashboard_data_path` | string | `logs/dashboard_history.json` | 历史落盘路径 |
-| `dashboard_model_reclaim_enabled` | bool | `true` | dashboard 是否显示模型回收 |
+| `dashboard_model_reclaim_enabled` | bool | `false` | dashboard 是否显示模型回收 |
 | `dashboard_reclaim_idle_seconds` | float | `20.0` | dashboard 关闭按钮所需的最小空闲秒数。和自动 LRU 回收的 60s 阈值独立——用户手动判断更宽松 |
 | `vram_low_free_reclaim_enabled` | bool | `true` | 检测显存低水位时主动回收 |
 | `vram_low_free_threshold_mib` | float | `200.0` | 低水位阈值（MiB） |
@@ -855,8 +888,10 @@ Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 
 | `memory_low_free_threshold_mib` | float | `2048.0` | 内存低水位阈值（MiB） |
 | `playground_enabled` | bool | `false` | 是否启用轻量流式模型调试页；交互记录仅保留在当前页面内存中，刷新后清空 |
 | `playground_host` / `playground_port` | | `127.0.0.1` / `21431` | Playground 独立 listener；局域网访问时将 host 改为 `0.0.0.0`，修改后需重启进程 |
+| `playground_trusted_proxy_ips` | string[] | `[]` | 允许匿名 Playground 经代理访问时，代理的实际直连 IP；不使用转发头推断 |
+| `playground_allowed_origins` | string[] | `[]` | 与可信代理配套的精确公开 origin，例如 `https://models.example.com`；不能包含路径或尾部 `/` |
 
-启用后打开 `http://127.0.0.1:21431/playground/`，输入某个 interface 的 `access_tokens`，即可加载该 interface 暴露的模型。页面会读取模型的 capabilities/operations，自动提供聊天、视觉输入、视频分析、图片生成、图片编辑或视频生成模式，并按 workflow 动态显示真正生效的参数与推荐 preset；图片可粘贴、拖放或从文件选择，视频分析可拖放、选择一个本地视频，或启动手机 / PC 摄像头持续分析。摄像头模式按 `segment_seconds` 连续录制可独立解码的短片段，录制与 Mage-VL 推理并行，但 GPU 请求严格串行；推理落后时只保留最新的一个待处理片段并累计显示丢弃数，所以长时间运行不会形成浏览器内存、请求或显存积压。单段实时输出最多使用 128 个 token，且不执行整体总结。
+启用后打开 `http://127.0.0.1:21431/playground/`。本机直连且存在绑定回环地址的匿名模型接口时，可留空 API key；否则输入所选 interface 的 `access_tokens` 之一，加载它暴露的模型。页面按 capabilities/operations 提供聊天、视觉输入、视频分析、图片生成、图片编辑、视频生成或 Decision 模式，并按实际参数 schema 显示控制项。图片可粘贴、拖放或从文件选择；视频分析支持本地视频和手机 / PC 摄像头。摄像头按 `segment_seconds` 连续录制可独立解码的片段，录制与 Mage-VL 推理并行，GPU 请求串行；推理落后时只保留最新一个待处理片段并显示丢弃数。单段实时输出最多使用 128 个 token，且不执行整体总结。
 
 手机访问时，把 `playground_host` 设为 `0.0.0.0`，重启 fake-ollama 后打开 `http://<PC 局域网 IP>:21431/playground/`，并按需放行 Windows 防火墙的 TCP 21431 入站。这里的 HTTP 方案仅完成应用链路：主流手机浏览器通常只在 HTTPS 安全上下文中开放 `getUserMedia`，因此未配置 HTTPS 时可能看得到页面但无法取得摄像头权限；PC 上的 `http://localhost` 通常可直接使用。不要把 Playground 端口直接暴露到互联网。
 
@@ -869,22 +904,26 @@ node scripts\validation\validate_playground_camera.mjs
 
 脚本不需要 npm 依赖，不会打印 API key；它会用临时浏览器 profile 调用真实 Mage-VL，验证连续录制、单槽背压、结果历史和停止收尾后再关闭测试浏览器。
 
-聊天模式按模型保存当前页面内的完整轮次，每次请求会回传先前的 user/assistant 消息；前端读取 `context_length` 和 `max_output_tokens` 估算预算，超过 90% 安全阈值时优先丢弃最早的完整轮次，必要时再截短当前输入。视频分析、图片生成、图片编辑和视频生成也会保留逐轮输入与结果，但其 `history_mode=single_turn`，接口只接收本次输入。仅当 Playground 和所选免鉴权 interface 都绑定回环地址时，API key 才可以留空。监听 `0.0.0.0` 或其它非回环地址时必须填写某个接口的有效 token；无效 token 不会回退到匿名接口。
+聊天模式按模型保存当前页面内的完整轮次，每次请求会回传先前的 user/assistant 消息；前端读取 `context_length` 和 `max_output_tokens` 估算预算，超过 90% 安全阈值时优先丢弃最早的完整轮次，必要时再截短当前输入。视频分析、图片生成、图片编辑和视频生成也会保留逐轮输入与结果，但其 `history_mode=single_turn`，接口只接收本次输入。
+
+匿名 Playground 默认仅允许实际回环监听、回环直连客户端、正确端口的回环 Host 和同源请求，并从绑定回环的匿名接口中选择权限。直接通过局域网访问时需要有效的接口 token；无效 token 不会回退到匿名接口。若明确要让反向代理提供匿名入口，必须同时配置代理直连 IP `playground_trusted_proxy_ips` 和精确公开 origin `playground_allowed_origins`，并保留一个回环匿名模型接口。此配置明确授予该公开入口匿名模型访问能力；`Forwarded` / `X-Forwarded-*` 不能代替这两项配置。
 
 ## 内部 backends 视图
 
-`Settings` 之上有一份协议无关的 `backends` 列表，路由代码用它统一查找：
+`Settings` 通过来源查询方法构造协议无关的 `Backend`，没有 `settings.backends` 属性：
 
 ```python
-settings.backends
-# -> List[Backend]，每项 (name, protocol, kind, base_url, source)
-#    protocol: "anthropic" | "openai" | "ollama" | "comfyui"
+settings.all_sources()
+# -> 配置中的 source 对象列表
+settings.backend_by_name("deepseek_remote")
+# -> Backend（未知来源返回 None）；含 name、protocol、kind、base_url、source 等字段
+#    protocol: "anthropic" | "openai" | "ollama" | "comfyui" | "decision"
 #    kind:     "remote" | "local"
-#    source:   底层 AnthropicUpstream / OpenaiUpstream / OllamaTarget / LlamaCppTarget / ComfyUITarget
+#    source:   底层 AnthropicUpstream / OpenAIUpstream / OllamaTarget / GenericOpenAITarget / LlamaCppTarget / ComfyUITarget / DecisionTarget
 
-settings.resolve_request("deepseek-r1", interface_name="api")
-# -> 按某个接口的视角解析「客户端请求 model」到 (backend, ModelEntry)
-#    会查 exposed_models（含 tagless 回退），找不到返回 None
+settings.resolve_request("deepseek-r1@deepseek_remote", interface_name="api")
+# -> 按接口解析「客户端请求 model」到 (backend, 源级显示名)
+#    会查 exposed_models（含 tagless 回退），找不到抛出 ValueError
 ```
 
 `resolve_request` 取代了旧版 `backend_for("model@target", surface=...)`：从「surface=internal/external」改成显式传 `interface_name`，因为接口现在是数组。
@@ -931,16 +970,16 @@ claude
 
 ## Web 配置编辑器（/admin）
 
-启动后浏览器打开 <http://127.0.0.1:21433/admin>。左侧侧栏按 「Forward Proxy / Reverse Proxy / Shared Settings / Admin UI」 分块：
+启动后浏览器打开 <http://127.0.0.1:21433/admin>。左侧按 Model Sources、H3 Context-IR-fake、Interfaces、Runtime、Dashboard、Model Playground 和 Admin UI 分组：
 
 - 每个字段左侧复选框 = 「是否写入 JSON」；取消勾选 = 回退默认值。
-- `anthropic_upstreams` / `openai_upstreams` / `ollama_targets` / `llama_cpp_targets` / `ollama_interfaces` / `api_interfaces` / `model_profiles` 都是可重复组，自带 +add / Remove。
+- 模型来源（含 `generic_openai_targets` / `decision_targets` / `comfyui_targets`）、接口和 `model_profiles` 都是可重复组，自带 +add / Remove。
 - 视觉上 Ollama 和 llama.cpp source 卡片用不同强调色和图标分组，方便区分。
 - **Detect models**：upstream / Ollama 卡片支持探测后合并到 `models`；llama.cpp 卡片支持探测后写入单个 `model`。
 - **Exposure**：每个接口卡片里的 `exposed_models` 是结构化表格，`model` / `target` 都带 datalist 自动补全；mismatch（引用了不存在的 source / model）会高亮。
 - **access_tokens**：每行带 Show / Generate；列表底部有 "+ generate token"。
 - 顶部按钮：**Save & Reload** / **Discard & Reload from disk** / **Toggle raw JSON**。
-- 校验失败会显示 Pydantic 详细错误，配置不会被写入。
+- 校验失败会显示字段位置和错误原因，省略提交值以免回显密钥，配置不会被写入。
 
 `/admin` 只挂在独立 admin listener 上，**不会**被任何 `ollama_interfaces` / `api_interfaces` 暴露。
 
@@ -964,31 +1003,28 @@ pytest -m integration
 
 ## 手动验证示例
 
+先替换配置中的上游模型与凭据，再从当前接口的模型列表选取公开 ID。以下使用 PowerShell 原生命令，避免 Windows PowerShell 的 `curl` 别名和 JSON 引号差异；聊天请求会实际调用所选模型。
+
 ```powershell
-# Ollama 接口（默认 21434）
-curl http://127.0.0.1:21434/api/tags
-curl -X POST http://127.0.0.1:21434/api/chat `
-  -H "Content-Type: application/json" `
-  -d '{"model":"claude-3-5-sonnet-20241022@default","stream":false,"messages":[{"role":"user","content":"hi"}]}'
+# Ollama 匿名接口；配置了 token 时也须传对应认证头
+Invoke-RestMethod http://127.0.0.1:21434/api/tags
+$ollamaModel = '替换为 /api/tags 返回的一个聊天模型名'
+$body = @{ model = $ollamaModel; stream = $false; messages = @(@{ role = 'user'; content = 'hi' }) } | ConvertTo-Json -Depth 8
+Invoke-RestMethod http://127.0.0.1:21434/api/chat -Method Post -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
 
-# API 接口（默认 21435，需 token）；默认返回 OpenAI Model List 结构
-curl http://127.0.0.1:21435/v1/models -H "x-api-key: tk-..."
+# API 接口：默认返回 OpenAI 模型列表；带 anthropic-version 时返回 Anthropic 结构
+$apiHeaders = @{ 'x-api-key' = '替换为此接口的 token' }
+Invoke-RestMethod http://127.0.0.1:21435/v1/models -Headers $apiHeaders
+$anthropicHeaders = @{ 'x-api-key' = $apiHeaders['x-api-key']; 'anthropic-version' = '2023-06-01' }
+Invoke-RestMethod http://127.0.0.1:21435/v1/models -Headers $anthropicHeaders
 
-# 同一路径带 anthropic-version 时返回 Anthropic Model List 结构
-curl http://127.0.0.1:21435/v1/models `
-  -H "anthropic-version: 2023-06-01" -H "x-api-key: tk-..."
+# Playground 启用后，完整调试元数据在其独立端口提供
+Invoke-RestMethod http://127.0.0.1:21431/playground/api/models -Headers $apiHeaders
 
-# Playground 启用后，完整调试能力元数据只在其独立端口提供
-curl http://127.0.0.1:21431/playground/api/models -H "x-api-key: tk-..."
-
-curl -X POST http://127.0.0.1:21435/v1/messages `
-  -H "Content-Type: application/json" -H "x-api-key: tk-..." `
-  -d '{"model":"llama3.1","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
-
-# llama.cpp OpenAI 直通（同一个 API 接口）
-curl -X POST http://127.0.0.1:21435/v1/chat/completions `
-  -H "Content-Type: application/json" -H "x-api-key: tk-..." `
-  -d '{"model":"qwen-vision","stream":false,"messages":[{"role":"user","content":"hi"}]}'
+$apiModel = '替换为 /v1/models 返回的一个聊天模型 ID'
+$body = @{ model = $apiModel; max_tokens = 64; messages = @(@{ role = 'user'; content = 'hi' }) } | ConvertTo-Json -Depth 8
+Invoke-RestMethod http://127.0.0.1:21435/v1/messages -Method Post -Headers $anthropicHeaders -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
+Invoke-RestMethod http://127.0.0.1:21435/v1/chat/completions -Method Post -Headers $apiHeaders -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
 ```
 
 ## 请求数据日志
@@ -1024,16 +1060,18 @@ python -m fake_ollama --no-request-data-log
 ## 故障排查
 
 - **`/v1/messages` 返回 404 `model '...' is not exposed on interface 'xxx'`**：该模型不在该 `api_interfaces[*].exposed_models` 里。去 admin UI 勾选。
-- **`/api/chat` 返回 400 `unknown model '...'`**：客户端传的 model 不匹配任何公开 ID，也不在 tagless 回退里。先请求 `/api/tags` 获取当前接口的可用列表。
+- **`/api/chat` 返回 404 `model '...' is not exposed ...`**：客户端传的 model 不匹配公开 ID，也不在 tagless 回退里。先请求 `/api/tags` 获取当前接口的列表；源级 alias 不能代替接口级公开 ID。
 - **返回 401**：该接口 `access_tokens` 非空，请求头里没带或带错 token。检查 `x-api-key` / `Authorization: Bearer`。
 - **启动报 `cycle detected in model-forwarding graph`**：某条上游链路在同名模型上回到了自己，会无限递归。给链路上某一跳起一个不同的 alias 就能避免；`:latest` 标签会被归一化，重命名时注意区分。
-- **启动报 `cycle detected ... admin/dashboard listener`**：某个 `*_upstreams[*].base_url` 指向了 fake_ollama 自己的 admin / dashboard 端口（这些端口不服务模型流量）。改 URL 或删该 upstream。
+- **启动报 `cycle detected ... admin/dashboard/playground listener`**：上游 URL 回指了本进程的管理或 Playground 端口，这些端口不能作为来源转发目标。改 URL 或删该来源。
 - **运行时 HTTP 508 `loop detected`**：请求绕一圈又回到本进程（通常是反向代理 / 动态 DNS 绕过了启动期检测）。检查 upstream / 代理链。
-- **启动报端口冲突**：两个 interface（或与 admin / dashboard）共用了同一个 host:port。
+- **启动报端口冲突**：接口或 Admin / Dashboard / Playground 复用了同一个端口；即使 host 不同也不允许。
+- **匿名模型请求返回 403**：核对 Host、实际监听端口和浏览器 Origin。原生本机客户端使用 `127.0.0.1` / `localhost`；通过其他域名或代理访问时为接口配置 token。
+- **上传返回 413 / 408**：分别表示整个请求体过大或接收超时。Mage-VL 还有独立上限，须同时核对网关配置和[伴生服务设置](services/mage_vl/README.md)，并为 base64 编码预留空间。
 - **找不到日志文件**：默认相对 CWD：`logs/fake_ollama.log` 与 `logs/fake_ollama.requests.jsonl`。在项目根目录启动，或显式 `--log-file` / `--request-data-log-file`。
 - **502 / 连不上上游**：`httpx` 默认会读 Windows 系统代理。装了 Clash / V2Ray 且上游是直连 IP 时，保持 `use_system_proxy: false`。
 - **503 `Insufficient GPU VRAM`**：某个本地模型在 `model_profiles` 里配了 `estimated_vram_gb`，但可用显存不足。核对估算、等待模型空闲或手动释放显存；若需用停止命令管理外部服务，还须显式设置 `manage_external_runtime`。prompt 失联或关闭失败导致的隔离应先通过管理恢复接口核查，不能用降低估算绕过。
-- **503 `Insufficient system RAM`**：某个本地模型配了 `estimated_memory_gb`，但当前可用系统内存不足；处理方式同上（降低估算、等模型空闲、释放内存）。
+- **503 `Insufficient system RAM`**：某个本地模型配了 `estimated_memory_gb`，但当前可用系统内存不足。核对估算、等待空闲或释放内存；估算应以实际需求为依据。
 - **缺少 thinking / signature**：回传完整、未编辑的历史或明确携带 reasoning；截断、改写的历史不会命中缓存。兼容端需要无签名 thinking 时显式配置 `allow_unsigned_thinking`；官方 Anthropic 的签名要求不能用这项配置绕过。
 
 ## 参考文档
@@ -1061,4 +1099,4 @@ MIT — 详见 [LICENSE](./LICENSE)。
 
 ## Typed decision models
 
-Dedicated `decision_targets` support SystemOne (`/v1/systemone`) and OpenAI Decisions (`/v1/decisions`) with explicit typed codecs, native runtime capability checks, and managed local lifecycles. See [decision configuration and examples](docs/decisions.md) and [optional official StartLux setup](docs/decision-startlux.md). Runtimes and model weights are prepared separately by the operator; this project has no model-download feature.
+Dedicated `decision_targets` support SystemOne (`/v1/systemone`) and OpenAI Decisions (`/v1/decisions`) with explicit typed codecs, native runtime capability checks, and managed local lifecycles. See [decision configuration and examples](docs/decisions.md) and [optional official StartLux setup](docs/decision-startlux.md). Runtimes and model weights are prepared separately by the operator; decision runtime launches never fetch missing model files.

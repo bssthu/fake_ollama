@@ -8,12 +8,18 @@
 - 认证头：通过 `x-api-key` 发送
 
 API 调用示例正常使用时不需要手动传 `--base-url` 和 `--api-key`；调试其他实例时可显式覆盖。
+这些脚本都会先读取 `--config` 文件（默认仓库根目录 `config.json`），即使显式传了 URL / key 也需要该文件存在。
+`call_video_generation.py` 和 `call_joyai_vl_recognition.py` 要求非空 key，可由首个接口的 token 或显式 `--api-key` 提供；
+`call_mage_vl_video.py` 也支持该接口没有 token 的情况。三个脚本都禁用 `urllib` 系统代理。
+`--model` 必须是所选接口 `/v1/models` 返回的公开 ID；仅设置 source alias 不会自动产生同名的裸 ID。
 [H3 Ref2VA 构建工具](#h3-ref2va-原生工作流) 只写出工作流 JSON，不读取 API 配置或凭据。
+主服务启动参数见 [CLI 使用说明](../docs/cli.md)。
 
 ## 0. Mage-VL 本机视频分析：`examples/call_mage_vl_video.py`
 
-先按 [`services/mage_vl/README.md`](../services/mage_vl/README.md) 安装独立服务并配置模型目录。
-fake_ollama 会在首次请求时按 `config.json` 中的生命周期命令启动适配器：
+先按 [`services/mage_vl/README.md`](../services/mage_vl/README.md) 安装独立服务并配置模型目录，
+再从 [Windows 配置示例](../config/examples/config.windows-local.json) 合并 Mage-VL target、profile 和 exposure。
+根目录的最小配置示例不包含 Mage-VL。设置 `auto_start: true` 和有效启动命令后，fake_ollama 才会在首次请求时启动适配器：
 
 ```powershell
 python scripts\examples\call_mage_vl_video.py .tmp\joyai-test.mp4 `
@@ -24,6 +30,9 @@ python scripts\examples\call_mage_vl_video.py .tmp\joyai-test.mp4 `
 默认按 8 秒窗口逐段处理、每段抽取 8 帧、最多分析 12 段。可用
 `--segment-seconds`、`--frames-per-segment`、`--max-segments` 调整；
 `--include-summary` 会在逐段结果后再生成整体总结。
+其他默认值为 `--model mage-vl-local`、`--max-tokens 256`、`--temperature 0`、`--timeout 3600`。
+脚本将整个视频作为 base64 JSON 上传，须同时满足网关和 Mage-VL 的整个请求体上限；`--output` 始终保存回答文本。
+自动停机凭据由启动入口和停止脚本处理，不需要传入本脚本。
 
 ## 1. 视频生成
 
@@ -289,19 +298,27 @@ python scripts\examples\call_joyai_vl_recognition.py input.mp4 `
 
 - `call_*.py` 默认请求 fake_ollama 的 `api_interface`，并带 `x-api-key`；Ref2VA 构建工具仅写本地 JSON。
 - `generic_openai_targets[*].auth_token` 可以为空；它只影响 fake_ollama 到本机 adapter 的出站调用，不代表外部客户端可以绕过 fake_ollama 的 `access_tokens`。
-- `examples/call_joyai_vl_recognition.py` 会显式禁用 Python `urllib` 的系统代理，避免本地视频帧 payload 误走环境代理。
+- 三个 HTTP 调用示例均显式禁用 Python `urllib` 的系统代理。
 - 不建议把 JoyAI adapter 的 `127.0.0.1:8070` 改成裸露到局域网的地址。对外调用应通过 fake_ollama 的 API 入口和 token 控制。
 
 ## 排错
 
-检查 fake_ollama 是否看到模型：
+查看脚本参数（不会连接模型服务）：
 
 ```powershell
 python scripts\examples\call_joyai_vl_recognition.py --help
 python scripts\examples\call_video_generation.py --help
+python scripts\examples\call_mage_vl_video.py --help
 ```
 
-常见日志位置：
+确认 fake_ollama 是否暴露目标模型，须实际查询所选接口的模型列表，例如：
+
+```powershell
+$headers = @{ 'x-api-key' = '替换为所选接口的 token' }
+Invoke-RestMethod http://127.0.0.1:21435/v1/models -Headers $headers
+```
+
+以下是默认或示例部署的日志位置；后端日志以实际启动命令和运行环境为准：
 
 - fake_ollama：`logs\fake_ollama.log`
 - fake_ollama 请求日志：`logs\fake_ollama.requests.jsonl`

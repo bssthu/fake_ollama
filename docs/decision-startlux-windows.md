@@ -26,6 +26,10 @@ Windows 的上述 PyTorch 构建没有 Flash Attention。companion 在启动官�
 通过 fake_ollama 的 API 接口调用上述模型；本地服务由网关按需启动和回收。
 使用现有 API 接口的令牌。Playground 的 Decision 模式使用相同配置。
 
+表中端口是示例值：Laya 伴生服务固定使用 `21461`。若需要同时运行 Laya 和 Instant，
+请在 StartLux target 的 `base_url` 中为 Instant 选择其他空闲端口；管理启动会从该 URL 取端口。
+不要仅修改调用端地址而保留冲突的 target 配置。
+
 原始模型目录位于 `J:\Projects\LLM_Models\StartLux`：
 
 - `StartLux-Decision-v1.1-4B-Instant`，HF revision `416088f77cfce09633906a3675c7cd2e5dabcf10`。

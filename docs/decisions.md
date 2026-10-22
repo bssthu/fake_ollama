@@ -24,6 +24,8 @@ The optional official StartLux server also calls its **SystemOne-schema** alias
 `/v1/decisions`. A StartLux target therefore uses `dialect: "systemone"` and its
 native endpoint path independently of the public API requested by a client.
 See [optional StartLux setup](decision-startlux.md).
+For the separately recorded Windows CUDA deployment and its verification scope,
+see [StartLux v1.1 4B on Windows](decision-startlux-windows.md).
 
 ## Configuration
 
@@ -36,7 +38,9 @@ Start with one of the complete examples:
 Declare `decision_targets`, expose the model on the intended API
 interface, and give clients that listener's token. A source model `alias` is the
 internal/display name, `upstream_id` is the native wire ID, and an exposure
-`alias` is the public API ID. No model-name whitelist is used: models such as D3
+`alias` is the public API ID. Without an exposure alias, the public ID is
+`display-name@target-name`; a source alias alone does not remove that suffix.
+No built-in model-name whitelist is used: models such as D3
 mini, Clef, Intern and Kev can be served by their own compatible native runtimes.
 Model weights and their licenses remain the operator's responsibility.
 
@@ -63,7 +67,7 @@ model files. Secrets should not be put in shell commands or extra arguments.
 
 ## Local models only
 
-There is no model-download feature, automatic fallback, or download opt-in.
+Decision runtime launches have no model-download feature, automatic fallback, or download opt-in.
 Install the runtime yourself and download all weights, tokenizer/processor
 files and model metadata separately. `model_path` must exist at actual start;
 configuration loading and ordinary app startup do not access/download weights.

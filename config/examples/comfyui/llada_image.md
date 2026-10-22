@@ -58,8 +58,10 @@ available in ComfyUI and is not advertised as a separate Playground operation.
 Turbo's four diffusion steps do not remove the preceding VQ token-generation
 cost.
 
-Open `http://127.0.0.1:21431/playground/`, enter an existing interface token,
-load models, choose one of the two LLaDA models and expand **请求参数**.
+Enable Playground and expose the two models on the intended interface, then open
+`http://127.0.0.1:21431/playground/`. A direct local connection can leave the key
+empty when a loopback anonymous model interface exposes them; otherwise enter
+that interface's token. Load models, choose a LLaDA model and expand **请求参数**.
 The dedicated ComfyUI page is `http://127.0.0.1:21482/` while that runtime is running.
 
 Initial validation before the memory optimization on 2026-09-08 used an RTX 4090

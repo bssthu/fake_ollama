@@ -750,7 +750,7 @@ GROUP_LABELS: List[Dict[str, str]] = [
   {"key": "runtime", "label": "Runtime & Profiles", "hint": "运行时缺省值、出站网络与每模型 capability / thinking profile", "section": "runtime", "section_label": "Runtime", "section_hint": "跨所有 target / 接口共享的运行时设置"},
   {"key": "dashboard", "label": "Dashboard", "hint": "Runtime graphs and the low-VRAM safety monitor", "section": "dashboard", "section_label": "Dashboard", "section_hint": "Memory, VRAM, and loaded local model telemetry"},
   {"key": "playground", "label": "Model Playground", "hint": "轻量流式模型调试页（不保存历史记录或会话）", "section": "playground", "section_label": "Model Playground", "section_hint": "修改监听开关或端口后，请保存配置并重启进程"},
-  {"key": "admin", "label": "Admin UI", "hint": "配置页面自身的开关与监听地址（无内置鉴权）", "section": "admin", "section_label": "Admin UI", "section_hint": "仅影响 /admin 配置页面本身"},
+  {"key": "admin", "label": "Admin UI", "hint": "配置页面的开关、监听地址与独立管理鉴权", "section": "admin", "section_label": "Admin UI", "section_hint": "仅影响 /admin 配置页面本身"},
 ]
 
 

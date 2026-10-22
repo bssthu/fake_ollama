@@ -1,5 +1,9 @@
 # Correctness and lifecycle remediation
 
+This is the historical record of stages 0–6, not a current test-count or deployment
+status report. Later changes and operational instructions are documented in the
+[README](../README.md) and [CLI guide](cli.md); the handoff evidence below is retained as recorded.
+
 Baseline: `57a6a5c`, clean working tree. Requested sequence: prerequisite stage 0,
 then stages 1–6, with a separate local commit for each completed stage.
 Production `config.json`, its backups, paid services and GPU workloads are excluded.
