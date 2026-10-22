@@ -13,8 +13,9 @@ from typing import Any, AsyncIterator, Iterator, Mapping
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .control import require_shutdown_access
 from .engine import MageEngine
-from .request import prepare_request
+from .request import prepare_request, read_json_request
 from .settings import AdapterSettings
 
 
@@ -87,6 +88,7 @@ def create_app(
     app.state.engine = mage
     app.state.inference_lock = asyncio.Lock()
     app.state.uvicorn_server = None
+    app.state.shutdown_token = None
 
     @app.get("/health")
     async def health() -> JSONResponse:
@@ -121,10 +123,7 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Any:
-        try:
-            payload = await request.json()
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise HTTPException(status_code=400, detail="request body must be JSON") from exc
+        payload = await read_json_request(request, adapter_settings)
         if not isinstance(payload, Mapping):
             raise HTTPException(status_code=400, detail="request body must be an object")
         requested_model = str(payload.get("model") or adapter_settings.model_id)
@@ -214,12 +213,10 @@ def create_app(
 
     @app.post("/shutdown")
     async def shutdown(request: Request) -> dict[str, Any]:
-        client_host = request.client.host if request.client else ""
-        if client_host not in {"127.0.0.1", "::1", "testclient"}:
-            raise HTTPException(status_code=403, detail="shutdown is loopback-only")
+        require_shutdown_access(request)
         server = app.state.uvicorn_server
         if server is None:
-            return {"status": "accepted", "detail": "test server has no runtime owner"}
+            raise HTTPException(status_code=503, detail="shutdown has no runtime owner")
         asyncio.get_running_loop().call_later(
             0.2, lambda: setattr(server, "should_exit", True)
         )

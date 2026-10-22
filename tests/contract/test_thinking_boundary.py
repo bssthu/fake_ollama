@@ -77,7 +77,7 @@ def test_missing_thinking_policy_rejects_before_upstream(settings):
     app = create_app(settings)
     app.state.clients = {"default": AnthropicClient("http://upstream.test", "test-token",
                         client=httpx.AsyncClient(transport=httpx.MockTransport(lambda req: pytest.fail("Must not contact upstream"))))}
-    with TestClient(app, base_url="http://testserver:21435") as client:
+    with TestClient(app, base_url="http://127.0.0.1:21435") as client:
         response = client.post("/v1/chat/completions", json={
             "model": "llama-test@default", "messages": [
                 {"role": "user", "content": "hi"},

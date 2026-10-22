@@ -608,8 +608,8 @@ class LlamaCppClient:
                     )
                 if self._start_argv:
                     logger.info(
-                        "starting llama.cpp target: %s",
-                        " ".join(self._start_argv),
+                        "starting llama.cpp target %s with configured argv",
+                        self.target_id,
                     )
                     self._process = await create_managed_subprocess_exec(
                         self._start_argv,
@@ -618,7 +618,7 @@ class LlamaCppClient:
                         stderr=stderr_log,
                     )
                 else:
-                    logger.info("starting llama.cpp target: %s", self._start_command)
+                    logger.info("starting llama.cpp target %s with configured command", self.target_id)
                     self._process = await create_managed_subprocess_shell(
                         self._start_command,
                         cwd=self._cwd,
@@ -640,15 +640,10 @@ class LlamaCppClient:
                 if proc is not None and proc.returncode is not None and proc.returncode != 0:
                     rc = proc.returncode
                     # Retain process-tree ownership even after launcher failure.
-                    cmd_repr = (
-                        " ".join(self._start_argv)
-                        if self._start_argv
-                        else self._start_command
-                    )
                     raise httpx.ConnectError(
                         f"llama.cpp target process exited with code {rc} before "
                         f"becoming healthy. Check the start_command / binary_path / "
-                        f"model_path. Command was: {cmd_repr}"
+                        "model_path and the runtime stderr log."
                     )
                 if self._shutdown_requested:
                     raise httpx.ConnectError(

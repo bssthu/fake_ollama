@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -18,11 +19,100 @@ from fake_ollama.request_data_log import (
 )
 from fake_ollama.security import (
     RequestBodyLimitMiddleware, management_session_token, require_management_access,
+    require_anonymous_model_access,
 )
 from fake_ollama.server import (
     _authorise_external_planner_url, _playground_interface_for,
     _select_context_ir_provider, create_app,
 )
+
+
+@pytest.mark.parametrize("launch_kind", ["argv", "command"])
+async def test_llama_launch_diagnostics_do_not_disclose_credentials(launch_kind, monkeypatch, caplog):
+    from fake_ollama.config import LlamaCppTarget
+    from fake_ollama.llama_cpp_client import LlamaCppClient
+    from fake_ollama.proxy_errors import _upstream_error
+
+    secret = "synthetic-backend-credential"
+    target = LlamaCppTarget(model="test-model", model_path="fixture.gguf", auth_token=secret)
+    argv = target.synthesize_start_argv()
+    command = "fixture-runner --credential " + secret
+    process = SimpleNamespace(returncode=1)
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr("fake_ollama.llama_cpp_client.create_managed_subprocess_exec", spawn)
+    monkeypatch.setattr("fake_ollama.llama_cpp_client.create_managed_subprocess_shell", spawn)
+    monkeypatch.setattr("fake_ollama.llama_cpp_client.terminate_process_tree", AsyncMock(return_value=True))
+    client = LlamaCppClient("http://launch-fixture.test", auto_start=True,
+        start_argv=argv if launch_kind == "argv" else None,
+        start_command=command if launch_kind == "command" else None)
+    monkeypatch.setattr(client, "_healthy", AsyncMock(return_value=False))
+    monkeypatch.setattr(client, "_stderr_log_path", lambda: None)
+    caplog.set_level("INFO", logger="fake_ollama")
+    try:
+        with pytest.raises(httpx.ConnectError) as error:
+            await client._ensure_ready()
+        # The real launch still receives its credential; only diagnostics omit it.
+        assert secret in str(spawn.call_args.args[0])
+        assert "exited with code 1" in str(error.value)
+        assert secret not in _upstream_error(error.value).body.decode()
+        assert secret not in caplog.text
+        assert "starting llama.cpp target" in caplog.text
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "[::1]"])
+@pytest.mark.parametrize("browser", [False, True])
+def test_anonymous_model_policy_accepts_local_native_and_browser_clients(settings, host, browser):
+    app = create_app(settings)
+    origin = f"http://{host}:21434" if browser else None
+    request = _request(app, path="/api/tags", host=host, port=21434, origin=origin)
+    if browser:
+        request.scope["headers"].append((b"sec-fetch-site", b"same-origin"))
+    require_anonymous_model_access(request, settings.ollama_interfaces[0])
+
+
+@pytest.mark.parametrize("headers", [
+    [(b"host", b"workstation.example:21434")],
+    [(b"host", b"127.0.0.1:21435")],
+    [(b"host", b"127.0.0.1:21434"), (b"origin", b"http://docs.example")],
+    [(b"host", b"127.0.0.1:21434"), (b"origin", b"null")],
+    [(b"host", b"127.0.0.1:21434"), (b"sec-fetch-site", b"cross-site")],
+    [(b"host", b"127.0.0.1:21434"), (b"sec-fetch-site", b"same-site")],
+])
+async def test_anonymous_model_policy_rejects_before_reading_body(settings, headers):
+    app = create_app(settings)
+    scope = _request(app, path="/api/chat", port=21434).scope
+    scope.update(method="POST", headers=headers, http_version="1.1")
+    sent = []
+    async def receive():
+        raise AssertionError("admission must run before body parsing")
+    async def send(message):
+        sent.append(message)
+    await app(scope, receive, send)
+    assert next(item["status"] for item in sent if item["type"] == "http.response.start") == 403
+
+
+def test_anonymous_wildcard_listener_accepts_only_its_socket_authority(settings):
+    app = create_app(settings)
+    interface = settings.ollama_interfaces[0].model_copy(update={"host": "0.0.0.0"})
+    request = _request(app, path="/api/tags", host="192.0.2.10", port=21434)
+    request.scope["server"] = ("192.0.2.10", 21434)
+    require_anonymous_model_access(request, interface)
+    request.scope["headers"] = [(b"host", b"workstation.example:21434")]
+    with pytest.raises(HTTPException) as error:
+        require_anonymous_model_access(Request(request.scope), interface)
+    assert error.value.status_code == 403
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_local_admin_and_playground_keep_direct_access(settings, host):
+    app = create_app(settings.model_copy(update={"playground_enabled": True}))
+    with TestClient(app, base_url=f"http://{host}:21433", client=("127.0.0.1", 50100)) as client:
+        assert client.get("/admin/").status_code == 200
+    with TestClient(app, base_url=f"http://{host}:21431", client=("127.0.0.1", 50100)) as client:
+        assert client.get("/playground/").status_code == 200
+        assert client.get("/playground/api/models", headers={"Origin": f"http://{host}:21431"}).status_code == 200
 
 
 def _request(app, *, path="/admin/config", token="", origin=None, host="127.0.0.1", port=21433):
@@ -196,7 +286,7 @@ def test_external_planner_urls_require_explicit_exact_authorization():
 def test_show_obeys_interface_visibility(settings):
     data = settings.model_dump()
     data["ollama_interfaces"][0]["exposed_models"] = [data["ollama_interfaces"][0]["exposed_models"][0]]
-    with TestClient(create_app(Settings.model_validate(data)), base_url="http://testserver:21434") as client:
+    with TestClient(create_app(Settings.model_validate(data)), base_url="http://127.0.0.1:21434") as client:
         assert client.post("/api/show", json={"model": "llama-test@default"}).status_code == 404
 
 

@@ -780,7 +780,7 @@ def test_routes_request_via_composite_id_through_app(monkeypatch, tmp_path):
         ),
     }
 
-    with TestClient(app) as tc:
+    with TestClient(app, base_url="http://127.0.0.1") as tc:
         r1 = tc.post("/api/chat", json={
             "model": "sonnet@anthropic", "stream": False,
             "messages": [{"role": "user", "content": "hi"}],

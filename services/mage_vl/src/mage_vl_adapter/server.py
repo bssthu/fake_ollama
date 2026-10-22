@@ -7,6 +7,7 @@ import logging
 from typing import Sequence
 
 from .api import create_app
+from .control import shutdown_credentials
 from .engine import MageEngine
 from .request import prepare_request
 from .settings import AdapterSettings, AnalysisOptions, PreparedRequest, SegmentWindow
@@ -48,11 +49,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         port=args.port,
         log_level=args.log_level,
         access_log=True,
+        proxy_headers=False,
         timeout_graceful_shutdown=None,
     )
     server = uvicorn.Server(config)
     app.state.uvicorn_server = server
-    server.run()
+    # A failed duplicate start must not replace the running instance's token.
+    sock = config.bind_socket()
+    try:
+        with shutdown_credentials(sock.getsockname()[1]) as token:
+            app.state.shutdown_token = token
+            server.run(sockets=[sock])
+    finally:
+        app.state.shutdown_token = None
+        sock.close()
     return 0
 
 

@@ -239,7 +239,7 @@ def _build_client(
     fake_llama_cpp: Optional[_FakeLlamaCppClient] = None,
     fake_generic_openai: Optional[_FakeLlamaCppClient] = None,
     upstream_transport: Optional[httpx.MockTransport] = None,
-    base_url: str = "http://testserver:21435",
+    base_url: str = "http://127.0.0.1:21435",
 ) -> TestClient:
     from fake_ollama.anthropic_client import AnthropicClient
 
@@ -1374,7 +1374,7 @@ def test_openai_chat_internal_port_routes_to_upstream(reverse_settings):
         settings,
         fake_ollama=fake,
         upstream_transport=httpx.MockTransport(handler),
-        base_url="http://testserver:21434",
+        base_url="http://127.0.0.1:21434",
     )
     with client:
         resp = client.post(

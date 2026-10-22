@@ -50,7 +50,7 @@ def harness(upstream, frontend, counts):
         app.state.ollama_clients = {"up": OllamaClient("http://up.test", client=transport)}
     port = 21434 if frontend == "ollama" else 21435
     path = {"openai": "/v1/chat/completions", "anthropic": "/v1/messages", "ollama": "/api/chat"}[frontend]
-    return TestClient(app, base_url=f"http://testserver:{port}"), path, seen
+    return TestClient(app, base_url=f"http://127.0.0.1:{port}"), path, seen
 
 
 def frames(response):

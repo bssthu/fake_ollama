@@ -1015,6 +1015,8 @@ python -m fake_ollama --no-request-data-log
 - `logs/fake_ollama.requests.jsonl*` 会包含 prompt、工具参数、模型输出、图片 base64，应按敏感数据处理。
 - 所有接口默认 `127.0.0.1`。要对外暴露：要么把对应实例的 `host` 改 `0.0.0.0`，要么保持 `127.0.0.1` + Nginx/Caddy 反代加 TLS。
 - Admin / Dashboard 默认只允许回环监听、回环客户端与回环 Host。本机浏览器页面自动取得进程内管理凭据，所有管理 API 都验证该凭据；页面不缓存，跨站请求被拒绝。
+- 免鉴权模型接口也会校验 Host 与实际监听端口，并拒绝跨源 Origin、跨站或仅同站的浏览器请求。本机 CLI、`127.0.0.1` / `localhost` 和 Playground 的同源访问仍可免填 token。非回环监听只接受配置的主机名或地址；通配监听接受实际连接的本机地址。通过其他域名或反向代理访问模型接口时，应配置接口 `access_tokens`。
+- llama.cpp 启动日志和对外启动失败信息不输出完整命令或参数，避免泄露后端 `auth_token`；诊断保留目标名、退出码和配置检查提示。
 - 远程访问或经反向代理提供管理页时，必须配置独立的 `management_access_tokens`，并使用 TLS。浏览器登录框的用户名可填 `admin`，密码填写管理 token；页面会自动认证后续 API 请求。命令行可使用 `Authorization: Bearer <management-token>` 或 `X-Management-Token`。模型接口的 token 不授予管理权限。修改管理凭据后旧页面失效，重新加载登录即可。
 - 更新环境依赖后重启进程才会加载安全修复；端口隔离按 ASGI 原始路径判定，管理路由自身也独立验证监听端口及凭据。
 - 反向代理 token：建议用 Web UI 的 Generate 生成 ≥24 字节随机串，不要复用其他系统 token。Token 池可放多个，便于按客户端轮换。

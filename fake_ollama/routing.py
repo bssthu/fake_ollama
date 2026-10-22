@@ -12,7 +12,7 @@ from starlette.requests import ClientDisconnect
 from .config import FORWARDED_BY_HEADER, INSTANCE_ID, GenericOpenAITarget, Settings, parse_forwarded_chain, reset_inbound_forwarded_chain, set_inbound_forwarded_chain
 from .openai_client import OpenAIClient
 from .thinking_cache import bind_scope as bind_thinking_scope
-from .security import is_loopback_host, require_management_access, playground_anonymous_allowed
+from .security import is_loopback_host, require_management_access, playground_anonymous_allowed, require_anonymous_model_access
 from .dashboard import RequestMetrics
 
 import logging
@@ -666,4 +666,9 @@ def _authorise_interface(request: Request):
                     "or Authorization: Bearer header)"
                 ),
             )
+    else:
+        settings = request.app.state.settings
+        # _playground_interface_for already checks the local/proxy boundary.
+        if not (settings.playground_listener_enabled and _local_port(request) == settings.playground_port):
+            require_anonymous_model_access(request, iface)
     return iface

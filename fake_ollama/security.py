@@ -36,6 +36,43 @@ def token_matches(token: str, candidates) -> bool:
     )
 
 
+def require_anonymous_model_access(request: Request, interface) -> None:
+    """Keep native clients working without granting arbitrary websites access.
+
+    A loopback bind alone cannot prevent browser requests. Check Host even if
+    Origin/Fetch Metadata are absent (including same-origin browser reads).
+    Authenticated listeners and Playground have their own admission policies.
+    """
+    host = request.headers.get("host", "")
+    scheme = request.scope.get("scheme", "http")
+    try:
+        authority = urlsplit(scheme + "://" + host)
+        if (not authority.hostname or authority.username is not None
+                or authority.password is not None or authority.path
+                or authority.query or authority.fragment
+                or any(char.isspace() for char in host)
+                or len(request.headers.getlist("host")) != 1):
+            raise ValueError
+        port = authority.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        raise HTTPException(400, "invalid Host header") from None
+
+    server = request.scope.get("server")
+    bound_host = interface.host.lower()
+    if bound_host in {"0.0.0.0", "::"}:
+        bound_host = str(server[0]).lower() if server else ""
+    hostname = authority.hostname.lower()
+    host_allowed = (is_loopback_host(hostname) if is_loopback_host(bound_host)
+                    else hostname == bound_host and bound_host not in {"", "0.0.0.0", "::"})
+    if not host_allowed or not server or port != server[1]:
+        raise HTTPException(403, "anonymous model requests require the listener's local authority")
+    origin = request.headers.get("origin")
+    if (origin is not None and origin != f"{scheme}://{host}") or request.headers.get(
+        "sec-fetch-site", ""
+    ).lower() not in {"", "same-origin", "none"}:
+        raise HTTPException(403, "cross-origin anonymous model requests are not allowed")
+
+
 def playground_anonymous_allowed(request: Request) -> bool:
     """Verify the actual binding, direct peer and browser authority boundary."""
     settings = request.app.state.settings

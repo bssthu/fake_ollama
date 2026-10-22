@@ -301,7 +301,7 @@ def test_oversize_upload_is_rejected_before_decode(tmp_path: Path) -> None:
     assert not list(settings.temp_root.glob("request-*"))
 
 
-def test_metadata_health_and_shutdown_endpoints(tmp_path: Path) -> None:
+def test_metadata_and_health_endpoints(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     app = create_app(settings, _BrokenRuntimeEngine())  # type: ignore[arg-type]
     with TestClient(app) as client:
@@ -311,13 +311,11 @@ def test_metadata_health_and_shutdown_endpoints(tmp_path: Path) -> None:
             "/v1/chat/completions",
             json={"model": "other-model", "messages": []},
         )
-        shutdown = client.post("/shutdown")
 
     assert health.status_code == 503
     assert health.json()["problems"] == ["ffmpeg executable not found"]
     assert models.json()["data"][0]["id"] == "mage-vl-local"
     assert unknown.status_code == 404
-    assert shutdown.json()["status"] == "accepted"
 
 
 @pytest.mark.parametrize("stream", [False, True])

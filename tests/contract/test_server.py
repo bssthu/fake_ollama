@@ -36,7 +36,7 @@ def _make_client(settings, transport: httpx.MockTransport) -> TestClient:
         )
         for up in settings.anthropic_upstreams
     }
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def test_request_shutdown_rejects_new_requests(settings):
@@ -54,7 +54,7 @@ def test_request_shutdown_rejects_new_requests(settings):
     app.state.ollama_clients = {"local": fake}
     request_shutdown(app)
 
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
     with client:
         resp = client.get("/api/version")
 
@@ -114,9 +114,9 @@ def test_request_logs_include_listener_labels(caplog: pytest.LogCaptureFixture):
     app = create_app(settings, test_listener_fallback=True)
     caplog.set_level(logging.INFO, logger="fake_ollama")
 
-    with TestClient(app, base_url="http://testserver:21434") as ollama:
+    with TestClient(app, base_url="http://127.0.0.1:21434") as ollama:
         assert ollama.get("/api/version").status_code == 200
-    with TestClient(app, base_url="http://testserver:21435") as api:
+    with TestClient(app, base_url="http://127.0.0.1:21435") as api:
         assert api.get("/v1/models", headers={"x-api-key": "rev-tk-1"}).status_code == 200
     with TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000)) as admin:
         assert admin.get("/admin/").status_code == 200
@@ -174,12 +174,12 @@ async def test_client_disconnect_is_logged_as_499(
         "raw_path": b"/v1/messages",
         "query_string": b"",
         "headers": [
-            (b"host", b"testserver"),
+            (b"host", b"127.0.0.1"),
             (b"content-type", b"application/json"),
             (b"content-length", b"100"),
         ],
         "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
+        "server": ("127.0.0.1", 80),
     }
 
     await app(scope, receive, send)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import json
 import math
 import mimetypes
 import re
@@ -12,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from .settings import AdapterSettings, AnalysisOptions, PreparedRequest
 
@@ -20,6 +22,38 @@ from .settings import AdapterSettings, AnalysisOptions, PreparedRequest
 _DATA_URI_RE = re.compile(
     r"^data:(?P<mime>[^;,]+)?(?P<base64>;base64)?,(?P<data>.*)$", re.DOTALL
 )
+
+
+async def read_json_request(request: Request, settings: AdapterSettings) -> Any:
+    """Bound the entire encoded request before JSON parsing or video decoding."""
+    if request.headers.get("content-encoding", "identity").lower() != "identity":
+        raise HTTPException(415, "compressed request bodies are not supported")
+    limit = settings.request_body_limit
+    try:
+        length = int(request.headers.get("content-length", "0"))
+        if length < 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(400, "invalid Content-Length") from None
+    if length > limit:
+        raise HTTPException(413, "request body exceeds the configured size limit")
+
+    async def read_body() -> bytearray:
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(chunk) > limit - len(data):
+                raise HTTPException(413, "request body exceeds the configured size limit")
+            data.extend(chunk)
+        return data
+
+    try:
+        data = await asyncio.wait_for(read_body(), timeout=settings.request_body_timeout_seconds)
+    except asyncio.TimeoutError:
+        raise HTTPException(408, "request body timed out") from None
+    try:
+        return json.loads(data)
+    except (ValueError, RecursionError):
+        raise HTTPException(400, "request body must be JSON") from None
 
 
 def _bounded_number(

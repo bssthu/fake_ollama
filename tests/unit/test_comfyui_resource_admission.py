@@ -331,7 +331,7 @@ async def test_image_api_returns_success_only_after_resource_admission(
     app.state.vram_coordinator = runtime.gpu
     app.state.memory_coordinator = runtime.ram
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://testserver:21435",
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:21435",
     ) as client:
         response = await client.post(
             "/v1/images/generations", headers={"x-api-key": "test-token"},

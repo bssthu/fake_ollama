@@ -298,7 +298,7 @@ def _install_openai_client(
 def test_ollama_chat_routes_via_openai_upstream() -> None:
     settings = _settings_with_openai()
     app = create_app(settings, test_listener_fallback=True)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         captured = _install_openai_client(app)
         resp = client.post(
             "/api/chat",
@@ -320,7 +320,7 @@ def test_ollama_chat_routes_via_openai_upstream() -> None:
 def test_openai_chat_routes_via_openai_upstream_passthrough() -> None:
     settings = _settings_with_openai()
     app = create_app(settings, test_listener_fallback=True)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         captured = _install_openai_client(app)
         resp = client.post(
             "/v1/chat/completions",
@@ -340,7 +340,7 @@ def test_openai_chat_routes_via_openai_upstream_passthrough() -> None:
 def test_anthropic_messages_routes_via_openai_upstream() -> None:
     settings = _settings_with_openai()
     app = create_app(settings, test_listener_fallback=True)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         _install_openai_client(app)
         resp = client.post(
             "/v1/messages",

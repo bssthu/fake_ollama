@@ -86,7 +86,7 @@ def make_client(upstream, frontend, *, text=True, failure=None):
         app.state.ollama_clients = {"up": OllamaClient("http://up.test", client=transport)}
     port = 21434 if frontend == "ollama" else 21435
     path = {"ollama": "/api/chat", "openai": "/v1/chat/completions", "anthropic": "/v1/messages"}[frontend]
-    return TestClient(app, base_url=f"http://testserver:{port}"), path, seen
+    return TestClient(app, base_url=f"http://127.0.0.1:{port}"), path, seen
 
 
 def frames(response, frontend):

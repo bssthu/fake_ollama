@@ -59,7 +59,7 @@ def test_request_data_log_records_http_and_backend_payloads(settings, tmp_path):
             )
             for up in settings.anthropic_upstreams
         }
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1") as client:
             resp = client.post(
                 "/api/chat",
                 json={
@@ -131,7 +131,7 @@ async def test_request_data_log_marks_client_disconnect_cancelled(tmp_path):
             (b"content-length", b"100"),
         ],
         "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
+        "server": ("127.0.0.1", 80),
     }
 
     try:
@@ -185,12 +185,12 @@ async def test_request_data_log_marks_routed_disconnect_499_cancelled(
         "raw_path": b"/v1/messages",
         "query_string": b"",
         "headers": [
-            (b"host", b"testserver"),
+            (b"host", b"127.0.0.1"),
             (b"content-type", b"application/json"),
             (b"content-length", b"100"),
         ],
         "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
+        "server": ("127.0.0.1", 80),
     }
 
     try:

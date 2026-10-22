@@ -650,7 +650,7 @@ def test_admin_disabled_returns_404(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 def test_admin_routes_are_only_on_admin_port(admin_settings):
     app = create_app(admin_settings)
-    with TestClient(app, base_url="http://testserver:21434") as ollama:
+    with TestClient(app, base_url="http://127.0.0.1:21434") as ollama:
         assert ollama.get("/admin/").status_code == 404
         assert ollama.get("/api/version").status_code == 200
     with TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)}) as admin:
@@ -660,7 +660,7 @@ def test_admin_routes_are_only_on_admin_port(admin_settings):
 
 def test_dashboard_routes_are_only_on_dashboard_port(admin_settings):
     app = create_app(admin_settings)
-    with TestClient(app, base_url="http://testserver:21434") as ollama:
+    with TestClient(app, base_url="http://127.0.0.1:21434") as ollama:
         assert ollama.get("/dashboard/").status_code == 404
         assert ollama.get("/api/version").status_code == 200
     with TestClient(app, base_url="http://127.0.0.1:21433", client=("127.0.0.1", 50000), headers={"X-Management-Token": management_session_token(app)}) as admin:

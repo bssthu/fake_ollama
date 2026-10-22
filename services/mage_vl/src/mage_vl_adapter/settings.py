@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import tempfile
@@ -32,6 +33,20 @@ class AdapterSettings:
     default_max_segments: int = 12
     max_segments_limit: int = DEFAULT_MAX_SEGMENTS_LIMIT
     max_frame_width: int = 768
+    max_request_body_bytes: int | None = None
+    request_body_timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.max_request_body_bytes is not None and self.max_request_body_bytes <= 0:
+            raise ValueError("max_request_body_bytes must be positive")
+        if not math.isfinite(self.request_body_timeout_seconds) or self.request_body_timeout_seconds <= 0:
+            raise ValueError("request_body_timeout_seconds must be finite and positive")
+
+    @property
+    def request_body_limit(self) -> int:
+        # Base64 expands a video by 4/3; leave 1 MiB for JSON and prompt fields.
+        return (self.max_request_body_bytes if self.max_request_body_bytes is not None
+                else 4 * ((self.max_video_bytes + 2) // 3) + 1024 * 1024)
 
     @classmethod
     def from_env(cls) -> "AdapterSettings":
@@ -42,6 +57,13 @@ class AdapterSettings:
             model_id=os.environ.get("MAGE_VL_MODEL_ID", DEFAULT_MODEL_ID),
             max_video_bytes=_env_int(
                 "MAGE_VL_MAX_VIDEO_BYTES", DEFAULT_MAX_VIDEO_BYTES, minimum=1024
+            ),
+            max_request_body_bytes=(
+                _env_int("MAGE_VL_MAX_REQUEST_BODY_BYTES", 1024 * 1024, minimum=1024)
+                if os.environ.get("MAGE_VL_MAX_REQUEST_BODY_BYTES") else None
+            ),
+            request_body_timeout_seconds=_env_float(
+                "MAGE_VL_REQUEST_BODY_TIMEOUT_SECONDS", 30.0, minimum=0.1
             ),
             default_segment_seconds=_env_float(
                 "MAGE_VL_SEGMENT_SECONDS", 8.0, minimum=1.0
