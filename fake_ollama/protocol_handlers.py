@@ -498,7 +498,7 @@ async def _handle_openai_chat(request: Request) -> Any:
                     estimated_vram_gb=estimated_vram_gb,
                     estimated_memory_gb=estimated_memory_gb,
                 )):
-                    if line.startswith("data:"):
+                    if line.startswith(("data:", ":")):
                         yield (line + "\n\n").encode("utf-8")
                     else:
                         yield ("data: " + line + "\n\n").encode("utf-8")
