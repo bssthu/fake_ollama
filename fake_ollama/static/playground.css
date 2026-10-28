@@ -694,3 +694,19 @@ details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px
 .decision-probability-cell span { text-align: right; font-variant-numeric: tabular-nums; }
 .decision-result-meta { color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .decision-error { color: var(--danger); font-size: 12px; white-space: pre-wrap; }
+
+.ocr-section { border-top: 1px solid var(--line); padding-top: 14px; }
+.ocr-engines { display: grid; gap: 8px; font-size: 12px; }
+.ocr-engines label, .ocr-check { display: flex; align-items: flex-start; gap: 7px; line-height: 1.5; }
+.ocr-check { margin-bottom: 14px; font-size: 12px; }
+.ocr-candidate { display: grid; gap: 5px; margin-bottom: 10px; }
+.ocr-candidate button { justify-self: end; }
+.ocr-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 12px; min-width: 0; }
+.ocr-summary, .ocr-results > details { grid-column: 1 / -1; }
+.ocr-summary { font-size: 13px; color: var(--muted); line-height: 1.6; }
+.ocr-result { min-width: 0; border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+.ocr-best { border-color: var(--accent); }
+.ocr-result strong { font-size: 13px; overflow-wrap: anywhere; }
+.ocr-score { color: var(--accent); font-size: 12px; margin-top: 8px; }
+.ocr-result pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.7; max-height: 480px; overflow: auto; }
+.ocr-failure { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; }

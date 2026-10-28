@@ -37,9 +37,10 @@
                     aria-label="显示 API key" title="显示或隐藏">◉</button>
           </div>
           <div class="help">不会写入 localStorage、Cookie 或服务端配置。</div>
+          <div id="authenticationHint" class="help">是否需要 key 由服务端访问策略决定。</div>
         </div>
 
-        <button id="loadModels" class="secondary" type="button">连接并加载模型</button>
+        <button id="loadModels" class="secondary" type="button">连接并获取模型列表</button>
 
         <div class="field">
           <label for="model">模型</label>
@@ -56,6 +57,50 @@
           </select>
           <div id="operationHint" class="help">能力由 Playground 专用发现接口返回，不按模型名称猜测。</div>
         </div>
+
+        <section id="ocrSection" class="ocr-section" hidden aria-label="OCR 设置">
+          <div class="field">
+            <label for="ocrCategory">识别区域类型</label>
+            <select id="ocrCategory"><option value="text">文字</option><option value="formula">公式</option><option value="table">表格</option></select>
+          </div>
+          <div id="ocrEnginesField" class="field" hidden>
+            <span class="label">对比引擎</span><div id="ocrEngines" class="ocr-engines"></div>
+          </div>
+          <div id="ocrFallbackField" class="field" hidden>
+            <label for="ocrFallback">低分 / 识别失败后的备用引擎</label><select id="ocrFallback"></select>
+            <div class="help">最多重试一次；复核服务故障不会触发重识别。</div>
+          </div>
+          <div class="field">
+            <label for="ocrVerifier">复核模型</label>
+            <select id="ocrVerifier"><option value="">不复核</option></select>
+            <div id="ocrVerifierHint" class="help">可选；不复核时仅返回 OCR 识别结果。</div>
+          </div>
+          <div class="row parameter-row">
+            <div class="field"><label for="ocrThreshold">复核阈值</label><input id="ocrThreshold" class="control" type="number" min="0" max="1" step="0.01" value="0.9"></div>
+            <div class="field"><label for="ocrMaxTokens">Max tokens</label><input id="ocrMaxTokens" class="control" type="number" min="64" max="8192" step="64" value="4096"></div>
+          </div>
+          <div class="field">
+            <label for="ocrLifetime">任务完成后</label>
+            <select id="ocrLifetime"><option value="release">释放模型</option><option value="keep">保留模型，供连续识别</option></select>
+            <div class="help">保留识别模型及所选复核模型，占用内存 / 显存；关闭页面仍保留。停止任务、手动释放或服务退出时清理。</div>
+          </div>
+          <div class="field">
+            <label for="ocrRepeat">连续运行次数</label>
+            <input id="ocrRepeat" class="control" type="number" min="1" max="20" step="1" value="1">
+            <div class="help">依次处理同一输入；关闭请求提示词缓存。选择保留模型，可比较首轮加载与后续识别耗时。</div>
+          </div>
+          <div id="ocrRuntimeStatus" class="help" role="status">模型状态尚未获取</div>
+          <div class="row">
+            <button id="ocrRefreshRuntime" class="secondary" type="button">刷新状态</button>
+            <button id="ocrRelease" class="secondary" type="button" disabled>释放已保留模型</button>
+          </div>
+          <div id="ocrBenchmark" class="help" role="status" hidden></div>
+          <div id="ocrCandidatesField" class="field" hidden>
+            <span class="label">待复核候选（最多 8 个）</span><div id="ocrCandidates"></div>
+            <button id="ocrAddCandidate" class="secondary" type="button">添加候选</button>
+          </div>
+          <div class="help">请上传或粘贴一个文字、公式或表格区域。Jev 评分表示图文一致性；表格分数偏低，不宜直接套用文字阈值。</div>
+        </section>
 
         <section id="decisionSection" class="decision-section" hidden aria-label="决策请求">
           <div class="section-title"><h2>结构化决策</h2><span class="help">独立请求</span></div>

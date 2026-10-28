@@ -1,0 +1,169 @@
+{
+  "sample": "synthetic mixed Chinese/English screenshot",
+  "timing": "browser request roundtrip includes loading; warm mean excludes first request",
+  "prompt_cache": false,
+  "engines": {
+    "ppocr-v6": {
+      "verifier": null,
+      "keep_loaded": true,
+      "roundtrip_seconds": [
+        1.9158,
+        0.7431,
+        0.7301
+      ],
+      "first_seconds": 1.9158,
+      "subsequent_mean_seconds": 0.7366,
+      "inference_seconds": [
+        1.093,
+        0.702,
+        0.696
+      ],
+      "events": [
+        [
+          {
+            "model": "PP-OCRv6 small / ONNX",
+            "load_seconds": 0.3664,
+            "reused": false
+          }
+        ],
+        [
+          {
+            "model": "PP-OCRv6 small / ONNX",
+            "load_seconds": 0,
+            "reused": true
+          }
+        ],
+        [
+          {
+            "model": "PP-OCRv6 small / ONNX",
+            "load_seconds": 0,
+            "reused": true
+          }
+        ]
+      ]
+    },
+    "hunyuan-ocr-current": {
+      "verifier": null,
+      "keep_loaded": true,
+      "roundtrip_seconds": [
+        2.0845,
+        0.2169,
+        0.217
+      ],
+      "first_seconds": 2.0845,
+      "subsequent_mean_seconds": 0.2169,
+      "inference_seconds": [
+        0.233,
+        0.176,
+        0.177
+      ],
+      "events": [
+        [
+          {
+            "model": "HunyuanOCR 1.5 / F16",
+            "load_seconds": 1.5098,
+            "reused": false
+          }
+        ],
+        [
+          {
+            "model": "HunyuanOCR 1.5 / F16",
+            "load_seconds": 0,
+            "reused": true
+          }
+        ],
+        [
+          {
+            "model": "HunyuanOCR 1.5 / F16",
+            "load_seconds": 0,
+            "reused": true
+          }
+        ]
+      ]
+    },
+    "minicpm-ocr": {
+      "verifier": "minicpm-ocr-jev",
+      "keep_loaded": true,
+      "roundtrip_seconds": [
+        6.0633,
+        1.3309,
+        1.2819
+      ],
+      "first_seconds": 6.0633,
+      "subsequent_mean_seconds": 1.3064,
+      "inference_seconds": [
+        0.461,
+        0.387,
+        0.37
+      ],
+      "events": [
+        [
+          {
+            "model": "MiniCPM-OCR 1.0 / F16",
+            "load_seconds": 1.7567,
+            "reused": false
+          },
+          {
+            "model": "MiniCPM-OCR-Jev / F16",
+            "load_seconds": 2.4547,
+            "reused": false
+          }
+        ],
+        [
+          {
+            "model": "MiniCPM-OCR 1.0 / F16",
+            "load_seconds": 0,
+            "reused": true
+          },
+          {
+            "model": "MiniCPM-OCR-Jev / F16",
+            "load_seconds": 0,
+            "reused": true
+          }
+        ],
+        [
+          {
+            "model": "MiniCPM-OCR 1.0 / F16",
+            "load_seconds": 0,
+            "reused": true
+          },
+          {
+            "model": "MiniCPM-OCR-Jev / F16",
+            "load_seconds": 0,
+            "reused": true
+          }
+        ]
+      ]
+    },
+    "release_mode": {
+      "verifier": null,
+      "keep_loaded": false,
+      "roundtrip_seconds": [
+        2.4606,
+        2.4709
+      ],
+      "first_seconds": 2.4606,
+      "subsequent_mean_seconds": 2.4709,
+      "inference_seconds": [
+        0.236,
+        0.239
+      ],
+      "events": [
+        [
+          {
+            "model": "HunyuanOCR 1.5 / F16",
+            "load_seconds": 1.5163,
+            "reused": false
+          }
+        ],
+        [
+          {
+            "model": "HunyuanOCR 1.5 / F16",
+            "load_seconds": 1.5121,
+            "reused": false
+          }
+        ]
+      ]
+    }
+  }
+}

@@ -49,6 +49,7 @@
 - admin 接口（`admin_host` / `admin_port`）只服务 `/admin/*`，**不会**出现在任何 `ollama_interfaces` / `api_interfaces` 上；同样，`/api/*` 与 `/v1/*` 也**不会**出现在 admin 端口。
 - Embeddings 尚未实现：`/api/embed`、`/api/embeddings` 和 `/v1/embeddings` 返回 501，不会转发到后端。
 - Model Playground 默认关闭。启用后使用独立端口，按 `/playground/api/models` 返回的 capabilities/operations 调用聊天、视觉、视频分析、图片生成/编辑与视频生成接口；支持图片粘贴/拖放、本地视频选择，以及手机或 PC 摄像头的分窗近实时分析。API key 与交互记录仅保存在当前浏览器页面内存中。
+- 可选 [OCR 功能](services/ocr/README.md) 已并入 `/playground/` 主页面：支持 MiniCPM-OCR、PP-OCR、HunyuanOCR 对比，可选择 Jev 区域复核和最多一次低分重试，并提供模型保留/释放与连续识别计时。通过 `playground_ocr_config` 指向隔离运行环境的本机配置；[调研与实测结果](docs/ocr-local-research.md) 包含 Hunyuan 旧 GGUF 的 EOS/EOT 问题与修复。
 - 想让别的机器访问某个接口：把对应实例的 `host` 改成 `0.0.0.0`，或者保持 `127.0.0.1` + 在前面挂 Nginx/Caddy（推荐，可以加 TLS / 限流 / 客户端证书）。
 
 ## 特性一览

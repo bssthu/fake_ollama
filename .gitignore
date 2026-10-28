@@ -52,3 +52,7 @@ config/local/
 *.log
 logs/
 dashboard_history.json
+services/ocr/.runtime/
+services/ocr/.upstream/
+services/ocr/.browsers/
+services/ocr/.convert/

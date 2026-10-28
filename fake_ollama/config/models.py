@@ -1867,6 +1867,8 @@ class Settings(BaseModel):
     playground_port: Optional[int] = 21431
     playground_trusted_proxy_ips: List[str] = Field(default_factory=list)
     playground_allowed_origins: List[str] = Field(default_factory=list)
+    # Optional local OCR worker configuration; no model weights in the gateway environment.
+    playground_ocr_config: Optional[str] = None
 
     @field_validator("playground_trusted_proxy_ips")
     @classmethod

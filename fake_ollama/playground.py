@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, Response, JSONResponse
 from . import routing, playground_support
 
 from .config import Settings
+from .security import is_loopback_host
 
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -31,6 +32,8 @@ def register_playground_routes(app: FastAPI) -> None:
     settings: Settings = app.state.settings
     if not settings.playground_enabled:
         return
+    from .ocr_playground import register_ocr_routes
+    register_ocr_routes(app)
 
     @app.get("/playground", include_in_schema=False)
     @app.get("/playground/", include_in_schema=False)
@@ -78,10 +81,25 @@ def register_playground_routes(app: FastAPI) -> None:
             for profile in settings.h3_context_ir_profiles
             if profile.enabled and profile.playground_visible
         )
+        from .ocr_playground import ocr_catalog, playground_entries
+        ocr, ocr_error = None, None
+        if settings.playground_ocr_config:
+            try:
+                ocr = ocr_catalog(settings)
+                models.extend(playground_entries(ocr))
+            except HTTPException as exc:
+                ocr_error = exc.detail
+        actual = getattr(request.app.state, 'actual_listener_settings', settings)
+        local = (is_loopback_host(actual.playground_host)
+                 and request.client and is_loopback_host(request.client.host)
+                 and is_loopback_host(request.url.hostname or ''))
         return JSONResponse(
             {
                 "schema_version": 1,
                 "models": models,
+                "authentication": "token" if iface.auth_required else ("local_anonymous" if local else "trusted_proxy_anonymous"),
+                "ocr": ocr,
+                "ocr_error": ocr_error,
             },
             headers={"Cache-Control": "no-store"},
         )

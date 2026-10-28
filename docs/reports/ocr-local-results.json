@@ -1,0 +1,1622 @@
+{
+  "date": "2026-10-29",
+  "hardware": "Windows / NVIDIA RTX 4090 24GB",
+  "synthetic": {
+    "mixed": {
+      "ground_truth": "订单编号：OCR-2026-1029\n苹果 3 个，单价 12.50 元，总计 37.50 元。\nPlease verify invoice A-019: Total USD 123.45.",
+      "normalized_length": 81,
+      "result": {
+        "results": [
+          {
+            "engine": "minicpm-ocr",
+            "text": "订单编号：OCR-2026-1029\n苹果 3 个，单价 12.50 元，总计 37.50 元。\nPlease verify invoice A-019: Total USD 123.45.",
+            "usage": {
+              "completion_tokens": 62,
+              "prompt_tokens": 1038,
+              "total_tokens": 1100,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "inference_seconds": 0.489,
+            "truncated": false,
+            "finish_reason": "stop",
+            "model_file": "MiniCPM-OCR-1_0-F16.gguf",
+            "score": 0.9428760270559938,
+            "verdict": "scored",
+            "elapsed_seconds": 2.685,
+            "score_seconds": 0.163,
+            "normalized_edit_distance": 0,
+            "normalized_cer": 0.0
+          },
+          {
+            "engine": "ppocr-v6",
+            "text": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45.",
+            "inference_seconds": 1.094,
+            "boxes": [
+              [
+                [
+                  24.0,
+                  22.0
+                ],
+                [
+                  415.0,
+                  20.0
+                ],
+                [
+                  415.0,
+                  58.0
+                ],
+                [
+                  24.0,
+                  60.0
+                ]
+              ],
+              [
+                [
+                  23.0,
+                  71.0
+                ],
+                [
+                  601.0,
+                  71.0
+                ],
+                [
+                  601.0,
+                  110.0
+                ],
+                [
+                  23.0,
+                  111.0
+                ]
+              ],
+              [
+                [
+                  22.0,
+                  119.0
+                ],
+                [
+                  690.0,
+                  120.0
+                ],
+                [
+                  690.0,
+                  164.0
+                ],
+                [
+                  22.0,
+                  163.0
+                ]
+              ]
+            ],
+            "recognition_scores": [
+              0.99921,
+              0.99457,
+              0.99805
+            ],
+            "runtime": "RapidOCR 3.10.0 / ONNX CPU",
+            "truncated": false,
+            "score": 0.9224823435231172,
+            "verdict": "scored",
+            "elapsed_seconds": 1.587,
+            "score_seconds": 0.084,
+            "normalized_edit_distance": 0,
+            "normalized_cer": 0.0
+          },
+          {
+            "engine": "hunyuan-ocr",
+            "text": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45.“订单编号：OCR-2026-1029“订单编号：OCR-2026-1029“Please verify invoice A-019: Total USD 123.45.“订单编号：OCR-2026-1029“苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.“订单编号：OCR-2026-1029“苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.“订单编号：OCR-2026-1029“苹果3个，单价12.50元",
+            "inference_seconds": 1.6509672,
+            "truncated": false,
+            "runtime": "Clipaste HunyuanOcrEngine (streaming, repeated-tail cleanup)",
+            "score": 0.0002982776415551503,
+            "verdict": "scored",
+            "elapsed_seconds": 3.65,
+            "score_seconds": 0.101,
+            "normalized_edit_distance": 278,
+            "normalized_cer": 3.432098765432099
+          },
+          {
+            "engine": "ppocr-clipaste",
+            "text": "订单编号：OCR-2026-1029\r\n苹果3个，单价12.50元，总计37.50元。\r\nPlease verify invoice A-019: Total USD 123.45.",
+            "inference_seconds": 2.0014166,
+            "truncated": false,
+            "runtime": "Clipaste PpOcrEngine / RapidOcrNet 3.0.0 / ONNX CPU (includes first load)",
+            "score": 0.9235233725598543,
+            "verdict": "scored",
+            "elapsed_seconds": 2.256,
+            "score_seconds": 0.079,
+            "normalized_edit_distance": 0,
+            "normalized_cer": 0.0
+          },
+          {
+            "engine": "hunyuan-ocr-current",
+            "text": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45.",
+            "usage": {
+              "completion_tokens": 42,
+              "prompt_tokens": 274,
+              "total_tokens": 316,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "inference_seconds": 0.237,
+            "truncated": false,
+            "finish_reason": "stop",
+            "model_file": "hunyuanocr-f16.gguf",
+            "score": 0.9224823435231172,
+            "verdict": "scored",
+            "elapsed_seconds": 1.8,
+            "score_seconds": 0.079,
+            "normalized_edit_distance": 0,
+            "normalized_cer": 0.0
+          }
+        ],
+        "best_index": 0,
+        "threshold": 0.9,
+        "decision": "accept",
+        "retry_count": 0,
+        "elapsed_seconds": 18.002,
+        "scope": "single_region",
+        "score_semantics": "Local Jev consistency score; threshold is not calibrated accuracy.",
+        "runtime_events": [
+          {
+            "model": "MiniCPM-OCR-1_0-F16.gguf",
+            "load_seconds": 2.035
+          },
+          {
+            "model": "hyocr-f16.gguf",
+            "load_seconds": 1.697
+          },
+          {
+            "model": "hunyuanocr-f16.gguf",
+            "load_seconds": 1.441
+          },
+          {
+            "model": "MiniCPM-OCR-Jev-F16.gguf",
+            "load_seconds": 2.462
+          }
+        ],
+        "renderer": {
+          "mode": "persistent",
+          "browsers": 1,
+          "browsers_alive": 1,
+          "pages_per_browser": 1,
+          "precheck": true,
+          "restarts": 0,
+          "uptime_sec": 2.4,
+          "pipeline": "v8.5",
+          "katex": "0.16.47"
+        },
+        "renderer_environment": "Windows SDK; absolute scores are not calibrated against Docker",
+        "image_size": [
+          1000,
+          250
+        ]
+      }
+    },
+    "small": {
+      "ground_truth": "识别测试：未付款 ≠ 已付款；金额 108.08 元。\nCode: O0-I1-lL / Invoice 2026-10-29 / Qty 8\n请核对小字、数字、标点和中英文混排。",
+      "normalized_length": 77,
+      "result": {
+        "results": [
+          {
+            "engine": "minicpm-ocr",
+            "text": "识别测试：未付款 ≠ 已付款；金额 108.08 元。\nCode: O0-I1-IL / Invoice 2026-10-29 / Qty 8\n请核对小字、数字、标点和中英文混排。",
+            "usage": {
+              "completion_tokens": 63,
+              "prompt_tokens": 1038,
+              "total_tokens": 1101,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "inference_seconds": 0.506,
+            "truncated": false,
+            "finish_reason": "stop",
+            "model_file": "MiniCPM-OCR-1_0-F16.gguf",
+            "score": 0.8663588093010424,
+            "verdict": "scored",
+            "elapsed_seconds": 2.616,
+            "score_seconds": 0.16,
+            "normalized_edit_distance": 1,
+            "normalized_cer": 0.012987012987012988
+          },
+          {
+            "engine": "ppocr-v6",
+            "text": "识别测试：未付款≠已付款；金额108.08元。\nCode: O0-I1-IL / Invoice 2026-10-29 / Qty 8\n请核对小字、数字、标点和中英文混排。",
+            "inference_seconds": 1.097,
+            "boxes": [
+              [
+                [
+                  26.0,
+                  23.0
+                ],
+                [
+                  397.0,
+                  23.0
+                ],
+                [
+                  397.0,
+                  45.0
+                ],
+                [
+                  26.0,
+                  45.0
+                ]
+              ],
+              [
+                [
+                  26.0,
+                  58.0
+                ],
+                [
+                  409.0,
+                  60.0
+                ],
+                [
+                  409.0,
+                  84.0
+                ],
+                [
+                  25.0,
+                  82.0
+                ]
+              ],
+              [
+                [
+                  26.0,
+                  97.0
+                ],
+                [
+                  342.0,
+                  97.0
+                ],
+                [
+                  342.0,
+                  122.0
+                ],
+                [
+                  26.0,
+                  122.0
+                ]
+              ]
+            ],
+            "recognition_scores": [
+              0.99708,
+              0.98161,
+              0.99989
+            ],
+            "runtime": "RapidOCR 3.10.0 / ONNX CPU",
+            "truncated": false,
+            "score": 0.8876923064102633,
+            "verdict": "scored",
+            "elapsed_seconds": 1.111,
+            "score_seconds": 0.085,
+            "normalized_edit_distance": 1,
+            "normalized_cer": 0.012987012987012988
+          },
+          {
+            "engine": "hunyuan-ocr",
+            "text": "",
+            "inference_seconds": 1.4196949,
+            "truncated": false,
+            "runtime": "Clipaste HunyuanOcrEngine (streaming, repeated-tail cleanup)",
+            "score": null,
+            "verdict": "unverified",
+            "elapsed_seconds": 3.167,
+            "normalized_edit_distance": 77,
+            "normalized_cer": 1.0
+          },
+          {
+            "engine": "ppocr-clipaste",
+            "text": "识别测试：未付款≠已付款；金额108.08元。\r\nCode: O0-I1-IL / Invoice 2026-10-29 / Qty 8\r\n请核对小字、数字、标点和中英文混排。",
+            "inference_seconds": 2.0444531,
+            "truncated": false,
+            "runtime": "Clipaste PpOcrEngine / RapidOcrNet 3.0.0 / ONNX CPU (includes first load)",
+            "score": 0.888758793492457,
+            "verdict": "scored",
+            "elapsed_seconds": 2.258,
+            "score_seconds": 0.079,
+            "normalized_edit_distance": 1,
+            "normalized_cer": 0.012987012987012988
+          },
+          {
+            "engine": "hunyuan-ocr-current",
+            "text": "识别测试：未付款≠已付款；金额108.08元。\n Code: O0-I1-IL / Invoice 2026-10-29 / Qty 8\n 请核对小字、数字、标点和中英文混排。",
+            "usage": {
+              "completion_tokens": 55,
+              "prompt_tokens": 274,
+              "total_tokens": 329,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "inference_seconds": 0.28,
+            "truncated": false,
+            "finish_reason": "stop",
+            "model_file": "hunyuanocr-f16.gguf",
+            "score": 0.8667540505954684,
+            "verdict": "scored",
+            "elapsed_seconds": 1.856,
+            "score_seconds": 0.08,
+            "normalized_edit_distance": 1,
+            "normalized_cer": 0.012987012987012988
+          }
+        ],
+        "best_index": 3,
+        "threshold": 0.9,
+        "decision": "review",
+        "retry_count": 0,
+        "elapsed_seconds": 16.313,
+        "scope": "single_region",
+        "score_semantics": "Local Jev consistency score; threshold is not calibrated accuracy.",
+        "runtime_events": [
+          {
+            "model": "MiniCPM-OCR-1_0-F16.gguf",
+            "load_seconds": 1.952
+          },
+          {
+            "model": "hyocr-f16.gguf",
+            "load_seconds": 1.44
+          },
+          {
+            "model": "hunyuanocr-f16.gguf",
+            "load_seconds": 1.445
+          },
+          {
+            "model": "MiniCPM-OCR-Jev-F16.gguf",
+            "load_seconds": 2.462
+          }
+        ],
+        "renderer": {
+          "mode": "persistent",
+          "browsers": 1,
+          "browsers_alive": 1,
+          "pages_per_browser": 1,
+          "precheck": true,
+          "restarts": 0,
+          "uptime_sec": 1.9,
+          "pipeline": "v8.5",
+          "katex": "0.16.47"
+        },
+        "renderer_environment": "Windows SDK; absolute scores are not calibrated against Docker",
+        "image_size": [
+          1000,
+          250
+        ]
+      }
+    },
+    "blurred": {
+      "ground_truth": "发票金额：￥1,280.50\n账户编号：AB-00917，数量：12，税率：13%\nDo not confuse 0 with O, or 1 with I.",
+      "normalized_length": 68,
+      "result": {
+        "results": [
+          {
+            "engine": "minicpm-ocr",
+            "text": "发票金额：¥1,280.50\n账户编号：AB-00917，数量：12，税率：13%\nDo not confuse 0 with O, or 1 with I.",
+            "usage": {
+              "completion_tokens": 50,
+              "prompt_tokens": 1038,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "inference_seconds": 0.456,
+            "truncated": false,
+            "finish_reason": "stop",
+            "model_file": "MiniCPM-OCR-1_0-F16.gguf",
+            "score": 0.9639160573870332,
+            "verdict": "scored",
+            "elapsed_seconds": 2.565,
+            "score_seconds": 0.165,
+            "normalized_edit_distance": 1,
+            "normalized_cer": 0.014705882352941176
+          },
+          {
+            "engine": "ppocr-v6",
+            "text": "发票金额：¥1,280.50\n账户编号：AB-00917，数量：12，税率：13%\nDo not confuse 0 with O, or 1 with I.",
+            "inference_seconds": 1.076,
+            "boxes": [
+              [
+                [
+                  25.0,
+                  23.0
+                ],
+                [
+                  271.0,
+                  22.0
+                ],
+                [
+                  271.0,
+                  51.0
+                ],
+                [
+                  25.0,
+                  52.0
+                ]
+              ],
+              [
+                [
+                  24.0,
+                  66.0
+                ],
+                [
+                  532.0,
+                  66.0
+                ],
+                [
+                  532.0,
+                  97.0
+                ],
+                [
+                  24.0,
+                  97.0
+                ]
+              ],
+              [
+                [
+                  26.0,
+                  110.0
+                ],
+                [
+                  445.0,
+                  110.0
+                ],
+                [
+                  445.0,
+                  139.0
+                ],
+                [
+                  26.0,
+                  139.0
+                ]
+              ]
+            ],
+            "recognition_scores": [
+              0.97008,
+              0.99967,
+              0.97633
+            ],
+            "runtime": "RapidOCR 3.10.0 / ONNX CPU",
+            "truncated": false,
+            "score": 0.9639160573870332,
+            "verdict": "scored",
+            "elapsed_seconds": 1.089,
+            "score_seconds": 0.083,
+            "normalized_edit_distance": 1,
+            "normalized_cer": 0.014705882352941176
+          },
+          {
+            "engine": "hunyuan-ocr",
+            "text": "发票金额: ￥1,280.50\n账户编号: AB-00917，数量: 12，税率: 13%\nDo not confuse 0 with O, or 1 with I.",
+            "inference_seconds": 0.5583893,
+            "truncated": false,
+            "runtime": "Clipaste HunyuanOcrEngine (streaming, repeated-tail cleanup)",
+            "score": 0.961929160460264,
+            "verdict": "scored",
+            "elapsed_seconds": 2.288,
+            "score_seconds": 0.085,
+            "normalized_edit_distance": 4,
+            "normalized_cer": 0.058823529411764705
+          },
+          {
+            "engine": "ppocr-clipaste",
+            "text": "发票金额：￥1,280.50\r\n账户编号：AB-00917，数量：12，税率：13%\r\nDo not confuse 0 with O, or 1 with I.",
+            "inference_seconds": 2.0824897,
+            "truncated": false,
+            "runtime": "Clipaste PpOcrEngine / RapidOcrNet 3.0.0 / ONNX CPU (includes first load)",
+            "score": 0.9673177624719052,
+            "verdict": "scored",
+            "elapsed_seconds": 2.3,
+            "score_seconds": 0.081,
+            "normalized_edit_distance": 0,
+            "normalized_cer": 0.0
+          },
+          {
+            "engine": "hunyuan-ocr-current",
+            "text": "发票金额：￥1,280.50\n账户编号：AB-00917，数量：12，税率：13%\nDo not confuse 0 with O, or 1 with I.",
+            "usage": {
+              "completion_tokens": 41,
+              "prompt_tokens": 274,
+              "total_tokens": 315,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "inference_seconds": 0.248,
+            "truncated": false,
+            "finish_reason": "stop",
+            "model_file": "hunyuanocr-f16.gguf",
+            "score": 0.9672250161000435,
+            "verdict": "scored",
+            "elapsed_seconds": 1.819,
+            "score_seconds": 0.08,
+            "normalized_edit_distance": 0,
+            "normalized_cer": 0.0
+          }
+        ],
+        "best_index": 3,
+        "threshold": 0.9,
+        "decision": "accept",
+        "retry_count": 0,
+        "elapsed_seconds": 16.216,
+        "scope": "single_region",
+        "score_semantics": "Local Jev consistency score; threshold is not calibrated accuracy.",
+        "runtime_events": [
+          {
+            "model": "MiniCPM-OCR-1_0-F16.gguf",
+            "load_seconds": 1.945
+          },
+          {
+            "model": "hyocr-f16.gguf",
+            "load_seconds": 1.448
+          },
+          {
+            "model": "hunyuanocr-f16.gguf",
+            "load_seconds": 1.437
+          },
+          {
+            "model": "MiniCPM-OCR-Jev-F16.gguf",
+            "load_seconds": 2.718
+          }
+        ],
+        "renderer": {
+          "mode": "persistent",
+          "browsers": 1,
+          "browsers_alive": 1,
+          "pages_per_browser": 1,
+          "precheck": true,
+          "restarts": 0,
+          "uptime_sec": 2.4,
+          "pipeline": "v8.5",
+          "katex": "0.16.47"
+        },
+        "renderer_environment": "Windows SDK; absolute scores are not calibrated against Docker",
+        "image_size": [
+          1000,
+          250
+        ]
+      }
+    }
+  },
+  "jev_official_examples": {
+    "formula_putnam_1999.score": {
+      "results": [
+        {
+          "engine": "candidate-1",
+          "text": "$$P''(x) = (k^2 - k)x^{k-2}R(x) + 2kx^{k-1}R'(x) + x^kR''(x).$$",
+          "score": 0.9734434290045008,
+          "verdict": "scored",
+          "score_seconds": 0.16
+        },
+        {
+          "engine": "candidate-2",
+          "text": "\\[ P ^ {\\prime \\prime} (x) = \\left(k ^ {2} - k\\right) x ^ {k - 2} R (x) + 2 k x ^ {k - 1} R ^ {\\prime} (x) + x ^ {k} R ^ {\\prime \\prime} (x). \\]",
+          "score": 0.9684111204457571,
+          "verdict": "scored",
+          "score_seconds": 0.08
+        }
+      ],
+      "best_index": 0,
+      "threshold": 0.9,
+      "decision": "accept",
+      "retry_count": 0,
+      "elapsed_seconds": 4.281,
+      "scope": "single_region",
+      "score_semantics": "Local Jev consistency score; threshold is not calibrated accuracy.",
+      "runtime_events": [
+        {
+          "model": "MiniCPM-OCR-Jev-F16.gguf",
+          "load_seconds": 2.463
+        }
+      ],
+      "renderer": {
+        "mode": "persistent",
+        "browsers": 1,
+        "browsers_alive": 1,
+        "pages_per_browser": 1,
+        "precheck": true,
+        "restarts": 0,
+        "uptime_sec": 1.0,
+        "pipeline": "v8.5",
+        "katex": "0.16.47"
+      },
+      "renderer_environment": "Windows SDK; absolute scores are not calibrated against Docker",
+      "image_size": [
+        590,
+        53
+      ],
+      "official_reference": {
+        "ground_truth": 0.96813,
+        "ocr_output": 0.96552
+      }
+    },
+    "table_gb_standard.score": {
+      "results": [
+        {
+          "engine": "candidate-1",
+          "text": "<table><thead><tr><td></td><td>$\\Delta U$</td><td>持续时间</td></tr></thead><tbody><tr><td>电压降落</td><td>30%</td><td>0.5s</td></tr><tr><td></td><td>60%</td><td>0.5s</td></tr><tr><td>电压切断</td><td>100%</td><td>电源波形一个周期</td></tr><tr><td></td><td></td><td>0.5s</td></tr><tr><td></td><td></td><td>60.0s</td></tr></tbody></table>",
+          "score": 0.05921025074128593,
+          "verdict": "scored",
+          "score_seconds": 0.177
+        },
+        {
+          "engine": "candidate-2",
+          "text": "<table><tr><td></td><td>ΔU</td><td>持续时间</td></tr><tr><td rowspan=\"2\">电压降落</td><td>30%</td><td>0.5a</td></tr><tr><td>60%</td><td>0.5a</td></tr><tr><td rowspan=\"3\">电压倒落</td><td rowspan=\"3\">100%</td><td>电源波形一个周期</td></tr><tr><td>0.5a</td></tr><tr><td>60.0a</td></tr></table>",
+          "score": 0.0012375796263571278,
+          "verdict": "scored",
+          "score_seconds": 0.098
+        }
+      ],
+      "best_index": 0,
+      "threshold": 0.9,
+      "decision": "review",
+      "retry_count": 0,
+      "elapsed_seconds": 4.337,
+      "scope": "single_region",
+      "score_semantics": "Local Jev consistency score; threshold is not calibrated accuracy.",
+      "runtime_events": [
+        {
+          "model": "MiniCPM-OCR-Jev-F16.gguf",
+          "load_seconds": 2.473
+        }
+      ],
+      "renderer": {
+        "mode": "persistent",
+        "browsers": 1,
+        "browsers_alive": 1,
+        "pages_per_browser": 1,
+        "precheck": true,
+        "restarts": 0,
+        "uptime_sec": 1.0,
+        "pipeline": "v8.5",
+        "katex": "0.16.47"
+      },
+      "renderer_environment": "Windows SDK; absolute scores are not calibrated against Docker",
+      "image_size": [
+        477,
+        112
+      ],
+      "official_reference": {
+        "ground_truth": 0.04075,
+        "ocr_output": 0.00116
+      }
+    },
+    "text_putnam_2009.score": {
+      "results": [
+        {
+          "engine": "candidate-1",
+          "text": "(a) $0 \\in S$;\n(b) If $x \\in S$ then $x + 1 \\in S$ and $x - 1 \\in S$; and\n(c) If $x \\in S$ and $x \\notin \\{0, 1\\}$, then $\\frac{1}{x(x-1)} \\in S$.",
+          "score": 0.9951796566723468,
+          "verdict": "scored",
+          "score_seconds": 0.144
+        },
+        {
+          "engine": "candidate-2",
+          "text": "(a)(b) If    x \\in S    then    x + 1 \\in S    and    x - 1 \\in S   ; and\\[ 0 \\in S;\\]\\[ (\\mathrm{c}) \\text{ If }x\\in S \\text{ and }x\\not\\in\\{0,1\\}, \\text{ then } \\frac{1}{x(x-1)}\\in S.\\]",
+          "score": 0.002963668429220373,
+          "verdict": "scored",
+          "score_seconds": 0.069
+        }
+      ],
+      "best_index": 0,
+      "threshold": 0.9,
+      "decision": "accept",
+      "retry_count": 0,
+      "elapsed_seconds": 4.317,
+      "scope": "single_region",
+      "score_semantics": "Local Jev consistency score; threshold is not calibrated accuracy.",
+      "runtime_events": [
+        {
+          "model": "MiniCPM-OCR-Jev-F16.gguf",
+          "load_seconds": 2.462
+        }
+      ],
+      "renderer": {
+        "mode": "persistent",
+        "browsers": 1,
+        "browsers_alive": 1,
+        "pages_per_browser": 1,
+        "precheck": true,
+        "restarts": 0,
+        "uptime_sec": 1.1,
+        "pipeline": "v8.5",
+        "katex": "0.16.47"
+      },
+      "renderer_environment": "Windows SDK; absolute scores are not calibrated against Docker",
+      "image_size": [
+        517,
+        141
+      ],
+      "official_reference": {
+        "ground_truth": 0.99501,
+        "ocr_output": 0.00702
+      }
+    }
+  },
+  "hunyuan": {
+    "ab": [
+      {
+        "variant": "original",
+        "task": "custom",
+        "http_status": 200,
+        "seconds": 1.606,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "length",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45.“订单编号：”在图片中未显示文字请提取图片中的全部文字内容图片中的文字是\n</td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td>订单编号：苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45.订单编号：苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.订单编号：苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.订单"
+              }
+            }
+          ],
+          "created": 1793216166,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 512,
+            "prompt_tokens": 292,
+            "total_tokens": 804,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-jrKcwci7wHWfp0eQxNQWHBNd1451mqYe",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 292,
+            "prompt_ms": 115.107,
+            "prompt_per_token_ms": 0.39420205479452053,
+            "prompt_per_second": 2536.7701356129514,
+            "predicted_n": 512,
+            "predicted_ms": 1481.393,
+            "predicted_per_token_ms": 2.8990078277886497,
+            "predicted_per_second": 344.94560187607203
+          }
+        }
+      },
+      {
+        "variant": "original",
+        "task": "official_text",
+        "http_status": 200,
+        "seconds": 1.676,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "length",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please"
+              }
+            }
+          ],
+          "created": 1793216168,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 512,
+            "prompt_tokens": 274,
+            "total_tokens": 786,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            }
+          },
+          "id": "chatcmpl-WUfHIb798tFzPLkr1cQg7qyUNZ4FINZn",
+          "timings": {
+            "cache_n": 1,
+            "prompt_n": 273,
+            "prompt_ms": 63.408,
+            "prompt_per_token_ms": 0.23226373626373628,
+            "prompt_per_second": 4305.450416351249,
+            "predicted_n": 512,
+            "predicted_ms": 1584.634,
+            "predicted_per_token_ms": 3.1010450097847357,
+            "predicted_per_second": 322.47193989274496
+          }
+        }
+      },
+      {
+        "variant": "original",
+        "task": "official_doc",
+        "http_status": 200,
+        "seconds": 1.607,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "length",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n\n苹果3个，单价12.50元，总计37.50元。\n\nPlease verify invoice A-019: Total USD 123.45.$ \\underline{Image-1:} $$ \\underline{Image-2:} $$ \\underline{Image-3:} $$ \\underline{Image-4:} $$ \\underline{Image-5:} $$ \\underline{Image-6:} $$ \\underline{Image-7:} $$ \\underline{Image-8:} $$ \\underline{Image-9:} $$ \\underline{Image-10:} $$ \\underline{Image-11:} $$ \\underline{Image-12:} $$ \\underline{Image-13:} $$ \\underline{Image-14:} $$ \\underline{Image-15:} $$ \\underline{Image-16:} $$ \\underline{Image-17:} $$ \\underline{Image-18:} $$ \\underline{Image-19:} $$ \\underline{Image-20:} $$ \\underline{Image-21:} $$ \\underline{Image-22:} $$ \\underline{Image-23:} $$ \\underline{Image-24:} $$ \\underline{Image-25:} $$ \\underline{Image-26:} $$ \\underline{Image-27:} $$ \\underline{Image-28:} $$ \\underline{Image-29:} $$ \\underline{Image-30:} $$ \\underline{Image-31: } $$ \\underline{Image-32: } $$ \\underline{Image-33: } $$ \\underline{Image-34: } $$ \\underline{Image-35: } $$ \\underline{Image-36: } $$ \\underline{Image-37: } $$ \\underline{Image-38: } $$ \\underline{Image-39: } $$ \\underline{Image-40: } $$ \\underline{Image-41: } $$ \\underline{Image-42: } $$ \\underline{Image-43:"
+              }
+            }
+          ],
+          "created": 1793216170,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 512,
+            "prompt_tokens": 312,
+            "total_tokens": 824,
+            "prompt_tokens_details": {
+              "cached_tokens": 270
+            }
+          },
+          "id": "chatcmpl-21ZLCvB9NCmdrbSebI0nSuJ6FFvHP8Yv",
+          "timings": {
+            "cache_n": 270,
+            "prompt_n": 42,
+            "prompt_ms": 6.684,
+            "prompt_per_token_ms": 0.15914285714285714,
+            "prompt_per_second": 6283.662477558349,
+            "predicted_n": 512,
+            "predicted_ms": 1571.453,
+            "predicted_per_token_ms": 3.0752504892367907,
+            "predicted_per_second": 325.1767631612272
+          }
+        }
+      },
+      {
+        "variant": "eos120007",
+        "task": "custom",
+        "http_status": 200,
+        "seconds": 0.256,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216172,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 292,
+            "total_tokens": 334,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-KI9f2xKna5yfpy8lytvJ3fj9PfAB72dY",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 292,
+            "prompt_ms": 125.248,
+            "prompt_per_token_ms": 0.4289315068493151,
+            "prompt_per_second": 2331.374552887072,
+            "predicted_n": 42,
+            "predicted_ms": 121.4,
+            "predicted_per_token_ms": 2.9609756097560975,
+            "predicted_per_second": 337.7265238879736
+          }
+        }
+      },
+      {
+        "variant": "eos120007",
+        "task": "official_text",
+        "http_status": 200,
+        "seconds": 0.2,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216172,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 274,
+            "total_tokens": 316,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            }
+          },
+          "id": "chatcmpl-E6h5HGG8eT9ELO4FcGaYVwREN5fGjFn0",
+          "timings": {
+            "cache_n": 1,
+            "prompt_n": 273,
+            "prompt_ms": 63.233,
+            "prompt_per_token_ms": 0.23162271062271061,
+            "prompt_per_second": 4317.365932345453,
+            "predicted_n": 42,
+            "predicted_ms": 116.343,
+            "predicted_per_token_ms": 2.8376341463414634,
+            "predicted_per_second": 352.40624704537447
+          }
+        }
+      },
+      {
+        "variant": "eos120007",
+        "task": "official_doc",
+        "http_status": 200,
+        "seconds": 0.134,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n\n苹果3个，单价12.50元，总计37.50元。\n\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216172,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 312,
+            "total_tokens": 354,
+            "prompt_tokens_details": {
+              "cached_tokens": 270
+            }
+          },
+          "id": "chatcmpl-RKpCXReWfik25O5PtPvfCxQqDmcltugT",
+          "timings": {
+            "cache_n": 270,
+            "prompt_n": 42,
+            "prompt_ms": 6.62,
+            "prompt_per_token_ms": 0.15761904761904763,
+            "prompt_per_second": 6344.410876132931,
+            "predicted_n": 42,
+            "predicted_ms": 119.258,
+            "predicted_per_token_ms": 2.908731707317073,
+            "predicted_per_second": 343.7924499823911
+          }
+        }
+      },
+      {
+        "variant": "jinja",
+        "task": "custom",
+        "http_status": 200,
+        "seconds": 1.603,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "length",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45.“订单编号：”在图片中未显示文字请提取图片中的全部文字内容图片中的文字是\n</td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td></td>订单编号：苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45.订单编号：苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.订单编号：苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45.订单"
+              }
+            }
+          ],
+          "created": 1793216176,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 512,
+            "prompt_tokens": 292,
+            "total_tokens": 804,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-GdWDbyDf3uC88vl1KYhSFtLb49bCx26g",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 292,
+            "prompt_ms": 110.933,
+            "prompt_per_token_ms": 0.37990753424657536,
+            "prompt_per_second": 2632.219447774783,
+            "predicted_n": 512,
+            "predicted_ms": 1483.376,
+            "predicted_per_token_ms": 2.9028884540117414,
+            "predicted_per_second": 344.48447325560073
+          }
+        }
+      },
+      {
+        "variant": "jinja",
+        "task": "official_text",
+        "http_status": 200,
+        "seconds": 1.571,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "length",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please verify invoice A-019: Total USD 123.45. 订单编号：OCR-2026-1029苹果3个，单价12.50元，总计37.50元。Please"
+              }
+            }
+          ],
+          "created": 1793216177,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 512,
+            "prompt_tokens": 274,
+            "total_tokens": 786,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            }
+          },
+          "id": "chatcmpl-mFEfKiMm6rLXVnKwwL6dguPBOx0qWMlC",
+          "timings": {
+            "cache_n": 1,
+            "prompt_n": 273,
+            "prompt_ms": 60.854,
+            "prompt_per_token_ms": 0.2229084249084249,
+            "prompt_per_second": 4486.147171919676,
+            "predicted_n": 512,
+            "predicted_ms": 1482.72,
+            "predicted_per_token_ms": 2.90160469667319,
+            "predicted_per_second": 344.63688356533936
+          }
+        }
+      },
+      {
+        "variant": "jinja",
+        "task": "official_doc",
+        "http_status": 200,
+        "seconds": 1.531,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "length",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n\n苹果3个，单价12.50元，总计37.50元。\n\nPlease verify invoice A-019: Total USD 123.45.$ \\underline{Image-1:} $$ \\underline{Image-2:} $$ \\underline{Image-3:} $$ \\underline{Image-4:} $$ \\underline{Image-5:} $$ \\underline{Image-6:} $$ \\underline{Image-7:} $$ \\underline{Image-8:} $$ \\underline{Image-9:} $$ \\underline{Image-10:} $$ \\underline{Image-11:} $$ \\underline{Image-12:} $$ \\underline{Image-13:} $$ \\underline{Image-14:} $$ \\underline{Image-15:} $$ \\underline{Image-16:} $$ \\underline{Image-17:} $$ \\underline{Image-18:} $$ \\underline{Image-19:} $$ \\underline{Image-20:} $$ \\underline{Image-21:} $$ \\underline{Image-22:} $$ \\underline{Image-23:} $$ \\underline{Image-24:} $$ \\underline{Image-25:} $$ \\underline{Image-26:} $$ \\underline{Image-27:} $$ \\underline{Image-28:} $$ \\underline{Image-29:} $$ \\underline{Image-30:} $$ \\underline{Image-31: } $$ \\underline{Image-32: } $$ \\underline{Image-33: } $$ \\underline{Image-34: } $$ \\underline{Image-35: } $$ \\underline{Image-36: } $$ \\underline{Image-37: } $$ \\underline{Image-38: } $$ \\underline{Image-39: } $$ \\underline{Image-40: } $$ \\underline{Image-41: } $$ \\underline{Image-42: } $$ \\underline{Image-43:"
+              }
+            }
+          ],
+          "created": 1793216179,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 512,
+            "prompt_tokens": 312,
+            "total_tokens": 824,
+            "prompt_tokens_details": {
+              "cached_tokens": 270
+            }
+          },
+          "id": "chatcmpl-xmLTKO6fShmbRESI3MgX7TzbhCqPP4YM",
+          "timings": {
+            "cache_n": 270,
+            "prompt_n": 42,
+            "prompt_ms": 6.046,
+            "prompt_per_token_ms": 0.14395238095238097,
+            "prompt_per_second": 6946.741647370161,
+            "predicted_n": 512,
+            "predicted_ms": 1498.731,
+            "predicted_per_token_ms": 2.9329373776908025,
+            "predicted_per_second": 340.95511469369757
+          }
+        }
+      },
+      {
+        "variant": "eos_jinja",
+        "task": "custom",
+        "http_status": 200,
+        "seconds": 0.301,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216181,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 292,
+            "total_tokens": 334,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-bwb7Z6aF7nweu30PN6SAXjojHMsCsIbj",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 292,
+            "prompt_ms": 133.876,
+            "prompt_per_token_ms": 0.4584794520547945,
+            "prompt_per_second": 2181.122830081568,
+            "predicted_n": 42,
+            "predicted_ms": 158.174,
+            "predicted_per_token_ms": 3.8579024390243903,
+            "predicted_per_second": 259.20821373929977
+          }
+        }
+      },
+      {
+        "variant": "eos_jinja",
+        "task": "official_text",
+        "http_status": 200,
+        "seconds": 0.25,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216181,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 274,
+            "total_tokens": 316,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            }
+          },
+          "id": "chatcmpl-00cJkKQ31OpEKvbYnhxGK5S6hyXCQcKq",
+          "timings": {
+            "cache_n": 1,
+            "prompt_n": 273,
+            "prompt_ms": 113.686,
+            "prompt_per_token_ms": 0.4164322344322345,
+            "prompt_per_second": 2401.3510898439563,
+            "predicted_n": 42,
+            "predicted_ms": 118.832,
+            "predicted_per_token_ms": 2.898341463414634,
+            "predicted_per_second": 345.0249091153898
+          }
+        }
+      },
+      {
+        "variant": "eos_jinja",
+        "task": "official_doc",
+        "http_status": 200,
+        "seconds": 0.131,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n\n苹果3个，单价12.50元，总计37.50元。\n\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216181,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 312,
+            "total_tokens": 354,
+            "prompt_tokens_details": {
+              "cached_tokens": 270
+            }
+          },
+          "id": "chatcmpl-8DdRYnvPDnBJ5BLgUkowqWfmrGKqM5Ux",
+          "timings": {
+            "cache_n": 270,
+            "prompt_n": 42,
+            "prompt_ms": 5.678,
+            "prompt_per_token_ms": 0.1351904761904762,
+            "prompt_per_second": 7396.970764353646,
+            "predicted_n": 42,
+            "predicted_ms": 116.864,
+            "predicted_per_token_ms": 2.8503414634146345,
+            "predicted_per_second": 350.8351588170865
+          }
+        }
+      }
+    ],
+    "dflash": [
+      {
+        "sample": "short",
+        "mode": "ar",
+        "iteration": 0,
+        "seconds": 0.242,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216506,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 274,
+            "total_tokens": 316,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-xKeBnoJAnfGp2scZESBFiDXumc0HLQaq",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 274,
+            "prompt_ms": 106.238,
+            "prompt_per_token_ms": 0.38772992700729925,
+            "prompt_per_second": 2579.1148176735255,
+            "predicted_n": 42,
+            "predicted_ms": 127.088,
+            "predicted_per_token_ms": 3.0997073170731704,
+            "predicted_per_second": 322.61110411683245
+          }
+        }
+      },
+      {
+        "sample": "short",
+        "mode": "ar",
+        "iteration": 1,
+        "seconds": 0.2,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216506,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 274,
+            "total_tokens": 316,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-Tpo0W0FcNPpd46rHWNxl1ixl1juP0Dgs",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 274,
+            "prompt_ms": 65.636,
+            "prompt_per_token_ms": 0.23954744525547444,
+            "prompt_per_second": 4174.538363093425,
+            "predicted_n": 42,
+            "predicted_ms": 125.373,
+            "predicted_per_token_ms": 3.0578780487804877,
+            "predicted_per_second": 327.02415990683795
+          }
+        }
+      },
+      {
+        "sample": "short",
+        "mode": "dflash",
+        "iteration": 0,
+        "seconds": 0.228,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216509,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 274,
+            "total_tokens": 316,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-DCLz8hhkNLEenXHhkId8El439d69N9wr",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 274,
+            "prompt_ms": 161.131,
+            "prompt_per_token_ms": 0.5880693430656935,
+            "prompt_per_second": 1700.479733881128,
+            "predicted_n": 42,
+            "predicted_ms": 57.689,
+            "predicted_per_token_ms": 1.407048780487805,
+            "predicted_per_second": 710.7074138917299,
+            "draft_n": 60,
+            "draft_n_accepted": 37
+          }
+        }
+      },
+      {
+        "sample": "short",
+        "mode": "dflash",
+        "iteration": 1,
+        "seconds": 0.121,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "订单编号：OCR-2026-1029\n苹果3个，单价12.50元，总计37.50元。\nPlease verify invoice A-019: Total USD 123.45."
+              }
+            }
+          ],
+          "created": 1793216509,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 42,
+            "prompt_tokens": 274,
+            "total_tokens": 316,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-OYlGQwZITkWpyygVJTU8Hh1dyQrtlKmu",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 274,
+            "prompt_ms": 71.559,
+            "prompt_per_token_ms": 0.2611642335766423,
+            "prompt_per_second": 3829.0082309702484,
+            "predicted_n": 42,
+            "predicted_ms": 40.342,
+            "predicted_per_token_ms": 0.9839512195121951,
+            "predicted_per_second": 1016.3105448416043,
+            "draft_n": 60,
+            "draft_n_accepted": 37
+          }
+        }
+      },
+      {
+        "sample": "document",
+        "mode": "ar",
+        "iteration": 0,
+        "seconds": 4.982,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content_sha256": "570986a6a9a06cce806e8b277e061a39bad8ef72b12303d614b512bb173beffb",
+                "content_characters": 2898,
+                "note": "Official test document OCR text omitted from distributable report; local raw evidence remains in .tmp."
+              }
+            }
+          ],
+          "created": 1793216516,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 969,
+            "prompt_tokens": 3774,
+            "total_tokens": 4743,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-Cfe46CPjK8Q3Mn7jKGD6NdE4P79PF8mb",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 3774,
+            "prompt_ms": 1651.753,
+            "prompt_per_token_ms": 0.43766640169581345,
+            "prompt_per_second": 2284.84525228651,
+            "predicted_n": 969,
+            "predicted_ms": 3237.262,
+            "predicted_per_token_ms": 3.344278925619835,
+            "predicted_per_second": 299.01812086880824
+          }
+        }
+      },
+      {
+        "sample": "document",
+        "mode": "ar",
+        "iteration": 1,
+        "seconds": 4.844,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content_sha256": "570986a6a9a06cce806e8b277e061a39bad8ef72b12303d614b512bb173beffb",
+                "content_characters": 2898,
+                "note": "Official test document OCR text omitted from distributable report; local raw evidence remains in .tmp."
+              }
+            }
+          ],
+          "created": 1793216521,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 969,
+            "prompt_tokens": 3774,
+            "total_tokens": 4743,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-k4m5uGYzlOaqSYSdwnLxnrkXtyNo1Fxu",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 3774,
+            "prompt_ms": 1558.434,
+            "prompt_per_token_ms": 0.412939586645469,
+            "prompt_per_second": 2421.6617450594636,
+            "predicted_n": 969,
+            "predicted_ms": 3176.013,
+            "predicted_per_token_ms": 3.281005165289256,
+            "predicted_per_second": 304.7846466623405
+          }
+        }
+      },
+      {
+        "sample": "document",
+        "mode": "dflash",
+        "iteration": 0,
+        "seconds": 2.902,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content_sha256": "eb3d5cfd3242091d3e427c5417fe3daf1c5eaa13c3062621297c397c4112efc1",
+                "content_characters": 2906,
+                "note": "Official test document OCR text omitted from distributable report; local raw evidence remains in .tmp."
+              }
+            }
+          ],
+          "created": 1793216526,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 975,
+            "prompt_tokens": 3774,
+            "total_tokens": 4749,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-AJLuDua3XfvjbJfEP0LpWDchTazbyV6v",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 3774,
+            "prompt_ms": 1754.009,
+            "prompt_per_token_ms": 0.46476126126126127,
+            "prompt_per_second": 2151.642323386026,
+            "predicted_n": 975,
+            "predicted_ms": 1047.66,
+            "predicted_per_token_ms": 1.0756262833675565,
+            "predicted_per_second": 929.6909302636351,
+            "draft_n": 1545,
+            "draft_n_accepted": 872
+          }
+        }
+      },
+      {
+        "sample": "document",
+        "mode": "dflash",
+        "iteration": 1,
+        "seconds": 2.785,
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content_sha256": "eb3d5cfd3242091d3e427c5417fe3daf1c5eaa13c3062621297c397c4112efc1",
+                "content_characters": 2906,
+                "note": "Official test document OCR text omitted from distributable report; local raw evidence remains in .tmp."
+              }
+            }
+          ],
+          "created": 1793216528,
+          "model": "ocr-local",
+          "system_fingerprint": "b11960-8642541b2",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 975,
+            "prompt_tokens": 3774,
+            "total_tokens": 4749,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "id": "chatcmpl-KfnGdqVRgx96frSov1eXyUQI3Vq91Vqo",
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 3774,
+            "prompt_ms": 1655.234,
+            "prompt_per_token_ms": 0.438588765235824,
+            "prompt_per_second": 2280.0401635055828,
+            "predicted_n": 975,
+            "predicted_ms": 1032.963,
+            "predicted_per_token_ms": 1.0605369609856263,
+            "predicted_per_second": 942.9185750118834,
+            "draft_n": 1545,
+            "draft_n_accepted": 872
+          }
+        }
+      }
+    ],
+    "tensor-comparison": {
+      "model": {
+        "old_tensors": 266,
+        "new_tensors": 266,
+        "changed_tensors": [],
+        "old_stop_tokens": {
+          "tokenizer.ggml.eos_token_id": 120020
+        },
+        "new_stop_tokens": {
+          "tokenizer.ggml.eos_token_id": 120020,
+          "tokenizer.ggml.eot_token_id": 120007
+        }
+      },
+      "mmproj": {
+        "old_tensors": 447,
+        "new_tensors": 447,
+        "changed_tensors": [],
+        "old_stop_tokens": {},
+        "new_stop_tokens": {}
+      }
+    }
+  }
+}

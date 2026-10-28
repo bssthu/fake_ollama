@@ -87,6 +87,10 @@
   };
 
   const OP_LABELS = {
+    ocr_recognize: 'OCR 识别 / 可选复核',
+    ocr_auto: 'OCR → 复核 → 低分重识别',
+    ocr_compare: 'OCR 多模型对比',
+    ocr_score: '候选复核',
     chat: '聊天 / 文本补全',
     decision: '结构化决策 / Decision',
     image_generation: '图片生成',
@@ -97,7 +101,7 @@
   };
   const KNOWN_CAPABILITIES = new Set([
     'completion', 'tools', 'vision', 'image_generation', 'image_edit',
-    'video_generation', 'video_understanding', 'h3_context_ir', 'decision',
+    'video_generation', 'video_understanding', 'h3_context_ir', 'decision', 'ocr',
   ]);
   const CONTEXT_THRESHOLD_RATIO = 0.9;
   const DISCOVERY_SCHEMA_VERSION = 1;
@@ -114,6 +118,9 @@
     decisionForms: new Map(),
     activeDecisionModelId: null,
     loadedCredential: null,
+    ocrCatalog: null,
+    ocrRuntime: null,
+    ocrReleasing: false,
     attachments: [],
     controller: null,
     requestDiscarded: false,
@@ -535,6 +542,8 @@
         appendMessageElement(wrap, turn.assistant, 'assistant', {reasoning: turn.reasoning});
       } else if (turn.decision) {
         appendDecisionResultElement(wrap, turn.decision);
+      } else if (turn.ocr) {
+        appendOcrResult(wrap, turn.ocr);
       } else if (turn.media) {
         appendMediaResultElement(wrap, turn.media, op);
       }
@@ -890,7 +899,7 @@
       els.operation.disabled = false;
       if (operations.some((op) => op.id === previous)) els.operation.value = previous;
     }
-    els.modelChip.textContent = info ? info.id : '未选择模型';
+    els.modelChip.textContent = info ? (info.label || info.id) : '未选择模型';
     const hasChat = operations.some((operation) => operation.id === 'chat');
     renderModelResourceChips(info, {showContext: hasChat});
     syncOperation();
@@ -905,7 +914,8 @@
     const isVideoAnalysis = op && op.id === 'video_analysis';
     const isContextIR = op && op.id === 'h3_context_ir';
     const isDecision = op && op.id === 'decision';
-    const isMedia = op && !isChatRequest && !isDecision;
+    const isOcr = Boolean(op && op.ocr_mode);
+    const isMedia = op && !isChatRequest && !isDecision && !isOcr;
     const usesMediaQueue = operationUsesMediaQueue(op);
     const acceptsUploads = op && (op.accepts_images || op.accepts_videos);
 
@@ -955,7 +965,7 @@
       els.dropHint.textContent = '当前格式不支持这些图片。请切回后端原生格式或移除图片；不会自动转换或丢弃。';
     }
     els.chatParams.hidden = !isChatRequest;
-    els.chatParams.closest('.advanced').hidden = Boolean(isDecision);
+    els.chatParams.closest('.advanced').hidden = Boolean(isDecision || isOcr);
     els.mediaParams.hidden = !(isMedia || isVideoAnalysis);
     els.ttftMetric.hidden = !isChatRequest;
     els.resultTitle.textContent = isDecision ? '决策结果' : isChat
@@ -1020,6 +1030,7 @@
         : (isChat ? '发送请求 →' : (isContextIR ? '增强 H3 Prompt →' : (isVideoGeneration ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →'))));
     }
     renderOperationParameters(op);
+    syncOcrForm(op);
     resetOutput();
     renderInteractionHistory();
     updatePlannerProviderUi();
@@ -1247,11 +1258,32 @@
     );
     els.send.disabled = Boolean(state.controller) || cameraBusy || !selectedModel() || !op
       || !credentialReady || op.configured === false
-      || (op.id !== 'decision' && !els.prompt.value.trim()) || missingRequiredMedia || !externalPlannerReady
+      || (op.id !== 'decision' && !op.ocr_mode && !els.prompt.value.trim()) || missingRequiredMedia || !externalPlannerReady
       || (op.id === 'decision' && hasImage && !op.accepts_images);
     els.generationCount.disabled = Boolean(state.controller) || !operationUsesMediaQueue(op);
     for (const input of els.decisionSection.querySelectorAll('input, select, textarea, button')) {
       input.disabled = Boolean(state.controller) || (input.classList.contains('decision-remove') && decisionForm(op)?.questions.length <= 1);
+    }
+    for (const input of $('ocrSection').querySelectorAll('input, select, textarea, button')) {
+      input.disabled = Boolean(state.controller) || input.dataset.unavailable === 'true';
+    }
+    if (op && op.ocr_mode) {
+      els.send.disabled ||= state.ocrReleasing;
+      $('ocrRelease').disabled = Boolean(state.controller) || state.ocrReleasing || !credentialReady
+        || !state.ocrRuntime?.worker_running || state.ocrRuntime?.busy;
+      $('ocrRefreshRuntime').disabled = Boolean(state.controller) || state.ocrReleasing || !credentialReady;
+      const requiresVerifier = ['auto', 'score'].includes(op.ocr_mode);
+      const verifierReady = (state.ocrCatalog?.verifiers || []).some(v => v.id === $('ocrVerifier').value && v.available);
+      $('ocrThreshold').disabled = Boolean(state.controller) || !verifierReady;
+      $('ocrVerifier').options[0].textContent = requiresVerifier ? '请选择复核模型（必选）' : '不复核';
+      $('ocrVerifierHint').textContent = requiresVerifier
+        ? '此模式需要复核模型；请选择后再运行。'
+        : '可选；不复核时仅返回 OCR 识别结果。';
+      els.send.disabled ||= (op.ocr_mode === 'compare' && !$('ocrEngines').querySelector('input:checked'))
+        || (op.ocr_mode === 'auto' && !$('ocrFallback').value)
+        || (requiresVerifier && !verifierReady)
+        || (Boolean($('ocrVerifier').value) && !verifierReady)
+        || (op.ocr_mode === 'score' && ![...$('ocrCandidates').querySelectorAll('textarea')].some(e => e.value.trim()));
     }
     updateDecisionPreview();
     syncCameraControls();
@@ -1311,6 +1343,8 @@
             ? `正在生成第 1/${(plan && plan.runCount) || 1} 份编辑结果…`
             : `正在生成第 1/${(plan && plan.runCount) || 1} 份图片…`));
     }
+    if (op.ocr_mode) els.answerText.textContent = '正在识别 / 复核…';
+    if (op.ocr_mode) els.apiKey.disabled = true;
     els.loadModels.disabled = true;
     els.model.disabled = true;
     els.operation.disabled = true;
@@ -1320,6 +1354,7 @@
   }
 
   function finishRequest() {
+    els.apiKey.disabled = false;
     if (state.timer) window.clearInterval(state.timer);
     state.timer = null;
     els.answerText.classList.remove('cursor');
@@ -1847,7 +1882,7 @@
         state.loadedCredential === null
         || state.loadedCredential !== els.apiKey.value.trim()
       ) {
-        throw new Error('请先用当前 API key 连接并加载模型');
+        throw new Error('请先用当前 API key 连接并获取模型列表');
       }
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error('当前浏览器没有开放 getUserMedia');
@@ -2051,6 +2086,7 @@
       });
       if (!response.ok) throw new Error(await responseError(response));
       const data = await response.json();
+      if (credential !== els.apiKey.value.trim()) return;
       if (data.schema_version !== DISCOVERY_SCHEMA_VERSION) {
         throw new Error(`不支持的模型发现格式：${data.schema_version ?? 'missing'}`);
       }
@@ -2062,6 +2098,13 @@
         state.decisionForms.clear();
       }
       state.loadedCredential = credential;
+      state.ocrCatalog = data.ocr || null;
+      populateOcrEngines();
+      $('authenticationHint').textContent = data.authentication === 'local_anonymous'
+        ? '本机免密：当前本机监听与接口配置允许不填 key。此按钮仅获取列表，执行时才加载模型。'
+        : data.authentication === 'trusted_proxy_anonymous'
+          ? '当前通过服务端明确配置的可信代理免密访问。此按钮仅获取列表。'
+          : '使用接口 API key 连接。此按钮仅获取列表，执行时才加载模型。';
       state.models.clear();
       els.model.replaceChildren();
       if (!models.length) {
@@ -2070,12 +2113,13 @@
       } else {
         for (const info of models) {
           state.models.set(info.id, info);
-          els.model.append(new Option(info.id, info.id));
+          els.model.append(new Option(info.label || info.id, info.id));
         }
         els.model.disabled = false;
-        setConnection(`${models.length} 个模型`, 'ok');
+        setConnection(`${models.length} 个模型${data.authentication === 'local_anonymous' ? ' · 本机免密' : ''}`, 'ok');
       }
       syncModel();
+      if (data.ocr_error) showError(data.ocr_error);
     } catch (error) {
       state.models.clear();
       els.model.replaceChildren(new Option('模型加载失败', ''));
@@ -2948,10 +2992,230 @@
     }
   }
 
+  function populateOcrEngines() {
+    $('ocrEngines').replaceChildren();
+    for (const engine of state.ocrCatalog?.engines || []) {
+      const label = document.createElement('label'), check = document.createElement('input');
+      check.type = 'checkbox'; check.value = engine.id;
+      check.checked = engine.available && !engine.id.endsWith('-dflash');
+      check.dataset.unavailable = String(!engine.available);
+      label.append(check, document.createTextNode(engine.label + (engine.available ? '' : '（文件缺失）')));
+      $('ocrEngines').append(label);
+    }
+    const previousVerifier = $('ocrVerifier').value;
+    $('ocrVerifier').replaceChildren(new Option('不复核', ''));
+    for (const verifier of state.ocrCatalog?.verifiers || []) {
+      const option = new Option(verifier.label + (verifier.available ? '' : '（不可用）'), verifier.id);
+      option.disabled = !verifier.available;
+      $('ocrVerifier').append(option);
+    }
+    $('ocrVerifier').value = (state.ocrCatalog?.verifiers || []).some(v => v.id === previousVerifier && v.available) ? previousVerifier : '';
+    state.ocrRuntime = null;
+    refreshOcrRuntime();
+  }
+
+  function syncOcrForm(op) {
+    const mode = op?.ocr_mode;
+    $('ocrSection').hidden = !mode;
+    if (!mode) return;
+    $('ocrEnginesField').hidden = mode !== 'compare';
+    $('ocrFallbackField').hidden = mode !== 'auto';
+    $('ocrCandidatesField').hidden = mode !== 'score';
+    const previous = $('ocrFallback').value;
+    const alternatives = (state.ocrCatalog?.engines || []).filter(e => e.available && e.id !== selectedModel()?.ocr_engine);
+    $('ocrFallback').replaceChildren(...alternatives.map(e => new Option(e.label, e.id)));
+    $('ocrFallback').value = alternatives.find(e => e.id === previous)?.id
+      || alternatives.find(e => e.id === 'hunyuan-ocr-current')?.id || alternatives[0]?.id || '';
+    els.resultTitle.textContent = 'OCR 识别与复核记录';
+    els.uploadLabel.textContent = '待识别 / 复核区域';
+    els.uploadRequirement.textContent = '需要 1 张图片';
+    els.fileInput.accept = 'image/png,image/jpeg,image/webp';
+    els.dropHint.textContent = '一个文字、公式或表格区域 · PNG / JPEG / WebP · 最大 12 MiB';
+    els.prompt.placeholder = '可选备注（仅保留在本页记录，不作为 OCR 指令）';
+    els.send.textContent = '运行 ' + OP_LABELS[op.id] + ' →';
+    els.operationHint.textContent = mode === 'auto'
+      ? '识别 → 所选模型复核 → 低于阈值或识别失败时用备用引擎重试一次'
+      : mode === 'score' ? '将候选文本渲染后，与上传图片比较；不执行 OCR 识别'
+        : mode === 'compare' ? '依次运行选中引擎，保留全部识别结果与可选复核评分'
+          : '运行选中的 OCR 模型，可选复核；不会自动重试';
+  }
+
+  function addOcrCandidate() {
+    const list = $('ocrCandidates');
+    if (list.children.length >= 8) return;
+    const row = document.createElement('div'); row.className = 'ocr-candidate';
+    const input = document.createElement('textarea'); input.maxLength = 24000; input.rows = 3;
+    input.placeholder = '粘贴待复核的识别结果'; input.setAttribute('aria-label', '候选文本');
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'secondary'; remove.textContent = '删除';
+    remove.onclick = () => { row.remove(); syncSendState(); };
+    row.append(input, remove); list.append(row); syncSendState();
+  }
+
+  function prepareOcrRequest(op) {
+    const mode = op.ocr_mode, engine = selectedModel()?.ocr_engine;
+    const engines = mode === 'compare'
+      ? [...$('ocrEngines').querySelectorAll('input:checked')].map(e => e.value)
+      : mode === 'auto' ? [engine, $('ocrFallback').value]
+        : mode === 'score' ? [] : [engine];
+    if (mode !== 'score' && (!engines.length || engines.some(e => !e))) throw new Error('请选择可用 OCR 引擎。');
+    const verifier = $('ocrVerifier').value || null;
+    if (['auto', 'score'].includes(mode) && !verifier) throw new Error('此模式需要选择复核模型。');
+    if (verifier && !state.ocrCatalog?.verifiers.some(v => v.id === verifier && v.available)) throw new Error('所选复核模型不可用。');
+    if (mode === 'auto' && engines[0] === engines[1]) throw new Error('自动重试需要两个不同引擎。');
+    const attachment = state.attachments.find(e => e.kind === 'image');
+    if (!attachment || !/^data:image\/(png|jpeg|webp);base64,/.test(attachment.dataUrl)) throw new Error('请上传 PNG、JPEG 或 WebP 图片。');
+    if (attachment.file.size > 12 * 1024 * 1024) throw new Error('图片超过 12 MiB，请先裁剪。');
+    const candidates = mode === 'score' ? [...$('ocrCandidates').querySelectorAll('textarea')].map(e => e.value.trim()).filter(Boolean) : [];
+    if (mode === 'score' && !candidates.length) throw new Error('请填写至少一个候选文本。');
+    const threshold = Number($('ocrThreshold').value), maxTokens = Number($('ocrMaxTokens').value);
+    const repeat = Number($('ocrRepeat').value);
+    if (!Number.isInteger(repeat) || repeat < 1 || repeat > 20) throw new Error('连续运行次数须为 1–20 的整数。');
+    if (verifier && (!$('ocrThreshold').value || !Number.isFinite(threshold) || threshold < 0 || threshold > 1)) throw new Error('复核阈值须在 0–1 之间。');
+    if (!Number.isInteger(maxTokens) || maxTokens < 64 || maxTokens > 8192) throw new Error('Max tokens 须为 64–8192 的整数。');
+    const payload = {image: attachment.dataUrl, mode, engines, candidates,
+      category: $('ocrCategory').value, verifier,
+      threshold: verifier ? threshold : 0.9, max_tokens: maxTokens, keep_loaded: $('ocrLifetime').value === 'keep'};
+    const note = els.prompt.value.trim();
+    return {modelId: els.model.value, operationId: op.id, payload, runCount: repeat,
+      userMessage: userMessageForRequest(op, OP_LABELS[op.id] + (note ? `\n备注：${note}` : ''))};
+  }
+
+  function appendOcrResult(parent, result) {
+    const wrap = document.createElement('div'); wrap.className = 'ocr-results';
+    const summary = document.createElement('p'); summary.className = 'ocr-summary';
+    const decisions = {accept: '达到设定阈值', review: '需要人工核对', unverified: '未复核'};
+    const verifierLabel = result.verifier_label || result.verifier;
+    summary.textContent = `${decisions[result.decision] || result.decision} · 总耗时 ${result.elapsed_seconds}s · 重试 ${result.retry_count} 次。`
+      + (verifierLabel ? `复核模型：${verifierLabel}；阈值 ${result.threshold}，评分仅针对当前区域。` : '未使用复核模型。');
+    summary.textContent += result.keep_loaded ? ' 模型已保留。' : ' 模型已释放。';
+    if (result.browser_seconds != null) summary.textContent += ` 本轮往返 ${result.browser_seconds.toFixed(3)}s。`;
+    if (result.runtime_events?.length) {
+      const loading = result.runtime_events.reduce((sum, e) => sum + (e.load_seconds || 0), 0);
+      summary.textContent += ` 模型加载合计 ${loading.toFixed(3)}s，复用 ${result.runtime_events.filter(e => e.reused).length} 次。`;
+    }
+    if (result.benchmark_summary) summary.textContent += ' ' + result.benchmark_summary;
+    wrap.append(summary);
+    for (const [index, row] of result.results.entries()) {
+      const card = document.createElement('article'); card.className = 'ocr-result' + (index === result.best_index ? ' ocr-best' : '');
+      const title = document.createElement('strong'); title.textContent = state.ocrCatalog?.engines.find(e => e.id === row.engine)?.label || row.engine;
+      const score = document.createElement('div'); score.className = 'ocr-score';
+      score.textContent = row.score == null ? (result.verifier ? `未获得有效评分 · ${row.verdict}` : '未复核') : `复核分 ${row.score.toFixed(4)}${index === result.best_index ? ' · 当前最高分' : ''}`;
+      const meta = document.createElement('p'); meta.className = 'help';
+      meta.textContent = `${row.model_reused ? '复用已加载模型' : '首次 / 重新加载'} · 加载 ${row.load_seconds ?? '—'}s · 识别阶段 ${row.elapsed_seconds ?? '—'}s · 推理 ${row.inference_seconds ?? '—'}s${row.truncated ? ' · 输出截断，未接受' : ''}`;
+      const text = document.createElement('pre'); text.textContent = row.text || '';
+      card.append(title, score, meta, text);
+      if (row.error || row.verification_error) {
+        const error = document.createElement('p'); error.className = 'ocr-failure'; error.textContent = row.error || row.verification_error; card.append(error);
+      }
+      const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'secondary'; copy.textContent = '复制识别文本';
+      copy.onclick = async () => {
+        try { await navigator.clipboard.writeText(row.text || ''); copy.textContent = '已复制 ✓'; }
+        catch (e) { showError('复制失败：' + e.message); }
+      };
+      card.append(copy); wrap.append(card);
+    }
+    appendDecisionRaw(wrap, '原始结果与运行信息', result);
+    parent.append(wrap);
+  }
+
+  async function runOcr(op, plan) {
+    const rounds = [];
+    $('ocrBenchmark').hidden = false;
+    $('ocrBenchmark').textContent = `连续测试 0/${plan.runCount}`;
+    try {
+      for (let i = 0; i < plan.runCount; i++) {
+        if (state.controller.signal.aborted) throw new DOMException('Stopped', 'AbortError');
+        els.answer.classList.add('active');
+        els.answerText.textContent = `正在识别 / 复核，第 ${i + 1}/${plan.runCount} 轮…`;
+        const start = performance.now();
+        const response = await fetch(op.endpoint, {method: 'POST', headers: authHeaders(true),
+          body: JSON.stringify(plan.payload), signal: state.controller.signal});
+        if (!response.ok) throw new Error(await responseError(response));
+        const result = await response.json();
+        if (state.requestDiscarded) return;
+        result.browser_seconds = (performance.now() - start) / 1000;
+        result.round = i + 1;
+        rounds.push(result);
+        const later = rounds.slice(1);
+        const avg = later.length ? later.reduce((sum, r) => sum + r.browser_seconds, 0) / later.length : null;
+        const failed = result.results.some(r => r.error || r.verification_error);
+        const summary = `完成 ${rounds.length}/${plan.runCount} 轮 · 首轮往返 ${rounds[0].browser_seconds.toFixed(3)}s`
+          + (avg == null ? '' : ` · 后续平均往返 ${avg.toFixed(3)}s`)
+          + (failed ? ' · 出错，已停止后续轮次' : '');
+        result.benchmark_summary = summary;
+        $('ocrBenchmark').textContent = summary;
+        state.ocrRuntime = {worker_running: result.keep_loaded, loaded_models: result.loaded_models || [], busy: false};
+        renderOcrRuntime();
+        interactionFor(plan.modelId, plan.operationId).turns.push({user: plan.userMessage, ocr: result});
+        els.answerText.textContent = ''; els.answer.classList.remove('active');
+        renderInteractionHistory();
+        if (failed) break;
+      }
+    } finally {
+      // Cancellation may race the server's disconnect cleanup. Explicit release
+      // also handles stopping between rounds when there is no pending HTTP call.
+      if (state.controller?.signal.aborted) {
+        await releaseOcrRuntime(true);
+        if (state.requestDiscarded) $('ocrBenchmark').hidden = true;
+      }
+      await refreshOcrRuntime();
+    }
+  }
+
+  function renderOcrRuntime() {
+    const value = state.ocrRuntime;
+    $('ocrRuntimeStatus').textContent = value ? (value.worker_running
+      ? `已保留 ${(value.loaded_models || []).length} 个模型：${(value.loaded_models || []).join('、')}${value.busy ? '（运行中）' : ''}`
+      : '当前无保留模型') : '模型状态尚未获取';
+  }
+
+  async function refreshOcrRuntime() {
+    if (!state.ocrCatalog || state.loadedCredential !== els.apiKey.value.trim()) return;
+    const credential = els.apiKey.value.trim();
+    try {
+      const response = await fetch('/playground/api/ocr/models', {headers: authHeaders(), cache: 'no-store'});
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json();
+      if (credential !== els.apiKey.value.trim()) return;
+      state.ocrRuntime = result;
+      renderOcrRuntime(); syncSendState();
+    } catch (e) {
+      state.ocrRuntime = null;
+      $('ocrRuntimeStatus').textContent = '状态获取失败：' + e.message;
+      syncSendState();
+    }
+  }
+
+  async function releaseOcrRuntime(afterCancel = false) {
+    state.ocrReleasing = true; syncSendState();
+    try {
+      for (let attempt = 0; attempt < (afterCancel ? 30 : 1); attempt++) {
+        const response = await fetch('/playground/api/ocr/release', {method: 'POST', headers: authHeaders()});
+        if (response.status === 409 && afterCancel) { await new Promise(resolve => setTimeout(resolve, 200)); continue; }
+        if (!response.ok) throw new Error(await responseError(response));
+        state.ocrRuntime = await response.json(); renderOcrRuntime(); return;
+      }
+      throw new Error('任务清理仍在进行，请稍后刷新状态并手动释放。');
+    } catch (e) {
+      if (afterCancel) throw new Error('请求已停止，但释放模型失败：' + e.message);
+      showError('释放模型失败：' + e.message);
+    }
+    finally { state.ocrReleasing = false; syncSendState(); }
+  }
+
+  $('ocrRelease').addEventListener('click', () => releaseOcrRuntime());
+  $('ocrRefreshRuntime').addEventListener('click', refreshOcrRuntime);
+
+  $('ocrAddCandidate').addEventListener('click', addOcrCandidate);
+  $('ocrSection').addEventListener('input', syncSendState);
+  $('ocrSection').addEventListener('change', syncSendState);
+  addOcrCandidate();
+
   async function runRequest() {
     const op = selectedOperation();
-    if (state.controller || !op || (op.id !== 'decision' && !els.prompt.value.trim())) return;
-    if (op.id === 'decision' && state.loadedCredential !== els.apiKey.value.trim()) return;
+    if (op?.ocr_mode && state.ocrReleasing) return;
+    if (state.controller || !op || (op.id !== 'decision' && !op.ocr_mode && !els.prompt.value.trim())) return;
+    if (state.loadedCredential !== els.apiKey.value.trim()) return;
     const imageCount = state.attachments.filter(
       (attachment) => attachment.kind === 'image',
     ).length;
@@ -2980,7 +3244,7 @@
     try {
       plan = operationUsesChatEndpoint(op)
         ? prepareChatRequest(op)
-        : (op.id === 'decision' ? prepareDecisionRequest(op) : prepareMediaRequest(op));
+        : (op.ocr_mode ? prepareOcrRequest(op) : (op.id === 'decision' ? prepareDecisionRequest(op) : prepareMediaRequest(op)));
     } catch (error) {
       showError(error instanceof Error ? error.message : String(error));
       return;
@@ -2993,7 +3257,7 @@
     state.startedAt = performance.now();
     state.firstTokenAt = 0;
     beginRequest(op, plan);
-    if (op.id !== 'decision') clearComposerInput();
+    if (op.id !== 'decision' && !op.ocr_mode) clearComposerInput();
     els.prompt.focus();
     syncSendState();
     state.timer = window.setInterval(() => {
@@ -3001,17 +3265,18 @@
     }, 100);
     try {
       if (operationUsesChatEndpoint(op)) await runChat(op, plan);
+      else if (op.ocr_mode) await runOcr(op, plan);
       else if (op.id === 'decision') await runDecision(op, plan);
       else if (op.id === 'h3_context_ir') await runContextIR(op, plan);
       else await runMedia(op, plan);
     } catch (error) {
-      if (state.requestDiscarded) {
+      if (state.requestDiscarded && (!error || error.name === 'AbortError')) {
         // Clear cancels this decision without repopulating the cleared view.
       } else if (error && error.name === 'AbortError') {
         showRequestError(
           op,
           plan && plan.runCount > 1
-            ? '生成队列已停止；已完成结果已保留。'
+            ? (op.ocr_mode ? '连续识别已停止；已完成结果已保留。' : '生成队列已停止；已完成结果已保留。')
             : '请求已停止。',
         );
       }
@@ -3147,7 +3412,7 @@
   els.clear.addEventListener('click', () => {
     const op = selectedOperation();
     if (state.controller) {
-      if (op && op.id === 'decision') state.requestDiscarded = true;
+      if (op && (op.id === 'decision' || op.ocr_mode)) state.requestDiscarded = true;
       state.controller.abort();
     }
     if (op) {
