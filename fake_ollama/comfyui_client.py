@@ -30,6 +30,7 @@ from .config import outbound_cycle_headers
 from .h3_media import add_keyframes, add_reference_inputs
 from .comfyui_jobs import PromptRecord, runtime_for, recover
 from .process_utils import create_managed_subprocess_shell, terminate_process_tree
+from .privacy import privacy_mode_enabled
 from .request_data_log import (
     body_from_bytes,
     body_from_json,
@@ -445,6 +446,8 @@ class ComfyUIClient:
             return False
 
     def _stderr_log_path(self) -> Optional[Path]:
+        if privacy_mode_enabled():
+            return None
         parsed = urlparse(self._base)
         port = parsed.port
         host = (parsed.hostname or "").strip()

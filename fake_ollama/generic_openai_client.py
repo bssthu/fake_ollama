@@ -13,6 +13,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from .llama_cpp_client import LlamaCppClient
+from .privacy import privacy_mode_enabled
 
 
 class GenericOpenAIClient(LlamaCppClient):
@@ -33,6 +34,8 @@ class GenericOpenAIClient(LlamaCppClient):
         )
 
     def _stderr_log_path(self) -> Optional[Path]:
+        if privacy_mode_enabled():
+            return None
         parsed = urlparse(self._base)
         port = parsed.port
         host = (parsed.hostname or "").strip()

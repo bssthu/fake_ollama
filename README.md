@@ -1046,6 +1046,16 @@ python -m fake_ollama --request-data-log-file I:\path\requests.jsonl
 python -m fake_ollama --no-request-data-log
 ```
 
+需要避免将 API 调用内容记入文件时，可在启动服务时启用隐私模式（默认关闭）：
+
+```powershell
+python -m fake_ollama --config ./config.json --privacy-mode
+```
+
+隐私模式关闭请求 / 响应正文日志、可能包含上游报错内容的运行日志文件，以及网关代管的后端 stderr 文件捕获；终端日志保留。
+它优先于 `--log-file` 和 `--request-data-log-file`，不创建或追加这些日志文件，也不删除已有日志；不传此参数时保持原有日志行为。
+该开关仅对本次启动生效，不控制外部服务或启动脚本自行写入的日志、终端重定向，以及推理所需的临时文件或生成的媒体文件。更多选项见 [CLI 使用说明](docs/cli.md#日志)。
+
 ## 安全提示
 
 - `.env` / `config.json` 已加入 `.gitignore`，不要提交真实 token。

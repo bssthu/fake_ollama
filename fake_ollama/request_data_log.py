@@ -19,6 +19,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
+from .privacy import privacy_mode_enabled
+
 Scope = Dict[str, Any]
 Message = Dict[str, Any]
 Receive = Callable[[], Awaitable[Message]]
@@ -57,7 +59,7 @@ def configure_request_data_logging(log_file: Optional[str]) -> None:
         handler.close()
 
     _configured_path = None
-    if not log_file:
+    if not log_file or privacy_mode_enabled():
         return
 
     path = Path(log_file)
@@ -78,7 +80,7 @@ def request_data_log_path() -> Optional[str]:
 
 
 def request_data_logging_enabled() -> bool:
-    return bool(_logger.handlers)
+    return not privacy_mode_enabled() and bool(_logger.handlers)
 
 
 def current_request_id() -> Optional[str]:

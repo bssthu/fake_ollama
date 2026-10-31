@@ -30,6 +30,7 @@ from .process_utils import (
     create_managed_subprocess_shell,
     terminate_process_tree,
 )
+from .privacy import privacy_mode_enabled
 from .request_data_log import (
     body_from_bytes,
     body_from_json,
@@ -552,6 +553,8 @@ class LlamaCppClient:
         Returns ``None`` if we cannot derive a stable, filesystem-safe name
         from the target — the caller falls back to DEVNULL in that case.
         """
+        if privacy_mode_enabled():
+            return None
         parsed = urlparse(self._base)
         port = parsed.port
         host = (parsed.hostname or "").strip()

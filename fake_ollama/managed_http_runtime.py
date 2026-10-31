@@ -22,6 +22,7 @@ import httpx
 from . import runtime_ownership
 from .config import outbound_cycle_headers
 from .lifecycle import BackendShuttingDownError, finish_cleanup
+from .privacy import privacy_mode_enabled
 from .process_utils import (create_managed_subprocess_exec, create_managed_subprocess_shell,
                             process_tree_running, run_stop_command, terminate_process_tree)
 from .vram import (VRAM_IDLE_RECLAIM_SECONDS, MemoryCoordinator, MemoryReleaseCandidate,
@@ -624,13 +625,20 @@ class ManagedHTTPRuntime:
     async def prepare_start(self) -> None:
         """Validate the configured launcher immediately before process start."""
 
-    def _stderr_log_path(self) -> Path:
+    def _stderr_log_path(self) -> Optional[Path]:
+        if privacy_mode_enabled():
+            return None
         import re
         name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.target_id)
         return Path("logs") / f"{name}.err.log"
 
     def _startup_error_detail(self) -> str:
         path = self._stderr_log_path()
+        if privacy_mode_enabled():
+            return (
+                "Check the configured executable and local model_path; "
+                "stderr capture is disabled in privacy mode."
+            )
         if path is not None:
             try:
                 with path.open("rb") as stream:

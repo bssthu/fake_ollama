@@ -48,6 +48,17 @@ python -m fake_ollama --config .\config.json --playground-port 21431
 | `--no-log-file` | 禁用运行日志文件；终端输出保留，优先于 `--log-file` |
 | `--request-data-log-file PATH` | `logs/fake_ollama.requests.jsonl`；记录已授权模型请求 / 响应的有限正文预览 |
 | `--no-request-data-log` | 禁用正文预览日志，优先于 `--request-data-log-file` |
+| `--privacy-mode` | 隐私模式，默认关闭；禁用运行日志文件、请求 / 响应正文日志及网关代管的后端 stderr 文件捕获，保留终端日志；优先于两个日志文件路径参数 |
+
+本次启动不希望将 API 调用内容记入日志文件时：
+
+```powershell
+python -m fake_ollama --config .\config.json --privacy-mode
+```
+
+运行日志中的上游报错也可能包含调用内容，因此隐私模式同时关闭运行日志文件。
+该开关仅对本次进程及其代管的文件捕获生效，不写入配置；已有日志文件保留原样，重启时不传参数即恢复默认日志行为。
+它不控制外部服务或启动脚本自行写入的日志、终端重定向，以及推理所需的临时文件或生成的媒体文件。
 
 两种日志独立开关。仅指定 `--no-log-file` 仍会写请求正文预览；若要同时关闭两者：
 

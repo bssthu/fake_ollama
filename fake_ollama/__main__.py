@@ -14,6 +14,7 @@ from typing import Callable, Optional
 import uvicorn
 
 from .config import load_settings
+from .privacy import configure_privacy_mode, privacy_mode_enabled
 from .request_data_log import (
     DEFAULT_REQUEST_DATA_LOG_FILE,
     configure_request_data_logging,
@@ -86,7 +87,7 @@ def _configure_logging(level_name: str, *, log_file: Optional[str]) -> None:
 
     handlers: list[logging.Handler] = [stream_handler]
 
-    if log_file:
+    if log_file and not privacy_mode_enabled():
         path = Path(log_file)
         path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
@@ -138,16 +139,27 @@ def main() -> None:
         action="store_true",
         help="disable the separate request/response preview JSONL log",
     )
+    parser.add_argument(
+        "--privacy-mode",
+        action="store_true",
+        help=(
+            "disable application/request-data log files and managed backend stderr "
+            "file capture; keep terminal logging (default: off)"
+        ),
+    )
     args = parser.parse_args()
 
-    log_file = None if args.no_log_file else args.log_file
+    configure_privacy_mode(args.privacy_mode)
+    log_file = None if args.privacy_mode or args.no_log_file else args.log_file
     _configure_logging(args.log_level, log_file=log_file)
     request_data_log_file = (
-        None if args.no_request_data_log else args.request_data_log_file
+        None if args.privacy_mode or args.no_request_data_log else args.request_data_log_file
     )
     configure_request_data_logging(request_data_log_file)
 
     settings = load_settings(config_path=args.config)
+    if args.privacy_mode:
+        logger.info("privacy mode enabled; file logging and backend stderr capture disabled")
     logger.info(
         "logging initialised%s",
         f"; file={Path(log_file)}" if log_file else "; file=disabled",

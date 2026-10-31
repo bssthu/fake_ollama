@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import IO, Optional, Sequence, Tuple, Union
 
 from .lifecycle import finish_cleanup
+from .privacy import PRIVACY_MODE_ENV, privacy_mode_enabled
 
 StderrTarget = Union[None, str, os.PathLike, int, IO]
 
@@ -24,8 +25,9 @@ def _resolve_stderr(stderr: StderrTarget) -> Tuple[object, Optional[IO]]:
     must close it once the child has inherited the fd. Path-like targets
     are opened in append mode so each restart appends to (rather than
     truncates) the file. ``None`` keeps the historical DEVNULL behaviour.
+    Privacy mode discards file capture but leaves explicit in-memory pipes intact.
     """
-    if stderr is None:
+    if stderr is None or (privacy_mode_enabled() and stderr != asyncio.subprocess.PIPE):
         return asyncio.subprocess.DEVNULL, None
     if isinstance(stderr, (str, os.PathLike)):
         path = Path(stderr)
@@ -53,7 +55,9 @@ def _common_kwargs(
         "stderr": stderr_value,
     }
     if env is not None:
-        kwargs["env"] = env
+        kwargs["env"] = dict(env)
+        if privacy_mode_enabled():
+            kwargs["env"][PRIVACY_MODE_ENV] = "1"
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x4  # CREATE_SUSPENDED
     else:
