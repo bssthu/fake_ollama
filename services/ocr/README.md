@@ -60,7 +60,7 @@ API：`GET /playground/api/ocr/models` 读取本机文件就绪状态、`worker_
 
 Jev 直接使用 GGUF 的 `/v1/systemone` 分类接口：`state` 是候选文字，`files` 顺序必须为原图、候选渲染图，`questions.consistency` 为 `choice`、类别 `0/1`。只接受两类归一化概率中的 `1`，不能把它当文本生成模型。渲染调用固定版本 OpenBMB `RenderPool`，带本地 KaTeX 与语法预检查；阻断候选的网络资源请求，拒绝可执行 HTML。
 
-PP-OCR 仅使用 RapidOCR 3.10.0 / ONNX CPU。权重和字典独立存放在 `K:\Projects\LLM_Models\PP-OCRv6-small-onnx`，复制后 SHA256 校验一致；运行不依赖 Clipaste 源码、安装目录或 .NET 桥。
+PP-OCR 仅使用 RapidOCR 3.10.0 / ONNX CPU。权重和字典独立存放在 `K:\Projects\LLM_Models\PaddlePaddle\PP-OCRv6-small-onnx`，复制后 SHA256 校验一致；运行不依赖 Clipaste 源码、安装目录或 .NET 桥。
 
 旧 Hunyuan 基线及 .NET 对照项已移除，历史实验数据仍保留在调研报告。Hunyuan 直接使用官方任务提示词和正常 EOS/EOT，遵守页面最大输出限制。重新转换没有改变所比较的主模型及视觉投影张量，修复的是结束标记等 GGUF 元数据；DFlash 可单独选用。
 
@@ -74,8 +74,8 @@ PP-OCR 仅使用 RapidOCR 3.10.0 / ONNX CPU。权重和字典独立存放在 `K:
     "minicpm-ocr-jev": {
       "label": "MiniCPM-OCR-Jev / F16",
       "kind": "minicpm_jev",
-      "model": "K:/Projects/LLM_Models/MiniCPM-OCR-Jev-gguf/MiniCPM-OCR-Jev-F16.gguf",
-      "mmproj": "K:/Projects/LLM_Models/MiniCPM-OCR-Jev-gguf/mmproj-model-f16.gguf",
+      "model": "K:/Projects/LLM_Models/OpenBMB/MiniCPM-OCR-Jev-gguf/MiniCPM-OCR-Jev-F16.gguf",
+      "mmproj": "K:/Projects/LLM_Models/OpenBMB/MiniCPM-OCR-Jev-gguf/mmproj-model-f16.gguf",
       "context": 8192,
       "renderer_source": "services/ocr/.upstream/MiniCPM-OCR-b33b474136088dc43a2341e94590c804ec0c16a5/scripts/minicpm-ocr-jev"
     }
@@ -105,7 +105,7 @@ llama.cpp 固定 `b11960`，CUDA 12.4 Windows 包及配套 cudart 解压到 `.ru
 Hunyuan 当前官方快照是 `47644ecc4fc854efa4f505155158831f36773ee4`。
 使用同一 `b11960` 源码中的 `convert_hf_to_gguf.py` 分别转换主模型 F16、`--mmproj` F16、`dflash` BF16（需要 `--target-model-dir`）。转换环境与 OCR 渲染环境分开。此版本转换器从 `generation_config.json` 写入 EOT；校验输出含 EOS 120020 和 EOT 120007。
 
-本机 `K:\Projects\LLM_Models\minicpm-ocr-manifest.json`、`HunyuanOCR-1.5-HF/download-manifest.json`、`HunyuanOCR-1.5-b11960/conversion-manifest.json` 记录来源和 SHA256。
+本机 `K:\Projects\LLM_Models\minicpm-ocr-manifest.json`、`Hunyuan/HunyuanOCR-1.5-HF/download-manifest.json`、`Hunyuan/HunyuanOCR-1.5-b11960/conversion-manifest.json` 记录来源和 SHA256（后两项相对同一模型根目录）。
 模型、浏览器、运行库与源码快照均忽略，不进入 Git。
 
 ## 验证

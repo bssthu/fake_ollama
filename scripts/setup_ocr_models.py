@@ -60,7 +60,7 @@ def main():
             entries.append(dict(repo=repo, revision=revision, file=name, bytes=f.get('size'),
                                 sha256=f.get('lfs', {}).get('sha256'),
                                 url=f'https://huggingface.co/{repo}/resolve/{revision}/{name}',
-                                path=str(root / repo.split('/')[-1] / name)))
+                                path=str(root / 'OpenBMB' / repo.split('/')[-1] / name)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         futures = [pool.submit(download, e['url'], e['path'], e['sha256']) for e in entries]
         for future in futures:

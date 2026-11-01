@@ -22,7 +22,7 @@ async def main():
             runtime=Runtime(config,image,work)
             for mode in ['ar','dflash']:
                 spec=copy.deepcopy(config['engines']['hunyuan-ocr-current'])
-                if mode=='dflash':spec['extra_args']+=['--spec-draft-model','K:/Projects/LLM_Models/HunyuanOCR-1.5-b11960/dflash-bf16.gguf','--spec-type','draft-dflash','--spec-draft-n-max','15']
+                if mode=='dflash':spec['extra_args']+=['--spec-draft-model','K:/Projects/LLM_Models/Hunyuan/HunyuanOCR-1.5-b11960/dflash-bf16.gguf','--spec-type','draft-dflash','--spec-draft-n-max','15']
                 try:
                     async with runtime.engine(spec) as client:
                         for iteration in range(2):

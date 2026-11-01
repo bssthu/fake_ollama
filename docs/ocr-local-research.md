@@ -16,10 +16,10 @@ MiniCPM-OCR 1.0 是约 1.3B 的识别模型，支持中英文、表格和公式�
 
 | 内容 | 路径 / 版本 |
 |---|---|
-| MiniCPM-OCR F16 + projector | `K:\Projects\LLM_Models\MiniCPM-OCR-1.0-gguf`；HF revision `674e62bf4ef7560ba502fe9b366a2780028aef20` |
-| Jev F16 + projector | `K:\Projects\LLM_Models\MiniCPM-OCR-Jev-gguf`；HF revision `2554d7c9173b4cb767c4ecfc3e886e824978965c` |
-| Hunyuan 当前官方 HF 权重与 DFlash | `K:\Projects\LLM_Models\HunyuanOCR-1.5-HF`；revision `47644ecc4fc854efa4f505155158831f36773ee4` |
-| Hunyuan 重新转换的 F16 / projector / DFlash BF16 | `K:\Projects\LLM_Models\HunyuanOCR-1.5-b11960` |
+| MiniCPM-OCR F16 + projector | `K:\Projects\LLM_Models\OpenBMB\MiniCPM-OCR-1.0-gguf`；HF revision `674e62bf4ef7560ba502fe9b366a2780028aef20` |
+| Jev F16 + projector | `K:\Projects\LLM_Models\OpenBMB\MiniCPM-OCR-Jev-gguf`；HF revision `2554d7c9173b4cb767c4ecfc3e886e824978965c` |
+| Hunyuan 当前官方 HF 权重与 DFlash | `K:\Projects\LLM_Models\Hunyuan\HunyuanOCR-1.5-HF`；revision `47644ecc4fc854efa4f505155158831f36773ee4` |
+| Hunyuan 重新转换的 F16 / projector / DFlash BF16 | `K:\Projects\LLM_Models\Hunyuan\HunyuanOCR-1.5-b11960` |
 | Clipaste 基线 | 只读复用 `I:\Projects\clipaste\src\Clipaste` 的 PP-OCRv6 small 与 Hunyuan GGUF |
 
 MiniCPM 与 Jev 四个权重文件约 6.39 GiB；下载均与 HF LFS SHA256 核对。Hunyuan 官方源权重也核对了 SHA256，转换输出另有清单。没有覆盖或删除旧模型。

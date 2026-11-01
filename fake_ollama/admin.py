@@ -683,6 +683,12 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
    "description": "模型调试页监听地址。保持 127.0.0.1 仅限本机；手机或其他局域网设备访问时可设为 0.0.0.0。API key 会由浏览器发送到该地址，请勿直接暴露到互联网"},
   {"key": "playground_port", "type": "int", "default": 21431, "group": "playground",
    "description": "模型调试页独立监听端口；必须与所有 interface、admin 和 dashboard 端口不同。启用后访问 /playground/"},
+  {"key": "playground_ocr_config", "type": "string", "default": None, "group": "playground",
+   "description": "OCR 隔离运行环境的本机 JSON 配置路径；空值表示未配置"},
+  {"key": "playground_speech_config", "type": "string", "default": None, "group": "playground",
+   "description": "语音翻译的本机 JSON 配置路径；模型只在启用推理且主动开始会话后加载"},
+  {"key": "playground_server_audio_remote_enabled", "type": "bool", "default": False, "group": "playground",
+   "description": "允许已鉴权的非 localhost 用户采集服务器系统音频。默认关闭；不会修改监听地址。经代理访问也视为远程"},
 
   {"key": "management_access_tokens", "type": "string_list", "default": [], "group": "admin",
    "description": "Admin 与 Dashboard 独立管理凭据。空列表仅允许本机页面；设置后浏览器登录时用户名任意，密码填写该 token"},

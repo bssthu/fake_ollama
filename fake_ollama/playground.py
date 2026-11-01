@@ -13,6 +13,7 @@ from . import routing, playground_support
 
 from .config import Settings
 from .security import is_loopback_host
+from .privacy import privacy_status, privacy_mode_enabled, backend_privacy_reason
 
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -34,12 +35,17 @@ def register_playground_routes(app: FastAPI) -> None:
         return
     from .ocr_playground import register_ocr_routes
     register_ocr_routes(app)
+    from .speech_playground import register_speech_routes
+    register_speech_routes(app)
 
     @app.get("/playground", include_in_schema=False)
     @app.get("/playground/", include_in_schema=False)
     async def playground_index() -> HTMLResponse:
         return HTMLResponse(
-            _PLAYGROUND_HTML,
+            _PLAYGROUND_HTML.replace('隐私模式：等待连接服务器',
+                '隐私模式：开启 · 内容仅在内存中处理' if privacy_status()['enabled'] else '隐私模式：关闭')
+                .replace('id="privacyStatus" data-enabled="false"',
+                         'id="privacyStatus" data-enabled="' + str(privacy_mode_enabled()).lower() + '"'),
             headers={
                 **_NO_STORE_HEADERS,
                 "Content-Security-Policy": (
@@ -81,6 +87,15 @@ def register_playground_routes(app: FastAPI) -> None:
             for profile in settings.h3_context_ir_profiles
             if profile.enabled and profile.playground_visible
         )
+        if privacy_mode_enabled():
+            for entry in models:
+                exposure = iface.exposure_for_public_id(entry['id']) if iface else None
+                source = settings.source_by_name(exposure.target) if exposure else None
+                reason = backend_privacy_reason(source)
+                entry['privacy_supported'] = reason is None
+                if reason:
+                    for operation in entry.get('operations', []):
+                        operation.update(configured=False, unavailable_reason=reason)
         from .ocr_playground import ocr_catalog, playground_entries
         ocr, ocr_error = None, None
         if settings.playground_ocr_config:
@@ -96,6 +111,8 @@ def register_playground_routes(app: FastAPI) -> None:
         return JSONResponse(
             {
                 "schema_version": 1,
+                "privacy": privacy_status(),
+                "speech_configured": bool(settings.playground_speech_config),
                 "models": models,
                 "authentication": "token" if iface.auth_required else ("local_anonymous" if local else "trusted_proxy_anonymous"),
                 "ocr": ocr,

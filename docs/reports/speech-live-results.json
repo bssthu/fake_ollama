@@ -1,0 +1,293 @@
+{
+  "date": "2026-11-01",
+  "hardware": "Windows / NVIDIA GeForce RTX 4090 24 GiB",
+  "input": {
+    "real_media": "R:/测试视频.mkv",
+    "clip_start_seconds": 90,
+    "clip_seconds": 26,
+    "asr_smoke_seconds": 8,
+    "mixed_audio": "Offline Windows Huihui + Zira TTS, 13.80 seconds; not natural code-switching",
+    "soak_media": "Audio-only remux repeated 20 times; file decoding, not audible realtime playback"
+  },
+  "default_pair": [
+    "whisper-large-v3-turbo",
+    "qwen3.5-2b"
+  ],
+  "matrix_scope": "Initial GPU co-residency smoke for all 12 pairs, followed by targeted model regressions and a sustained run after the live fixes. Matrix timings precede the Whisper VAD and translation prompt changes.",
+  "model_matrix": {
+    "qwen3-asr-1.7b/qwen3.5-2b": {
+      "passed": true,
+      "translator_load_seconds": 10.93,
+      "co_resident_asr_seconds": 0.645,
+      "translation_seconds": {
+        "audio": 0.745,
+        "mixed": 0.389,
+        "negation": 0.549
+      }
+    },
+    "qwen3-asr-1.7b/qwen3.5-4b": {
+      "passed": true,
+      "translator_load_seconds": 12.009,
+      "co_resident_asr_seconds": 0.64,
+      "translation_seconds": {
+        "audio": 1.282,
+        "mixed": 0.533,
+        "negation": 0.992
+      }
+    },
+    "qwen3-asr-1.7b/translategemma-4b": {
+      "passed": true,
+      "translator_load_seconds": 11.988,
+      "co_resident_asr_seconds": 0.636,
+      "translation_seconds": {
+        "audio": 1.476,
+        "mixed": 0.698,
+        "negation": 0.929
+      }
+    },
+    "whisper-large-v3/qwen3.5-2b": {
+      "passed": true,
+      "translator_load_seconds": 7.258,
+      "co_resident_asr_seconds": 0.661,
+      "translation_seconds": {
+        "audio": 0.663,
+        "mixed": 0.36,
+        "negation": 0.523
+      }
+    },
+    "whisper-large-v3/qwen3.5-4b": {
+      "passed": true,
+      "translator_load_seconds": 9.886,
+      "co_resident_asr_seconds": 0.647,
+      "translation_seconds": {
+        "audio": 0.62,
+        "mixed": 0.502,
+        "negation": 0.975
+      }
+    },
+    "whisper-large-v3/translategemma-4b": {
+      "passed": true,
+      "translator_load_seconds": 9.903,
+      "co_resident_asr_seconds": 0.641,
+      "translation_seconds": {
+        "audio": 0.674,
+        "mixed": 0.56,
+        "negation": 0.739
+      }
+    },
+    "whisper-large-v3-turbo/qwen3.5-2b": {
+      "passed": true,
+      "translator_load_seconds": 7.247,
+      "co_resident_asr_seconds": 0.221,
+      "translation_seconds": {
+        "audio": 0.647,
+        "mixed": 0.373,
+        "negation": 0.526
+      }
+    },
+    "whisper-large-v3-turbo/qwen3.5-4b": {
+      "passed": true,
+      "translator_load_seconds": 9.724,
+      "co_resident_asr_seconds": 0.224,
+      "translation_seconds": {
+        "audio": 0.627,
+        "mixed": 0.499,
+        "negation": 0.962
+      }
+    },
+    "whisper-large-v3-turbo/translategemma-4b": {
+      "passed": true,
+      "translator_load_seconds": 9.807,
+      "co_resident_asr_seconds": 0.223,
+      "translation_seconds": {
+        "audio": 0.664,
+        "mixed": 0.533,
+        "negation": 0.764
+      }
+    },
+    "voxtral-mini-4b-realtime-2602/qwen3.5-2b": {
+      "passed": true,
+      "translator_load_seconds": 7.277,
+      "co_resident_asr_seconds": 3.186,
+      "translation_seconds": {
+        "audio": 0.575,
+        "mixed": 0.376,
+        "negation": 0.519
+      }
+    },
+    "voxtral-mini-4b-realtime-2602/qwen3.5-4b": {
+      "passed": true,
+      "translator_load_seconds": 9.728,
+      "co_resident_asr_seconds": 3.193,
+      "translation_seconds": {
+        "audio": 0.848,
+        "mixed": 0.506,
+        "negation": 0.981
+      }
+    },
+    "voxtral-mini-4b-realtime-2602/translategemma-4b": {
+      "passed": true,
+      "translator_load_seconds": 9.763,
+      "co_resident_asr_seconds": 3.183,
+      "translation_seconds": {
+        "audio": 0.921,
+        "mixed": 0.558,
+        "negation": 0.763
+      }
+    }
+  },
+  "deployment": {
+    "url": "http://127.0.0.1:21431/playground/",
+    "real_browser_file_pass": true,
+    "segments": 4,
+    "resources_released": true
+  },
+  "followup_model_checks": {
+    "all_three_translators_after_prompt_and_clause_detection_changes": true,
+    "short_japanese_and_currency_prompt_regression": "和平啊，空闲啊。",
+    "exact_zero_pcm_returns_empty": true,
+    "qwen_4b_and_translategemma_after_generation_guard": true
+  },
+  "browser": {
+    "real_gpu": true,
+    "file_segments": 4,
+    "loopback_segments": 4,
+    "original_before_translation": true,
+    "desktop_mobile_srt_json": true,
+    "page_errors": [],
+    "cancel_loading_seconds": 0.219,
+    "refresh_releases": true,
+    "page_close_cleanup_seconds": 2.015,
+    "page_close_cleanup_method": "pagehide_delete"
+  },
+  "loopback_latency_seconds": {
+    "measurement": "Captured final frame to server publication; excludes device buffering and next browser poll (normally 0-0.5 seconds). Small 4-segment sample; no cold loading.",
+    "source": {
+      "n": 4,
+      "min": 0.51,
+      "p50": 0.661,
+      "p95": 0.676,
+      "max": 0.676
+    },
+    "translation": {
+      "n": 4,
+      "min": 0.77,
+      "p50": 1.047,
+      "p95": 1.26,
+      "max": 1.291
+    }
+  },
+  "soak": {
+    "minimum_active_wall_seconds": 1200,
+    "measurement": "Completed before the repetition guard fix. The harness reached its per-row quality assertion only after graceful terminal state, resource release and Start re-enabled. The retained rows were recovered from that assertion; exact final counters were not saved.",
+    "segments_at_last_sample": 1491,
+    "processed_audio_seconds_lower_bound": 11522.0,
+    "resources_released": true,
+    "retained_segments": 1000,
+    "translation_errors_in_retained_history": 7,
+    "processing_seconds": {
+      "n": 1000,
+      "min": 0.311,
+      "p50": 0.569,
+      "p95": 1.941,
+      "max": 16.711
+    },
+    "max_file_predecode_backlog_seconds": 38.6,
+    "sampled_total_gpu_memory_mib": {
+      "n": 40,
+      "min": 10165,
+      "p50": 10287.0,
+      "p95": 10445.1,
+      "max": 10478
+    },
+    "sampled_server_tree_rss_mib": {
+      "n": 129,
+      "min": 85.7,
+      "p50": 2920.7,
+      "p95": 2922.8,
+      "max": 2923.2
+    },
+    "sampled_server_tree_private_commit_mib": {
+      "n": 129,
+      "min": 73.9,
+      "p50": 14331.6,
+      "p95": 14434.54,
+      "max": 14493.9
+    }
+  },
+  "post_soak_fix": {
+    "reason": "7 retained Qwen 2B subtitle generations reached the token limit, without stopping the session.",
+    "replayed_original_contexts": 7,
+    "all_recovered_with_same_model": true,
+    "translation_seconds": {
+      "n": 7,
+      "min": 0.686,
+      "p50": 0.744,
+      "p95": 1.009,
+      "max": 1.097
+    },
+    "followup_continuous_seconds": 120,
+    "followup_segments": 184,
+    "followup_translation_errors": 0,
+    "followup_resources_released": true
+  },
+  "service_shutdown": {
+    "pid": 28788,
+    "port": 21439,
+    "stopped": true,
+    "resources_released": true,
+    "temporary_audio_removed": true
+  },
+  "additional_lifecycle": {
+    "cancel_incomplete_http_upload_seconds": 0.004,
+    "invalid_media_after_model_load": {
+      "error": "无法解码音频：文件损坏、不含音轨或格式不受 FFmpeg 支持。",
+      "resources_released": true
+    },
+    "abandoned_client_watchdog_seconds": 46.277,
+    "service_shutdown_with_loaded_models_seconds": 0.408,
+    "service_shutdown": {
+      "pid": 28788,
+      "port": 21439,
+      "stopped": true,
+      "resources_released": true,
+      "temporary_audio_removed": true
+    }
+  },
+  "offline_regression": {
+    "passed": 1032,
+    "skipped": 4,
+    "deselected": 17,
+    "frontend_tests": 2,
+    "real_windows_handle_conflicts": [
+      "read",
+      "unlink",
+      "replace"
+    ],
+    "cpu_capture": [
+      "resample",
+      "invalid_media",
+      "four_slot_backpressure",
+      "graceful_stop_full_queue",
+      "silent_stop"
+    ]
+  },
+  "resolved_live_failures": [
+    "Windows progress-file rename collision during polling: bounded retries and throttled progress writes.",
+    "Windows result mailbox permission collision after 379 segments: shared bounded retries for read, delete and atomic publication.",
+    "Whisper secondary Silero VAD removed audible high-pitched dialogue: disabled by default; optional per model.",
+    "All-zero PCM could trigger Whisper hallucinations: return empty before generation.",
+    "Qwen 2B occasionally retained Japanese: explicit language names and a current-turn translation instruction; preserve currencies and units.",
+    "TranslateGemma whole-input language detection absorbed Chinese into Japanese: clause detection, then merge adjacent equal languages.",
+    "Graceful finish at a full file queue discarded the waiting segment: drain already captured audio.",
+    "Qwen 2B repetition caused 14-17 second token-limit failures: detect generated-token loops and retry once with the same model and no history; all 7 exact retained failures recovered in 0.7-1.1 seconds."
+  ],
+  "quality_limits": [
+    "Qwen ASR misidentified an 8-second Japanese clip as English/romanized text; the 26-second clip was recognized as Japanese.",
+    "Whisper large-v3 and Voxtral omitted the English half of the single 13.80-second mixed TTS sample; Qwen ASR and Whisper turbo retained both languages.",
+    "Short/noisy/low-volume chunks can be misidentified, mistranscribed or hallucinated; proper names and translation wording remain imperfect.",
+    "No claim of accuracy across all supported languages; no natural multilingual benchmark or independently scored WER.",
+    "Voxtral uses bounded chunks, not a persistent native streaming cache.",
+    "The sustained run is file processing; real WASAPI validation is the 26-second playback sample."
+  ]
+}

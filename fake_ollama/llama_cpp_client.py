@@ -582,6 +582,8 @@ class LlamaCppClient:
 
     async def _ensure_ready(self) -> None:
         if await self._healthy():
+            if privacy_mode_enabled() and not self._started_by_us:
+                raise httpx.ConnectError('隐私模式禁止复用不属于本服务的现有模型进程')
             return
         self._clear_all_vram_state()
         if self._shutdown_requested:
@@ -594,6 +596,8 @@ class LlamaCppClient:
 
         async with self._start_lock:
             if await self._healthy():
+                if privacy_mode_enabled() and not self._started_by_us:
+                    raise httpx.ConnectError('隐私模式禁止复用不属于本服务的现有模型进程')
                 return
             if self._shutdown_requested:
                 raise httpx.ConnectError(

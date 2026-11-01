@@ -19,6 +19,7 @@ import socket
 import sys
 import tempfile
 import time
+from .privacy import privacy_mode_enabled
 
 import httpx
 from PIL import Image
@@ -56,14 +57,17 @@ def data_url(raw):
 
 class Runtime:
     def __init__(self, config, image, work, verifier=None, cache=None):
-        self.config, self.image, self.work = config, image, Path(work)
+        self.config, self.image, self.work = config, image, Path(work) if work else None
         self.cache = cache
         self.verifier = config.get('verifiers', {}).get(verifier) if verifier else None
         if verifier and (self.verifier is None or self.verifier.get('kind') != 'minicpm_jev'):
             raise ValueError('Unknown or unsupported OCR verifier')
-        self.original = self.work / 'original.png'
-        image.save(self.original)
-        self.image_url = data_url(self.original.read_bytes())
+        self.original = self.work / 'original.png' if self.work else None
+        encoded = io.BytesIO()
+        image.save(encoded, format='PNG')
+        self.image_url = data_url(encoded.getvalue())
+        if self.original is not None:
+            self.original.write_bytes(encoded.getvalue())
         self.events = []
         self.renderer_metadata = None
 
@@ -179,6 +183,8 @@ class Runtime:
                     runtime='RapidOCR 3.10.0 / ONNX CPU', truncated=False)
 
     async def score(self, texts, category):
+        if privacy_mode_enabled():
+            raise ValueError('隐私模式不允许尚需磁盘渲染的 Jev 复核；可使用 OCR 识别或多模型对比')
         if self.verifier is None:
             raise ValueError('No OCR verifier selected')
         # Import official pinned renderer instead of inventing different pixels/prompts.
@@ -268,6 +274,15 @@ class ModelCache:
 
 async def run(config, request, cache=None):
     image = decode_image(request.image)
+    if privacy_mode_enabled():
+        if request.verifier:
+            raise ValueError('所选复核器尚不支持无落盘处理')
+        runtime = Runtime(config, image, None, None, cache)
+        result = await run_pipeline(request, runtime.recognize, runtime.score)
+        result.update(runtime_events=runtime.events, renderer=None, verifier_label=None,
+                      renderer_environment='memory_only', image_size=list(image.size),
+                      keep_loaded=cache is not None, loaded_models=cache.loaded() if cache else [])
+        return result
     with tempfile.TemporaryDirectory(prefix='fake-ocr-images-') as work:
         runtime = Runtime(config, image, work, request.verifier, cache)
         result = await run_pipeline(request, runtime.recognize, runtime.score)
@@ -306,6 +321,10 @@ async def serve(config, directory):
 
 
 def main():
+    if '--memory' in sys.argv:
+        return asyncio.run(memory_serve())
+    if privacy_mode_enabled():
+        raise RuntimeError('隐私模式只允许内存通信入口')
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
     parser.add_argument('--serve')
@@ -327,6 +346,27 @@ def main():
         traceback.print_exc()
         result = {'fatal_error': str(exc), 'error_code': 'invalid_image' if isinstance(exc, InvalidOCRImage) else 'runtime_error'}
     Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+async def memory_serve():
+    from .memory_worker import Channel
+    channel = Channel.connect()
+    cache = ModelCache()
+    try:
+        while True:
+            payload, _ = await asyncio.to_thread(channel.receive)
+            try:
+                req = OCRRequest.model_validate(payload['request'])
+                result = await run(payload['config'], req, cache)
+                channel.send({'result': result})
+                req = payload = result = None
+            except Exception as exc:
+                channel.send({'error': str(exc)[:2000]})
+    except (EOFError, OSError):
+        pass
+    finally:
+        await cache.close()
+        channel.close()
 
 
 if __name__ == '__main__':

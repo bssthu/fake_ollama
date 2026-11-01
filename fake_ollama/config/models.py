@@ -1869,6 +1869,9 @@ class Settings(BaseModel):
     playground_allowed_origins: List[str] = Field(default_factory=list)
     # Optional local OCR worker configuration; no model weights in the gateway environment.
     playground_ocr_config: Optional[str] = None
+    # Discovery is CPU-only; inference starts only on an explicit speech session.
+    playground_speech_config: Optional[str] = None
+    playground_server_audio_remote_enabled: bool = False
 
     @field_validator("playground_trusted_proxy_ips")
     @classmethod

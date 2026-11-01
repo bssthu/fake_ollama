@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import IO, Optional, Sequence, Tuple, Union
 
 from .lifecycle import finish_cleanup
-from .privacy import PRIVACY_MODE_ENV, privacy_mode_enabled
+from .privacy import PRIVACY_MODE_ENV, privacy_mode_enabled, worker_environment
 
 StderrTarget = Union[None, str, os.PathLike, int, IO]
 
@@ -58,6 +58,10 @@ def _common_kwargs(
         kwargs["env"] = dict(env)
         if privacy_mode_enabled():
             kwargs["env"][PRIVACY_MODE_ENV] = "1"
+    if privacy_mode_enabled():
+        kwargs['env'] = {**worker_environment(), **(kwargs.get('env') or {}),
+                         PRIVACY_MODE_ENV: '1', 'CUDA_CACHE_DISABLE': '1',
+                         'PYTHONDONTWRITEBYTECODE': '1', 'TORCH_COMPILE_DISABLE': '1'}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x4  # CREATE_SUSPENDED
     else:

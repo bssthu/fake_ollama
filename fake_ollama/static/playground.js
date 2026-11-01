@@ -90,7 +90,7 @@
     ocr_recognize: 'OCR 识别 / 可选复核',
     ocr_auto: 'OCR → 复核 → 低分重识别',
     ocr_compare: 'OCR 多模型对比',
-    ocr_score: '候选复核',
+    ocr_score: 'OCR 候选复核',
     chat: '聊天 / 文本补全',
     decision: '结构化决策 / Decision',
     image_generation: '图片生成',
@@ -882,10 +882,50 @@
     showContextNotice(warning);
   }
 
+  const functionModels = new Map();
+  function selectFunction() {
+    const task = $('function').value;
+    const speech = task === 'speech';
+    $('generalWorkspace').hidden = speech;
+    $('speechWorkspace').hidden = !speech;
+    document.dispatchEvent(new CustomEvent('playground-function', {detail: {id: task}}));
+    if (speech) return;
+    const old = functionModels.get(task) || els.model.value;
+    const choices = [...state.models.values()].filter(info => modelOperations(info).some(op => op.id === task));
+    els.model.replaceChildren(...choices.map(info => {
+      const option = new Option((info.label || info.id) + (info.privacy_supported === false ? ' · 隐私模式不可用' : ''), info.id);
+      option.disabled = info.privacy_supported === false;
+      return option;
+    }));
+    if (choices.some(info => info.id === old)) els.model.value = old;
+    els.model.disabled = !choices.length;
+    $('modelField').hidden = ['ocr_compare', 'ocr_score'].includes(task);
+    syncModel();
+  }
+  function populateFunctions(speechConfigured) {
+    const previous = $('function').value;
+    const ids = new Set([...state.models.values()].flatMap(info => modelOperations(info).map(op => op.id)));
+    if (speechConfigured) ids.add('speech');
+    const order = ['chat', 'ocr_recognize', 'ocr_auto', 'ocr_compare', 'ocr_score', 'speech', 'image_generation', 'image_edit', 'video_generation', 'video_analysis', 'h3_context_ir', 'decision'];
+    $('function').replaceChildren();
+    for (const id of [...new Set([...order, ...ids])]) {
+      if (ids.has(id)) $('function').append(new Option(id === 'speech' ? '即时语音翻译' : OP_LABELS[id] || id, id));
+    }
+    if (ids.has(previous)) $('function').value = previous;
+    $('function').disabled = !ids.size;
+    selectFunction();
+  }
+  $('function').addEventListener('change', selectFunction);
+  document.addEventListener('speech-busy', event => {
+    $('function').disabled = event.detail.busy;
+    els.apiKey.disabled = els.loadModels.disabled = event.detail.busy;
+  });
   function syncModel() {
     const info = selectedModel();
     const previous = els.operation.value;
-    const operations = modelOperations(info);
+    const task = $('function').value;
+    const operations = modelOperations(info).filter(op => !task || op.id === task);
+    if (info && task) functionModels.set(task, info.id);
     renderCapabilities(info);
     els.operation.replaceChildren();
     if (!operations.length) {
@@ -1005,7 +1045,7 @@
         : '';
       const limits = op.limits || {};
       const limitHints = [usesHistory ? '携带页面内历史' : '仅发送本次输入'];
-      if (op.configured === false) limitHints.push('工作流尚未配置');
+      if (op.configured === false) limitHints.push(op.unavailable_reason || '工作流尚未配置');
       if (usesMediaQueue) limitHints.push(`可自动排队 1–${MAX_MEDIA_QUEUE_RUNS} 份`);
       else if (limits.max_batch_size) limitHints.push(`最多 ${limits.max_batch_size} 个结果`);
       if (limits.max_reference_images) limitHints.push(`最多 ${limits.max_reference_images} 张参考图`);
@@ -1242,6 +1282,7 @@
   }
 
   function syncSendState() {
+    if ($('function').value !== 'speech') $('function').disabled = Boolean(state.controller) || state.models.size === 0;
     const op = selectedOperation();
     updatePlannerProviderUi();
     const hasImage = state.attachments.some((attachment) => attachment.kind === 'image');
@@ -2099,6 +2140,9 @@
       }
       state.loadedCredential = credential;
       state.ocrCatalog = data.ocr || null;
+      $('privacyStatus').textContent = data.privacy?.enabled ? '隐私模式：开启 · 内容仅在内存中处理' : '隐私模式：关闭';
+      $('privacyStatus').dataset.enabled = String(Boolean(data.privacy?.enabled));
+      document.dispatchEvent(new CustomEvent('playground-privacy', {detail: data.privacy || {enabled: false}}));
       populateOcrEngines();
       $('authenticationHint').textContent = data.authentication === 'local_anonymous'
         ? '本机免密：当前本机监听与接口配置允许不填 key。此按钮仅获取列表，执行时才加载模型。'
@@ -2116,9 +2160,9 @@
           els.model.append(new Option(info.label || info.id, info.id));
         }
         els.model.disabled = false;
-        setConnection(`${models.length} 个模型${data.authentication === 'local_anonymous' ? ' · 本机免密' : ''}`, 'ok');
+        setConnection(`${models.length} 个条目${data.authentication === 'local_anonymous' ? ' · 本机免密' : ''}`, 'ok');
       }
-      syncModel();
+      populateFunctions(data.speech_configured);
       if (data.ocr_error) showError(data.ocr_error);
     } catch (error) {
       state.models.clear();

@@ -143,8 +143,8 @@ def main() -> None:
         "--privacy-mode",
         action="store_true",
         help=(
-            "disable application/request-data log files and managed backend stderr "
-            "file capture; keep terminal logging (default: off)"
+            "keep supported session content in memory; disable file logs and "
+            "reject unverified backends (default: off)"
         ),
     )
     args = parser.parse_args()

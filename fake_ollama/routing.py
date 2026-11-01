@@ -205,6 +205,8 @@ def _backend_client(app: FastAPI, backend) -> Any:  # type: ignore[no-untyped-de
     * ``ollama`` + ``local`` → :class:`OllamaClient`
     * ``openai`` + ``local`` → :class:`LlamaCppClient`
     """
+    from .privacy import require_private_backend
+    require_private_backend(backend.source)
     if backend.protocol == "anthropic":
         client = app.state.clients.get(backend.name)
         if client is None:

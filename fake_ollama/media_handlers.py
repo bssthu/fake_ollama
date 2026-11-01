@@ -430,6 +430,9 @@ async def _invoke_context_ir_provider(
     external_connection: Optional[ExternalPlannerConnection] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     if provider.name == "external":
+        from .privacy import privacy_mode_enabled
+        if privacy_mode_enabled():
+            raise HTTPException(409, '隐私模式禁止向无法确认保存行为的外部规划器发送内容')
         if external_connection is None:
             raise ValueError("external Planner connection is unavailable")
         async with _external_planner_http_client(app) as http_client:

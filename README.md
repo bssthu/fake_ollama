@@ -7,6 +7,8 @@
 
 附带一个零依赖的 Web 配置编辑器（`/admin`），以及可选的轻量模型调试页（`/playground`）。
 
+Playground 先选功能、再选模型，还提供 [即时语音翻译](docs/realtime-speech-translation.md)：浏览器授权共享音频、服务器 Windows 系统回放或音视频文件，自动源语言，四种识别和三种翻译模型。Voxtral 支持原生流式和延迟设置；隐私模式在内存中处理会话内容并关闭导出。模型已完成 GPU 接入验证；默认 Whisper large-v3 turbo + Qwen3.5 2B，具体性能与识别边界见功能文档。
+
 ## 架构概览
 
 监听分为 Admin、Dashboard、Playground、Ollama 兼容入口和 API 接口五类。前三类各有独立端口，后两类支持多实例数组。Admin / Dashboard 共用独立的管理凭据；模型接口各自配置白名单和 token，Playground 按所选接口的权限提供模型调试。
@@ -1052,9 +1054,11 @@ python -m fake_ollama --no-request-data-log
 python -m fake_ollama --config ./config.json --privacy-mode
 ```
 
-隐私模式关闭请求 / 响应正文日志、可能包含上游报错内容的运行日志文件，以及网关代管的后端 stderr 文件捕获；终端日志保留。
+隐私模式关闭请求 / 响应正文日志、运行日志文件和代管后端 stderr 文件捕获，并要求受支持链路在内存中处理会话内容。Playground 与 Dashboard 显示服务端的实际状态；页面不能覆盖启动参数。
 它优先于 `--log-file` 和 `--request-data-log-file`，不创建或追加这些日志文件，也不删除已有日志；不传此参数时保持原有日志行为。
-该开关仅对本次启动生效，不控制外部服务或启动脚本自行写入的日志、终端重定向，以及推理所需的临时文件或生成的媒体文件。更多选项见 [CLI 使用说明](docs/cli.md#日志)。
+语音的文件读取、PCM、识别原文和译文通过内存通道传递；普通 OCR 在隐私模式下也不使用图片或请求结果临时文件。字幕导出、Dashboard 历史写入被禁用。尚需磁盘渲染的 Jev 复核、外部服务、ComfyUI 及未经校验的自定义后端会拒绝执行；标准本地 llama.cpp 只允许受控启动参数，且不会复用外部进程。
+
+该开关默认关闭、仅对本次启动生效，并通过 `FAKE_OLLAMA_PRIVACY_MODE` 传给代管 Python 进程；不会删除已有日志。已有模型与原始文件仍可读取。应用层约束不等于控制 Windows 分页、休眠、崩溃转储、浏览器自身缓存或调用者的终端重定向。更多选项见 [CLI 使用说明](docs/cli.md#日志) 和 [语音翻译说明](docs/realtime-speech-translation.md)。
 
 ## 安全提示
 

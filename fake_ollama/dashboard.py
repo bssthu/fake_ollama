@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .security import management_page, require_management_access
+from .privacy import privacy_mode_enabled, privacy_status
 
 from .vram import (
     MemoryCoordinator,
@@ -174,6 +175,8 @@ def _dashboard_retention_seconds(settings: Any) -> float:
 
 
 def _dashboard_data_path(settings: Any) -> Optional[Path]:
+    if privacy_mode_enabled():
+        return None
     raw = getattr(settings, "dashboard_data_path", None)
     if raw is None:
         return None
@@ -667,6 +670,7 @@ class DashboardState:
         return {
             "now": now,
             "range_seconds": range_seconds,
+            "privacy": privacy_status(),
             "sample_interval_seconds": settings.dashboard_sample_interval_seconds,
             "retention_seconds": settings.dashboard_retention_seconds,
             "limits": {

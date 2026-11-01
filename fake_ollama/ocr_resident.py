@@ -8,6 +8,8 @@ import time
 from fastapi import HTTPException
 from .process_utils import create_managed_subprocess_exec, terminate_process_tree
 from .lifecycle import finish_cleanup
+from .memory_worker import MemoryWorker
+from .privacy import privacy_mode_enabled
 
 
 class ResidentOCR:
@@ -18,6 +20,7 @@ class ResidentOCR:
         self.loaded = []
         self.shutting_down = False
         self.stop_lock = asyncio.Lock()
+        self.memory_worker = None
 
     def begin_shutdown(self):
         self.shutting_down = True
@@ -31,6 +34,10 @@ class ResidentOCR:
             await self._stop()
 
     async def _stop(self):
+        if self.memory_worker:
+            await self.memory_worker.stop()
+            self.memory_worker = None
+            self.process = None
         if self.process is not None:
             if not await terminate_process_tree(self.process):
                 raise RuntimeError('OCR resident process cleanup failed')
@@ -42,6 +49,8 @@ class ResidentOCR:
             self.directory = None
 
     async def run(self, payload, config, request):
+        if privacy_mode_enabled():
+            return await self.run_memory(payload, config, request)
         started = time.perf_counter()
         key = json.dumps(config, sort_keys=True)
         try:
@@ -86,5 +95,37 @@ class ResidentOCR:
             result['request_seconds'] = round(time.perf_counter() - started, 4)
             return result
         except BaseException:
+            await finish_cleanup(self.stop_if_owned())
+            raise
+
+    async def run_memory(self, payload, config, request):
+        key = json.dumps(config, sort_keys=True)
+        task = None
+        try:
+            if self.shutting_down:
+                raise HTTPException(503, 'OCR is shutting down')
+            if self.config_key != key:
+                await self.stop_if_owned()
+            if self.memory_worker is None:
+                self.memory_worker = MemoryWorker(config['python'], 'fake_ollama.ocr_worker')
+                await self.memory_worker.start()
+                self.process = self.memory_worker.process
+                self.config_key = key
+            started = time.perf_counter()
+            task = asyncio.create_task(self.memory_worker.call({'config': config, 'request': payload.model_dump()}, timeout=900))
+            while not task.done():
+                await asyncio.wait({task}, timeout=.1)
+                if await request.is_disconnected():
+                    raise HTTPException(499, 'OCR request cancelled')
+            result = await task
+            self.loaded = result.get('loaded_models', [])
+            result['request_seconds'] = round(time.perf_counter() - started, 4)
+            result['keep_loaded'] = payload.keep_loaded
+            return result
+        except BaseException:
+            if task and not task.done():
+                task.cancel()
+                from contextlib import suppress
+                with suppress(asyncio.CancelledError): await task
             await finish_cleanup(self.stop_if_owned())
             raise

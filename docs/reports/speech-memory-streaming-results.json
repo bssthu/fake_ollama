@@ -1,0 +1,126 @@
+{
+  "date": "2026-11-01",
+  "scope": "Function-first Playground, three audio sources, startup-only content privacy and native Voxtral streaming",
+  "environment": {
+    "os": "Windows",
+    "gpu": "RTX 4090 24 GiB",
+    "torch": "2.8.0+cu128",
+    "transformers": "5.22.1",
+    "qwen_asr_transformers": "4.57.6",
+    "pyav": "19.0.2"
+  },
+  "regression": {
+    "pytest": {"passed": 1046, "skipped": 4, "deselected": 17, "warnings": 3, "seconds": 49.35},
+    "playground_decision_dom": "passed",
+    "subtitle_frontend_tests": {"passed": 2},
+    "final_proxy_origin_and_memory_targeted_tests": {"passed": 19},
+    "cli_privacy_logging_e2e": {"passed": 9},
+    "idle_worker": {"idle_seconds": 185, "resumed": true, "released": true}
+  },
+  "privacy": {
+    "content_transport": "Bounded memory channels; browser range reads; no upload, PCM or request/result mailbox files",
+    "ipc": "Authenticated ephemeral loopback TCP, owned Windows Job process trees",
+    "python_worker_file_write_denied": true,
+    "speech_models_loaded_and_inferred": [
+      "qwen3-asr-1.7b", "whisper-large-v3", "whisper-large-v3-turbo",
+      "voxtral-mini-4b-realtime-2602", "qwen3.5-2b", "qwen3.5-4b", "translategemma-4b"
+    ],
+    "ocr": {
+      "ppocr_v6": {"cold": "passed", "warm_reuse": true, "released": true},
+      "minicpm_ocr": {"cold_load_seconds": 4.7881, "warm_reuse": true, "released": true}
+    },
+    "exports_disabled": true,
+    "dashboard_history_write_disabled": true,
+    "unverified_external_backends_and_jev": "rejected",
+    "os_native_write_trace_performed": false,
+    "boundary": "Application and managed components; not a guarantee about OS paging, hibernation, dumps, browser internals or caller shell redirection"
+  },
+  "real_browser": {
+    "function_first_navigation": "passed",
+    "console_errors": 0,
+    "mobile_horizontal_overflow": false,
+    "private_file_clip": {"audio_seconds": 26.0003125, "completed_rows": 4},
+    "deployed_normal_mode_file_clip": {"processed_seconds": 26.0, "completed_rows": 4, "exports_enabled": true, "mobile_privacy_badge_visible": true},
+    "wasapi_tail_before_manual_stop": {
+      "audio_seconds": 26.0003125,
+      "processed_seconds": 26.42,
+      "completed_rows": 4,
+      "still_listening": true
+    },
+    "browser_tab_capture": {
+      "native_getDisplayMedia_audioWorklet_websocket_inference": true,
+      "completed_rows": 3,
+      "audio_and_video_tracks_ended": true,
+      "consent_test": "Full Chromium chooser automated with test-only auto-select-tab flag; production invokes browser consent",
+      "native_consent_rejection_created_no_session": true,
+      "cancel_during_pending_consent_late_tracks_stopped": true
+    },
+    "native_cancel_release_seconds": 0.828,
+    "native_page_close_release_seconds": 0.329,
+    "full_mkv_default_delay": {
+      "decoded_audio_seconds": 659.7973125,
+      "processed_seconds": 659.8,
+      "native_contexts": 23,
+      "empty_contexts": 11,
+      "completed_translation_rows": 12,
+      "max_queued_frames": 40,
+      "final_queued_frames": 0,
+      "released": true,
+      "note": "Complete transport and cleanup coverage, not complete recognition accuracy"
+    }
+  },
+  "file_transport": {
+    "full_mkv": {"range_reads": 1602, "backward_reads": 1, "largest_read_bytes": 80258},
+    "public_mp4_moov_at_end": {"audio_seconds": 2.0, "passed": true}
+  },
+  "voxtral_resources": {
+    "same_worker_rounds": 12,
+    "audio_seconds_per_round": 30,
+    "round_end_threads": 2,
+    "round_end_cuda_allocated_bytes": 8867886592,
+    "round_end_cuda_reserved_bytes": 9281994752,
+    "round_end_audio_buffer_bytes": 0,
+    "peak_audio_buffer_bytes": 127600,
+    "growth_observed_between_rounds": false,
+    "scope": "Six minutes of input, faster-than-realtime processing; not an indefinite leak guarantee"
+  },
+  "voxtral_delay": {
+    "realtime_paced_12_second_clip": [
+      {"delay_ms": 480, "first_text_wall_seconds": 2.3023, "total_wall_seconds": 12.5448},
+      {"delay_ms": 2400, "first_text_wall_seconds": 4.2015, "total_wall_seconds": 13.2573}
+    ],
+    "japanese_clip_60_2_to_90_2": {
+      "delay_480_offline_chars": 0,
+      "delay_480_native_chars": 0,
+      "delay_2400_native_chars": 67,
+      "note": "Coverage improvement on one sample, not a word accuracy score"
+    },
+    "japanese_clip_180_6_to_210_6": {"delay_480_offline_chars": 2, "delay_480_native_chars": 2}
+  },
+  "recognition_findings": {
+    "qwen": {
+      "sample_seconds": 96,
+      "8_second_windows": {"count": 12, "non_japanese_language_labels": 6},
+      "16_second_windows": {"count": 6, "non_japanese_language_labels": 1},
+      "production_source_language": "auto",
+      "streaming": "Official SDK streaming requires vLLM; this Windows Transformers runtime uses segments",
+      "limits": "Burned-subtitle spot checks still show names, wordplay and acted-voice errors; language labels are not a word accuracy metric"
+    },
+    "whisper": {
+      "finding": "Cropping VAD removed some audible high-pitched dialogue and one opening window produced Thank you",
+      "change": "Conservative whole-window speech gate, keep original audio context, word timestamps and hallucination-silence handling",
+      "phrase_blacklist": false,
+      "limits": "Music, short speech and language confusion can still hallucinate; no claim of universal elimination"
+    }
+  },
+  "deployment": {
+    "url": "http://127.0.0.1:21431/playground/",
+    "listen_host": "127.0.0.1",
+    "remote_server_audio_default": false,
+    "privacy_enabled_on_regular_instance": false,
+    "privacy_flag": "--privacy-mode",
+    "isolated_private_test_port": 21439,
+    "isolated_private_test_server_stopped": true,
+    "existing_explicit_https_proxy_origin_policy": "preserved; in-process contract tested without opening a remote listener"
+  }
+}

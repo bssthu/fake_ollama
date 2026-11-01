@@ -13,6 +13,8 @@
   "playground_enabled": false,
   "playground_host": "127.0.0.1",
   "playground_port": 21431,
+  "playground_speech_config": null,
+  "playground_server_audio_remote_enabled": false,
   "decision_targets": [],
   "anthropic_upstreams": [
     {

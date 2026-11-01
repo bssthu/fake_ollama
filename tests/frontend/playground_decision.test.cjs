@@ -75,6 +75,7 @@ async function upload(name = 'fixture.png', mime = 'image/png') {
   assert.equal($('decisionSection').hidden, true);
   input('apiKey', 'fixture-secret');
   $('loadModels').click(); await settle();
+  input('function', 'decision', 'change');
   assert.equal(requests[0].options.headers.Authorization, 'Bearer fixture-secret');
   assert.equal($('decisionSection').hidden, false);
   assert.equal($('decisionThinkField').hidden, true);
@@ -240,12 +241,14 @@ async function upload(name = 'fixture.png', mime = 'image/png') {
   assert.equal($('send').disabled, false);
   waitForAbort = false;
 
+  input('function', 'chat', 'change');
   input('model', 'chat-fixture', 'change');
   assert.equal($('decisionSection').hidden, true);
   assert.equal($('decisionStateLabel').hidden, true);
   assert.equal($('chatParams').hidden, false);
   assert.equal($('mediaParams').hidden, true);
   assert.equal($('ttftMetric').hidden, false);
+  input('function', 'decision', 'change');
   input('model', 'fixture-decision', 'change');
   assert.equal(window.document.querySelectorAll('.decision-result').length, 2);
   $('clear').click(); await settle();

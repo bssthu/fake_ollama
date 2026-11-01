@@ -1,0 +1,4 @@
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+qwen-asr==0.0.6
+# qwen-asr pins transformers==4.57.6 and accelerate==1.12.0.

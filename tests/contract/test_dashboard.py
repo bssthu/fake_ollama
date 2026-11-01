@@ -43,6 +43,18 @@ def _app(settings: Settings) -> SimpleNamespace:
     return SimpleNamespace(state=SimpleNamespace(settings=settings))
 
 
+async def test_private_dashboard_reports_policy_without_touching_history(tmp_path, monkeypatch):
+    from fake_ollama.privacy import PRIVACY_MODE_ENV
+    monkeypatch.setenv(PRIVACY_MODE_ENV, '1')
+    path = tmp_path / 'history.json'
+    path.write_bytes(b'existing history must stay unchanged')
+    before = path.stat().st_mtime_ns
+    result = await DashboardState().data(_app(_settings(path)), range_seconds=60)
+    assert result['privacy']['enabled'] and result['privacy']['content_storage'] == 'memory_only'
+    assert path.read_bytes() == b'existing history must stay unchanged'
+    assert path.stat().st_mtime_ns == before
+
+
 def _model_snapshot() -> dict[str, object]:
     return {
         "backend": "ollama",

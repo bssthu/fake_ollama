@@ -299,6 +299,7 @@ td.errors { color: var(--danger); white-space: normal; }
   <div class="toolbar" id="rangeButtons"></div>
 </header>
 <main>
+  <div class="status" id="privacyStatus">隐私模式：正在获取服务端状态</div>
   <div class="status" id="status">loading</div>
   <section class="metrics">
     <div class="metric"><span>Free RAM</span><strong id="ramNow">-</strong></div>
@@ -944,6 +945,7 @@ async function loadData() {
     const resp = await managementFetch(`/dashboard/data?range_seconds=${selectedRange}`, {cache: 'no-store'});
     if (!resp.ok) throw new Error(await resp.text());
     latest = await resp.json();
+    $('privacyStatus').textContent = latest.privacy?.enabled ? '隐私模式：开启 · 内容仅在内存中处理' : '隐私模式：关闭';
     $('status').textContent = `updated ${new Date(latest.now * 1000).toLocaleString()}`;
     render();
   } catch (err) {

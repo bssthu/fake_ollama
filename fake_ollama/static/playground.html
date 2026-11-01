@@ -17,13 +17,12 @@
           <p>fake-ollama · 轻量、多能力、即时调试</p>
         </div>
       </div>
-      <div class="privacy">API key 与交互记录仅保存在当前页面内存</div>
+      <div class="privacy" id="privacyStatus" data-enabled="false" role="status">隐私模式：等待连接服务器</div>
     </header>
 
-    <main class="workspace">
-      <aside class="settings card">
+    <section class="card connection-panel">
         <div class="section-title">
-          <h2>连接与模型</h2>
+          <h2>连接与功能</h2>
           <span id="connectionStatus" class="status-dot">未连接</span>
         </div>
 
@@ -40,9 +39,50 @@
           <div id="authenticationHint" class="help">是否需要 key 由服务端访问策略决定。</div>
         </div>
 
-        <button id="loadModels" class="secondary" type="button">连接并获取模型列表</button>
+        <button id="loadModels" class="secondary" type="button">连接并获取功能列表</button>
 
-        <div class="field">
+<div class="field"><label for="function">功能</label><select id="function" disabled><option value="">先连接并获取功能列表</option></select></div>
+</section>
+    <section id="speechWorkspace" class="speech-workspace" hidden aria-label="即时语音翻译">
+      <aside class="card speech-settings">
+        <h2>即时语音翻译</h2>
+        <p class="help">自动识别每段语言，先显示原文，再输出译文。支持音频中途换语言及模型能力范围内的混合语言。</p>
+        <div class="field"><label for="speechAsr">语音识别模型</label><select id="speechAsr" disabled></select><div id="speechAsrNote" class="help"></div></div>
+        <div class="field"><label for="speechTranslator">文字翻译模型</label><select id="speechTranslator" disabled></select><div id="speechTranslatorNote" class="help"></div></div>
+        <div class="field"><label for="speechTarget">目标输出语言</label><input id="speechTarget" class="control" list="speechLanguages" value="zh" maxlength="12" placeholder="语言代码，例如 zh、en、ja"><datalist id="speechLanguages"><option value="zh">中文</option><option value="en">英语</option><option value="ja">日语</option><option value="ko">韩语</option><option value="fr">法语</option><option value="de">德语</option><option value="es">西班牙语</option><option value="ru">俄语</option><option value="pt">葡萄牙语</option><option value="ar">阿拉伯语</option><option value="hi">印地语</option><option value="it">意大利语</option><option value="vi">越南语</option><option value="th">泰语</option></datalist><div class="help">输入语言：auto · 不锁定开头检测的语言</div></div>
+        <div class="field"><label for="speechSource">音频来源</label><select id="speechSource"><option value="browser">这台电脑的共享音频（浏览器授权）</option><option value="loopback" selected>服务器系统音频</option><option value="file">视频 / 音频文件</option></select></div>
+        <div id="speechDeviceField" class="field"><label for="speechDevice">系统回放设备</label><select id="speechDevice"><option value="default">Windows 默认播放设备</option></select><button id="speechDevices" class="secondary" type="button">刷新播放设备</button><div class="help">读取运行 fake-ollama 的这台电脑的声音；不需要开启麦克风。</div></div>
+        <div id="speechFileField" class="field" hidden><label for="speechFile">选择视频或音频</label><input id="speechFile" type="file" accept="audio/*,video/*,.mkv,.flac,.m4a,.ogg,.wav,.mp3,.mp4,.webm"><div class="help">按需读取原始文件，不在服务器保存副本。</div></div>
+        <div id="speechBrowserNotice" class="help" hidden>开始时浏览器会弹出共享选择框，请显式勾选共享音频。仅传输音频，不上传画面。</div>
+        <div class="field"><label for="speechMode">识别方式</label><select id="speechMode"><option value="auto">模型推荐方式</option></select><div id="speechModeNote" class="help"></div></div>
+        <div class="field" id="speechDetectionField" hidden><label><input id="speechDetection" type="checkbox" checked>Whisper 非语音过滤</label><div class="help">减少静音、音乐中的幻觉字幕；若夸张声线或轻声台词被漏掉，可关闭后对比。</div></div>
+        <div id="speechStreamingSettings" hidden><div class="field"><label for="speechDelay">Voxtral 识别延迟（更长通常更准确）</label><select id="speechDelay"><option value="240">240 ms</option><option value="480" selected>480 ms</option><option value="960">960 ms</option><option value="1200">1200 ms</option><option value="2400">2400 ms</option></select></div><div class="field"><label for="speechContext">流式上下文上限（秒）</label><input id="speechContext" class="control" type="number" min="5" max="120" value="30"><div class="help">停顿时提交译文；持续讲话达到上限后提交并重建缓存。此处是资源上限，不是每次送入模型的音频长度。</div></div></div>
+        <div class="row parameter-row">
+          <div class="field" id="speechWindowField"><label for="speechWindow">最长音频段（秒）</label><input id="speechWindow" class="control" type="number" min="3" max="30" value="8"></div>
+          <div class="field"><label for="speechSilence">静音阈值</label><input id="speechSilence" class="control" type="number" min="0" max="0.1" step="0.001" value="0.003"></div>
+        </div>
+        <div class="help">优先在停顿处分段。声音较小时可降低能量阈值；设为 0 只关闭能量过滤。Qwen 推荐 16 秒窗口以提供更多语种判断上下文。短句、夸张声线、音乐和快速换语仍可能识别错误。</div>
+        <div id="speechReadiness" class="speech-notice" role="status">获取模型列表不会加载模型。</div>
+        <div class="speech-actions">
+          <button id="speechStart" class="primary" type="button" disabled>开始转写与翻译</button>
+          <button id="speechFinish" class="secondary" type="button" disabled>停止采集并处理余音</button>
+          <button id="speechCancel" class="stop" type="button" disabled>立即停止并释放模型</button>
+        </div>
+      </aside>
+      <div class="card speech-results">
+        <div class="section-title"><h2>原文与译文</h2><span id="speechStatus" role="status" aria-live="polite">未开始</span></div>
+        <div id="speechMetrics" class="help">等待音频输入</div>
+        <div id="speechError" class="speech-notice speech-error" role="alert" hidden></div>
+        <div class="speech-export"><button id="speechExportSrt" class="secondary" type="button" disabled>导出双语 SRT</button><button id="speechExportJson" class="secondary" type="button" disabled>导出 JSON</button></div>
+        <p class="help">时间为语句级位置，非逐字对齐。页面保留最近 2,000 段；普通模式可导出，隐私模式禁止保存字幕文件。</p>
+        <div id="speechCaptions" class="speech-captions" aria-label="字幕记录"><p class="help">识别后的原文会先出现，翻译完成后补入右侧。</p></div>
+      </div>
+    </section>
+
+    <main id="generalWorkspace" class="workspace">
+      <aside class="settings card">
+        <h2>模型与参数</h2>
+        <div class="field" id="modelField">
           <label for="model">模型</label>
           <select id="model" disabled>
             <option value="">先加载模型列表</option>
@@ -50,7 +90,7 @@
           <div id="capabilityList" class="capability-list" aria-label="模型能力"></div>
         </div>
 
-        <div class="field">
+        <div class="field" hidden>
           <label for="operation">调试能力</label>
           <select id="operation" disabled>
             <option value="">选择模型后自动识别</option>
@@ -330,5 +370,6 @@
     </main>
   </div>
   <script src="/playground/playground.js" defer></script>
+  <script src="/playground/speech.js" defer></script>
 </body>
 </html>

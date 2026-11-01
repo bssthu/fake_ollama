@@ -8,6 +8,19 @@ from fake_ollama.config import Settings
 from fake_ollama.server import create_app
 
 
+def test_private_playground_exposes_policy_and_marks_external_models_unavailable(monkeypatch):
+    from fake_ollama.privacy import PRIVACY_MODE_ENV
+    monkeypatch.setenv(PRIVACY_MODE_ENV, '1')
+    app = create_app(_settings())
+    with TestClient(app, base_url='http://127.0.0.1:21431', client=('127.0.0.1', 5000)) as client:
+        page = client.get('/playground/').text
+        assert '隐私模式：开启' in page
+        result = client.get('/playground/api/models', headers={'Authorization': 'Bearer key-a'}).json()
+        assert result['privacy']['enabled']
+        assert all(m['privacy_supported'] is False for m in result['models'])
+        assert all(op['configured'] is False for m in result['models'] for op in m['operations'])
+
+
 def _settings() -> Settings:
     return Settings(
         anthropic_upstreams=[

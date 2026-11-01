@@ -41,7 +41,8 @@ textarea:focus-visible, summary:focus-visible {
   margin: 0 auto;
   padding: 24px;
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-columns: 350px minmax(0, 1fr);
+  grid-template-rows: auto auto 1fr;
   gap: 18px;
 }
 
@@ -55,7 +56,7 @@ textarea:focus-visible, summary:focus-visible {
   justify-content: space-between;
 }
 
-.topbar { gap: 20px; }
+.topbar { grid-column: 1 / -1; gap: 20px; }
 .brand { gap: 12px; }
 .brand h1 { margin: 0; font-size: 18px; letter-spacing: -0.02em; }
 .brand p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
@@ -89,16 +90,16 @@ textarea:focus-visible, summary:focus-visible {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--ok);
-  box-shadow: 0 0 0 3px rgba(44, 120, 87, 0.12);
+  background: var(--muted);
 }
+.privacy[data-enabled="true"]::before { background: var(--ok); box-shadow: 0 0 0 3px rgba(44, 120, 87, 0.12); }
 
 .workspace {
-  min-height: 0;
-  display: grid;
-  grid-template-columns: 350px minmax(0, 1fr);
-  gap: 18px;
+  display: contents;
 }
+
+.settings, .speech-settings { grid-column: 1; grid-row: 3; min-width: 0; }
+.result, .speech-results { grid-column: 2; grid-row: 2 / span 2; min-width: 0; align-self: start; }
 
 .card {
   border: 1px solid var(--line);
@@ -643,9 +644,9 @@ details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px
 .actions button { min-height: 38px; }
 
 @media (max-width: 900px) {
-  .shell { padding: 14px; }
-  .privacy { display: none; }
-  .workspace { grid-template-columns: 1fr; }
+  .shell { padding: 14px; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; }
+  .topbar { flex-wrap: wrap; gap: 10px; }
+  .connection-panel, .settings, .speech-settings, .result, .speech-results { grid-column: 1; grid-row: auto; }
   .settings { position: static; max-height: none; }
   .result { min-height: 72vh; }
   .metrics { display: none; }
@@ -710,3 +711,28 @@ details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px
 .ocr-score { color: var(--accent); font-size: 12px; margin-top: 8px; }
 .ocr-result pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.7; max-height: 480px; overflow: auto; }
 .ocr-failure { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Speech workspace shares the Playground page and its in-memory credentials. */
+.speech-workspace { display:contents; }
+.speech-workspace[hidden], #generalWorkspace[hidden] { display:none; }
+.speech-settings, .speech-results { padding:22px; }
+.speech-settings { align-self:start; }
+.speech-results { min-height:calc(100vh - 108px); }
+.speech-settings .field { margin-top:16px; }
+.speech-settings h2, .speech-results h2 { margin-top:0; }
+.speech-settings select, .speech-settings input.control { width:100%; }
+.speech-actions { display:grid; gap:10px; margin-top:18px; }
+.speech-notice { margin-top:14px; padding:12px; border-radius:8px; background:#eef4fc; color:#254564; line-height:1.6; overflow-wrap:anywhere; }
+.speech-error { background:#fff0ed; color:#9e2d20; }
+.speech-export { display:flex; gap:8px; margin-top:18px; flex-wrap:wrap; }
+.speech-captions { max-height:75vh; min-height:260px; overflow-y:auto; margin-top:16px; }
+.speech-caption { border-top:1px solid #dfe6ef; padding:14px 0; }
+.speech-caption-meta { font-size:12px; color:#64748b; margin-bottom:8px; }
+.speech-caption-text { display:grid; grid-template-columns:1fr 1fr; gap:22px; }
+.speech-caption-text p { white-space:pre-wrap; overflow-wrap:anywhere; margin:0; line-height:1.7; }
+.speech-caption-text p:last-child { color:#155e75; }
+.speech-caption[data-state="translation_error"] p:last-child { color:#a33224; }
+@media (max-width:900px) { .speech-caption-text { grid-template-columns:1fr; gap:8px; } .speech-results { min-height:72vh; } }
+
+.connection-panel { grid-column: 1; grid-row: 2; padding: 20px; display: grid; gap: 17px; align-self: start; min-width: 0; }
+@media (max-width: 900px) { .connection-panel { grid-row: auto; } }
+.speech-caption[data-state="recognizing"] { opacity: .8; border-left: 3px solid var(--accent, #3278b5); }

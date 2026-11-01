@@ -189,6 +189,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        speech_manager = getattr(app.state, 'speech_manager', None)
+        if speech_manager is not None:
+            speech_manager.begin_shutdown()
+            await speech_manager.stop_if_owned()
         ocr_resident = getattr(app.state, 'ocr_resident', None)
         if ocr_resident is not None:
             ocr_resident.begin_shutdown()
@@ -246,6 +250,10 @@ def request_shutdown(app: FastAPI) -> None:
             if getattr(client, "stop_if_owned", None) is not None:
                 owned_clients.append(client)
 
+    speech_manager = getattr(app.state, 'speech_manager', None)
+    if speech_manager is not None:
+        speech_manager.begin_shutdown()
+        owned_clients.append(speech_manager)
     ocr_resident = getattr(app.state, 'ocr_resident', None)
     if ocr_resident is not None:
         ocr_resident.begin_shutdown()

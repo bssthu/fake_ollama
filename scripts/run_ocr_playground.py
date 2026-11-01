@@ -7,12 +7,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import uvicorn
 from fake_ollama.config import load_settings
 from fake_ollama.server import create_app
+from fake_ollama.privacy import configure_privacy_mode
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='config.json')
     parser.add_argument('--port', type=int, default=21431)
+    parser.add_argument('--privacy-mode', action='store_true')
     args = parser.parse_args()
+    configure_privacy_mode(args.privacy_mode)
     settings = load_settings(args.config)
     settings = settings.model_copy(update={'playground_enabled': True, 'playground_host': '127.0.0.1',
                                            'playground_port': args.port, 'admin_enabled': False,

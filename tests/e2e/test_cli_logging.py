@@ -120,8 +120,12 @@ class Server:
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 16, "stream": stream,
                 })
-                assert response.status_code == status, response.text
-                assert expected in response.text, response.text
+                if '--privacy-mode' in sys.argv:
+                    assert response.status_code == 409, response.text
+                    assert prompt not in response.text
+                else:
+                    assert response.status_code == status, response.text
+                    assert expected in response.text, response.text
 
 cli._ShutdownAwareServer = Server
 cli.main()
@@ -129,7 +133,7 @@ cli.main()
 
 
 @pytest.mark.parametrize("mode", ["default", "private", "private-custom-first", "private-custom-last", "legacy-disabled"])
-def test_cli_privacy_controls_files_without_changing_api_responses(settings, tmp_path, mode):
+def test_cli_privacy_controls_files_and_blocks_unverified_external_backends(settings, tmp_path, mode):
     config = settings.model_dump(mode="json")
     config.update(admin_enabled=False, dashboard_enabled=False, ollama_interfaces=[])
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")

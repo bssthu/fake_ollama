@@ -1,0 +1,120 @@
+{
+  "checked_at": "2026-10-31T23:44:58.179117+08:00",
+  "scope": "development, model downloads, offline and CPU validation only",
+  "asr_or_translation_model_loaded": false,
+  "cuda_initialized_in_dependency_import_checks": false,
+  "production_service_restarted": false,
+  "inference_enabled": false,
+  "validation": {
+    "full_offline_pytest": {
+      "passed": 1024,
+      "skipped": 4,
+      "deselected": 17,
+      "warnings": 3
+    },
+    "subsequent_speech_cancellation_regression": {
+      "passed": 18
+    },
+    "frontend_node": {
+      "passed": 2
+    },
+    "browser": "rendered Chromium with mock speech API; desktop and mobile, upload, original before translation, text escaping, export and cancel passed",
+    "cpu_audio": {
+      "stereo_48000_to_mono_16000": true,
+      "tail_preserved": true,
+      "invalid_media_rejected": true,
+      "loopback_devices_enumerated": 2,
+      "synthetic_long_file_seconds": 56,
+      "segments_consumed": 17,
+      "maximum_queued_segments": 4,
+      "silent_device_stop": true,
+      "temporary_audio_removed": true
+    }
+  },
+  "downloads": {
+    "files_verified": 58,
+    "bytes": 36272535869,
+    "errors": [],
+    "partial_files_remaining": [],
+    "models": [
+      {
+        "repo": "Qwen/Qwen3-ASR-1.7B",
+        "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+        "name": "qwen-asr",
+        "bytes": 4703112789,
+        "weight_sha256": {
+          "model-00001-of-00002.safetensors": "a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6",
+          "model-00002-of-00002.safetensors": "6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc"
+        }
+      },
+      {
+        "repo": "Qwen/Qwen3.5-4B",
+        "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        "name": "qwen-4b",
+        "bytes": 9342905899,
+        "weight_sha256": {
+          "model.safetensors-00001-of-00002.safetensors": "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61",
+          "model.safetensors-00002-of-00002.safetensors": "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188",
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        }
+      },
+      {
+        "repo": "Systran/faster-whisper-large-v3",
+        "revision": "edaa852ec7e145841d8ffdb056a99866b5f0a478",
+        "name": "whisper-v3",
+        "bytes": 3090837754,
+        "weight_sha256": {
+          "model.bin": "69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1"
+        }
+      },
+      {
+        "repo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+        "revision": "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+        "name": "whisper-turbo",
+        "bytes": 1621667428,
+        "weight_sha256": {
+          "model.bin": "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da"
+        }
+      },
+      {
+        "repo": "mistralai/Voxtral-Mini-4B-Realtime-2602",
+        "revision": "2769294da9567371363522aac9bbcfdd19447add",
+        "name": "voxtral",
+        "bytes": 8874375628,
+        "weight_sha256": {
+          "model.safetensors": "e745e4902df6a4c48f29f2f8dc1f6d0fb4cc73c7156bc45923451a5bcdfcd1d6",
+          "tekken.json": "8434af1d39eba99f0ef46cf1450bf1a63fa941a26933a1ef5dbbf4adf0d00e44"
+        }
+      },
+      {
+        "repo": "RedHatAI/translategemma-4b-it",
+        "revision": "7da9de35f146086cc1e45e75563c5d62a079aaf6",
+        "upstream": "google/translategemma-4b-it",
+        "upstream_revision": "10042cb0e6e7fdce748996a71dc3dc432a4e0c89",
+        "weights_match_upstream_sha256": true,
+        "name": "translategemma",
+        "bytes": 8639636371,
+        "weight_sha256": {
+          "model-00001-of-00002.safetensors": "6187566ec8d00990103cd9243b306aceaa352697abfa3bb6fcbc5ce7a64ce142",
+          "model-00002-of-00002.safetensors": "40c6a896b2275866e8bf56abc1da85f37a0d1d8fee824ad3008ea3231f4a3b70",
+          "tokenizer.json": "7d4046bf0505a327dd5a0abbb427ecd4fc82f99c2ceaa170bc61ecde12809b0c",
+          "tokenizer.model": "1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c"
+        }
+      }
+    ]
+  },
+  "reused_model": "J:/Projects/LLM_Models/Qwen/Qwen3.5-2B",
+  "moves": {
+    "directories": 7,
+    "files": 100,
+    "bytes": 546401195877,
+    "method": "same-volume directory rename; no model copy or backup",
+    "ocr_and_active_xolotl_references_exist": true
+  },
+  "remaining_validation": [
+    "Actual system audio transcription and mixed-language quality",
+    "GPU loading and all 4 ASR x 3 translator combinations",
+    "End-to-end latency, throughput, VRAM and 20-30 minute sustained run",
+    "Real model cancellation and GPU release"
+  ]
+}
