@@ -5,7 +5,7 @@
     return `${String(Math.floor(ms / 3600000)).padStart(2, '0')}:${String(Math.floor(ms / 60000) % 60).padStart(2, '0')}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')},${String(ms % 1000).padStart(3, '0')}`;
   }
   function subtitles(rows) {
-    return rows.filter(r => r.text).map((r, i) => `${i + 1}\n${timestamp(r.start)} --> ${timestamp(r.end)}\n${r.text}\n${r.translation || '[译文未完成]'}\n`).join('\n');
+    return rows.filter(r => r.text).map((r, i) => `${i + 1}\n${timestamp(r.start)} --> ${timestamp(r.end)}\n${r.text}\n${r.translation || '[译文未完成]'}${r.translation && r.translation_is_partial ? '\n[临时译文，尚未确认]' : ''}\n`).join('\n');
   }
   if (typeof module !== 'undefined' && module.exports) module.exports = { timestamp, subtitles };
   if (typeof document === 'undefined') return;
@@ -32,7 +32,7 @@
   }
   function controls() {
     const ready = state.catalog?.inference_enabled && !state.catalog?.busy && $('speechAsr').selectedOptions[0]?.disabled === false && $('speechTranslator').selectedOptions[0]?.disabled === false;
-    for (const id of ['speechAsr', 'speechTranslator', 'speechTarget', 'speechSource', 'speechDevice', 'speechDevices', 'speechFile', 'speechWindow', 'speechSilence', 'speechMode', 'speechDelay', 'speechContext', 'speechDetection']) $(id).disabled = state.busy;
+    for (const id of ['speechAsr', 'speechTranslator', 'speechTarget', 'speechSource', 'speechDevice', 'speechDevices', 'speechFile', 'speechWindow', 'speechSilence', 'speechMode', 'speechDelay', 'speechContext', 'speechTranslationInterval', 'speechDetection']) $(id).disabled = state.busy;
     $('speechStart').disabled = state.busy || !ready;
     $('speechCancel').disabled = !state.busy;
     $('speechFinish').disabled = !state.busy || !state.session || state.finishing;
@@ -83,6 +83,10 @@
   }
   function renderRow(row) {
     const list = $('speechCaptions');
+    if (row.state === 'discarded') {
+      state.rows.delete(row.id); state.nodes.get(row.id)?.remove(); state.nodes.delete(row.id);
+      return;
+    }
     const follow = list.scrollHeight - list.scrollTop - list.clientHeight < 90;
     if (!state.rows.size) list.replaceChildren();
     state.rows.set(row.id, row);
@@ -95,10 +99,14 @@
       state.nodes.set(row.id, node); list.append(node);
     }
     node.dataset.state = row.state;
-    node.firstChild.textContent = `${timestamp(row.start)} — ${timestamp(row.end)} · ${row.language || 'unknown'}${row.state === 'recognizing' ? ' · 流式识别中' : ''}${row.translation_latency_seconds !== undefined ? ` · 段尾到译文 ${row.translation_latency_seconds}s` : ''}`;
+    const progress = row.state === 'recognizing'
+      ? ` · 流式识别中${row.translation_in_progress ? ' · 翻译更新中' : row.error ? ' · 临时翻译失败，等待后续更新' : row.translation ? row.translation_pending ? ' · 临时译文，新内容待翻译' : ' · 临时译文' : ' · 等待翻译间隔'}`
+      : row.state === 'translating' ? ' · 确认最终译文中' : '';
+    node.firstChild.textContent = `${timestamp(row.start)} — ${timestamp(row.end)} · ${row.language || 'unknown'}${progress}${row.translation_latency_seconds !== undefined ? ` · 段尾到译文 ${row.translation_latency_seconds}s` : ''}`;
     node.lastChild.children[0].textContent = row.text;
-    node.lastChild.children[1].textContent = row.translation || (row.error ? `翻译失败：${row.error}` : row.state === 'recognizing' ? '等待语句提交…' : '翻译中…');
-    node.lastChild.children[1].title = (row.warnings || []).join('\n');
+    node.lastChild.children[1].textContent = row.translation || (row.error ? `翻译失败：${row.error}` : row.translation_in_progress || row.state !== 'recognizing' ? '翻译中…' : '等待翻译间隔…');
+    if (row.translation && row.state === 'translation_error') node.lastChild.children[1].textContent += `\n\n当前为临时译文，最终翻译失败：${row.error}`;
+    node.lastChild.children[1].title = [...(row.warnings || []), ...(row.error ? [row.error] : [])].join('\n');
     while (state.rows.size > 2000) {
       const oldest = state.rows.keys().next().value;
       state.rows.delete(oldest); state.nodes.get(oldest)?.remove(); state.nodes.delete(oldest);
@@ -190,6 +198,7 @@
         file_size: source === 'file' ? file.size : 0, segment_seconds: Number($('speechWindow').value),
         silence_threshold: Number($('speechSilence').value), asr_mode: $('speechMode').value,
         transcription_delay_ms: Number($('speechDelay').value), stream_context_seconds: Number($('speechContext').value),
+        partial_translation_interval_seconds: Number($('speechTranslationInterval').value),
         speech_detection: $('speechDetection').checked};
       const data = await api('/sessions', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(options)});
       if (!state.busy || generation !== state.generation) {

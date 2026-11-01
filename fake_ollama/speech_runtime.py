@@ -60,6 +60,12 @@ class SpeechSession:
         self.stream_start = self.stream_silence = 0
         self.stream_preroll = bytearray()
         self.stream_text = ''
+        self.stream_row = None
+        self.partial_task = None
+        self.partial_due = None
+        self.partial_wakeup = asyncio.Event()
+        self.stream_finalizing = False
+        self.preview_attempted = ''
         self.previous = ''
 
     @property
@@ -151,32 +157,96 @@ class SpeechSession:
         except Exception as exc:
             await self.frames.put(('eof', b'', None) if self.stopping else ('error', str(exc), None))
 
-    async def translate_row(self, result, start, end, overlap=False, captured_at=None):
+    async def translate_row(self, result, start, end, overlap=False, captured_at=None, row=None):
         text = remove_boundary_overlap(self.previous, result.get('text', ''), overlap)
         self.previous = result.get('text', '')
         if not text:
             self.empty_segments += 1
+            if row is not None:
+                self.publish({**row, 'state': 'discarded', 'text': '', 'translation': ''})
             return
         self.count += 1
-        row = {'id': self.count, 'start': start, 'end': end, 'text': text,
-               'language': result.get('language', 'unknown'), 'translation': '', 'state': 'translating',
-               'asr_seconds': result.get('seconds', 0), 'warnings': result.get('warnings', [])}
+        if row is None:
+            row = {'translation': '', 'translation_source': ''}
+        reuse = bool(row['translation'] and row.get('translation_source') == text)
+        row.update(id=self.count, start=start, end=end, text=text, state='translating',
+                   language=result.get('language', 'unknown'), asr_seconds=result.get('seconds', 0),
+                   translation_is_partial=bool(row['translation']), translation_pending=not reuse,
+                   translation_in_progress=not reuse)
+        row.pop('error', None)
         started = time.monotonic()
         if captured_at: row['source_latency_seconds'] = round(max(0., started - captured_at), 3)
         self.publish(row)
         self.status = 'translating'
         try:
-            translated = await self.translator.call({'op': 'translate', 'text': text,
-                        'target': self.payload.target_language, 'context': list(self.context)})
-            row.update(translated, state='complete', translation_seconds=translated['seconds'])
-            self.context.append({'source': text[-1200:], 'translation': translated['translation'][-1200:]})
-        except Exception as exc: row.update(state='translation_error', error=str(exc))
+            if not reuse:
+                translated = await self.translator.call({'op': 'translate', 'text': text,
+                            'target': self.payload.target_language, 'context': list(self.context)})
+                row.update(translated, translation_source=text, translation_seconds=translated['seconds'])
+            row.update(state='complete', translation_is_partial=False, translation_pending=False)
+            self.context.append({'source': text[-1200:], 'translation': row['translation'][-1200:]})
+        except (TimeoutError, EOFError, OSError):
+            # A transport failure leaves the reply stream unusable. End the
+            # session and release workers instead of consuming a stale reply.
+            raise
+        except Exception as exc:
+            row.update(state='translation_error', error=str(exc))
+        row['translation_in_progress'] = False
         row['processing_seconds'] = round(time.monotonic() - started + result.get('seconds', 0), 3)
         row['segment_duration'] = round(end - start, 3)
         if captured_at: row['translation_latency_seconds'] = round(max(0., time.monotonic() - captured_at), 3)
         self.publish(row)
 
+    def update_native_text(self, text, clock):
+        self.stream_text = text
+        if self.stream_row is None:
+            self.stream_row = {'id': self.count + 1, 'start': self.stream_start,
+                               'translation': '', 'translation_source': '', 'language': 'unknown',
+                               'translation_is_partial': True, 'translation_in_progress': False}
+        row = self.stream_row
+        row.update(text=text, end=clock, state='recognizing',
+                   translation_pending=row['translation_source'] != text)
+        self.publish(row)
+        # First dirty update starts a fixed wall-clock window. Later tokens
+        # replace its payload, not its deadline, so continuous speech cannot
+        # starve translation. There is only one active translation task.
+        if self.partial_due is None and text != self.preview_attempted:
+            self.partial_due = time.monotonic() + self.payload.partial_translation_interval_seconds
+        if self.partial_task is None or self.partial_task.done():
+            if self.partial_task is not None: self.partial_task.result()
+            self.partial_task = asyncio.create_task(self.translate_partial(row))
+
+    async def translate_partial(self, row):
+        while row is self.stream_row and not self.stream_finalizing and self.partial_due is not None:
+            delay = max(0., self.partial_due - time.monotonic())
+            if delay:
+                try: await asyncio.wait_for(self.partial_wakeup.wait(), delay)
+                except asyncio.TimeoutError: pass
+            if self.stream_finalizing: return
+            text = row['text']
+            self.partial_due = None
+            self.preview_attempted = text
+            if row['translation_source'] == text and row['translation']: continue
+            row['translation_in_progress'] = True
+            row.pop('error', None)
+            self.publish(row)
+            try:
+                translated = await self.translator.call({'op': 'translate', 'text': text,
+                            'target': self.payload.target_language, 'context': list(self.context)})
+            except (TimeoutError, EOFError, OSError):
+                raise
+            except Exception as exc:
+                row['error'] = str(exc)
+            else:
+                row.update(translated, translation_source=text, translation_seconds=translated['seconds'])
+            # Recognition may have advanced while translation was in flight.
+            # Keep its newer source text and identify the translated snapshot.
+            row.update(translation_in_progress=False, translation_is_partial=True,
+                       translation_pending=row['translation_source'] != row['text'])
+            self.publish(row)
+
     async def native_frame(self, pcm, clock, captured_at):
+        if self.partial_task is not None and self.partial_task.done(): self.partial_task.result()
         samples = array('h', pcm)
         rms = math.sqrt(sum(x*x for x in samples) / max(1, len(samples))) / 32768
         voiced = rms >= max(self.payload.silence_threshold, .00001)
@@ -189,22 +259,34 @@ class SpeechSession:
             self.stream_preroll.clear()
             self.stream_start = clock - len(pcm) / 32000
             self.stream_active, self.stream_silence = True, 0
+            self.stream_finalizing = False
+            self.partial_wakeup.clear()
+            self.preview_attempted = ''
         self.stream_silence = 0 if voiced else self.stream_silence + len(samples)
         result = await self.asr.call({'op': 'stream_push', 'delay_ms': self.payload.transcription_delay_ms}, pcm)
+        if self.stream_row is not None: self.stream_row['end'] = clock
         if result.get('text') and result['text'] != self.stream_text:
-            self.stream_text = result['text']
-            self.publish({'id': self.count + 1, 'start': self.stream_start, 'end': clock,
-                          'text': result['text'], 'translation': '', 'language': 'unknown', 'state': 'recognizing'})
+            self.update_native_text(result['text'], clock)
         if self.stream_silence >= 16000 * .8 or clock - self.stream_start >= self.payload.stream_context_seconds:
             await self.finish_native(clock, captured_at)
 
     async def finish_native(self, clock, captured_at=None):
         if self.stream_active:
+            self.stream_finalizing = True
+            self.partial_wakeup.set()
             result = await self.asr.call({'op': 'stream_finish'})
-            await self.translate_row(result, self.stream_start, clock, captured_at=captured_at)
+            if self.stream_row is not None and result.get('text'):
+                self.stream_row.update(text=result['text'], end=clock, state='translating',
+                                       translation_pending=self.stream_row['translation_source'] != result['text'])
+                self.publish(self.stream_row)
+            # Wake a pending timer immediately. Join an in-flight inference
+            # without cancelling its IPC; then translate the final revision.
+            if self.partial_task is not None: await self.partial_task
+            await self.translate_row(result, self.stream_start, clock, captured_at=captured_at, row=self.stream_row)
             self.stream_active = False
             self.stream_silence = 0
             self.stream_text = ''
+            self.stream_row = self.partial_task = self.partial_due = None
 
     async def run(self):
         pending = bytearray()
@@ -270,6 +352,12 @@ class SpeechSession:
             if self.cleaned: return
             self.source_done = True
             errors = []
+            if self.partial_task is not None:
+                self.partial_task.cancel()
+                with suppress(asyncio.CancelledError, Exception): await self.partial_task
+                self.partial_task = None
+            self.stream_row = self.partial_due = None
+            self.stream_text = ''
             if self.source_task and not self.source_task.done():
                 self.source_task.cancel()
                 try: await self.source_task

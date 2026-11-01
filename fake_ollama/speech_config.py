@@ -24,6 +24,7 @@ class SpeechRequest(BaseModel):
     asr_mode: Literal['auto', 'segments', 'native_streaming'] = 'auto'
     transcription_delay_ms: int = 480
     stream_context_seconds: int = Field(default=30, ge=5, le=120)
+    partial_translation_interval_seconds: float = Field(default=2, ge=.5, le=30)
     speech_detection: bool = True
 
     @field_validator('transcription_delay_ms')

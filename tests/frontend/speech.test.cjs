@@ -16,3 +16,9 @@ test('bilingual export preserves mixed source and visibly marks failed translati
   assert.match(result, /Hello 你好 bonjour\n你好，你好，你好/);
   assert.match(result, /00:00:02,100 --> 00:00:03,000\nStill visible\n\[译文未完成\]/);
 });
+
+test('export identifies provisional translations until the source is finalized', () => {
+  const row = {start: 0, end: 10, text: 'An unfinished sentence', translation: '未完成的句子', translation_is_partial: true};
+  assert.match(subtitles([row]), /\[临时译文，尚未确认\]/);
+  assert.doesNotMatch(subtitles([{...row, translation_is_partial: false}]), /临时译文/);
+});

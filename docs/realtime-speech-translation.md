@@ -15,7 +15,7 @@
 | 浏览器所在电脑的声音 | 点击开始后调用浏览器共享选择框；用户必须显式授权并分享音频，不上传画面。支持范围由浏览器与系统决定 |
 | 服务器正在播放的声音 | Windows WASAPI loopback；可选默认播放设备或指定回放设备，不使用麦克风；无新数据包约 0.8 秒时也提交尾段 |
 | 视频、音频文件 | 浏览器按解码器要求读取文件范围，PyAV 只解码首条音轨为 16 kHz 单声道 PCM；支持 seek，不整段读入内存或保存副本；默认文件上限 2 GiB |
-| 字幕延迟 | Whisper 默认最长 8 秒；Qwen 推荐 16 秒，窗口可设 3–30 秒；Voxtral 原生流式显示增量原文，在停顿或上下文上限处翻译 |
+| 字幕延迟 | Whisper 默认最长 8 秒；Qwen 推荐 16 秒，窗口可设 3–30 秒；Voxtral 显示增量原文，按独立间隔更新临时译文，在停顿或上下文上限处确认最终译文 |
 | 输入语言未知、中途切换 | 不强制源语种，每个音频段重新执行自动识别；Whisper 开启 multilingual |
 | 一段中混合多种语言 | Qwen ASR 和 Whisper turbo 已通过中英合成音频切换样本；其他模型及短促换语仍可能漏句，详见实测边界 |
 | 选择目标语言 | 输入语言代码，例如 zh、en、ja、pt-BR；不支持的 TranslateGemma 方向会保留原文并显示翻译错误 |
@@ -25,6 +25,12 @@
 | 取消与释放 | 停止采集并处理余音，或立即停止并释放；页面断开 45 秒、服务关闭时清理自有进程 |
 
 Voxtral 默认使用 Transformers 原生增量编码与解码，维护同一语句的编码器、卷积及解码器缓存，不会每收到一块音频就重新识别整段。页面可选 240、480、960、1200、2400 ms 识别延迟（默认 480 ms）；参数只修改进程内处理器，不修改模型文件。流式上下文默认上限 30 秒，可设 5–120 秒，停顿或到达上限后提交并重建缓存。识别延迟参数不是包含采集、网络、翻译的总延迟保证。该上游流式接口仍为实验性 API，因此本机固定已验证的 Transformers 5.22.1。
+
+“临时译文更新间隔”独立于上述两个参数，默认 2 秒，可设 0.5–30 秒。首次出现尚未翻译的新原文后开始按真实时间计时，持续新增内容不会重置截止时间；到期后翻译当前语句的最新完整原文，更新同一字幕行。翻译执行期间识别继续，已有译文保留，并标注为临时译文或新内容待翻译。处理较慢时只合并保留最新待译内容，不累积逐词翻译任务。文件按最快速度解码，因此该间隔不是文件时间轴上的分段长度。
+
+停顿、达到上下文上限或结束时，不再等待翻译间隔：等待正在进行的翻译结束，再校正最终原文对应的译文；若已经翻译过完全相同的原文则直接复用。只有最终确认的字幕进入后续翻译上下文。立即停止或断开会取消定时与正在执行的翻译，并释放受管进程。JSON 请求字段为 `partial_translation_interval_seconds`，仅原生流式模式使用；导出 SRT 时仍未确认的译文会明确标记为临时译文。
+
+三个翻译模型均已用真实 Voxtral 文件输入验证，同一条字幕在结束前多次更新临时译文；默认 2 秒间隔下，首轮约在原文出现后 2.8–3.4 秒显示。这里是 26 秒样本按处理速度解码的观察值，不包含模型冷启动，不等同于实时采集的总延迟保证。回归及取消回收记录见 [流式临时译文验证](reports/speech-partial-translation-results.json)。
 
 Qwen 官方 `init_streaming_state` / `streaming_transcribe` 当前只支持 vLLM；本机 Windows Transformers 运行时未启用该接口，页面明确标注分段模式。保留 auto 输入，推荐 16 秒窗口、至少约 8 秒语境后在停顿提交；播放结束、断流和手动停止仍立即提交短尾段。
 
@@ -153,6 +159,7 @@ services/ocr/.venv/Scripts/python.exe scripts/validation/speech_refactor_browser
 services/ocr/.venv/Scripts/python.exe scripts/validation/speech_browser_capture.py
 services/ocr/.venv/Scripts/python.exe scripts/validation/ocr_private_memory.py
 services/ocr/.venv/Scripts/python.exe scripts/validation/speech_disconnect.py
+services/ocr/.venv/Scripts/python.exe scripts/validation/speech_partial_translation.py
 .venv/Scripts/python.exe scripts/validation/speech_file_transport.py
 ```
 

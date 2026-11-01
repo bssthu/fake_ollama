@@ -56,7 +56,11 @@
         <div id="speechBrowserNotice" class="help" hidden>开始时浏览器会弹出共享选择框，请显式勾选共享音频。仅传输音频，不上传画面。</div>
         <div class="field"><label for="speechMode">识别方式</label><select id="speechMode"><option value="auto">模型推荐方式</option></select><div id="speechModeNote" class="help"></div></div>
         <div class="field" id="speechDetectionField" hidden><label><input id="speechDetection" type="checkbox" checked>Whisper 非语音过滤</label><div class="help">减少静音、音乐中的幻觉字幕；若夸张声线或轻声台词被漏掉，可关闭后对比。</div></div>
-        <div id="speechStreamingSettings" hidden><div class="field"><label for="speechDelay">Voxtral 识别延迟（更长通常更准确）</label><select id="speechDelay"><option value="240">240 ms</option><option value="480" selected>480 ms</option><option value="960">960 ms</option><option value="1200">1200 ms</option><option value="2400">2400 ms</option></select></div><div class="field"><label for="speechContext">流式上下文上限（秒）</label><input id="speechContext" class="control" type="number" min="5" max="120" value="30"><div class="help">停顿时提交译文；持续讲话达到上限后提交并重建缓存。此处是资源上限，不是每次送入模型的音频长度。</div></div></div>
+        <div id="speechStreamingSettings" hidden>
+          <div class="field"><label for="speechDelay">Voxtral 识别延迟（更长通常更准确）</label><select id="speechDelay"><option value="240">240 ms</option><option value="480" selected>480 ms</option><option value="960">960 ms</option><option value="1200">1200 ms</option><option value="2400">2400 ms</option></select></div>
+          <div class="field"><label for="speechTranslationInterval">临时译文更新间隔（秒）</label><input id="speechTranslationInterval" class="control" type="number" min="0.5" max="30" step="0.5" value="2"><div class="help">出现新原文后开始计时，到期翻译当前内容；持续讲话也会更新。语句结束时校正最终译文。</div></div>
+          <div class="field"><label for="speechContext">流式上下文上限（秒）</label><input id="speechContext" class="control" type="number" min="5" max="120" value="30"><div class="help">停顿时确认最终译文；持续讲话达到上限后确认并重建缓存。此上限不影响临时译文的更新间隔。</div></div>
+        </div>
         <div class="row parameter-row">
           <div class="field" id="speechWindowField"><label for="speechWindow">最长音频段（秒）</label><input id="speechWindow" class="control" type="number" min="3" max="30" value="8"></div>
           <div class="field"><label for="speechSilence">静音阈值</label><input id="speechSilence" class="control" type="number" min="0" max="0.1" step="0.001" value="0.003"></div>

@@ -1,0 +1,33 @@
+{
+  "date": "2026-11-01",
+  "feature": "Independently timed provisional translations during native streaming ASR",
+  "interval_seconds": {"default": 2, "minimum": 0.5, "maximum": 30},
+  "semantics": {
+    "clock": "Wall time from the first untranslated source update; subsequent tokens do not postpone the deadline",
+    "pending_work": "One active translation; latest source revision coalesced for the next update",
+    "finalization": "Wake pending timer, publish final source, join in-flight translation, translate final revision or reuse an exact match",
+    "history": "Only finalized source/translation pairs enter later translation context",
+    "privacy": "Existing memory-only transport and startup privacy policy preserved"
+  },
+  "regression": {
+    "full_pytest": {"passed": 1061, "skipped": 4, "deselected": 17, "seconds": 53.78},
+    "final_source_visibility_targeted": {"passed": 12},
+    "subtitle_frontend": {"passed": 3},
+    "playground_decision_dom": "passed"
+  },
+  "real_gpu_browser": {
+    "privacy_enabled": true,
+    "asr": "voxtral-mini-4b-realtime-2602",
+    "input": "Existing 26-second Japanese clip from the user-provided test video; file processing, not realtime pacing",
+    "stream_context_limit_seconds": 30,
+    "translation_interval_seconds": 2,
+    "translations": [
+      {"model": "qwen3.5-2b", "preview_updates": 3, "first_preview_after_first_text_seconds": 2.812, "final_rows": 1},
+      {"model": "qwen3.5-4b", "preview_updates": 3, "first_preview_after_first_text_seconds": 3.015, "final_rows": 1},
+      {"model": "translategemma-4b", "preview_updates": 3, "first_preview_after_first_text_seconds": 3.422, "final_rows": 1}
+    ],
+    "cancel_during_preview_update": {"released": true, "seconds": 0.828, "remaining_audio_queue": 0},
+    "console_errors": 0,
+    "timing_scope": "Includes timer, inference and browser delivery after first source text; excludes model loading. Small-sample timings, not a universal latency guarantee."
+  }
+}
