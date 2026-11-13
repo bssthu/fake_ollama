@@ -665,6 +665,8 @@ Playground 的预计显存、预计内存和上下文会随实际 Planner 选择
 
 ### 本机 MiniMax H3 768p 后端
 
+需要保留量化入口并增加 16 位高精度版本时，参见 [BF16 双入口配置与模型下载](config/examples/comfyui/minimax_h3_bf16.md)。该方案为 Pruned BF16 DiT + BF16 文本编码器，支持显存与内存之间动态卸载。
+
 #### 模型与路径
 
 仓库内置 `minimax_h3` preset，并在示例配置中把它作为独立 ComfyUI target 暴露为
