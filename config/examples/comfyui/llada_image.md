@@ -61,7 +61,8 @@ cost.
 Enable Playground and expose the two models on the intended interface, then open
 `http://127.0.0.1:21431/playground/`. A direct local connection can leave the key
 empty when a loopback anonymous model interface exposes them; otherwise enter
-that interface's token. Load models, choose a LLaDA model and expand **请求参数**.
+that interface's token. Click **连接并获取功能列表**, choose **图片生成** or
+**图片编辑**, select a LLaDA model and expand **请求参数**.
 The dedicated ComfyUI page is `http://127.0.0.1:21482/` while that runtime is running.
 
 Initial validation before the memory optimization on 2026-09-08 used an RTX 4090

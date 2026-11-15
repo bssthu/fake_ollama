@@ -1,6 +1,6 @@
 # scripts 使用说明
 
-这里提供 fake_ollama API 调用示例和 ComfyUI 工作流构建工具。命令均在仓库根目录执行。
+这里提供 fake_ollama API 调用示例、ComfyUI 工作流构建、可选环境准备和验证工具。命令均在仓库根目录执行。
 
 MiniMax H3-Image 的 W4A8 / BF16 权重下载使用 `setup_h3_image.py`，支持断点续传和 SHA-256 校验；
 双精度入口、2K / 4K 预设及模型复用方式见 [部署说明](../config/examples/comfyui/minimax_h3_image.md)。
@@ -18,6 +18,18 @@ API 调用示例正常使用时不需要手动传 `--base-url` 和 `--api-key`�
 `--model` 必须是所选接口 `/v1/models` 返回的公开 ID；仅设置 source alias 不会自动产生同名的裸 ID。
 [H3 Ref2VA 构建工具](#h3-ref2va-原生工作流) 只写出工作流 JSON，不读取 API 配置或凭据。
 主服务启动参数见 [CLI 使用说明](../docs/cli.md)。
+
+## 环境准备与验证入口
+
+| 工具 | 用途与说明 |
+| --- | --- |
+| `setup_h3_bf16.py` | 下载并校验 H3 视频 Pruned BF16 DiT 与文本编码器；[双入口配置](../config/examples/comfyui/minimax_h3_bf16.md) |
+| `setup_h3_image.py` | 下载并校验 H3-Image 两种精度 DiT 和图像 VAE，复用已有文本编码器；[部署说明](../config/examples/comfyui/minimax_h3_image.md) |
+| `install_h3_guides.py` | 检查固定版本的关键帧补丁，只有 `--apply` 才安装；[适用版本与回滚](../services/comfyui_h3_guides/README.md) |
+| `setup_ocr_models.py` / `run_ocr_playground.py` | 下载 MiniCPM/Jev 权重，或仅启动本机 Playground；完整 OCR 环境与配置见 [OCR 说明](../services/ocr/README.md) |
+| `setup_speech_runtime.ps1` / `configure_speech.py` | 安装隔离语音环境，创建语音配置并更新已有主配置；不会启用 Playground 或推理，见[配置步骤](../docs/realtime-speech-translation.md#配置与启动) |
+| `setup_speech_models.py` / `download_speech_ranges.py` | 创建下载计划并校验模型文件，或按已有计划并发续传；见[下载说明](../docs/realtime-speech-translation.md#下载和校验) |
+| `validation/` | 本机 OCR、语音、视频和浏览器验证；不少脚本会调用真实模型，环境与素材要求见对应功能文档，不属于默认离线测试 |
 
 ## 0. Mage-VL 本机视频分析：`examples/call_mage_vl_video.py`
 

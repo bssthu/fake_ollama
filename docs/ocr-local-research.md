@@ -1,6 +1,6 @@
 # MiniCPM-OCR、Jev 与 Clipaste OCR 本机调研
 
-2026-10-29；Windows / RTX 4090 24GB。已下载、接入并实际推理。入口为 [本机 Model Playground](http://127.0.0.1:21431/playground/)，OCR 与 Jev 直接出现在主页面模型和能力选择中，运行和配置说明见 [services/ocr](../services/ocr/README.md)。本次没有修改 Clipaste 工程或运行中的 Clipaste。
+2026-10-29；Windows / RTX 4090 24GB。本文保留当时的下载、接入及真实推理结果，不代表当前服务状态。入口为 [本机 Model Playground](http://127.0.0.1:21431/playground/)；当前页面先选 OCR 功能，再选择识别引擎和复核模型，运行、隐私模式和配置说明见 [services/ocr](../services/ocr/README.md)。本次没有修改 Clipaste 工程或运行中的 Clipaste。
 
 ## 能力与接入边界
 

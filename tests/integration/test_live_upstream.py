@@ -1,9 +1,11 @@
 """Live integration tests against the configured upstream.
 
 These tests are skipped automatically unless ``FAKE_OLLAMA_TEST_BASE_URL``
-and ``FAKE_OLLAMA_TEST_AUTH_TOKEN`` are set in the environment (or in
-``.env``). The two variables are used only as a presence signal: the
-actual upstream and credentials come from the active ``config.json``.
+and ``FAKE_OLLAMA_TEST_AUTH_TOKEN`` are set in the process environment.
+Neither pytest nor the server loads ``.env`` automatically. The two variables
+are presence signals only: actual upstreams and credentials come from the
+active JSON config (``FAKE_OLLAMA_CONFIG`` or ``./config.json``). Default test
+selection excludes integration tests; select them with ``-m integration``.
 """
 
 from __future__ import annotations
@@ -20,10 +22,8 @@ from fake_ollama.server import create_app
 
 @pytest.fixture
 def live_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
-    # Live tests run whenever upstream creds are configured (env vars
-    # or .env). They DO surface real regressions in the Anthropic <->
-    # Ollama translation layer, so we intentionally do NOT hide them
-    # behind an extra opt-in flag.
+    # Explicit environment signals opt into real upstream traffic when the
+    # integration marker is selected. Actual credentials come from settings.
     if not os.getenv("FAKE_OLLAMA_TEST_BASE_URL") or not os.getenv(
         "FAKE_OLLAMA_TEST_AUTH_TOKEN"
     ):

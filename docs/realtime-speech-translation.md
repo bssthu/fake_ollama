@@ -2,9 +2,9 @@
 
 在 `/playground/` 先选择功能，再选择该功能的模型。语音翻译、OCR、对话等共用连接与功能入口；语音内部选择一个识别模型和一个翻译模型。三种音源为浏览器显式授权的共享音频、服务器 Windows 系统回放、用户选择的音视频文件。
 
-用户于 2026-11-01 允许使用 GPU 后，已启用本机 `config/local/speech.json` 中的 `inference_enabled`。初版分段实现的四种 ASR 与三种翻译器共 12 个组合已完成真实 GPU 推理；本轮另验证七个模型的隐私内存路径、三种音源和 Voxtral 原生流式，具体范围见下方记录。默认选择 Whisper large-v3 turbo + Qwen3.5 2B，目标语言为中文；输入语言始终自动检测。查看页面、模型列表和设备列表不会加载模型。
+2026-11-01 的本机验收启用了 `config/local/speech.json` 中的 `inference_enabled`。初版分段实现的四种 ASR 与三种翻译器共 12 个组合完成了真实 GPU 推理；后续改造另验证七个模型的隐私内存路径、三种音源和 Voxtral 原生流式，具体范围见下方记录。这些是历史验收结果，当前是否可用以本机配置和页面就绪状态为准。默认选择 Whisper large-v3 turbo + Qwen3.5 2B，目标语言为中文；输入语言始终自动检测。查看页面、模型列表和设备列表不会加载模型。
 
-常用的 [Playground](http://127.0.0.1:21431/playground/) 保持只监听本机。初版分段实现的 GPU 与生命周期记录保留在 [历史验收记录](reports/speech-live-results.json)；功能优先、内存传输和原生流式的验证记录见 [本轮改造记录](reports/speech-memory-streaming-results.json)。历史计时不代表新版的流式延迟。
+[Playground](http://127.0.0.1:21431/playground/) 的默认监听地址是本机回环，需显式启用。初版分段实现的 GPU 与生命周期记录保留在 [历史验收记录](reports/speech-live-results.json)；功能优先、内存传输和原生流式的验证记录见 [内存与流式改造记录](reports/speech-memory-streaming-results.json)。历史计时不代表新版的流式延迟。
 
 六个新增模型共 58 个文件、36,272,535,869 字节已下载并通过完整哈希校验；复用已有 Qwen3.5-2B，无残留下载分片。最初不占用显卡的开发记录保留在 [开发验证记录](reports/speech-development-results.json)，其中的“未进行模型测试”只描述第一阶段，不代表后续 GPU 验收状态。
 
@@ -64,22 +64,30 @@ Google 官方 TranslateGemma 仓库需要账号授权。本机未配置授权凭
 
 ## 配置与启动
 
-软件依赖与主网关环境隔离：
+以下命令从仓库根目录执行，先按[快速开始](../README.md#快速开始)准备主环境与有效的 `config.json`。软件依赖与主网关环境隔离：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup_speech_runtime.ps1
 .venv/Scripts/python.exe scripts/configure_speech.py
 ```
 
-`configure_speech.py` 仅在配置不存在时创建 `config/local/speech.json`，并写入主配置的 `playground_speech_config`，不启用推理，不重启服务。已有配置不会被重复运行覆盖。Qwen ASR 环境单独固定官方依赖，避免改变主网关和其他模型服务的软件版本。
+`configure_speech.py` 仅在语音配置不存在时创建 `config/local/speech.json`，然后读取并更新仓库根目录已有的 `config.json`，写入 `playground_speech_config`；它不启用 Playground 或推理，也不重启服务。已有语音配置时脚本直接退出，不修改主配置；此时需手动补充下方路径字段。生成的配置使用本机 J/K 盘模型路径，其他机器须调整 `python`、各模型 `path` 和所需的运行环境路径。Qwen ASR 环境单独固定官方依赖，避免改变主网关和其他模型服务的软件版本。
 
-新安装默认不启用推理；准备好本地环境与权重后，将语音配置中的 `inference_enabled` 改为 `true`，正常重启/部署含新路由的 fake-ollama 代码。本机已经启用。单纯的语音配置内容在请求时重新读取；主配置的路径变更遵循项目已有配置加载规则。
+新安装默认不启用推理；准备好本地环境与权重后，将语音配置中的 `inference_enabled` 改为 `true`。主配置还需设置 `playground_enabled: true`，或启动时传 `--playground-port 21431`。语音配置内容在请求时重新读取，已有会话保留启动时的配置，修改后应重新开始会话；主配置的路径变更通过 Admin 保存重载，监听器启用或改址则需重启。
 
 ```json
 {
   "playground_speech_config": "I:/Projects/fake_ollama/config/local/speech.json"
 }
 ```
+
+例如在本机开启页面并启用隐私模式：
+
+```powershell
+.venv/Scripts/python.exe -m fake_ollama --config ./config.json --playground-port 21431 --privacy-mode
+```
+
+打开页面，点击“连接并获取功能列表”，选择“即时语音翻译”，再选择识别模型、翻译模型和音源。页面显示模型文件、运行环境与推理开关的就绪状态；首次点击开始才加载模型。OCR 与语音使用各自配置中的引擎清单，不要求把这些引擎加入聊天模型 `exposed_models`。
 
 音频任务继承 Playground 认证，WebSocket 首帧携带当前页面凭据，校验同源及真实监听端口；会话绑定凭据和页面随机标识。文件读取只接受所选文件的字节，不接受服务器任意文件路径或网络 URL，解码器禁止外部协议。兼容 HTTP 上传只在内存中保留最多 32 MiB，大文件使用页面按需读取。
 
@@ -99,7 +107,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup_speech_runtime
 - 每段显示处理耗时；系统回放另显示采集段尾到译文发布的延迟，不含设备缓冲及约 0–0.2 秒的页面推送间隔。文件按最快处理速度解码，有界预读会保持非零积压，这不是实时声源持续落后。
 - 模型返回空文字时，页面累计显示空结果段数；这可能是静音或音乐，也可能是漏识别，不能把已处理秒数当作识别覆盖率。
 
-## 本轮内存与流式实测
+## 内存与流式实测（2026-11-01）
 
 2026-11-01 的完整离线回归、真实浏览器和 GPU 记录见 [本轮改造记录](reports/speech-memory-streaming-results.json)。验证包含七个模型在隐私模式下加载推理，PP-OCR 与 MiniCPM OCR 的内存识别、复用和释放；浏览器原生音频共享、拒绝授权、授权等待期间取消；真实 WASAPI 播放结束后自动提交尾段。
 
@@ -146,11 +154,14 @@ Windows 实测发现进度文件替换与结果邮箱读取/删除存在短暂�
 
 20 分钟测试采样的总显存峰值为 10,478 MiB，测试服务及子进程工作集峰值约 2,923 MiB；结束后只剩网关进程，工作集回落至约 86 MiB。真实异常路径检查包括：未结束 HTTP 上传约 0.004 秒可取消，加载中取消约 0.219 秒，页面失联约 46.3 秒自动回收，两个模型已加载时服务退出约 0.408 秒。损坏媒体报错后、正常停止、刷新和关闭页面均验证了资源释放。
 
-当前重跑脚本（会使用真实模型；先确保显卡可用）：
+## 当前验证命令
+
+下列脚本会使用真实模型；先准备各脚本所需素材，并确保显卡可用。`speech_server.py` 默认读取仓库根目录的 `config.json`，仅启动 `127.0.0.1:21439` 的测试 Playground，不修改配置文件；可用 `--config` 指定另一个包含 OCR/语音路径和访问权限的测试配置。下列浏览器与 OCR 脚本默认使用该测试端口：
 
 ```powershell
 $env:PYTHONPATH = (Get-Location).Path
 $env:PYTHONUTF8 = '1'
+New-Item -ItemType Directory -Force .tmp/speech-live | Out-Null
 .venv/Scripts/python.exe scripts/validation/speech_refactor_models.py --models voxtral-mini-4b-realtime-2602 --streaming --privacy --repeat 12 --seconds 30
 # 在单独终端启动隔离服务；验证结束通过 stop-server 文件正常关闭。
 .venv/Scripts/python.exe scripts/validation/speech_server.py --privacy-mode
@@ -162,6 +173,8 @@ services/ocr/.venv/Scripts/python.exe scripts/validation/speech_disconnect.py
 services/ocr/.venv/Scripts/python.exe scripts/validation/speech_partial_translation.py
 .venv/Scripts/python.exe scripts/validation/speech_file_transport.py
 ```
+
+验证结束后，在另一个终端执行 `New-Item -ItemType File -Force .tmp/speech-live/stop-server`，请求测试服务正常退出。测试素材与各验证脚本依赖仍需提前准备；模型验收命令不属于默认离线测试。
 
 浏览器脚本使用已有 OCR Playwright 环境。`speech_browser_capture.py` 使用完整 Chromium 和仅供测试的自动选择标签页开关，实际执行 `getDisplayMedia`、AudioWorklet、WebSocket、ASR 与翻译；另用浏览器原生拒绝授权开关验证不创建会话。产品代码始终需要用户点击并授权，不携带这些测试开关。
 

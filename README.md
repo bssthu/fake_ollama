@@ -94,7 +94,7 @@ ComfyUI 请求取消、超时或提交应答丢失后，会核查 `/history` 和
 
 Thinking 回查仅匹配同一凭据主体、后端、上游模型和完整规范化历史中的确切 assistant 轮次；不会用“最近一条”或相似文本补齐。明确提供的 reasoning 优先。缓存最多 512 项、保留 15 分钟，重载即失效。Anthropic 来源默认 `allow_unsigned_thinking: false`、`missing_thinking_policy: "omit"`；需要无签名 reasoning 的兼容端应显式开启前者，也可将缺失策略设为 `"error"`。网关保留收到的 signature，但不会伪造 signature。
 
-整改证据、逐阶段测试和残余边界见 [整改清单](docs/remediation.md)。默认测试排除 integration/e2e/gpu；Windows 隔离进程测试另行运行。真实 GPU、付费上游、POSIX 进程树及本轮浏览器视觉验收未执行。
+整改证据、逐阶段测试和当时的验证边界见 [整改清单](docs/remediation.md)。该记录属于 2026-10-17 的阶段验收，不代表当前全仓库的验证状态。默认测试排除 integration/e2e/gpu；Windows 隔离进程测试另行运行。后续 OCR、语音、StartLux 与媒体模型的真实推理和浏览器验证范围，分别记录在对应功能文档中。
 
 ## 快速开始
 
@@ -359,7 +359,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 | `qwen_image_edit_aio` | Qwen-Image-Edit 整合检查点（如 Qwen-Rapid-AIO） | `CheckpointLoaderSimple` 一次加载 UNet+CLIP+VAE；文生图用 `CLIPTextEncode`，图生图用 `TextEncodeQwenImageEditPlus`（参考图经 conditioning 注入，编辑 `denoise=1.0`） |
 | `sensenova_u1` | SenseNova-U1-8B（自定义节点 `ComfyUI_SenseNova_U1`） | 融合模型节点 + 融合采样节点；分辨率走 `target_pixels` 比例桶（请求 `size` 映射到最近比例，实际输出为该桶原生尺寸） |
 | `joyai_echo` | JoyAI Echo（自定义节点 `ComfyUI_JoyAI_Echo`） | 内置 T2V + 多参考图 I2V；公开尺寸、seed、帧数、FPS、prefetch、分块解码与模型流式加载；默认使用 256² / 17 帧安全调试预设 |
-| `minimax_h3` | MiniMax H3 Base / Ref2VA | 内置 T2V、首帧 I2V、首尾帧 FL2VA、末帧 L2VA 和 Ref2VA；Base / Ref2VA 使用各自的 Pruned INT8 ConvRot DiT，共用 Qwen3-VL-32B NVFP4-AWQ |
+| `minimax_h3` | MiniMax H3 Base / Ref2VA | 内置 T2V、首帧 I2V、首尾帧 FL2VA、末帧 L2VA 和 Ref2VA；默认使用各自的 Pruned INT8 ConvRot DiT，共用 Qwen3-VL-32B NVFP4-AWQ；可用 `static_inputs` 配置独立 BF16 入口 |
 | `minimax_h3_image` | MiniMax H3-Image | 6 步文生图与最多 16 张参考图编辑；2K / 4K 预设，支持 W4A8 与 Pruned BF16 权重覆盖 |
 
 当前内置模型的推荐公开参数如下；表中默认值来自对应 target 配置，因而 API 缺省行为、
@@ -372,6 +372,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 | SenseNova-U1 | 原生宽高比桶、`n`、`seed`、`steps`、`cfg`；不显示 workflow 没有输入的 sampler/scheduler/denoise | 1:1、8 steps、CFG 1；实际像素由模型的原生比例桶决定 |
 | JoyAI Echo | `size`、`seed`、`num_frames`、`fps`、`prefetch_count`、`enable_tile`、`enable_streaming` | 安全调试：256²、17 帧、8 FPS、prefetch 1、分块解码开；帧数必须为 `8k+1`，尺寸至少 256 且为 32 的倍数 |
 | MiniMax H3 | `size`、`seed`、`steps`、`sampler_name`、`scheduler`、`num_frames`、`fps`，以及 H3 Context-IR 的模式/Planner 参数 | 1344×768、124 帧、24 FPS、20 steps、`res_multistep` / `simple`；帧数必须为 `17k+5` |
+| MiniMax H3-Image | `size`、`seed`；编辑另接收最多 16 张参考图 | 2048²，可选 4096²；工作流固定 6 steps、CFG 1、`euler` / `simple`，采样参数不开放覆盖 |
 
 Playground 的图片生成、图片编辑和视频生成另有 **生成份数**（1～20）控制。它不会放大
 单次 API 请求的 `n`，而是把每份作为独立的 `n=1` 请求串行排队：前一份完成并立即展示后，
@@ -386,7 +387,7 @@ Seed 时仍由 target 的 `seed_mode` 决定。H3 `prompt_mode=auto` 若首份�
 > 修复，会分别表现为勾选分块解码仍发生显存不足，或报
 > `unsupported operand type(s) for +: 'generator' and 'int'`。
 
-图片 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` / `<preset>_i2i.json`，视频则对应 T2V / I2V / FL2VA / L2VA / Ref2VA workflow。要接入**其它** ComfyUI 模型，提供 API 格式 workflow JSON，再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可；支持 `t2i`、`i2i`、`video`、`i2v`、`fl2va`、`l2va`、`ref2va` 七种绑定模式。
+多数图片 preset 对应 `fake_ollama/workflows/<preset>_t2i.json` / `<preset>_i2i.json`；H3-Image 的文生图与编辑共用 `minimax_h3_image.json`，由代码按参考图数量连接 conditioning 节点。视频则对应 T2V / I2V / FL2VA / L2VA / Ref2VA workflow。要接入**其它** ComfyUI 模型，提供 API 格式 workflow JSON，再用 `bindings`（逻辑参数 → `[{node, input}]`）和 `static_inputs`（固定值，如模型文件名）声明落点即可；支持 `t2i`、`i2i`、`video`、`i2v`、`fl2va`、`l2va`、`ref2va` 七种绑定模式。
 
 > **客户端可能按模型名判断是否图片模型**：部分客户端（如 CherryStudio）靠模型 id 的正则/子串匹配来决定走聊天接口还是 `/v1/images/*`——只认 `z-image*` / `qwen-image*` / `flux*` / `sd*` 等已知图片模型名。若把图片模型暴露成它不认识的名字（如 `sensenova`），它会当普通聊天模型发到 `/v1/chat/completions`，被 fake_ollama 以 400「use /v1/images/...」拒绝。对策：在 `exposed_models[*].alias` 里给这类模型起一个**包含已知图片模型关键词的别名**（例如 `sensenova-z-image`）；这只改客户端看到的 id，后端 target 与 `model_profiles` 仍按真实模型名匹配，不受影响。
 
@@ -898,8 +899,13 @@ Ref2VA 至少需要一张参考图或一段参考视频。视频需预处理为 
 | `playground_host` / `playground_port` | | `127.0.0.1` / `21431` | Playground 独立 listener；局域网访问时将 host 改为 `0.0.0.0`，修改后需重启进程 |
 | `playground_trusted_proxy_ips` | string[] | `[]` | 允许匿名 Playground 经代理访问时，代理的实际直连 IP；不使用转发头推断 |
 | `playground_allowed_origins` | string[] | `[]` | 与可信代理配套的精确公开 origin，例如 `https://models.example.com`；不能包含路径或尾部 `/` |
+| `playground_ocr_config` | string? | `null` | [OCR 隔离环境配置](services/ocr/README.md)的 JSON 路径；未设置时不提供 OCR 功能 |
+| `playground_speech_config` | string? | `null` | [即时语音翻译配置](docs/realtime-speech-translation.md)的 JSON 路径；推理还需该文件中 `inference_enabled: true` |
+| `playground_server_audio_remote_enabled` | bool | `false` | 是否允许有 Playground 权限的远程页面采集服务器系统声音；不改变监听地址或免除认证 |
 
-启用后打开 `http://127.0.0.1:21431/playground/`。本机直连且存在绑定回环地址的匿名模型接口时，可留空 API key；否则输入所选 interface 的 `access_tokens` 之一，加载它暴露的模型。页面按 capabilities/operations 提供聊天、视觉输入、视频分析、图片生成、图片编辑、视频生成或 Decision 模式，并按实际参数 schema 显示控制项。图片可粘贴、拖放或从文件选择；视频分析支持本地视频和手机 / PC 摄像头。摄像头按 `segment_seconds` 连续录制可独立解码的片段，录制与 Mage-VL 推理并行，GPU 请求串行；推理落后时只保留最新一个待处理片段并显示丢弃数。单段实时输出最多使用 128 个 token，且不执行整体总结。
+启用后打开 `http://127.0.0.1:21431/playground/`。本机直连且存在绑定回环地址的匿名模型接口时，可留空 API key；否则输入所选 interface 的 `access_tokens` 之一。点击“连接并获取功能列表”，先选功能、再选模型。页面按 capabilities/operations 提供聊天、视觉输入、视频分析、图片生成、图片编辑、视频生成或 Decision 模式；配置隔离环境后还可使用 OCR 和即时语音翻译，并按实际参数 schema 显示控制项。图片可粘贴、拖放或从文件选择；视频分析支持本地视频和手机 / PC 摄像头。摄像头按 `segment_seconds` 连续录制可独立解码的片段，录制与 Mage-VL 推理并行，GPU 请求串行；推理落后时只保留最新一个待处理片段并显示丢弃数。单段实时输出最多使用 128 个 token，且不执行整体总结。
+
+OCR 和语音的模型清单来自各自配置文件，独立于聊天模型的 `exposed_models`；获准使用 Playground 的接口可访问已配置的这些功能。两个路径相对网关工作目录解析，建议填写绝对路径；仅填写路径不会启用 Playground 监听器，也不会安装依赖或下载模型。
 
 手机访问时，把 `playground_host` 设为 `0.0.0.0`，重启 fake-ollama 后打开 `http://<PC 局域网 IP>:21431/playground/`，并按需放行 Windows 防火墙的 TCP 21431 入站。这里的 HTTP 方案仅完成应用链路：主流手机浏览器通常只在 HTTPS 安全上下文中开放 `getUserMedia`，因此未配置 HTTPS 时可能看得到页面但无法取得摄像头权限；PC 上的 `http://localhost` 通常可直接使用。不要把 Playground 端口直接暴露到互联网。
 
@@ -1007,7 +1013,7 @@ pytest tests/unit/test_owned_process_tree.py -m e2e
 pytest -m integration
 ```
 
-`tests/conftest.py` 不读取开发机 `.env`，在缺少环境凭据时自动跳过 `@pytest.mark.integration` 用例。普通测试使用临时合成配置，不读取项目根目录的真实 `config.json`。
+`tests/conftest.py` 不读取开发机 `.env`，在缺少上述两个环境变量时自动跳过 `@pytest.mark.integration` 用例。这两个变量仅作为显式启用信号，值不会被用作 URL 或 token；实际上游和凭据来自 `FAKE_OLLAMA_CONFIG` 指定的 JSON，未指定则读取工作目录的 `config.json`。运行 live 测试前应选定专用测试配置。普通测试使用临时合成配置，不读取项目根目录的真实 `config.json`。
 
 ## 手动验证示例
 

@@ -1,16 +1,16 @@
 # 本机 OCR 与 Jev
 
-入口：[Model Playground](http://127.0.0.1:21431/playground/)。OCR 已并入主页面，共用 API key、图片上传/粘贴、运行/停止及交互记录。连接后在模型列表选择 MiniCPM、PP-OCR、Hunyuan，能力选“识别”或“低分重识别”；选择“OCR 多模型对比”可同时比较，选择“OCR 候选复核”可复核已有候选。复核模型在单独的下拉框中选择。旧 `/playground/ocr` 地址跳转到主页面。
+入口：[Model Playground](http://127.0.0.1:21431/playground/)。OCR 已并入主页面，共用 API key、图片上传/粘贴、运行/停止及交互记录。点击“连接并获取功能列表”，先选择“OCR 识别 / 可选复核”或“OCR → 复核 → 低分重识别”，再选择 MiniCPM、PP-OCR、Hunyuan 引擎；“OCR 多模型对比”依次运行多个引擎，“OCR 候选复核”用于复核已有候选。复核模型在单独的下拉框中选择。旧 `/playground/ocr` 地址跳转到主页面。
 
-“连接并获取模型列表”只读取元数据，不加载权重。页面显示当前认证方式：实际本机监听、同源本机访问且配置存在本机匿名接口时可留空 key；填入无效 key 会被拒绝，不会退回匿名。模型在执行任务时加载。
-连接时可使用现有模型 API 的 token，不是管理 token；若原有配置允许本机匿名入口，在受信任 loopback 上也可留空。页面不会持久保存凭据、原图或候选；工作进程的临时文件在完成、错误或取消后清理。
+获取功能列表只读取元数据，不加载权重。页面显示当前认证方式：实际本机监听、同源本机访问且配置存在本机匿名接口时可留空 key；填入无效 key 会被拒绝，不会退回匿名。模型在执行任务时加载。
+连接时可使用现有模型 API 的 token，不是管理 token；若原有配置允许本机匿名入口，在受信任 loopback 上也可留空。页面不会持久保存凭据、原图或候选；普通模式下工作进程的临时文件在完成、错误或取消后清理，隐私模式改用内存传输。
 
 安装和实测结果：[OCR 调研与本机对比](../../docs/ocr-local-research.md)。
 
 ## 运行
 
 本机配置为 `config/local/ocr.json`；主配置中的 `playground_ocr_config` 指向它。
-完整服务启动后可直接使用此页面。仅需本机 Playground 时，在项目根目录运行：
+完整服务还需启用 `playground_enabled`，或启动时传 `--playground-port 21431`。仅需本机 Playground 时，在项目根目录运行：
 
 ```powershell
 .venv\Scripts\python.exe scripts\run_ocr_playground.py --config config.json
@@ -56,7 +56,17 @@ API：`GET /playground/api/ocr/models` 读取本机文件就绪状态、`worker_
 `mode` 支持 `recognize/compare/score/auto`；`score` 另传字符串数组 `candidates`，可传 `engines: []`。`verifier` 是配置中的 ID，省略或 `null` 表示不复核；`auto/score` 必填。原布尔字段 `verify` 已由该字段替代。未知复核 ID 返回 422，不可用模型返回 503，均不会启动工作进程。
 响应包含 `results`（各候选的文字、有效分数或失败原因、耗时）、`best_index`、`decision`（`accept/review/unverified`）和 `retry_count`。最大 6 个识别引擎、8 个候选、单图 16 MP / 单边 8192 px；页面文件限制 12 MB。
 
-网关不导入 PyTorch、Pillow 或 ONNX。通过 `python` 配置项启动独立 `fake_ollama.ocr_worker`，使用原有 Windows Job / POSIX 进程树管理。每次任务独占 OCR 队列；忙时返回 409；最多 900 秒。`keep_loaded` 默认 false，保持每阶段卸载、每次任务退出工作进程；为 true 时使用常驻工作进程及私有文件信箱，不额外开放服务端口。每轮图片/结果临时文件照常删除；Jev 渲染浏览器仍按每次评分创建和释放，模型权重保留。取消、断连、超时或工作进程故障时清理整个所属进程树；配置变化会重建工作进程。不会停止其他服务的进程。
+网关不导入 PyTorch、Pillow 或 ONNX。通过 `python` 配置项启动独立 `fake_ollama.ocr_worker`，使用原有 Windows Job / POSIX 进程树管理。每次任务独占 OCR 队列；忙时返回 409；最多 900 秒。`keep_loaded` 默认 false，每次任务结束后退出工作进程；为 true 时保留模型供后续任务复用。取消、断连、超时或工作进程故障时清理整个所属进程树；下一次任务发现配置变化时重建工作进程。不会停止其他服务的进程。
+
+普通模式通过临时文件传递请求、图片和结果；保留模型时使用常驻工作进程及私有文件信箱，每轮内容文件仍会删除。Jev 渲染浏览器按每次评分创建和释放，模型权重可保留。启用 `--privacy-mode` 后，识别与不带复核的对比使用内存图像和经随机密钥鉴权的回环 TCP 通道，不创建这些内容文件；临时监听在自有子进程连接后关闭。`keep_loaded` 仍控制任务后是否保留模型。
+
+隐私模式下，Jev 渲染复核、自动重试及未通过隐私检查的引擎/自定义参数不可用，API 返回 409，不会退回磁盘处理。可这样启动专用页面：
+
+```powershell
+.venv\Scripts\python.exe scripts\run_ocr_playground.py --config config.json --privacy-mode
+```
+
+隐私开关由服务端启动参数决定，不能在页面关闭；日志和受管组件的完整边界见 [CLI 说明](../../docs/cli.md#日志)。
 
 Jev 直接使用 GGUF 的 `/v1/systemone` 分类接口：`state` 是候选文字，`files` 顺序必须为原图、候选渲染图，`questions.consistency` 为 `choice`、类别 `0/1`。只接受两类归一化概率中的 `1`，不能把它当文本生成模型。渲染调用固定版本 OpenBMB `RenderPool`，带本地 KaTeX 与语法预检查；阻断候选的网络资源请求，拒绝可执行 HTML。
 
@@ -118,4 +128,4 @@ services\ocr\.venv\Scripts\python.exe scripts\validation\ocr_browser.py
 services\ocr\.venv\Scripts\python.exe scripts\validation\ocr_retention.py
 ```
 
-浏览器验证使用真实 Chromium 的无头渲染，包含识别、评分、一次重试、取消。合成样本不是用户真实截图集，不应据此宣称整体精度排名。
+首条命令使用离线测试；后续脚本生成样本或调用本机模型/浏览器。隐私模式内存识别、保留和释放的真实验证入口为 `scripts/validation/ocr_private_memory.py`，需先按[语音验证说明](../../docs/realtime-speech-translation.md#当前验证命令)启动隔离端口的隐私模式测试服务。浏览器验证使用真实 Chromium 的无头渲染，包含识别、评分、一次重试、取消。合成样本不是用户真实截图集，不应据此宣称整体精度排名。
