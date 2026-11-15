@@ -339,7 +339,7 @@ COMFYUI_TARGET_ITEM_SCHEMA: List[Dict[str, Any]] = [
     {"key": "cwd", "type": "string", "default": None,
      "description": "执行 start_command / stop_command 时使用的工作目录"},
     {"key": "preset", "type": "string", "default": "z_image_turbo",
-     "description": "Declarative workflow preset：z_image_turbo、qwen_image_edit_aio、sensenova_u1、joyai_echo、minimax_h3；提供自定义 workflow path + bindings 时使用 custom/comfyui_api。"},
+     "description": "Declarative workflow preset：z_image_turbo、qwen_image_edit_aio、sensenova_u1、joyai_echo、minimax_h3、minimax_h3_image；提供自定义 workflow path + bindings 时使用 custom/comfyui_api。"},
     {"key": "bindings", "type": "json", "default": None,
      "description": "Optional JSON mapping of request fields to workflow node inputs, keyed by mode: t2i, i2i, video, i2v, fl2va, l2va, ref2va."},
     {"key": "static_inputs", "type": "json", "default": None,

@@ -1,6 +1,10 @@
 # scripts 使用说明
 
 这里提供 fake_ollama API 调用示例和 ComfyUI 工作流构建工具。命令均在仓库根目录执行。
+
+MiniMax H3-Image 的 W4A8 / BF16 权重下载使用 `setup_h3_image.py`，支持断点续传和 SHA-256 校验；
+双精度入口、2K / 4K 预设及模型复用方式见 [部署说明](../config/examples/comfyui/minimax_h3_image.md)。
+
 `examples/call_*.py` 调用示例默认读取仓库根目录的 `config.json`：
 
 - `base_url`：使用第一个 `api_interfaces` 的 `host` / `port`

@@ -151,7 +151,9 @@ def add_reference_inputs(graph: dict, node: str, slot: str, names: list[str], *,
             graph[components] = {"class_type": "GetVideoComponents", "inputs": {"video": [load, 0]}}
             inputs[f"{slot}.ref_video_{i}"] = [components, 0]
         else:
-            inputs[f"{slot}.ref_image_{i}"] = [load, 0]
+            key = (f"image_{i + 1}" if graph[node]["class_type"] == "MiniMaxH3ImageConditioning"
+                   else f"ref_image_{i}")
+            inputs[f"{slot}.{key}"] = [load, 0]
 
 
 def add_keyframes(graph: dict, guides: list[tuple[int, str]]) -> None:

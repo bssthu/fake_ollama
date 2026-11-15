@@ -1,0 +1,133 @@
+{
+  "comfyui_targets": [
+    {
+      "name": "minimax-h3-image-comfyui",
+      "model": "minimax-h3-image",
+      "preset": "minimax_h3_image",
+      "base_url": "http://127.0.0.1:21484",
+      "auto_start": true,
+      "start_command": "\"C:/path/to/H3-Image/.venv/Scripts/python.exe\" -s main.py --listen 127.0.0.1 --port 21484 --reserve-vram 2 --vram-headroom 3 --cache-none --disable-pinned-memory --bf16-text-enc --fp32-vae --disable-all-custom-nodes --offline --extra-model-paths-config \"C:/path/to/H3-Image/extra_model_paths.yaml\"",
+      "cwd": "C:/path/to/H3-Image/ComfyUI",
+      "min_width": 1024,
+      "default_width": 2048,
+      "max_width": 4096,
+      "width_modulo": 32,
+      "min_height": 1024,
+      "default_height": 2048,
+      "max_height": 4096,
+      "height_modulo": 32,
+      "default_steps": 6,
+      "default_cfg": 1,
+      "default_sampler_name": "euler",
+      "default_scheduler": "simple",
+      "default_edit_denoise": 1,
+      "max_batch_size": 1,
+      "max_reference_images": 16,
+      "output_prefix": "fake_ollama/minimax-h3-image",
+      "startup_timeout_seconds": 300,
+      "prompt_timeout_seconds": 7200,
+      "idle_timeout_seconds": 600
+    },
+    {
+      "name": "minimax-h3-image-bf16-comfyui",
+      "model": "minimax-h3-image-bf16",
+      "preset": "minimax_h3_image",
+      "base_url": "http://127.0.0.1:21484",
+      "auto_start": true,
+      "start_command": "\"C:/path/to/H3-Image/.venv/Scripts/python.exe\" -s main.py --listen 127.0.0.1 --port 21484 --reserve-vram 2 --vram-headroom 3 --cache-none --disable-pinned-memory --bf16-text-enc --fp32-vae --disable-all-custom-nodes --offline --extra-model-paths-config \"C:/path/to/H3-Image/extra_model_paths.yaml\"",
+      "cwd": "C:/path/to/H3-Image/ComfyUI",
+      "static_inputs": {
+        "t2i": {
+          "1": {
+            "unet_name": "minimax_h3_image_pruned_bf16.safetensors"
+          },
+          "2": {
+            "clip_name": "qwen3vl_32b_minimax_h3_bf16.safetensors"
+          }
+        },
+        "i2i": {
+          "1": {
+            "unet_name": "minimax_h3_image_pruned_bf16.safetensors"
+          },
+          "2": {
+            "clip_name": "qwen3vl_32b_minimax_h3_bf16.safetensors"
+          }
+        }
+      },
+      "min_width": 1024,
+      "default_width": 2048,
+      "max_width": 4096,
+      "width_modulo": 32,
+      "min_height": 1024,
+      "default_height": 2048,
+      "max_height": 4096,
+      "height_modulo": 32,
+      "default_steps": 6,
+      "default_cfg": 1,
+      "default_sampler_name": "euler",
+      "default_scheduler": "simple",
+      "default_edit_denoise": 1,
+      "max_batch_size": 1,
+      "max_reference_images": 16,
+      "output_prefix": "fake_ollama/minimax-h3-image-bf16",
+      "startup_timeout_seconds": 300,
+      "prompt_timeout_seconds": 14400,
+      "idle_timeout_seconds": 600
+    }
+  ],
+  "model_profiles": [
+    {
+      "model": "minimax-h3-image",
+      "target": "minimax-h3-image-comfyui",
+      "capabilities": [
+        "image_generation",
+        "image_edit"
+      ],
+      "context_length": 4096,
+      "estimated_vram_gb": 16,
+      "estimated_memory_gb": 40,
+      "request_vram_headroom_gb": 1,
+      "min_free_vram_gb": 2,
+      "vram_cleanup_policy": "unload",
+      "exclusive_gpu": true,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    },
+    {
+      "model": "minimax-h3-image-bf16",
+      "target": "minimax-h3-image-bf16-comfyui",
+      "capabilities": [
+        "image_generation",
+        "image_edit"
+      ],
+      "context_length": 4096,
+      "estimated_vram_gb": 18,
+      "estimated_memory_gb": 48,
+      "request_vram_headroom_gb": 1,
+      "min_free_vram_gb": 2,
+      "vram_cleanup_policy": "unload",
+      "exclusive_gpu": true,
+      "thinking_mode": "disabled",
+      "show_thinking": false
+    }
+  ],
+  "api_interfaces": [
+    {
+      "name": "api",
+      "host": "127.0.0.1",
+      "port": 21435,
+      "exposed_models": [
+        {
+          "model": "minimax-h3-image",
+          "target": "minimax-h3-image-comfyui",
+          "alias": "minimax-h3-image"
+        },
+        {
+          "model": "minimax-h3-image-bf16",
+          "target": "minimax-h3-image-bf16-comfyui",
+          "alias": "minimax-h3-image-bf16"
+        }
+      ]
+    }
+  ]
+}

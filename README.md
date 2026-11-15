@@ -328,6 +328,8 @@ llama.cpp server 进程模型：**一个 target = 一个模型 = 一个端口**�
 
 LLaDA-Image Base / Turbo 的社区 INT8 ComfyUI 接入见 [配置说明](config/examples/comfyui/llada_image.md) 和 [双模型配置样例](config/examples/comfyui/llada_image.json)。两版均支持 Playground 文生图、单参考图编辑和真实节点参数调整。
 
+MiniMax H3-Image 的 W4A8 / Pruned BF16 双精度入口见 [部署说明](config/examples/comfyui/minimax_h3_image.md) 和 [配置样例](config/examples/comfyui/minimax_h3_image.json)。支持 2K / 4K 原生文生图、参考图编辑和 Playground 分辨率预设，使用独立新版 ComfyUI 与内存卸载。
+
 视频 workflow 既可以使用内置 `joyai_echo` preset，也可以使用
 `custom` / `comfyui_api` + `video_workflow_path` / `image_to_video_workflow_path`。
 请求字段分别绑定在 `bindings.video`（文生视频）和 `bindings.i2v`（图生视频）；
@@ -358,6 +360,7 @@ ComfyUI workflow 图片模型：一个 target 负责一个公开图片模型名�
 | `sensenova_u1` | SenseNova-U1-8B（自定义节点 `ComfyUI_SenseNova_U1`） | 融合模型节点 + 融合采样节点；分辨率走 `target_pixels` 比例桶（请求 `size` 映射到最近比例，实际输出为该桶原生尺寸） |
 | `joyai_echo` | JoyAI Echo（自定义节点 `ComfyUI_JoyAI_Echo`） | 内置 T2V + 多参考图 I2V；公开尺寸、seed、帧数、FPS、prefetch、分块解码与模型流式加载；默认使用 256² / 17 帧安全调试预设 |
 | `minimax_h3` | MiniMax H3 Base / Ref2VA | 内置 T2V、首帧 I2V、首尾帧 FL2VA、末帧 L2VA 和 Ref2VA；Base / Ref2VA 使用各自的 Pruned INT8 ConvRot DiT，共用 Qwen3-VL-32B NVFP4-AWQ |
+| `minimax_h3_image` | MiniMax H3-Image | 6 步文生图与最多 16 张参考图编辑；2K / 4K 预设，支持 W4A8 与 Pruned BF16 权重覆盖 |
 
 当前内置模型的推荐公开参数如下；表中默认值来自对应 target 配置，因而 API 缺省行为、
 `/playground/api/models` 和 Playground 使用同一个值：

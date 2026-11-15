@@ -754,7 +754,7 @@ class ComfyUIClient:
             refs = [(image_bytes, filename or "input.png")]
         ref_limit = self._image_ref_limit(spec)
         if ref_limit is not None and len(refs) > ref_limit:
-            if mode == "ref2va" or self._workflow_config.get("preset") == "minimax_h3":
+            if mode == "ref2va" or self._workflow_config.get("preset") in {"minimax_h3", "minimax_h3_image"}:
                 raise ValueError(f"{mode} accepts at most {ref_limit} reference image(s)")
             refs = refs[:ref_limit]
         if video_inputs and not spec.binds("reference_videos"):

@@ -36,8 +36,10 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(root: Path, name: str, workers: int = 6, direct_cdn: bool = False) -> dict:
-    size, expected = FILES[name]
+def download(root: Path, name: str, workers: int = 6, direct_cdn: bool = False,
+             *, repo: str = REPO, revision: str = REVISION,
+             artifacts: dict | None = None) -> dict:
+    size, expected = (FILES if artifacts is None else artifacts)[name]
     dest = root / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".partial")
@@ -45,7 +47,7 @@ def download(root: Path, name: str, workers: int = 6, direct_cdn: bool = False) 
         if dest.stat().st_size != size or sha256(dest) != expected:
             raise ValueError(f"Existing file differs; refusing to overwrite: {dest}")
     else:
-        url = f"https://huggingface.co/{REPO}/resolve/{REVISION}/{name}"
+        url = f"https://huggingface.co/{repo}/resolve/{revision}/{name}"
         if direct_cdn:
             response = httpx.head(url, follow_redirects=False, timeout=60)
             if not response.is_redirect:

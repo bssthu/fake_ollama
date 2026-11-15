@@ -361,7 +361,35 @@ _MINIMAX_H3_REF2VA = _minimax_h3_spec(
     max_image_refs=9,
 )
 
+_H3_IMAGE_BINDINGS = {
+    "prompt": [("5", "prompt")],
+    "width": [("5", "width")],
+    "height": [("5", "height")],
+    "seed": [("6", "seed")],
+}
+_H3_IMAGE_PRESETS = (
+    OperationPreset("h3_image_2k", "2K · 2048×2048", {"size": "2048x2048"},
+                    "6 步原生生成，默认分辨率。", recommended=True),
+    OperationPreset("h3_image_4k", "4K · 4096×4096", {"size": "4096x4096"},
+                    "6 步原生生成；显存和耗时高于 2K。"),
+)
+_H3_IMAGE_T2I = WorkflowSpec(
+    path=WORKFLOW_DIR / "minimax_h3_image.json",
+    bindings=_H3_IMAGE_BINDINGS,
+    max_image_refs=0,
+    operation_presets=_H3_IMAGE_PRESETS,
+)
+_H3_IMAGE_I2I = WorkflowSpec(
+    path=WORKFLOW_DIR / "minimax_h3_image.json",
+    bindings={**_H3_IMAGE_BINDINGS, "reference_images": [("5", "images")]},
+    max_image_refs=16,
+    operation_presets=_H3_IMAGE_PRESETS,
+)
+
 PRESETS: Dict[str, Preset] = {
+    "minimax_h3_image": Preset(
+        name="minimax_h3_image", t2i=_H3_IMAGE_T2I, i2i=_H3_IMAGE_I2I,
+    ),
     "qwen_image_edit_aio": Preset(
         name="qwen_image_edit_aio", t2i=_QWEN_T2I, i2i=_QWEN_I2I
     ),
