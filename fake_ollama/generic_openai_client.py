@@ -50,3 +50,9 @@ class GenericOpenAIClient(LlamaCppClient):
             safe_host = re.sub(r"[^A-Za-z0-9._-]+", "_", host)
             stem = f"{stem}-{safe_host}"
         return Path("logs") / f"{stem}.err.log"
+
+    async def generate_motion(self, payload: dict, *, estimated_vram_gb, estimated_memory_gb) -> dict:
+        return await self._post_json(
+            "/v1/motions/generations", "motion_generation", payload,
+            estimated_vram_gb, estimated_memory_gb,
+        )

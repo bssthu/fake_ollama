@@ -191,6 +191,11 @@ def register_routes(app: FastAPI) -> None:
     async def openai_video_generations(request: Request) -> Any:
         return await media_handlers._handle_openai_video_generation(request)
 
+    @app.post("/v1/motions/generations")
+    async def generate_motion(request: Request) -> Any:
+        from ..motion import handle_motion
+        return await handle_motion(request)
+
     @app.post("/v1/videos/context-ir")
     async def h3_context_ir(request: Request) -> Any:
         return await media_handlers._handle_h3_context_ir(request)

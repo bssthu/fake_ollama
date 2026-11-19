@@ -56,6 +56,8 @@ Playground 先选功能、再选模型，还提供 [即时语音翻译](docs/rea
 
 ## 特性一览
 
+- [NVIDIA MotionBricks 骨骼动作生成](services/motionbricks/README.md) 支持 SOMA 人体与 Unitree G1。可在 Playground 输入姿态、预览和下载 30 FPS 动作，也可调用 `POST /v1/motions/generations`。
+
 - **多上游路由**：把 Anthropic / OpenAI 兼容（DeepSeek / Together / Groq / 自建网关 / claude-relay-service…）合并到同一组接口
 - **结构化模型标识 `{model, target}`**：每条暴露条目显式声明「上游显示名 + 来源 target 名」，相同名字但来源不同的模型不会再混淆；可选 `alias` 字段在客户端可见的公开 ID 上替换全名
 - **每模型 profile**：capabilities / 上下文长度 / 思维链开关 / 输出上限——key 支持 `model@target`（最优先）、裸 `model`、tagless base 三级回退

@@ -1,0 +1,34 @@
+{
+  "generic_openai_targets": [
+    {
+      "name": "motionbricks-soma-local",
+      "models": ["motionbricks-soma"],
+      "base_url": "http://127.0.0.1:21485",
+      "cwd": "J:/Projects/LLM_Models/MotionBricks/runtime",
+      "start_command": ".venv\\Scripts\\python.exe -u I:/Projects/fake_ollama/services/motionbricks/adapter.py --rig soma --port 21485",
+      "auto_start": true,
+      "startup_timeout_seconds": 900,
+      "idle_timeout_seconds": 300,
+      "max_concurrent_requests": 1
+    },
+    {
+      "name": "motionbricks-g1-local",
+      "models": ["motionbricks-g1"],
+      "base_url": "http://127.0.0.1:21486",
+      "cwd": "J:/Projects/LLM_Models/MotionBricks/runtime",
+      "start_command": ".venv\\Scripts\\python.exe -u I:/Projects/fake_ollama/services/motionbricks/adapter.py --rig g1 --port 21486",
+      "auto_start": true,
+      "startup_timeout_seconds": 900,
+      "idle_timeout_seconds": 300,
+      "max_concurrent_requests": 1
+    }
+  ],
+  "model_profiles": [
+    {"model": "motionbricks-soma", "target": "motionbricks-soma-local", "capabilities": ["motion_generation"], "estimated_vram_gb": 4, "estimated_memory_gb": 6},
+    {"model": "motionbricks-g1", "target": "motionbricks-g1-local", "capabilities": ["motion_generation"], "estimated_vram_gb": 4, "estimated_memory_gb": 6}
+  ],
+  "exposed_models": [
+    {"model": "motionbricks-soma", "target": "motionbricks-soma-local", "alias": "motionbricks-soma"},
+    {"model": "motionbricks-g1", "target": "motionbricks-g1-local", "alias": "motionbricks-g1"}
+  ]
+}

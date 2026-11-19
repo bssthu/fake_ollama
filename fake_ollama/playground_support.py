@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from .config import ComfyUITarget, DecisionTarget, H3ContextIRProfile, H3ContextIRProvider, Settings, outbound_cycle_headers
+from .config import ComfyUITarget, DecisionTarget, GenericOpenAITarget, H3ContextIRProfile, H3ContextIRProvider, Settings, outbound_cycle_headers
 from .media_operations import describe_comfyui_operation
 from .routing import (
     _listener_name,
@@ -122,6 +122,11 @@ def _playground_model_entry(
                 "tool_calling": "tools" in capability_set,
             }
         )
+    if "motion_generation" in capability_set and isinstance(source, GenericOpenAITarget):
+        operations.append({
+            "id": "motion_generation", "endpoint": "/v1/motions/generations",
+            "stream": False, "history_mode": "single_turn", "parameters": [],
+        })
     if "image_generation" in capability_set:
         operations.append(
             {

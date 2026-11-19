@@ -179,6 +179,10 @@ def _dispatch(
         "/v1/messages", "/v1/messages/count_tokens",
     }:
         raise HTTPException(400, "Decision models use /v1/systemone or /v1/decisions")
+    if (request.url.path in {"/api/chat", "/api/generate", "/v1/chat/completions",
+                             "/v1/messages", "/v1/messages/count_tokens"}
+            and settings.profile_for(f"{model}@{backend.name}").capabilities == ["motion_generation"]):
+        raise HTTPException(400, "Motion models use /v1/motions/generations")
     metrics: Optional[RequestMetrics] = getattr(
         request.app.state, "request_metrics", None
     )
@@ -332,6 +336,7 @@ _API_ONLY_PATH_PREFIXES = (
     "/v1/models",
     "/v1/images",
     "/v1/videos",
+    "/v1/motions",
     "/v1/systemone",
     "/v1/decisions",
 )
@@ -386,6 +391,8 @@ def _request_surface(path: str) -> str:
             return "decisions"
         if path.startswith("/v1/images"):
             return "images"
+        if path.startswith("/v1/motions"):
+            return "motions"
         if path.startswith("/v1/videos"):
             return "videos"
         return "anthropic" if path.startswith("/v1/messages") else "models"
@@ -588,7 +595,7 @@ def _install_port_router(app: FastAPI) -> None:
                 if path == "/":
                     return _finish(RedirectResponse("/playground/"))
                 playground_media = _has_path_prefix(
-                    path, ("/v1/images", "/v1/videos", "/v1/systemone", "/v1/decisions")
+                    path, ("/v1/images", "/v1/videos", "/v1/motions", "/v1/systemone", "/v1/decisions")
                 )
                 model_discovery = _has_path_prefix(path, ("/v1/models",))
                 if (

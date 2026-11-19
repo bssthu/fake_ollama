@@ -93,6 +93,7 @@
     ocr_score: 'OCR 候选复核',
     chat: '聊天 / 文本补全',
     decision: '结构化决策 / Decision',
+    motion_generation: '骨骼动作生成',
     image_generation: '图片生成',
     image_edit: '图片编辑',
     video_generation: '视频生成',
@@ -101,7 +102,7 @@
   };
   const KNOWN_CAPABILITIES = new Set([
     'completion', 'tools', 'vision', 'image_generation', 'image_edit',
-    'video_generation', 'video_understanding', 'h3_context_ir', 'decision', 'ocr',
+    'video_generation', 'video_understanding', 'h3_context_ir', 'decision', 'ocr', 'motion_generation',
   ]);
   const CONTEXT_THRESHOLD_RATIO = 0.9;
   const DISCOVERY_SCHEMA_VERSION = 1;
@@ -542,6 +543,8 @@
         appendMessageElement(wrap, turn.assistant, 'assistant', {reasoning: turn.reasoning});
       } else if (turn.decision) {
         appendDecisionResultElement(wrap, turn.decision);
+      } else if (turn.motion) {
+        appendMotionResult(wrap, turn.motion);
       } else if (turn.ocr) {
         appendOcrResult(wrap, turn.ocr);
       } else if (turn.media) {
@@ -954,8 +957,9 @@
     const isVideoAnalysis = op && op.id === 'video_analysis';
     const isContextIR = op && op.id === 'h3_context_ir';
     const isDecision = op && op.id === 'decision';
+    const isMotion = op && op.id === 'motion_generation';
     const isOcr = Boolean(op && op.ocr_mode);
-    const isMedia = op && !isChatRequest && !isDecision && !isOcr;
+    const isMedia = op && !isChatRequest && !isDecision && !isOcr && !isMotion;
     const usesMediaQueue = operationUsesMediaQueue(op);
     const acceptsUploads = op && (op.accepts_images || op.accepts_videos);
 
@@ -1005,7 +1009,7 @@
       els.dropHint.textContent = '当前格式不支持这些图片。请切回后端原生格式或移除图片；不会自动转换或丢弃。';
     }
     els.chatParams.hidden = !isChatRequest;
-    els.chatParams.closest('.advanced').hidden = Boolean(isDecision || isOcr);
+    els.chatParams.closest('.advanced').hidden = Boolean(isDecision || isOcr || isMotion);
     els.mediaParams.hidden = !(isMedia || isVideoAnalysis);
     els.ttftMetric.hidden = !isChatRequest;
     els.resultTitle.textContent = isDecision ? '决策结果' : isChat
@@ -1068,6 +1072,11 @@
       els.send.textContent = isDecision ? '运行决策 →' : isVideoAnalysis
         ? '分析视频 →'
         : (isChat ? '发送请求 →' : (isContextIR ? '增强 H3 Prompt →' : (isVideoGeneration ? '生成视频 →' : (isImageEdit ? '编辑图片 →' : '生成图片 →'))));
+      if (isMotion) {
+        els.prompt.placeholder = '留空运行步行样例，或粘贴含 context_poses 和 target_poses 的 JSON';
+        els.shortcut.textContent = 'Enter 生成动作 · Ctrl / ⌘ + Enter 换行';
+        els.send.textContent = '生成动作 →';
+      }
     }
     renderOperationParameters(op);
     syncOcrForm(op);
@@ -1299,7 +1308,7 @@
     );
     els.send.disabled = Boolean(state.controller) || cameraBusy || !selectedModel() || !op
       || !credentialReady || op.configured === false
-      || (op.id !== 'decision' && !op.ocr_mode && !els.prompt.value.trim()) || missingRequiredMedia || !externalPlannerReady
+      || (requiresPrompt(op) && !els.prompt.value.trim()) || missingRequiredMedia || !externalPlannerReady
       || (op.id === 'decision' && hasImage && !op.accepts_images);
     els.generationCount.disabled = Boolean(state.controller) || !operationUsesMediaQueue(op);
     for (const input of els.decisionSection.querySelectorAll('input, select, textarea, button')) {
@@ -1385,6 +1394,7 @@
             : `正在生成第 1/${(plan && plan.runCount) || 1} 份图片…`));
     }
     if (op.ocr_mode) els.answerText.textContent = '正在识别 / 复核…';
+    if (op.id === 'motion_generation') els.answerText.textContent = '正在生成骨骼动作…';
     if (op.ocr_mode) els.apiKey.disabled = true;
     els.loadModels.disabled = true;
     els.model.disabled = true;
@@ -2583,6 +2593,103 @@
     els.prompt.focus();
   }
 
+  function prepareMotionRequest(op) {
+    const text = els.prompt.value.trim();
+    const input = text ? JSON.parse(text) : {example: 'walk'};
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('请输入姿态 JSON 对象');
+    return {
+      modelId: els.model.value, operationId: op.id, payload: {...input, model: els.model.value},
+      userMessage: {role: 'user', content: input.example === 'walk' ? '步行样例' : '自定义起始与目标姿态'},
+    };
+  }
+
+  function appendMotionResult(parent, motion) {
+    const section = document.createElement('article');
+    section.className = 'message assistant';
+    const caption = document.createElement('p');
+    caption.textContent = `${motion.num_frames} 帧 · ${motion.fps} FPS · ${motion.joint_names.length} 个关节`;
+    const canvas = document.createElement('canvas');
+    canvas.width = 540;
+    canvas.height = 240;
+    canvas.style.maxWidth = '100%';
+    canvas.setAttribute('aria-label', '骨骼动作预览');
+    const ctx = canvas.getContext('2d');
+    const frames = motion.preview.positions.map(frame => frame.map(([x, y, z]) => [0.8*x + 0.6*y, -z + 0.16*(y - x)]));
+    const points = frames.flat();
+    const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+    const left = Math.min(...xs), top = Math.min(...ys);
+    const width = Math.max(...xs) - left, height = Math.max(...ys) - top;
+    const scale = Math.min(500 / Math.max(0.01, width), 216 / Math.max(0.01, height));
+    const draw = index => {
+      ctx.fillStyle = '#18212b';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = '#8edcc9';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (const [p, c] of motion.preview.bones) {
+        const [a, b] = [frames[index][p], frames[index][c]];
+        ctx.moveTo(270 + (a[0]-left-width/2)*scale, 120 + (a[1]-top-height/2)*scale);
+        ctx.lineTo(270 + (b[0]-left-width/2)*scale, 120 + (b[1]-top-height/2)*scale);
+      }
+      ctx.stroke();
+    };
+    const controls = document.createElement('div');
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = 0;
+    slider.max = frames.length - 1;
+    slider.value = 0;
+    slider.setAttribute('aria-label', '动作帧');
+    let animation;
+    slider.oninput = () => { cancelAnimationFrame(animation); draw(Number(slider.value)); };
+    const play = document.createElement('button');
+    play.textContent = '播放';
+    play.onclick = () => {
+      cancelAnimationFrame(animation);
+      const start = performance.now();
+      function tick(now) {
+        if (!canvas.isConnected) return;
+        const index = Math.min(frames.length - 1, Math.floor((now-start)*motion.fps/1000));
+        slider.value = index;
+        draw(index);
+        if (index < frames.length - 1) animation = requestAnimationFrame(tick);
+      }
+      animation = requestAnimationFrame(tick);
+    };
+    controls.append(play, slider);
+    for (const [label, suffix, data] of [['下载动作', 'motion', motion], ['下载输入姿态', 'input', motion.input]]) {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.onclick = () => {
+        const url = URL.createObjectURL(new Blob([JSON.stringify(data)], {type: 'application/json'}));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${motion.model}-${suffix}.json`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      };
+      controls.append(button);
+    }
+    section.append(caption, canvas, controls);
+    parent.append(section);
+    draw(0);
+  }
+
+  async function runMotion(op, plan) {
+    const response = await fetch(op.endpoint, {
+      method: 'POST', headers: authHeaders(true), body: JSON.stringify(plan.payload), signal: state.controller.signal,
+    });
+    if (!response.ok) throw new Error(await responseError(response));
+    const motion = await response.json();
+    interactionFor(plan.modelId, op.id).turns.push({user: plan.userMessage, motion});
+    els.answer.classList.remove('active');
+    renderInteractionHistory();
+  }
+
+  function requiresPrompt(op) {
+    return op && !op.ocr_mode && !['decision', 'motion_generation'].includes(op.id);
+  }
+
   async function runContextIR(op, plan) {
     const form = new FormData();
     for (const [key, value] of Object.entries(plan.payload)) {
@@ -3258,7 +3365,7 @@
   async function runRequest() {
     const op = selectedOperation();
     if (op?.ocr_mode && state.ocrReleasing) return;
-    if (state.controller || !op || (op.id !== 'decision' && !op.ocr_mode && !els.prompt.value.trim())) return;
+    if (state.controller || !op || (requiresPrompt(op) && !els.prompt.value.trim())) return;
     if (state.loadedCredential !== els.apiKey.value.trim()) return;
     const imageCount = state.attachments.filter(
       (attachment) => attachment.kind === 'image',
@@ -3286,7 +3393,8 @@
     }
     let plan;
     try {
-      plan = operationUsesChatEndpoint(op)
+      if (op.id === 'motion_generation') plan = prepareMotionRequest(op);
+      else plan = operationUsesChatEndpoint(op)
         ? prepareChatRequest(op)
         : (op.ocr_mode ? prepareOcrRequest(op) : (op.id === 'decision' ? prepareDecisionRequest(op) : prepareMediaRequest(op)));
     } catch (error) {
@@ -3301,7 +3409,7 @@
     state.startedAt = performance.now();
     state.firstTokenAt = 0;
     beginRequest(op, plan);
-    if (op.id !== 'decision' && !op.ocr_mode) clearComposerInput();
+    if (requiresPrompt(op)) clearComposerInput();
     els.prompt.focus();
     syncSendState();
     state.timer = window.setInterval(() => {
@@ -3311,6 +3419,7 @@
       if (operationUsesChatEndpoint(op)) await runChat(op, plan);
       else if (op.ocr_mode) await runOcr(op, plan);
       else if (op.id === 'decision') await runDecision(op, plan);
+      else if (op.id === 'motion_generation') await runMotion(op, plan);
       else if (op.id === 'h3_context_ir') await runContextIR(op, plan);
       else await runMedia(op, plan);
     } catch (error) {

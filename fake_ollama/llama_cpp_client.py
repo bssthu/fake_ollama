@@ -670,6 +670,15 @@ class LlamaCppClient:
     ) -> Dict[str, Any]:
         body = dict(payload)
         body["stream"] = False
+        return await self._post_json(
+            "/v1/chat/completions", "chat", body, estimated_vram_gb, estimated_memory_gb,
+        )
+
+    async def _post_json(
+        self, path: str, operation: str, body: Dict[str, Any],
+        estimated_vram_gb: Optional[float], estimated_memory_gb: Optional[float],
+    ) -> Dict[str, Any]:
+        url = self._base + path
         model = str(body.get("model") or "")
         self._begin_request_lifecycle()
         try:
@@ -698,14 +707,13 @@ class LlamaCppClient:
                 self._mark_memory_reserved(model, estimated_memory_gb)
                 try:
                     try:
-                        url = f"{self._base}/v1/chat/completions"
                         headers = self._headers()
                         if request_data_logging_enabled():
                             log_data_event(
                                 "backend_request",
                                 backend="llama.cpp",
                                 target_id=self.target_id,
-                                operation="chat",
+                                operation=operation,
                                 method="POST",
                                 url=url,
                                 headers=headers_from_mapping(headers),
@@ -721,7 +729,7 @@ class LlamaCppClient:
                                 "backend_response_start",
                                 backend="llama.cpp",
                                 target_id=self.target_id,
-                                operation="chat",
+                                operation=operation,
                                 method="POST",
                                 url=url,
                                 status=resp.status_code,
@@ -731,7 +739,7 @@ class LlamaCppClient:
                                 "backend_response_body",
                                 backend="llama.cpp",
                                 target_id=self.target_id,
-                                operation="chat",
+                                operation=operation,
                                 method="POST",
                                 url=url,
                                 body=body_from_bytes(resp.content),
@@ -740,7 +748,7 @@ class LlamaCppClient:
                                 "backend_response_end",
                                 backend="llama.cpp",
                                 target_id=self.target_id,
-                                operation="chat",
+                                operation=operation,
                                 method="POST",
                                 url=url,
                                 status=resp.status_code,
@@ -753,9 +761,9 @@ class LlamaCppClient:
                             "backend_error",
                             backend="llama.cpp",
                             target_id=self.target_id,
-                            operation="chat",
+                            operation=operation,
                             method="POST",
-                            url=f"{self._base}/v1/chat/completions",
+                            url=url,
                             error=f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}",
                         )
                         raise
